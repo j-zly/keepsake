@@ -58,7 +58,101 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
 配置优先级（高→低）：**环境变量 > JSON 配置文件 > config.yaml 内联 > 默认值**
 
-### 1. 创建 Redis Index（首次使用）
+### 1. 配置方式
+
+配置碎片化记忆有三种方式，按优先级从高到低排列：
+
+1. **环境变量**（优先级最高）  
+   设置如 `FRAGMENTED_REDIS_HOST`、`FRAGMENTED_REDIS_PASSWORD` 等环境变量。
+
+2. **JSON 配置文件**（~/.config/fragmented-memory/config.json）  
+   完整的 JSON 配置文件，用于所有设置。
+
+3. **代码默认值**（优先级最低）  
+   在代码中定义的默认值。
+
+### 2. 完整配置示例
+
+以下是配置文件 `~/.config/fragmented-memory/config.json` 的完整示例，包含所有可用选项：
+
+```json
+{
+  // Redis 连接配置
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379,
+  "redis_password": "",
+  
+  // 搜索相关配置
+  "top_k": 5,
+  "candidate_k": 10,
+  "bm25_limit": 10,
+  "tag_filter": "",
+  
+  // 时间衰减配置
+  "decay_half_days": 60,
+  "hot_topic_decay_half_days": 30,
+  
+  // 排序权重配置
+  "sentiment_boost_positive": 1.5,
+  "sentiment_boost_negative": 1.3,
+  "feedback_positive_boost": 1.3,
+  "feedback_negative_penalty": 0.5,
+  "hot_topic_boost": 1.2,
+  
+  // 注意力机制配置
+  "attention_boost_max": 1.5,
+  "attention_base_increment": 2.0,
+  "attention_emotion_factor": 1.5,
+  
+  // 嵌入配置（可选）
+  "embedder": {
+    "provider": "dashscope",
+    "api_key": "sk-xxx",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "text-embedding-v2"
+  },
+  
+  // 自动维护配置
+  "consolidate_min_group": 2,
+  "consolidate_max_age_hours": 72,
+  "forget_max_age_days": 30,
+  "forget_dry_run": true,
+  
+  // 情感强度因子
+  "emotion_intensity_factor": 0.4
+}
+```
+
+> 注意：Redis 密码兼容性：留空表示无认证，提供密码会自动发送 AUTH 命令。
+
+### 3. 环境变量对照表
+
+| 环境变量 | 对应配置项 | 说明 |
+|----------|------------|------|
+| `FRAGMENTED_REDIS_HOST` | `redis_host` | Redis 服务器地址 |
+| `FRAGMENTED_REDIS_PORT` | `redis_port` | Redis 服务器端口 |
+| `FRAGMENTED_REDIS_PASSWORD` | `redis_password` | Redis 认证密码 |
+| `FRAGMENTED_TOP_K` | `top_k` | 最终返回碎片数 |
+| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | 候选碎片数（用于 KNN） |
+| `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 搜索候选数 |
+| `FRAGMENTED_TAG_FILTER` | `tag_filter` | 标签过滤（逗号分隔） |
+| `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | 时间衰减半衰期（天） |
+| `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | 热门话题时间衰减半衰期（天） |
+| `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding 缓存时间（秒） |
+| `FRAGMENTED_EMBEDDER` | `embedder.provider` | 嵌入模型提供商（`openai`、`dashscope`） |
+| `FRAGMENTED_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
+| `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
+| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | 触发合并的最小碎片数 |
+| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | 碎片参与合并的最小年龄（小时） |
+| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | 碎片保留天数后可能被遗忘 |
+| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | 遗忘安全模式：仅统计不删除 |
+| `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | 情绪烈度→权重系数（0=禁用，1=最大） |
+
+> 注意：Redis 密码兼容空值（无认证）或提供密码进行 AUTH 认证。  
+
+> 注意：修改 config.json 立即生效（只需发送 `/new` 命令，无需重启）。
+
+### 4. 创建 Redis Index（首次使用）
 
 代码会自动创建（`ensure_index()`），也可以手动执行：
 
@@ -76,31 +170,13 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
 > 维度（DIM）根据实际使用的 Embedding 模型动态调整，默认 1536。
 > 如果用 Docker：`docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
 
-### 2. Hermes 配置
+### 5. Hermes 配置
 
 在 `~/.hermes/config.yaml` 中开启：
 
 ```yaml
 memory:
   provider: fragmented
-```
-
-详细配置推荐写到 JSON 配置文件（不需要嵌在 config.yaml 里）：
-
-`~/.config/fragmented-memory/config.json`：
-
-```json
-{
-  "redis_host": "127.0.0.1",
-  "redis_port": 6379,
-  "top_k": 5,
-  "candidate_k": 10,
-  "embedder": {
-    "provider": "dashscope",
-    "api_key": "sk-xxx",
-    "model": "text-embedding-v2"
-  }
-}
 ```
 
 如果不配置 `embedder`，则只走 BM25 全文搜索模式。

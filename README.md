@@ -52,7 +52,101 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
 Configuration precedence (high to low): **Environment variables > JSON config file > config.yaml inline > defaults**
 
-### 1. Create Redis Index (first-time usage)
+### 1. Configuration Methods
+
+There are three ways to configure Fragmented Memory, listed in order of priority:
+
+1. **Environment Variables** (Highest precedence)  
+   Set environment variables like `FRAGMENTED_REDIS_HOST`, `FRAGMENTED_REDIS_PASSWORD`, etc.
+
+2. **JSON Config File** (~/.config/fragmented-memory/config.json)  
+   A complete JSON configuration file for all settings.
+
+3. **Code Defaults** (Lowest precedence)  
+   Default values defined in the code.
+
+### 2. Complete Configuration Example
+
+Here's a comprehensive example of the configuration file `~/.config/fragmented-memory/config.json` with all available options:
+
+```json
+{
+  // Redis 连接配置
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379,
+  "redis_password": "",
+  
+  // 搜索相关配置
+  "top_k": 5,
+  "candidate_k": 10,
+  "bm25_limit": 10,
+  "tag_filter": "",
+  
+  // 时间衰减配置
+  "decay_half_days": 60,
+  "hot_topic_decay_half_days": 30,
+  
+  // 排序权重配置
+  "sentiment_boost_positive": 1.5,
+  "sentiment_boost_negative": 1.3,
+  "feedback_positive_boost": 1.3,
+  "feedback_negative_penalty": 0.5,
+  "hot_topic_boost": 1.2,
+  
+  // 注意力机制配置
+  "attention_boost_max": 1.5,
+  "attention_base_increment": 2.0,
+  "attention_emotion_factor": 1.5,
+  
+  // 嵌入配置（可选）
+  "embedder": {
+    "provider": "dashscope",
+    "api_key": "sk-xxx",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "text-embedding-v2"
+  },
+  
+  // 自动维护配置
+  "consolidate_min_group": 2,
+  "consolidate_max_age_hours": 72,
+  "forget_max_age_days": 30,
+  "forget_dry_run": true,
+  
+  // 情感强度因子
+  "emotion_intensity_factor": 0.4
+}
+```
+
+> Note: Redis password compatibility: leave empty for no authentication, or provide password to automatically send AUTH command.
+
+### 3. Environment Variables Reference
+
+| Environment Variable | Corresponding Config Item | Description |
+|----------------------|----------------------------|-------------|
+| `FRAGMENTED_REDIS_HOST` | `redis_host` | Redis server host |
+| `FRAGMENTED_REDIS_PORT` | `redis_port` | Redis server port |
+| `FRAGMENTED_REDIS_PASSWORD` | `redis_password` | Redis password for authentication |
+| `FRAGMENTED_TOP_K` | `top_k` | Number of final fragments returned |
+| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate fragments count (for KNN) |
+| `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
+| `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
+| `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
+| `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
+| `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
+| `FRAGMENTED_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
+| `FRAGMENTED_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
+| `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
+| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum fragments to trigger consolidation |
+| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before fragments can be consolidated |
+| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
+| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
+| `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+
+> Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
+
+> Note: Changes to config.json take effect immediately without restarting (just send `/new`).
+
+### 4. Create Redis Index (first-time usage)
 
 The code will auto-create (`ensure_index()`), or execute manually:
 
@@ -70,31 +164,13 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
 > Dimension (DIM) is dynamically adjusted based on the embedding model used, default 1536.
 > For Docker: `docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
 
-### 2. Hermes Configuration
+### 5. Hermes Configuration
 
 Enable in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
   provider: fragmented
-```
-
-Detailed configuration is recommended in a JSON config file (not embedded in config.yaml):
-
-`~/.config/fragmented-memory/config.json`:
-
-```json
-{
-  "redis_host": "127.0.0.1",
-  "redis_port": 6379,
-  "top_k": 5,
-  "candidate_k": 10,
-  "embedder": {
-    "provider": "dashscope",
-    "api_key": "sk-xxx",
-    "model": "text-embedding-v2"
-  }
-}
 ```
 
 If `embedder` is not configured, only BM25 full-text search mode will be used.
