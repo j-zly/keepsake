@@ -212,9 +212,12 @@ class RedisStorage:
 
         # 尝试检查 index 是否已存在
         try:
-            client.ft(RS_INDEX).search(Query("*").paging(0, 0))
+            client.execute_command("FT.INFO", RS_INDEX)
             idx_exists = True
-        except Exception:
+        except redis.ResponseError:
+            idx_exists = False
+        except Exception as e:
+            logger.debug("storage: FT.INFO check failed (will attempt recreate): %s", e)
             idx_exists = False
 
         # 如果 index 已存在，检查维度是否匹配
