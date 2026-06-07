@@ -29,6 +29,10 @@
 | 👍 **反馈加权** | 标记有用/没用的碎片会影响排序 |
 | 🔥 **热门话题** | 自动统计跨会话高频话题 |
 | 📖 **同义词表** | 存 Redis Hash，实时加载展开搜索，无需部署 |
+| 😡 **情绪烈度** | 检测用户表达激烈程度（反复问号/感叹号/程度副词），烈度高的碎片权重更高 |
+| 👁️ **注意力追踪** | 用户反复提起的话题自动标记为高关注，相关碎片在搜索中排名上升 |
+| 🧬 **多级合并** | 每 2 小时自动将同主题碎片合并提炼为高层记忆，支持 level 1→2→3 多级蒸馏 |
+| 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）碎片，保持库精简 |
 
 ## 依赖
 
@@ -140,6 +144,10 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
 | `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
 | `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
+| `consolidate_min_group` | — | `2` | 合并触发最少碎片数 |
+| `consolidate_max_age_hours` | — | `72` | 碎片最少年龄（小时）后才参与合并 |
+| `forget_max_age_days` | — | `30` | 碎片保留天数后可能被遗忘 |
+| `forget_dry_run` | — | `true` | 遗忘安全模式：仅统计不删除 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -187,8 +195,8 @@ fragmented: BM25-only mode (no embedder configured)
          │  BM25 全文搜索     │  ← 默认，零成本
          │  (KNN 向量 search) │  ← 可选（需 embedder）
          │   ↓                │
-         │  五维重排序        │  ← 相似度 × 时间衰减
-         │                    │    × 情感 × 反馈 × 热门话题
+         │  六维重排序        │  ← 相似度 × 时间衰减
+         │                    │    × 情绪 × 反馈 × 热门 × 注意力
          │   ↓                │
          │  Top N 注入上下文   │
          └─────────┬─────────┘
@@ -200,8 +208,15 @@ fragmented: BM25-only mode (no embedder configured)
          ┌─────────▼─────────┐
          │   sync_turn()      │  ← 对话结束自动存档
          │   智能句子切分      │  ← 保护缩写/数字/引号
+         │   注意力追踪        │  ← 提取关键词计入关注度
          │   ↓                │
          │   存入 Redis        │  ← 下次可被检索
+         └───────────────────┘
+                   │
+         ┌─────────▼─────────┐
+         │   [cron] 每 2h     │  ← 后台 maintenance
+         │   ① 多级合并       │  ← 同主题→LLM提炼→level+1
+         │   ② 选择性遗忘     │  ← 低价值碎片清理
          └───────────────────┘
 ```
 

@@ -29,6 +29,8 @@ from tools.registry import tool_error
 from .embedder import create_embedder
 from .splitter import split_text
 from .storage import RedisStorage
+from .consolidator import Consolidator
+from .forgetter import Forgetter
 
 # ---------------------------------------------------------------------------
 # 工具扇区（供 Hermes MemoryProvider 注册）
@@ -139,6 +141,10 @@ class FragmentedMemoryProvider(MemoryProvider):
     _initialized: bool = False
     _storage: Optional[RedisStorage] = None
     _tag_filter: str = ""
+    _consolidator: Optional[Consolidator] = None
+    _forgetter: Optional[Forgetter] = None
+    _last_maintenance: float = 0.0
+    _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
 
     def __init__(self, **config):
         """
@@ -278,6 +284,19 @@ class FragmentedMemoryProvider(MemoryProvider):
             session_id, top_k, self._tag_filter or "(none)",
         )
 
+        # 初始化 Consolidator 和 Forgetter（守护模式）
+        self._consolidator = Consolidator(
+            storage=self._storage,
+            min_group_size=int(cfg.get("consolidate_min_group", 2)),
+            max_age_hours=int(cfg.get("consolidate_max_age_hours", 72)),
+        )
+        self._forgetter = Forgetter(
+            storage=self._storage,
+            max_age_days=int(cfg.get("forget_max_age_days", 30)),
+            dry_run=bool(cfg.get("forget_dry_run", True)),
+        )
+        logger.info("fragmented: maintenance engines initialized")
+
     def system_prompt_block(self) -> str:
         parts = [
             "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
@@ -342,7 +361,7 @@ class FragmentedMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """对话每轮结束后，将用户消息切分存档。"""
+        """对话每轮结束后，将用户消息切分存档，并触发维护。"""
         if not self._storage or not user_content or len(user_content.strip()) < 10:
             return
 
@@ -356,6 +375,51 @@ class FragmentedMemoryProvider(MemoryProvider):
                 source="sync_turn",
                 fragment_type="conversation",
             )
+
+        # 定期触发维护（Consolidation + Forget）
+        self._maybe_maintain()
+
+    def _maybe_maintain(self) -> None:
+        """检查是否该执行维护，执行 Consolidation + Forget。"""
+        import time as _time
+        now = _time.time()
+        if now - self._last_maintenance < self._maintenance_interval:
+            return
+        self._last_maintenance = now
+        self.maintenance()
+
+    def maintenance(self) -> Dict[str, Any]:
+        """执行一轮完整维护：Consolidation → Forget。
+
+        返回:
+            维护统计
+        """
+        stats: Dict[str, Any] = {
+            "consolidator": {"status": "skipped"},
+            "forgetter": {"status": "skipped"},
+        }
+
+        # Step 1: Consolidation
+        if self._consolidator:
+            try:
+                result = self._consolidator.consolidate()
+                stats["consolidator"] = result
+                logger.info("fragmented: consolidation done — %s", result)
+            except Exception as e:
+                logger.warning("fragmented: consolidation error: %s", e)
+                stats["consolidator"] = {"status": "error", "reason": str(e)}
+
+        # Step 2: Selective Forgetting
+        if self._forgetter:
+            try:
+                result = self._forgetter.forget()
+                stats["forgetter"] = result
+                logger.info("fragmented: forgetting done — %s", result)
+            except Exception as e:
+                logger.warning("fragmented: forgetting error: %s", e)
+                stats["forgetter"] = {"status": "error", "reason": str(e)}
+
+        return stats
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FEEDBACK_SCHEMA, HOT_TOPICS_SCHEMA]

@@ -20,7 +20,9 @@ import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder
-from .splitter import analyze_sentiment, extract_keywords
+from .splitter import extract_keywords
+from .emotion import analyze_emotion
+from .attention import record_attention, match_attention_boost
 
 logger = logging.getLogger(__name__)
 
@@ -358,11 +360,19 @@ class RedisStorage:
         if not client:
             return False
 
-        # 情感分析（除非明确传入）
+        # 情绪分析（除非明确传入）
         if sentiment_score is None or sentiment_label is None:
-            score, label = analyze_sentiment(text)
+            intensity, label = analyze_emotion(text)
         else:
-            score, label = sentiment_score, sentiment_label
+            intensity, label = sentiment_score, sentiment_label
+
+        # 注意力追踪
+        if client:
+            try:
+                keywords = extract_keywords(text, max_keywords=5)
+                record_attention(client, text, intensity, keywords)
+            except Exception:
+                pass
 
         # 基于内容 hash 去重
         content_hash = hashlib.sha256(text.encode()).hexdigest()[:12]
@@ -384,7 +394,7 @@ class RedisStorage:
                 "category": category,
                 "source": source,
                 "created": datetime.now(timezone.utc).isoformat(),
-                "sentiment_score": str(score),  # RediSearch Hash 存字符串
+                "sentiment_score": str(intensity),  # RediSearch Hash 存字符串
                 "sentiment_label": label,
                 "feedback_score": existing_feedback,  # 保留已有反馈，不重置
             }
@@ -445,6 +455,16 @@ class RedisStorage:
 
         except Exception as e:
             logger.debug("storage: _record_topics error: %s", e)
+
+    def match_attention(self, content: str, top_n: int = 10) -> float:
+        """检查碎片内容命中多少高注意力话题，返回加权值（1.0~1.5）。"""
+        client = self._get_client()
+        if not client or not content:
+            return 1.0
+        try:
+            return match_attention_boost(client, content, top_n=top_n)
+        except Exception:
+            return 1.0
 
     def match_hot_topics(self, text: str, limit: int = 10) -> int:
         """检查文本中包含多少个热门话题关键词。
@@ -709,6 +729,7 @@ class RedisStorage:
     # ------------------------------------------------------------------
 
     def _rerank_with_decay(
+        self,
         fragments: List[Dict[str, Any]],
         score_key: str = "_bm25_score",
         is_knn: bool = False,
@@ -716,8 +737,8 @@ class RedisStorage:
     ) -> List[Dict[str, Any]]:
         """综合得分重排序。
 
-        BM25 模式: combined = BM25归一化得分 × 时间衰减 × 情感权重 × 反馈权重 × 热门权重
-        KNN 模式:   combined = (1 - 余弦距离/2) × 时间衰减 × 情感权重 × 反馈权重 × 热门权重
+        BM25 模式: combined = BM25归一化得分 × 时间衰减 × 情绪权重 × 反馈权重 × 热门权重 × 注意力权重
+        KNN 模式:   combined = (1 - 余弦距离/2) × 时间衰减 × 情绪权重 × 反馈权重 × 热门权重 × 注意力权重
 
         权重参数见模块顶部常量。
         """
@@ -737,17 +758,16 @@ class RedisStorage:
 
         # ---- Step 2: BM25 模式用 min-max 动态归一化 ----
         if not is_knn and fragments:
-            scores = [float(f.get(score_key, 0.0)) for f in fragments]
-            max_raw = max(scores) if scores else 1.0
+            scores_raw = [float(f.get(score_key, 0.0)) for f in fragments]
+            max_raw = max(scores_raw) if scores_raw else 1.0
             if max_raw < 0.001:
                 max_raw = 1.0
             for frag in fragments:
-                raw = float(frag.get(score_key, 0.0))
-                frag["_sim"] = raw / max_raw
+                raw_val = float(frag.get(score_key, 0.0))
+                frag["_sim"] = raw_val / max_raw
 
-        # ---- Step 3: 五维权重综合 ----
+        # ---- Step 3: 六维权重综合 ----
         for frag in fragments:
-            # 取当前碎片自己的相似度
             sim = float(frag.get("_sim", 0.0))
 
             # 3a: 时间衰减
@@ -766,14 +786,13 @@ class RedisStorage:
                 else:
                     decay = 2.0 ** (-age_days / self._decay_half_days)
 
-            # 3b: 情感权重
-            sentiment_label = frag.get("sentiment_label", "neutral")
-            if sentiment_label == "positive":
-                emotion_w = self._sentiment_boost_positive
-            elif sentiment_label == "negative":
-                emotion_w = self._sentiment_boost_negative
-            else:
-                emotion_w = self._sentiment_boost_neutral
+            # 3b: 情绪权重（基于烈度，不再分正负）
+            try:
+                intensity = float(frag.get("sentiment_score", 0))
+            except (ValueError, TypeError):
+                intensity = 0.0
+            # intensity 0.0~2.0 → 权重 1.0~1.8
+            emotion_w = 1.0 + min(intensity, 2.0) * 0.4
 
             # 3c: 反馈权重
             try:
@@ -800,13 +819,22 @@ class RedisStorage:
                 except Exception:
                     pass
 
-            frag["_combined_score"] = sim * decay * emotion_w * feedback_w * hot_w
+            # 3e: 注意力加权
+            attn_w = 1.0
+            if content and storage is not None and hasattr(storage, 'match_attention'):
+                try:
+                    attn_w = storage.match_attention(content)
+                except Exception:
+                    pass
+
+            frag["_combined_score"] = sim * decay * emotion_w * feedback_w * hot_w * attn_w
             frag["_weights"] = {
                 "sim": round(sim, 4),
                 "decay": round(decay, 4),
                 "emotion": round(emotion_w, 4),
                 "feedback": round(feedback_w, 4),
                 "hot_topic": round(hot_w, 4),
+                "attention": round(attn_w, 4),
             }
 
         fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
