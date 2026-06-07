@@ -147,11 +147,11 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 
 ### 同义词表
 
-存 Redis Hash `fragmented:synonyms`，搜索时实时加载：
+存 Redis Hash `fragmented:synonyms`，搜索时实时展开同义词，提高召回率：
 
 ```bash
-redis-cli HSET fragmented:synonyms 背驰 '["顶背驰","底背驰"]'
-redis-cli HSET fragmented:synonyms memory '["记忆","存储","碎片"]'
+redis-cli HSET fragmented:synonyms setup '["安装","配置","部署","搭建"]'
+redis-cli HSET fragmented:synonyms fix '["修","改","补","修复","解决"]'
 ```
 
 ## 验证
