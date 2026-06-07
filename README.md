@@ -28,6 +28,27 @@ User: "How did we set up that React project structure last time?"
 - **Auto Sync** — every turn is archived automatically, memory tool writes are synced
 - **Auto Maintenance** — consolidation + selective forgetting to keep storage tidy
 
+## Design Philosophy: Brain-like Memory
+
+Most AI agent memory systems work like an **external hard drive** — store conversations in a vector database, retrieve by semantic similarity. They are database-first, search-first.
+
+Fragmented Memory takes a different approach. It's modeled after **how the human brain actually remembers**:
+
+| Brain Mechanism | Implementation |
+|----------------|---------------|
+| Forgetting Curve | Time decay (60-day half-life) — old memories fade naturally |
+| Emotion Deepens Memory | Emotional weight boost — intense moments stick |
+| Repetition Reinforces | Attention tracking + hot topic scoring |
+| Correction Works | Correction detection — user says "no", the wrong memory is suppressed |
+| Use It or Lose It | Feedback reinforcement (frag_memory_feedback) |
+| Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
+| Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
+| Sleep Consolidation | Nightly cron: consolidation + synonym discovery at 3 AM |
+| Context Isolation | agent_id tagging — different identities, separate memories |
+| Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
+
+No vector database. No embedding API calls. No LLM inference for memory operations. Just **pure statistical methods** running on Redis + RediSearch — the same techniques the brain uses: frequency, recency, emotional salience, association, and feedback.
+
 ## Requirements
 
 - **Python 3.10+**
