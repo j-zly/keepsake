@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fragmented-memory"
 version = "1.0.0"
-description = "碎片化记忆系统 for Hermes Agent — 对话自动检索相关记忆碎片注入上下文"
+description = "Fragmented memory system for Hermes Agent — automatically retrieve relevant memory fragments and inject them into conversation context"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
