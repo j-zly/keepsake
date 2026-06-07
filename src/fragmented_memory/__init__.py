@@ -24,10 +24,64 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 from .embedder import create_embedder
 from .splitter import split_text
 from .storage import RedisStorage
+
+# ---------------------------------------------------------------------------
+# 工具扇区（供 Hermes MemoryProvider 注册）
+# ---------------------------------------------------------------------------
+
+FEEDBACK_SCHEMA = {
+    "name": "frag_memory_feedback",
+    "description": (
+        "记录用户对一条碎片的反馈 — 标记有用/没用。"
+        "正反馈让该碎片在未来搜索中排名更高，"
+        "负反馈大幅降权（标记为没用的碎片几乎不会再出现）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "fragment_key": {
+                "type": "string",
+                "description": "碎片的 Redis key（如 memory:frag:abc123），从相关碎片的 key 字段获得。",
+            },
+            "is_positive": {
+                "type": "boolean",
+                "description": "True = 这条记忆有用，False = 没用",
+            },
+        },
+        "required": ["fragment_key", "is_positive"],
+    },
+}
+
+HOT_TOPICS_SCHEMA = {
+    "name": "frag_hot_topics",
+    "description": (
+        "查询全局热门话题统计。返回跨会话出现最频繁的话题词。"
+        "可选日榜/周榜/全局。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "返回条数（默认 10，最大 30）",
+                "default": 10,
+            },
+            "period": {
+                "type": "string",
+                "enum": ["all", "daily", "weekly"],
+                "description": "统计周期：all=全局, daily=日榜, weekly=周榜",
+                "default": "all",
+            },
+        },
+        "required": [],
+    },
+}
+
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +269,10 @@ class FragmentedMemoryProvider(MemoryProvider):
             "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
             "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。",
             "相关碎片就在下面「相关碎片」段落里，直接使用即可。",
-            "碎片按语义相似度 + 时间权重综合排序，旧碎片权重逐步衰减。",
+            "碎片综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
+            "正反馈用 frag_memory_feedback(key, positive=True) 标记有用，",
+            "负反馈用 frag_memory_feedback(key, positive=False) 标记没用。",
+            "热门话题用 frag_hot_topics() 查询。",
         ]
         return "\n".join(parts)
 
@@ -242,10 +299,21 @@ class FragmentedMemoryProvider(MemoryProvider):
             lines.append(f"[{i}] {frag.get('content', '')}")
             tags = frag.get("tags", "")
             combined = frag.get("_combined_score", 0)
+            weights = frag.get("_weights", {})
             info_parts = []
             if tags:
                 info_parts.append(f"标签: {tags}")
             info_parts.append(f"综合: {combined:.2f}")
+            if weights:
+                info_parts.append(f"w: sim={weights.get('sim',0):.2f} decay={weights.get('decay',0):.2f} "
+                                  f"emotion={weights.get('emotion',1):.1f} fb={weights.get('feedback',1):.1f} "
+                                  f"hot={weights.get('hot_topic',1):.1f}")
+            # 情感标签可视化
+            sent_label = frag.get("sentiment_label", "")
+            if sent_label and sent_label != "neutral":
+                sent_score = frag.get("sentiment_score", "0")
+                icon = "😊" if sent_label == "positive" else "😠"
+                info_parts.append(f"{icon} {sent_label}({sent_score})")
             lines.append(f"    ({', '.join(info_parts)})")
             lines.append("")
 
@@ -276,7 +344,47 @@ class FragmentedMemoryProvider(MemoryProvider):
             )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return []
+        return [FEEDBACK_SCHEMA, HOT_TOPICS_SCHEMA]
+
+    def handle_tool_call(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        **kwargs,
+    ) -> str:
+        """Route tool calls to the appropriate handler."""
+        import json as _json
+
+        if tool_name == "frag_memory_feedback":
+            return self._handle_feedback(args, _json)
+        elif tool_name == "frag_hot_topics":
+            return self._handle_hot_topics(args, _json)
+        return tool_error(f"Unknown fragmented memory tool: '{tool_name}'")
+
+    # ------------------------------------------------------------------
+    # Tool handlers
+    # ------------------------------------------------------------------
+
+    def _handle_feedback(self, args: Dict[str, Any], _json) -> str:
+        key = args.get("fragment_key", "")
+        is_pos = bool(args.get("is_positive", True))
+        if not key:
+            return tool_error("fragment_key is required")
+        if not self._storage:
+            return tool_error("Memory storage not initialized")
+        ok = self._storage.record_feedback(key, is_pos)
+        if ok:
+            action = "有用 👍" if is_pos else "没用 👎"
+            return _json.dumps({"success": True, "action": action, "key": key})
+        return tool_error("Failed to record feedback")
+
+    def _handle_hot_topics(self, args: Dict[str, Any], _json) -> str:
+        limit = min(int(args.get("limit", 10)), 30)
+        period = args.get("period", "all")
+        if not self._storage:
+            return tool_error("Memory storage not initialized")
+        topics = self._storage.get_hot_topics(limit=limit, period=period)
+        return _json.dumps({"topics": topics, "count": len(topics)}, ensure_ascii=False)
 
     def shutdown(self) -> None:
         if self._storage:
