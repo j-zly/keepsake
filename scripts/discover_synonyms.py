@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""同义词自动发现 — 给 cron 调用用。"""
-import sys
-import json
+import sys, json, importlib.machinery
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+SRC = Path(__file__).resolve().parent.parent / 'src'
+sys.path.insert(0, str(SRC))
 
-from fragmented_memory.storage import RedisStorage
+from fragmented_memory import splitter, emotion, embedder
 
-config_path = Path("~/.config/fragmented-memory/config.json").expanduser()
-if config_path.exists():
-    with open(config_path) as f:
-        cfg = json.load(f)
-else:
-    cfg = {}
-
-storage = RedisStorage(
-    host=cfg.get("redis_host", "127.0.0.1"),
-    port=int(cfg.get("redis_port", 6379)),
-    password=cfg.get("redis_password") or None,
-    synonym_min_word_freq=int(cfg.get("synonym_min_word_freq", 10)),
-    synonym_jaccard_threshold=float(cfg.get("synonym_jaccard_threshold", 0.5)),
-    synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
+_loader = importlib.machinery.SourceFileLoader(
+    'fragmented_memory.storage',
+    str(SRC / 'fragmented_memory' / 'storage.py')
 )
-result = storage.discover_synonyms()
-storage.close()
+mod = type(sys)('fragmented_memory.storage')
+_loader.exec_module(mod)
+
+cfg_p = Path('~/.config/fragmented-memory/config.json').expanduser()
+cfg = json.loads(cfg_p.read_text()) if cfg_p.exists() else {}
+
+store = mod.RedisStorage(
+    host=cfg.get('redis_host', '127.0.0.1'),
+    port=int(cfg.get('redis_port', 6379)),
+    password=cfg.get('redis_password') or None,
+    synonym_min_word_freq=int(cfg.get('synonym_min_word_freq', 10)),
+    synonym_jaccard_threshold=float(cfg.get('synonym_jaccard_threshold', 0.5)),
+    synonym_min_co_occurrence=int(cfg.get('synonym_min_co_occurrence', 3)),
+)
+result = store.discover_synonyms()
+store.close()
 print(json.dumps(result, ensure_ascii=False))
