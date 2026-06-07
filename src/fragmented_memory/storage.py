@@ -136,6 +136,9 @@ class RedisStorage:
         attention_emotion_factor: float = 1.5,
         agent_id: str = "",
         is_primary: bool = False,
+        synonym_min_word_freq: int = 10,
+        synonym_jaccard_threshold: float = 0.5,
+        synonym_min_co_occurrence: int = 3,
     ):
         self._embedder = embedder
         self._host = host
@@ -160,6 +163,10 @@ class RedisStorage:
         self._attention_emotion_factor = attention_emotion_factor
         self._agent_id = agent_id
         self._is_primary = is_primary
+        # 同义词发现参数
+        self._synonym_min_word_freq = synonym_min_word_freq
+        self._synonym_jaccard_threshold = synonym_jaccard_threshold
+        self._synonym_min_co_occurrence = synonym_min_co_occurrence
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -998,3 +1005,159 @@ class RedisStorage:
 
         fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
         return fragments
+
+    def discover_synonyms(self) -> Dict[str, Any]:
+        """自动发现同义词组。
+
+        扫描全库碎片，统计词频和共现关系，生成同义词组并写入 Redis Hash。
+
+        Returns:
+            统计信息字典
+        """
+        from .splitter import _STOP_WORDS
+        import jieba
+
+        client = self._get_client()
+        if not client:
+            return {"discovered_groups": 0, "total_terms": 0, "scanned_fragments": 0}
+
+        # 统计词频和共现
+        word_freq: Dict[str, int] = {}
+        co_occur: Dict[Tuple[str, str], int] = {}
+        scanned_fragments = 0
+
+        # 遍历所有碎片
+        cursor = "0"
+        while cursor != 0:
+            cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=1000)
+            for key in keys:
+                try:
+                    # 获取 content 字段
+                    content = client.hget(key, "content")
+                    if content is None:
+                        continue
+                    if isinstance(content, bytes):
+                        content = content.decode("utf-8")
+
+                    # 分词（使用 jieba）
+                    words = jieba.lcut(content)
+
+                    # 过滤停用词（复用 splitter.py 的 _STOP_WORDS）
+                    stop_words = _STOP_WORDS
+
+                    # 过滤长度≥2 且不在停用词中的词
+                    filtered_words = [w for w in words
+                                      if len(w) >= 2
+                                      and w not in stop_words
+                                      and not w.isdigit()]
+
+                    if not filtered_words:
+                        continue
+
+                    scanned_fragments += 1
+
+                    # 统计词频
+                    unique_words = set(filtered_words)
+                    for word in unique_words:
+                        word_freq[word] = word_freq.get(word, 0) + 1
+
+                    # 统计共现（用 set 去重，避免重复词导致计数偏差）
+                    unique_list = sorted(unique_words)
+                    for i in range(len(unique_list)):
+                        for j in range(i + 1, len(unique_list)):
+                            key_pair = (unique_list[i], unique_list[j])
+                            co_occur[key_pair] = co_occur.get(key_pair, 0) + 1
+
+                except Exception as e:
+                    # 某条碎片解析失败跳过
+                    logger.debug("storage: skip fragment %s due to parsing error: %s", key, e)
+                    continue
+
+        # 过滤候选词
+        candidates = {word for word, freq in word_freq.items()
+                      if freq >= self._synonym_min_word_freq}
+
+        # 找出同义词组
+        discovered_groups = 0
+        new_synonym_map = {}
+
+        # 对候选集中每一对词
+        for word_a in candidates:
+            for word_b in candidates:
+                if word_a >= word_b:
+                    continue
+
+                # 获取共现次数
+                c = co_occur.get((word_a, word_b), 0)
+
+                # 计算 Jaccard 系数
+                if word_freq[word_a] + word_freq[word_b] - c > 0:
+                    jaccard = c / (word_freq[word_a] + word_freq[word_b] - c)
+                else:
+                    jaccard = 0.0
+
+                # 满足任一阈值条件则认为是同义词
+                if jaccard >= self._synonym_jaccard_threshold or c >= self._synonym_min_co_occurrence:
+                    # 添加到结果中（双向）
+                    if word_a not in new_synonym_map:
+                        new_synonym_map[word_a] = set()
+                    if word_b not in new_synonym_map:
+                        new_synonym_map[word_b] = set()
+
+                    new_synonym_map[word_a].add(word_b)
+                    new_synonym_map[word_b].add(word_a)
+                    discovered_groups += 1
+
+        # 合并新发现的同义词到现有映射
+        existing = client.hgetall(SYNONYM_HASH_KEY)
+        merged_synonym_map = {}
+
+        # 加载现有的同义词映射
+        for term_b, val_b in existing.items():
+            term = term_b.decode("utf-8").lower().strip()
+            if not term:
+                continue
+            try:
+                syns = _json.loads(val_b.decode("utf-8"))
+            except (_json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            terms_set = set()
+            for s in syns:
+                sl = s.lower().strip()
+                if sl and sl != term:
+                    terms_set.add(sl)
+            if terms_set:
+                merged_synonym_map[term] = terms_set
+                for s in terms_set:
+                    if s not in merged_synonym_map:
+                        merged_synonym_map[s] = set()
+                    merged_synonym_map[s].add(term)
+
+        # 将新发现的同义词加入合并结果（避免覆盖手动添加的）
+        for word, synonyms in new_synonym_map.items():
+            if word in merged_synonym_map:
+                # 手动已存在的，跳过（手动添加的优先级高）
+                continue
+            merged_synonym_map[word] = synonyms
+
+            # 更新反向映射
+            for syn in synonyms:
+                if syn not in merged_synonym_map:
+                    merged_synonym_map[syn] = set()
+                merged_synonym_map[syn].add(word)
+
+        # 写入 Redis Hash
+        if merged_synonym_map:
+            pipe = client.pipeline()
+            for word, synonyms in merged_synonym_map.items():
+                pipe.hset(SYNONYM_HASH_KEY, word, _json.dumps(list(synonyms)))
+            pipe.execute()
+
+        # 清除同义词缓存
+        self._synonym_cache = None
+
+        return {
+            "discovered_groups": discovered_groups,
+            "total_terms": len(merged_synonym_map),
+            "scanned_fragments": scanned_fragments
+        }

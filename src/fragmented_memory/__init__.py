@@ -206,6 +206,9 @@ class FragmentedMemoryProvider(MemoryProvider):
             "top_k": 5,
             "candidate_k": 10,
             "tag_filter": "",
+            "synonym_min_word_freq": 10,
+            "synonym_jaccard_threshold": 0.5,
+            "synonym_min_co_occurrence": 3,
         }
 
         # 2. JSON 配置文件覆盖
@@ -311,6 +314,9 @@ class FragmentedMemoryProvider(MemoryProvider):
             attention_emotion_factor=float(cfg.get("attention_emotion_factor", 1.5)),
             agent_id=cfg.get("agent_id", ""),
             is_primary=cfg.get("is_primary", False),
+            synonym_min_word_freq=int(cfg.get("synonym_min_word_freq", 10)),
+            synonym_jaccard_threshold=float(cfg.get("synonym_jaccard_threshold", 0.5)),
+            synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
         )
 
         # 自动创建/验证 index
@@ -473,6 +479,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("fragmented: forgetting error: %s", e)
                 stats["forgetter"] = {"status": "error", "reason": str(e)}
+
 
         return stats
 

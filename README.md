@@ -112,6 +112,11 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "forget_max_age_days": 30,
   "forget_dry_run": true,
   
+  // 同义词发现配置
+  "synonym_min_word_freq": 10,
+  "synonym_jaccard_threshold": 0.5,
+  "synonym_min_co_occurrence": 3,
+  
   // 情感强度因子
   "emotion_intensity_factor": 0.4
 }
@@ -223,6 +228,9 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `attention_boost_max` | — | `1.5` | Maximum attention weighting value |
 | `attention_base_increment` | — | `2.0` | Base attention increment per mention |
 | `attention_emotion_factor` | — | `1.5` | Emotion intensity amplification factor for attention |
+| `synonym_min_word_freq` | — | `10` | Minimum fragment frequency for word to be considered |
+| `synonym_jaccard_threshold` | — | `0.5` | Jaccard similarity threshold for synonym detection |
+| `synonym_min_co_occurrence` | — | `3` | Minimum co-occurrence count for synonym detection |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 

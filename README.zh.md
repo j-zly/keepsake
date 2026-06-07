@@ -118,6 +118,11 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
   "forget_max_age_days": 30,
   "forget_dry_run": true,
   
+  // 同义词发现配置
+  "synonym_min_word_freq": 10,
+  "synonym_jaccard_threshold": 0.5,
+  "synonym_min_co_occurrence": 3,
+  
   // 情感强度因子
   "emotion_intensity_factor": 0.4
 }
@@ -229,6 +234,9 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `attention_boost_max` | — | `1.5` | 注意力加权最大值 |
 | `attention_base_increment` | — | `2.0` | 每次提及的基础关注增量 |
 | `attention_emotion_factor` | — | `1.5` | 情绪烈度对注意力的放大系数 |
+| `synonym_min_word_freq` | — | `10` | 词至少出现在 N 条碎片里才考虑 |
+| `synonym_jaccard_threshold` | — | `0.5` | 两词 Jaccard 系数 ≥ 此值视为同义 |
+| `synonym_min_co_occurrence` | — | `3` | 两词绝对共现次数 ≥ 此值视为同义 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
