@@ -17,6 +17,7 @@ fragmented-memory — 碎片化记忆系统 for Hermes Agent.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +32,23 @@ from .splitter import split_text
 from .storage import RedisStorage
 from .consolidator import Consolidator
 from .forgetter import Forgetter
+
+# ---------------------------------------------------------------------------
+# 纠正检测 — 用户否定/纠正时降权前几轮碎片
+# ---------------------------------------------------------------------------
+
+_CORRECTION_PATTERNS = [
+    '不对', '不是', '错了', '删除了', '回退',
+    '不是这样', '说错了', '搞错了', '弄错了',
+    '不对啊', '不对呀', '不对吧',
+]
+
+def _is_correction(text: str) -> bool:
+    """检测用户消息是否为纠正/否定语气。"""
+    for pattern in _CORRECTION_PATTERNS:
+        if pattern in text:
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # 工具扇区（供 Hermes MemoryProvider 注册）
@@ -145,6 +163,8 @@ class FragmentedMemoryProvider(MemoryProvider):
     _forgetter: Optional[Forgetter] = None
     _last_maintenance: float = 0.0
     _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
+    _recent_fragment_keys: List[str] = []
+    _max_recent_keys: int = 30
 
     def __init__(self, **config):
         """
@@ -198,6 +218,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             "top_k": os.environ.get("FRAGMENTED_TOP_K"),
             "candidate_k": os.environ.get("FRAGMENTED_CANDIDATE_K"),
             "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
+            "agent_id": os.environ.get("FRAGMENTED_AGENT_ID"),
+            "is_primary": os.environ.get("FRAGMENTED_IS_PRIMARY"),
         }
         for key, val in env_overrides.items():
             if val is not None:
@@ -205,6 +227,17 @@ class FragmentedMemoryProvider(MemoryProvider):
 
         # 4. inline（Hermes 传入的 config.yaml 配置）覆盖
         cfg = _deep_merge(cfg, inline_cfg)
+
+        # 5. 验证 agent_id 必须配置
+        agent_id = cfg.get("agent_id")
+        if agent_id is None or agent_id == "":
+            raise ValueError("agent_id must be configured in config file, environment variable, or inline config")
+
+        # 6. 解析 is_primary，默认为 false
+        is_primary = cfg.get("is_primary", False)
+        if isinstance(is_primary, str):
+            is_primary = is_primary.lower() in ("true", "1", "yes", "on")
+        cfg["is_primary"] = bool(is_primary)
 
         return cfg
 
@@ -273,6 +306,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             attention_boost_max=float(cfg.get("attention_boost_max", 1.5)),
             attention_base_increment=float(cfg.get("attention_base_increment", 2.0)),
             attention_emotion_factor=float(cfg.get("attention_emotion_factor", 1.5)),
+            agent_id=cfg.get("agent_id", ""),
+            is_primary=cfg.get("is_primary", False),
         )
 
         # 自动创建/验证 index
@@ -366,13 +401,17 @@ class FragmentedMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """对话每轮结束后，将用户消息切分存档，并触发维护。"""
+        """对话每轮结束后，将用户消息切分存档，并检测纠正标记。"""
         if not self._storage or not user_content or len(user_content.strip()) < 10:
             return
 
         segments = split_text(user_content.strip())
         sid_short = session_id[:8] if session_id else "unknown"
+        current_keys: List[str] = []
         for seg in segments:
+            content_hash = hashlib.sha256(seg.encode()).hexdigest()[:12]
+            key = f"memory:frag:{content_hash}"
+            current_keys.append(key)
             self._storage.store(
                 text=seg,
                 tags=f"session:{sid_short}",
@@ -380,6 +419,14 @@ class FragmentedMemoryProvider(MemoryProvider):
                 source="sync_turn",
                 fragment_type="conversation",
             )
+
+        # 纠正检测：如果用户否定了前面的内容，降权 ring buffer 中之前的碎片
+        if _is_correction(user_content) and self._recent_fragment_keys:
+            self._storage.correct_fragments(self._recent_fragment_keys)
+
+        # 更新 ring buffer（当前轮次加入，限制最大条目数）
+        self._recent_fragment_keys.extend(current_keys)
+        self._recent_fragment_keys = self._recent_fragment_keys[-self._max_recent_keys:]
 
         # 定期触发维护（Consolidation + Forget）
         self._maybe_maintain()

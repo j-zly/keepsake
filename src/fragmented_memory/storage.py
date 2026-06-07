@@ -133,6 +133,8 @@ class RedisStorage:
         attention_boost_max: float = 1.5,
         attention_base_increment: float = 2.0,
         attention_emotion_factor: float = 1.5,
+        agent_id: str = "",
+        is_primary: bool = False,
     ):
         self._embedder = embedder
         self._host = host
@@ -154,6 +156,8 @@ class RedisStorage:
         self._attention_boost_max = attention_boost_max
         self._attention_base_increment = attention_base_increment
         self._attention_emotion_factor = attention_emotion_factor
+        self._agent_id = agent_id
+        self._is_primary = is_primary
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -404,9 +408,25 @@ class RedisStorage:
             except Exception:
                 pass
 
+            # 处理 tags：自动添加 agent tag
+            final_tags = tags
+            if self._agent_id:
+                # 将 agent tag 添加到 tags 列表中
+                if not final_tags:
+                    final_tags = f"agent:{self._agent_id}"
+                else:
+                    # 检查是否已经有 agent: 开头的 tag
+                    tag_list = [t.strip() for t in final_tags.split(",") if t.strip()]
+                    agent_tag = f"agent:{self._agent_id}"
+
+                    # 移除已有的 agent tag
+                    filtered_tags = [t for t in tag_list if not t.startswith("agent:")]
+                    filtered_tags.append(agent_tag)
+                    final_tags = ",".join(filtered_tags)
+
             mapping: Dict[str, Any] = {
                 "content": text,
-                "tags": tags,
+                "tags": final_tags,
                 "category": category,
                 "source": source,
                 "created": datetime.now(timezone.utc).isoformat(),
@@ -433,6 +453,43 @@ class RedisStorage:
         except Exception as e:
             logger.warning("storage: store error: %s", e)
             return False
+
+    # ------------------------------------------------------------------
+    # 纠正标记 — 用户否定时降权前几轮碎片
+    # ------------------------------------------------------------------
+
+    def correct_fragments(self, keys: List[str]) -> int:
+        """标记一批碎片为已纠正，降权使其几乎不出现在搜索结果中。
+
+        做两件事：
+          1. tags 中添加 'corrected' 标签
+          2. feedback_score 设为 -1（已纠正标记，排序阶段直接压到最低）
+        """
+        client = self._get_client()
+        if not client:
+            return 0
+        count = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for key in keys:
+            try:
+                existing_tags = client.hget(key, "tags")
+                if existing_tags is None:
+                    continue
+                if isinstance(existing_tags, bytes):
+                    existing_tags = existing_tags.decode("utf-8")
+                tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
+                if "corrected" not in tag_list:
+                    tag_list.append("corrected")
+                    client.hset(key, "tags", ",".join(tag_list))
+                # 设 feedback_score 为负数，排序时大幅降权
+                client.hset(key, "feedback_score", "-1")
+                client.hset(key, "corrected_at", now)
+                count += 1
+            except Exception:
+                continue
+        if count:
+            logger.info("storage: corrected %d fragments", count)
+        return count
 
     # ------------------------------------------------------------------
     # 热门话题统计
@@ -618,6 +675,8 @@ class RedisStorage:
         self,
         query: str,
         tag_filter: str = "",
+        agent_id: str = "",
+        is_primary: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索，经时间衰减重排序后返回。
 
@@ -641,7 +700,7 @@ class RedisStorage:
             # 用 | 连接所有词（OR 语义），每个词单独转义
             safe_terms = "|".join(_escape_query_term(t) for t in expanded)
 
-            # 构建全文查询
+            # 构建基础查询表达式
             if tag_filter:
                 safe_tags = ",".join(
                     _escape_query_term(t.strip())
@@ -650,6 +709,20 @@ class RedisStorage:
                 query_expr = f"@tags:{{{safe_tags}}} @content:{safe_terms}"
             else:
                 query_expr = f"@content:{safe_terms}"
+
+            # 如果不是主脑且指定了 agent_id，则添加 agent 过滤条件
+            effective_agent_id = agent_id if agent_id else self._agent_id
+            effective_is_primary = is_primary if is_primary is not None else self._is_primary
+
+            if not effective_is_primary and effective_agent_id:
+                # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
+                agent_filter = f"@tags:{{agent:{effective_agent_id}}}"
+                shared_filter = f"@tags:{{shared}}"
+                # 两者之一即可
+                query_expr = f"({agent_filter} || {shared_filter}) AND {query_expr}"
+            elif not effective_is_primary and not effective_agent_id:
+                # 如果没有 agent_id，只搜索 shared 标签
+                query_expr = f"@tags:{{shared}} AND {query_expr}"
 
             q = (
                 Query(query_expr)
@@ -690,6 +763,8 @@ class RedisStorage:
         self,
         query: str,
         tag_filter: str = "",
+        agent_id: str = "",
+        is_primary: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """KNN 向量搜索，经时间衰减重排序后返回。"""
         if not self._has_embedder():
@@ -704,6 +779,7 @@ class RedisStorage:
             return []
 
         try:
+            # 构建基础查询表达式
             if tag_filter:
                 safe_tags = ",".join(
                     _escape_query_term(t.strip())
@@ -712,6 +788,20 @@ class RedisStorage:
                 query_expr = f"@tags:{{{safe_tags}}}=>[KNN $K @embed_bin $vec AS score]"
             else:
                 query_expr = "*=>[KNN $K @embed_bin $vec AS score]"
+
+            # 如果不是主脑且指定了 agent_id，则添加 agent 过滤条件
+            effective_agent_id = agent_id if agent_id else self._agent_id
+            effective_is_primary = is_primary if is_primary is not None else self._is_primary
+
+            if not effective_is_primary and effective_agent_id:
+                # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
+                agent_filter = f"@tags:{{agent:{effective_agent_id}}}"
+                shared_filter = f"@tags:{{shared}}"
+                # 两者之一即可
+                query_expr = f"({agent_filter} || {shared_filter}) AND {query_expr}"
+            elif not effective_is_primary and not effective_agent_id:
+                # 如果没有 agent_id，只搜索 shared 标签
+                query_expr = f"@tags:{{shared}} AND {query_expr}"
 
             q = (
                 Query(query_expr)
@@ -753,6 +843,8 @@ class RedisStorage:
         self,
         query: str,
         tag_filter: str = "",
+        agent_id: str = "",
+        is_primary: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """统一检索入口。
 
@@ -760,15 +852,21 @@ class RedisStorage:
           1. 先走 BM25 全文搜索（零成本，有同义词扩展）
           2. 如果 BM25 无结果 且 embedder 可用，走 KNN 向量搜索
           3. BM25 有结果则直接返回，不做合并
+
+        如果是主脑（is_primary=True），不限制搜索范围，否则只搜索指定 agent 或 shared 标签的碎片。
         """
+        # 如果传入了参数，则优先使用参数；否则使用类实例中的配置
+        effective_agent_id = agent_id if agent_id else self._agent_id
+        effective_is_primary = is_primary if is_primary is not None else self._is_primary
+
         # BM25 全文搜索（默认）
-        results = self.search_bm25(query, tag_filter)
+        results = self.search_bm25(query, tag_filter, effective_agent_id, effective_is_primary)
         if results:
             return results
 
         # 无结果时尝试 KNN 向量搜索（如果 embedder 可用）
         if self._has_embedder():
-            results = self.search_knn(query, tag_filter)
+            results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
 
         return results
 
@@ -817,6 +915,12 @@ class RedisStorage:
         # ---- Step 3: 六维权重综合 ----
         for frag in fragments:
             sim = float(frag.get("_sim", 0.0))
+
+            # 0: 已纠正碎片直接压到最低，永远不出现在 Top-K
+            tags = frag.get("tags", "")
+            if "corrected" in (tags if isinstance(tags, str) else ""):
+                frag["_combined_score"] = -1.0
+                continue
 
             # 3a: 时间衰减
             created_str = frag.get("created", "")
