@@ -6,6 +6,7 @@ fragmented-memory — 碎片化记忆系统 for Hermes Agent.
   - 🔍 向量搜索 — RediSearch KNN 语义检索
   - ⏳ 时间衰减 — 新碎片权重高，旧碎片逐步降权
   - 🔄 自动写入 — memory() 操作和对话轮次自动存档
+  - 🏷️ 标签过滤 — 可选按标签范围搜索
 
 安装: pip install fragmented-memory
 激活: config.yaml 中设置 memory.provider: fragmented
@@ -35,6 +36,7 @@ class FragmentedMemoryProvider(MemoryProvider):
 
     _initialized: bool = False
     _storage: Optional[RedisStorage] = None
+    _tag_filter: str = ""
 
     def __init__(self, **config):
         """
@@ -45,8 +47,11 @@ class FragmentedMemoryProvider(MemoryProvider):
               fragmented:
                 redis_host: 127.0.0.1
                 redis_port: 6379
+                top_k: 5                    # 可选，返回条数
+                candidate_k: 10             # 可选，KNN 候选数
+                tag_filter: ""              # 可选，只搜索特定标签
                 embedder:
-                  provider: openai         # openai | dashscope
+                  provider: openai
                   api_key: sk-xxx
                   base_url: https://api.openai.com/v1
                   model: text-embedding-3-small
@@ -63,7 +68,6 @@ class FragmentedMemoryProvider(MemoryProvider):
         return "fragmented"
 
     def is_available(self) -> bool:
-        """检查关键依赖是否就绪。"""
         try:
             import redis as _  # noqa: F401
         except ImportError:
@@ -71,10 +75,13 @@ class FragmentedMemoryProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """初始化 — 加载配置、连接 Redis、验证 index。"""
+        """初始化 — 加载配置、连接 Redis、自动创建 index。"""
         frag_cfg = self._config.get("fragmented", {})
         redis_host = frag_cfg.get("redis_host", "127.0.0.1")
         redis_port = int(frag_cfg.get("redis_port", 6379))
+        top_k = int(frag_cfg.get("top_k", 5))
+        candidate_k = int(frag_cfg.get("candidate_k", 10))
+        self._tag_filter = frag_cfg.get("tag_filter", "")
 
         embed_cfg = frag_cfg.get("embedder", {})
         embedder = create_embedder(
@@ -88,27 +95,32 @@ class FragmentedMemoryProvider(MemoryProvider):
             embedder=embedder,
             host=redis_host,
             port=redis_port,
+            candidate_count=candidate_k,
+            final_limit=top_k,
         )
 
-        if not self._storage.check_index():
+        # 自动创建/验证 index
+        if not self._storage.ensure_index():
             logger.warning(
-                "fragmented: Redis / RediSearch not ready at %s:%s. "
-                "Make sure Redis with RediSearch module is running and "
-                "the index '%s' exists.",
-                redis_host, redis_port, RedisStorage.RS_INDEX,
+                "fragmented: Redis / RediSearch not ready at %s:%s",
+                redis_host, redis_port,
             )
             return
 
         self._initialized = True
-        logger.info("fragmented: connected (session=%s)", session_id)
+        logger.info(
+            "fragmented: connected (session=%s, top_k=%d, tag_filter=%s)",
+            session_id, top_k, self._tag_filter or "(none)",
+        )
 
     def system_prompt_block(self) -> str:
-        return (
-            "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。\n"
-            "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。\n"
-            "相关碎片就在下面「相关碎片」段落里，直接使用即可。\n"
-            "碎片按语义相似度 + 时间权重综合排序，旧碎片权重逐步衰减。"
-        )
+        parts = [
+            "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
+            "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。",
+            "相关碎片就在下面「相关碎片」段落里，直接使用即可。",
+            "碎片按语义相似度 + 时间权重综合排序，旧碎片权重逐步衰减。",
+        ]
+        return "\n".join(parts)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
@@ -117,7 +129,10 @@ class FragmentedMemoryProvider(MemoryProvider):
 
         import time as _time
         start = _time.time()
-        fragments = self._storage.search(query.strip())
+        fragments = self._storage.search(
+            query.strip(),
+            tag_filter=self._tag_filter,
+        )
         elapsed = _time.time() - start
 
         if not fragments:
@@ -129,9 +144,12 @@ class FragmentedMemoryProvider(MemoryProvider):
         for i, frag in enumerate(fragments, 1):
             lines.append(f"[{i}] {frag.get('content', '')}")
             tags = frag.get("tags", "")
-            decay = frag.get("_decay_score", 1.0)
+            combined = frag.get("_combined_score", 0)
+            info_parts = []
             if tags:
-                lines.append(f"    标签: {tags}  (时间权重: {decay:.2f})")
+                info_parts.append(f"标签: {tags}")
+            info_parts.append(f"综合: {combined:.2f}")
+            lines.append(f"    ({', '.join(info_parts)})")
             lines.append("")
 
         lines.append("</fragmented_memory>")
