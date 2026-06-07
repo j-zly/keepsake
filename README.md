@@ -3,15 +3,15 @@
 碎片化记忆系统 — 每次对话自动检索相关记忆碎片注入上下文。
 
 ```text
-用户: "BTC 支撑位在哪？"
+用户: "上次那个 React 项目结构怎么搭的？"
                       ↓
          碎片化记忆系统     ← Redis + RediSearch
                       ↓
-    ┌─────────────────────────────┐
-    │  [1] BTC 73000 附近有强支撑  │
-    │  [2] 30分钟底分型确认        │
-    │  [3] 上次类似行情 BTFD 策略  │
-    └─────────────────────────────┘
+    ┌─────────────────────────────────────┐
+    │  [1] 用户偏好 TypeScript + Vite    │
+    │  [2] 之前做过的项目用了 pinia 状态管理 │
+    │  [3] 后端建议用 .NET 10 实现       │
+    └─────────────────────────────────────┘
                       ↓
          模型直接利用碎片回答
 ```
@@ -74,15 +74,14 @@ memory:
     redis_port: 6379
     embedder:
       provider: openai            # openai | dashscope
-      api_key: sk-your-key-here   # 或设环境变量 OPENAI_API_KEY
+      api_key: sk-xxx             # 或设环境变量 OPENAI_API_KEY
       model: text-embedding-3-small
 ```
 
 也可以通过环境变量配置：
 
 ```bash
-export OPENAI_API_KEY=sk-xxx
-export FRAGMENTED_REDIS_HOST=127.0.0.1
+export OPENAI_API_KEY=*** FRAGMENTED_REDIS_HOST=127.0.0.1
 export FRAGMENTED_REDIS_PORT=6379
 export FRAGMENTED_EMBEDDER=openai
 ```
