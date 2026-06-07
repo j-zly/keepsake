@@ -30,8 +30,6 @@ User: "How did we set up that React project structure last time?"
 
 ## Design Philosophy: Brain-like Memory
 
-Most AI agent memory systems work like an **external hard drive** — store conversations in a vector database, retrieve by semantic similarity. They are database-first, search-first.
-
 Fragmented Memory takes a different approach. It's modeled after **how the human brain actually remembers**:
 
 | Brain Mechanism | Implementation |
