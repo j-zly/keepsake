@@ -115,6 +115,15 @@ class RedisStorage:
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         final_limit: int = DEFAULT_FINAL_LIMIT,
         embed_dim: int = 1536,
+        bm25_limit: int = DEFAULT_BM25_LIMIT,
+        decay_half_days: int = DECAY_HALF_DAYS,
+        embed_cache_ttl: int = EMBED_CACHE_TTL,
+        sentiment_boost_positive: float = SENTIMENT_BOOST_POSITIVE,
+        sentiment_boost_negative: float = SENTIMENT_BOOST_NEGATIVE,
+        sentiment_boost_neutral: float = SENTIMENT_BOOST_NEUTRAL,
+        feedback_positive_boost: float = FEEDBACK_POSITIVE_BOOST,
+        feedback_negative_penalty: float = FEEDBACK_NEGATIVE_PENALTY,
+        hot_topic_boost: float = HOT_TOPIC_BOOST,
     ):
         self._embedder = embedder
         self._host = host
@@ -122,6 +131,15 @@ class RedisStorage:
         self._candidate_count = candidate_count
         self._final_limit = final_limit
         self._embed_dim = embed_dim
+        self._bm25_limit = bm25_limit
+        self._decay_half_days = decay_half_days
+        self._embed_cache_ttl = embed_cache_ttl
+        self._sentiment_boost_positive = sentiment_boost_positive
+        self._sentiment_boost_negative = sentiment_boost_negative
+        self._sentiment_boost_neutral = sentiment_boost_neutral
+        self._feedback_positive_boost = feedback_positive_boost
+        self._feedback_negative_penalty = feedback_negative_penalty
+        self._hot_topic_boost = hot_topic_boost
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -307,7 +325,7 @@ class RedisStorage:
 
         if client:
             try:
-                client.setex(cache_key, EMBED_CACHE_TTL, blob)
+                client.setex(cache_key, self._embed_cache_ttl, blob)
             except Exception:
                 pass
 
@@ -567,7 +585,7 @@ class RedisStorage:
 
             q = (
                 Query(query_expr)
-                .paging(0, DEFAULT_BM25_LIMIT)
+                .paging(0, self._bm25_limit)
                 .dialect(2)
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score")
@@ -690,7 +708,6 @@ class RedisStorage:
     # 综合得分重排序
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _rerank_with_decay(
         fragments: List[Dict[str, Any]],
         score_key: str = "_bm25_score",
@@ -747,16 +764,16 @@ class RedisStorage:
                     decay = 0.01
                     age_days = 0
                 else:
-                    decay = 2.0 ** (-age_days / DECAY_HALF_DAYS)
+                    decay = 2.0 ** (-age_days / self._decay_half_days)
 
             # 3b: 情感权重
             sentiment_label = frag.get("sentiment_label", "neutral")
             if sentiment_label == "positive":
-                emotion_w = SENTIMENT_BOOST_POSITIVE
+                emotion_w = self._sentiment_boost_positive
             elif sentiment_label == "negative":
-                emotion_w = SENTIMENT_BOOST_NEGATIVE
+                emotion_w = self._sentiment_boost_negative
             else:
-                emotion_w = SENTIMENT_BOOST_NEUTRAL
+                emotion_w = self._sentiment_boost_neutral
 
             # 3c: 反馈权重
             try:
@@ -764,9 +781,9 @@ class RedisStorage:
             except (ValueError, TypeError):
                 fb = 0.0
             if fb > 0:
-                feedback_w = 1.0 + (FEEDBACK_POSITIVE_BOOST - 1.0) * min(fb / 3.0, 1.0)
+                feedback_w = 1.0 + (self._feedback_positive_boost - 1.0) * min(fb / 3.0, 1.0)
             elif fb < 0:
-                feedback_w = 1.0 - (1.0 - FEEDBACK_NEGATIVE_PENALTY) * min(abs(fb) / 3.0, 1.0)
+                feedback_w = 1.0 - (1.0 - self._feedback_negative_penalty) * min(abs(fb) / 3.0, 1.0)
             else:
                 feedback_w = 1.0
 

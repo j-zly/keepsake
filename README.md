@@ -128,10 +128,20 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `top_k` | `FRAGMENTED_TOP_K` | `5` | 最终返回碎片数 |
 | `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | 候选碎片数（KNN 用） |
 | `tag_filter` | `FRAGMENTED_TAG_FILTER` | `""` | 标签过滤（逗号分隔） |
+| `bm25_limit` | `FRAGMENTED_BM25_LIMIT` | `10` | BM25 搜索候选数 |
+| `decay_half_days` | `FRAGMENTED_DECAY_HALF_DAYS` | `60` | 时间衰减半衰期（天） |
+| `embed_cache_ttl` | `FRAGMENTED_EMBED_CACHE_TTL` | `3600` | Embedding 缓存时间（秒） |
+| `sentiment_boost_positive` | — | `1.5` | 正面碎片权重乘数 |
+| `sentiment_boost_negative` | — | `1.3` | 负面碎片权重乘数 |
+| `feedback_positive_boost` | — | `1.3` | 正反馈加分权重 |
+| `feedback_negative_penalty` | — | `0.5` | 负反馈降权系数 |
+| `hot_topic_boost` | — | `1.2` | 热门话题加权乘数 |
 | `embedder.provider` | `FRAGMENTED_EMBEDDER` | `openai` | `openai` / `dashscope` |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
 | `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
 | `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
+
+> `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
 ### Embedding 模型与维度
 

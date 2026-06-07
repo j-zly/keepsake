@@ -254,6 +254,14 @@ class FragmentedMemoryProvider(MemoryProvider):
             candidate_count=candidate_k,
             final_limit=top_k,
             embed_dim=embed_dim,
+            bm25_limit=int(cfg.get("bm25_limit", 10)),
+            decay_half_days=int(cfg.get("decay_half_days", 60)),
+            embed_cache_ttl=int(cfg.get("embed_cache_ttl", 3600)),
+            sentiment_boost_positive=float(cfg.get("sentiment_boost_positive", 1.5)),
+            sentiment_boost_negative=float(cfg.get("sentiment_boost_negative", 1.3)),
+            feedback_positive_boost=float(cfg.get("feedback_positive_boost", 1.3)),
+            feedback_negative_penalty=float(cfg.get("feedback_negative_penalty", 0.5)),
+            hot_topic_boost=float(cfg.get("hot_topic_boost", 1.2)),
         )
 
         # 自动创建/验证 index
