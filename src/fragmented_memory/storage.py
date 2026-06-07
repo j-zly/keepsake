@@ -42,7 +42,7 @@ EMBED_CACHE_TTL = 3600
 # FT.CREATE 命令（首次使用自动执行）
 # 注意：用于 client.execute_command(*parts)，不要加引号（split 后引号变字面字符）
 _CREATE_INDEX_CMD = (
-    "FT.CREATE idx:memories ON HASH PREFIX 1 memory:frag: SCHEMA "
+    "FT.CREATE idx:memories ON HASH PREFIX 1 memory:frag: LANGUAGE chinese SCHEMA "
     "content TEXT WEIGHT 1 "
     "tags TAG SEPARATOR , "
     "category TAG SEPARATOR , "
@@ -53,6 +53,17 @@ _CREATE_INDEX_CMD = (
 )
 
 SYNONYM_HASH_KEY = "fragmented:synonyms"
+
+
+# RediSearch 查询语法特殊字符（需要转义）
+_QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"')
+
+
+def _escape_query_term(term: str) -> str:
+    """转义 RediSearch 查询语法中的特殊字符。"""
+    for ch in _QUERY_SPECIAL_CHARS:
+        term = term.replace(ch, f"\\{ch}")
+    return term
 
 
 def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
@@ -87,6 +98,7 @@ class RedisStorage:
         self._candidate_count = candidate_count
         self._final_limit = final_limit
         self._client: Optional[redis.Redis] = None
+        self._synonym_cache: Optional[Dict[str, set]] = None
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -156,13 +168,16 @@ class RedisStorage:
         pass
 
     def _load_synonym_map(self) -> Dict[str, set]:
-        """从 Redis Hash fragmented:synonyms 加载同义词表。"""
+        """从 Redis Hash fragmented:synonyms 加载同义词表（带实例级缓存）。"""
+        if self._synonym_cache is not None:
+            return self._synonym_cache
         client = self._get_client()
         if not client:
             return {}
         try:
             raw = client.hgetall(SYNONYM_HASH_KEY)
             if not raw:
+                self._synonym_cache = {}
                 return {}
             import json as _json
             synonym_map: Dict[str, set] = {}
@@ -185,9 +200,11 @@ class RedisStorage:
                         if s not in synonym_map:
                             synonym_map[s] = set()
                         synonym_map[s].add(term)
+            self._synonym_cache = synonym_map
             return synonym_map
         except Exception as e:
             logger.debug("storage: load synonyms error: %s", e)
+            self._synonym_cache = {}
             return {}
 
     def close(self) -> None:
@@ -304,8 +321,8 @@ class RedisStorage:
             if not expanded:
                 return []
 
-            # 用 | 连接所有词（OR 语义）
-            safe_terms = "|".join(expanded)
+            # 用 | 连接所有词（OR 语义），每个词单独转义
+            safe_terms = "|".join(_escape_query_term(t) for t in expanded)
 
             # 构建全文查询
             if tag_filter:
@@ -417,7 +434,7 @@ class RedisStorage:
         策略:
           1. 先走 BM25 全文搜索（零成本，有同义词扩展）
           2. 如果 BM25 无结果 且 embedder 可用，走 KNN 向量搜索
-          3. 返回合并后的去重结果
+          3. BM25 有结果则直接返回，不做合并
         """
         # BM25 全文搜索（默认）
         results = self.search_bm25(query, tag_filter)
@@ -442,22 +459,36 @@ class RedisStorage:
     ) -> List[Dict[str, Any]]:
         """综合得分重排序。
 
-        BM25 模式: combined = BM25得分 × 时间衰减
+        BM25 模式: combined = BM25归一化得分 × 时间衰减
         KNN 模式:   combined = (1 - 余弦距离/2) × 时间衰减
         """
+        if not fragments:
+            return fragments
+
         now = datetime.now(timezone.utc)
 
+        # ---- Step 1: 计算语义相似度 sim ----
         for frag in fragments:
-            # 获取原始分数并归一化到 0~1
             raw = float(frag.get(score_key, 0.0))
             if is_knn:
                 # KNN: score 是余弦距离（0~2），越小越近
                 sim = 1.0 - max(0.0, min(1.0, raw / 2.0))
             else:
-                # BM25: score 越大越相关，归一化到 0~1
-                sim = min(1.0, max(0.0, raw / 10.0))
+                sim = raw  # 暂存原始 BM25 分数，后面归一化
 
-            # 时间衰减
+        # ---- Step 2: BM25 模式用 min-max 动态归一化 ----
+        if not is_knn and fragments:
+            scores = [float(f.get(score_key, 0.0)) for f in fragments]
+            max_raw = max(scores) if scores else 1.0
+            if max_raw < 0.001:
+                max_raw = 1.0
+            for frag in fragments:
+                raw = float(frag.get(score_key, 0.0))
+                sim = raw / max_raw
+
+        # ---- Step 3: 时间衰减 ----
+        for frag in fragments:
+            # sim 已归一化到 0~1
             created_str = frag.get("created", "")
             if not created_str:
                 frag["_combined_score"] = sim * 0.01
