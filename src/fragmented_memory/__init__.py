@@ -198,6 +198,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             "top_k": os.environ.get("FRAGMENTED_TOP_K"),
             "candidate_k": os.environ.get("FRAGMENTED_CANDIDATE_K"),
             "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
+            "agent_id": os.environ.get("FRAGMENTED_AGENT_ID"),
+            "is_primary": os.environ.get("FRAGMENTED_IS_PRIMARY"),
         }
         for key, val in env_overrides.items():
             if val is not None:
@@ -205,6 +207,17 @@ class FragmentedMemoryProvider(MemoryProvider):
 
         # 4. inline（Hermes 传入的 config.yaml 配置）覆盖
         cfg = _deep_merge(cfg, inline_cfg)
+
+        # 5. 验证 agent_id 必须配置
+        agent_id = cfg.get("agent_id")
+        if agent_id is None or agent_id == "":
+            raise ValueError("agent_id must be configured in config file, environment variable, or inline config")
+
+        # 6. 解析 is_primary，默认为 false
+        is_primary = cfg.get("is_primary", False)
+        if isinstance(is_primary, str):
+            is_primary = is_primary.lower() in ("true", "1", "yes", "on")
+        cfg["is_primary"] = bool(is_primary)
 
         return cfg
 
@@ -273,6 +286,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             attention_boost_max=float(cfg.get("attention_boost_max", 1.5)),
             attention_base_increment=float(cfg.get("attention_base_increment", 2.0)),
             attention_emotion_factor=float(cfg.get("attention_emotion_factor", 1.5)),
+            agent_id=cfg.get("agent_id", ""),
+            is_primary=cfg.get("is_primary", False),
         )
 
         # 自动创建/验证 index
