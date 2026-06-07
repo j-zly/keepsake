@@ -6,6 +6,8 @@ import re
 from collections import Counter
 from typing import Dict, List, Tuple
 
+import jieba
+
 NEWLINE = "\n"
 
 # ---------------------------------------------------------------------------
@@ -102,13 +104,10 @@ def analyze_sentiment(text: str) -> Tuple[float, str]:
 
 
 def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
-    """从文本中提取关键词。
+    """从文本中提取关键词（基于 jieba 分词）。
 
-    不引入外部 NLP 库，用启发式规则提取有意义的短语：
-      - 提取 2~4 字中文词（常见模式：两字词、三字词、四字成语）
-      - 提取 3 字母以上英文词
-      - 过滤常见停用词
-      - 使用滑动窗口 + 词频筛选
+    使用 jieba 进行中文分词 + 词频统计，过滤停用词后返回
+    高频词作为关键词。英文词单独提取（3 字母以上）。
     """
     if not text or not text.strip():
         return []
@@ -122,34 +121,31 @@ def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
         "the", "this", "that", "what", "why", "how", "and",
         "but", "for", "with", "not", "are", "was", "had",
         "its", "has", "all", "can", "use", "get", "set",
+        "的", "了", "在", "是", "我", "有", "和", "就", "不",
+        "人", "都", "一", "一个", "上", "也", "很", "到", "说",
+        "要", "去", "你", "会", "着", "没有", "看", "好", "自己",
+        "这",
     }
 
     text_lower = text.lower().strip()
     candidates: List[str] = []
 
-    # 1. 提取连续中文，取 2 字子串（中文词汇最常见长度）
-    chinese_blocks = re.findall(r"[\u4e00-\u9fff]+", text_lower)
-    for block in chinese_blocks:
-        for i in range(len(block) - 1):
-            candidates.append(block[i:i + 2])
-
-    # 2. 提取 3 字词（常见专业术语如 "比特币" "区块链"）
-    for block in chinese_blocks:
-        for i in range(len(block) - 2):
-            candidates.append(block[i:i + 3])
+    # 1. 用 jieba 做中文分词
+    words = jieba.lcut(text)
+    # 过滤停用词 + 长度 >= 2（单字词一般是语气词/助词）
+    chinese_words = [w for w in words
+                     if len(w) >= 2
+                     and w not in _STOP_WORDS
+                     and not w.isdigit()
+                     and len(set(w)) > 1]  # 过滤 "哈哈" "AA" 类重复词
+    candidates.extend(chinese_words)
 
     # 2. 提取英文词（3 字母以上）
     eng_words = re.findall(r"\b[a-zA-Z]{3,}\b", text_lower)
-    candidates.extend(eng_words)
+    candidates.extend([w for w in eng_words if w not in _STOP_WORDS])
 
-    # 3. 过滤停用词 + 数字类词
-    filtered = [w for w in candidates
-                if w not in _STOP_WORDS
-                and not w.isdigit()
-                and len(set(w)) > 1]       # 过滤 "哈哈" "AA" 类重复词
-
-    # 4. 按频次降序
-    freq = Counter(filtered)
+    # 3. 按频次降序
+    freq = Counter(candidates)
     sorted_words = sorted(freq.items(), key=lambda x: -x[1])
     return [w for w, _ in sorted_words[:max_keywords]]
 

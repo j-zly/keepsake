@@ -27,6 +27,7 @@ classifiers = [
 
 dependencies = [
     "redis>=5.0",
+    "jieba>=0.42",
 ]
 
 [tool.setuptools.packages.find]
