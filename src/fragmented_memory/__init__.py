@@ -118,18 +118,13 @@ class FragmentedMemoryProvider(MemoryProvider):
         合并顺序（后覆盖前）: 默认值 ← JSON 文件 ← 环境变量 ← inline
         inline = Hermes 的 config.yaml memory.fragmented 或 __init__ 传参
         """
-        # 1. 硬编码默认值
-        cfg = {
+        # 1. 硬编码默认值（不含 embedder — 由配置文件/环境变量按需开启）
+        cfg: dict = {
             "redis_host": "127.0.0.1",
             "redis_port": 6379,
             "top_k": 5,
             "candidate_k": 10,
             "tag_filter": "",
-            "embedder": {
-                "provider": "openai",
-                "base_url": "https://api.openai.com/v1",
-                "model": "text-embedding-3-small",
-            },
         }
 
         # 2. JSON 配置文件覆盖
@@ -179,12 +174,19 @@ class FragmentedMemoryProvider(MemoryProvider):
         self._tag_filter = cfg.get("tag_filter", "")
 
         embed_cfg = cfg.get("embedder", {})
-        embedder = create_embedder(
-            provider=embed_cfg.get("provider", ""),
-            api_key=embed_cfg.get("api_key", ""),
-            base_url=embed_cfg.get("base_url", ""),
-            model=embed_cfg.get("model", ""),
-        )
+        embed_provider = embed_cfg.get("provider", "").strip().lower()
+        # 只有显式配置了 embedder provider 才创建，否则走 BM25-only 模式
+        if embed_provider and embed_provider not in ("", "default", "none"):
+            embedder = create_embedder(
+                provider=embed_cfg.get("provider", ""),
+                api_key=embed_cfg.get("api_key", ""),
+                base_url=embed_cfg.get("base_url", ""),
+                model=embed_cfg.get("model", ""),
+            )
+            logger.info("fragmented: embedder enabled (%s/%s)", embed_provider, embedder._model)
+        else:
+            embedder = None
+            logger.info("fragmented: BM25-only mode (no embedder configured)")
 
         self._storage = RedisStorage(
             embedder=embedder,

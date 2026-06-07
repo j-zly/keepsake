@@ -1,4 +1,10 @@
-"""Redis + RediSearch 存储层 — 碎片的读写与语义检索。"""
+"""
+Redis + RediSearch 存储层 — 碎片的读写与检索。
+
+支持两种检索模式（可共存）：
+  - BM25 全文搜索（默认，零成本）— 同义词扩展 + 标签过滤
+  - KNN 向量搜索（可选）— 需要 embedder 配置
+"""
 
 from __future__ import annotations
 
@@ -20,14 +26,17 @@ logger = logging.getLogger(__name__)
 # RediSearch index 名称
 RS_INDEX = "idx:memories"
 
-# 默认 KNN 候选数（多拉一些给 rerank 留空间）
-DEFAULT_CANDIDATE_COUNT = 10
-# 默认最终返回条数
-DEFAULT_FINAL_LIMIT = 5
+# BM25 检索参数
+DEFAULT_BM25_LIMIT = 10        # BM25 搜多少条候选
+DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
+
+# KNN 参数（embedding 模式用）
+DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
+
 # 时间衰减半衰期（天）
 DECAY_HALF_DAYS = 60
 
-# embedding 缓存 TTL（秒）— 1 小时
+# embedding 缓存 TTL（秒）
 EMBED_CACHE_TTL = 3600
 
 # FT.CREATE 命令（首次使用自动执行）
@@ -43,16 +52,65 @@ _CREATE_INDEX_CMD = (
     "embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE"
 )
 
+# 同义词组 — 搜索时自动扩展
+# 建索引后用 _build_synonym_map() 转为快速查找 dict
+SYNONYM_GROUPS: List[List[str]] = [
+    ["BTC", "比特币", "Bitcoin"],
+    ["ETH", "以太坊", "Ethereum"],
+    ["支撑", "支撑位", "support"],
+    ["阻力", "阻力位", "resistance"],
+    ["缠论", "禅论", "缠中说禅", "chan theory"],
+    ["买入", "做多", "多头", "买", "long"],
+    ["卖出", "做空", "空头", "卖", "short"],
+    ["背驰", "背离", "顶背驰", "底背驰", "divergence"],
+    ["中枢", "箱体", "震荡区间"],
+    ["突破", "破位", "跌破", "升破"],
+    ["成交量", "量能", "交易量", "volume"],
+    ["MACD", "均线", "移动平均", "ema", "ma"],
+]
+
+# 将同义词组编译成快速查找 dict {term: {all related terms}}
+_SYNONYM_MAP: Dict[str, set] = {}
+
+
+def _build_synonym_map() -> None:
+    """将 SYNONYM_GROUPS 编译为 {term: {all_synonyms}} 查找表。"""
+    global _SYNONYM_MAP
+    if _SYNONYM_MAP:
+        return
+    for group in SYNONYM_GROUPS:
+        term_set = set(t.lower() for t in group if t)
+        for t in term_set:
+            if t not in _SYNONYM_MAP:
+                _SYNONYM_MAP[t] = set()
+            _SYNONYM_MAP[t].update(term_set - {t})
+
+
+def _expand_terms(terms: List[str]) -> List[str]:
+    """用同义词表展开搜索词列表。
+
+    例: ["BTC", "支撑"] → ["BTC", "比特币", "Bitcoin", "支撑", "支撑位", "support"]
+    """
+    _build_synonym_map()
+    expanded = list(terms)
+    for t in terms:
+        tl = t.lower()
+        if tl in _SYNONYM_MAP:
+            for syn in _SYNONYM_MAP[tl]:
+                if syn not in expanded:
+                    expanded.append(syn)
+    return expanded
+
 
 class RedisStorage:
     """碎片存储与检索。
 
-    基于 Redis + RediSearch 实现向量化语义搜索。
+    基于 Redis + RediSearch，同时支持 BM25 全文搜索（默认）和 KNN 向量搜索。
     """
 
     def __init__(
         self,
-        embedder: Embedder,
+        embedder: Optional[Embedder] = None,
         host: str = "127.0.0.1",
         port: int = 6379,
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
@@ -91,34 +149,47 @@ class RedisStorage:
             logger.warning("storage: Redis not reachable (%s)", e)
             return None
 
+    def _has_embedder(self) -> bool:
+        """检查 embedder 是否可用。"""
+        return self._embedder is not None and hasattr(self._embedder, "get_embedding")
+
     def ensure_index(self) -> bool:
-        """初始化时自动创建/验证 RediSearch index。"""
+        """初始化时自动创建/验证 RediSearch index + 注册同义词。"""
         client = self._get_client()
         if not client:
             return False
 
-        # 先尝试检查 index 是否已存在
+        # 尝试检查 index 是否已存在
         try:
             client.ft(RS_INDEX).search(Query("*").paging(0, 0))
-            return True
+            idx_exists = True
         except Exception:
-            pass
+            idx_exists = False
 
-        # index 不存在，自动创建
-        try:
-            parts = _CREATE_INDEX_CMD.split()
-            client.execute_command(*parts)
-            logger.info("storage: created RediSearch index '%s'", RS_INDEX)
-            return True
-        except redis.ResponseError as e:
-            if "already exists" in str(e).lower():
-                logger.info("storage: index '%s' already exists", RS_INDEX)
-                return True
-            logger.warning("storage: failed to create index: %s", e)
-            return False
-        except Exception as e:
-            logger.warning("storage: failed to create index: %s", e)
-            return False
+        # 创建 index（如果不存在）
+        if not idx_exists:
+            try:
+                parts = _CREATE_INDEX_CMD.split()
+                client.execute_command(*parts)
+                logger.info("storage: created RediSearch index '%s'", RS_INDEX)
+            except redis.ResponseError as e:
+                if "already exists" in str(e).lower():
+                    logger.info("storage: index '%s' already exists", RS_INDEX)
+                else:
+                    logger.warning("storage: failed to create index: %s", e)
+                    return False
+            except Exception as e:
+                logger.warning("storage: failed to create index: %s", e)
+                return False
+
+        # 注册同义词组（幂等）
+        self._ensure_synonyms(client)
+        return True
+
+    def _ensure_synonyms(self, client: redis.Redis) -> None:
+        """确保同义词表已构建。"""
+        _build_synonym_map()
+        logger.info("storage: built synonym map (%d groups)", len(SYNONYM_GROUPS))
 
     def close(self) -> None:
         if self._client is not None:
@@ -129,14 +200,11 @@ class RedisStorage:
             self._client = None
 
     # ------------------------------------------------------------------
-    # 向量化（带 MD5 缓存）
+    # 向量化（带 MD5 缓存，仅 embedding 模式使用）
     # ------------------------------------------------------------------
 
     def _text_to_blob(self, text: str) -> Optional[bytes]:
-        """文本 → 1536 维 float32 二进制 blob。
-
-        用 MD5 做缓存 key，相同文本重复调 embedding API 时秒回。
-        """
+        """文本 → float32 二进制 blob。"""
         md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
         cache_key = f"embed_cache:{md5}"
 
@@ -149,6 +217,8 @@ class RedisStorage:
             except Exception:
                 pass
 
+        if not self._has_embedder():
+            return None
         vec = self._embedder.get_embedding(text)
         if not vec:
             return None
@@ -174,11 +244,11 @@ class RedisStorage:
         source: str = "",
         fragment_type: str = "",
     ) -> bool:
-        """将一段文本写入碎片库。"""
-        blob = self._text_to_blob(text)
-        if not blob:
-            return False
+        """将一段文本写入碎片库。
 
+        embed_bin 是可选的（仅 embedding 模式需要）。
+        BM25 全文搜索只需要 content + tags 字段。
+        """
         client = self._get_client()
         if not client:
             return False
@@ -191,10 +261,16 @@ class RedisStorage:
                 "category": category,
                 "source": source,
                 "created": datetime.now(timezone.utc).isoformat(),
-                "embed_bin": blob,
             }
             if fragment_type:
                 mapping["fragment_type"] = fragment_type
+
+            # embed_bin 可选：有 embedder 时计算并存
+            if self._has_embedder():
+                blob = self._text_to_blob(text)
+                if blob:
+                    mapping["embed_bin"] = blob
+
             client.hset(key, mapping=mapping)
             return True
         except Exception as e:
@@ -202,26 +278,86 @@ class RedisStorage:
             return False
 
     # ------------------------------------------------------------------
-    # 检索 + 重排序
+    # BM25 全文检索（默认，零成本）
     # ------------------------------------------------------------------
 
-    def search(
+    def search_bm25(
         self,
         query: str,
         tag_filter: str = "",
     ) -> List[Dict[str, Any]]:
-        """语义搜索碎片，经时间衰减重排序后返回。
-
-        参数:
-            query: 搜索文本
-            tag_filter: 可选的标签过滤，如 "btc,eth" 只搜这些标签的碎片
+        """BM25 全文搜索，经时间衰减重排序后返回。
 
         流程:
-          1. 计算查询的 embedding
-          2. FT.SEARCH KNN 拉 top candidate_count（支持标签过滤）
-          3. 综合得分（向量距离 × 时间衰减）重排序
+          1. 构建 RediSearch 文本查询（自动扩展同义词）
+          2. 可选标签过滤
+          3. 时间衰减重排序
           4. 取 top final_limit
         """
+        client = self._get_client()
+        if not client or not query.strip():
+            return []
+
+        try:
+            # 展开同义词后构建查询
+            raw_terms = query.strip().split()
+            expanded = _expand_terms(raw_terms)
+            if not expanded:
+                return []
+
+            # 用 | 连接所有词（OR 语义）
+            safe_terms = "|".join(expanded)
+
+            # 构建全文查询
+            if tag_filter:
+                tags = ",".join(t.strip() for t in tag_filter.split(",") if t.strip())
+                query_expr = f"@tags:{{{tags}}} @content:{safe_terms}"
+            else:
+                query_expr = f"@content:{safe_terms}"
+
+            q = (
+                Query(query_expr)
+                .paging(0, DEFAULT_BM25_LIMIT)
+                .dialect(2)
+                .return_fields("content", "tags", "category", "source", "created")
+            )
+
+            result = client.ft(RS_INDEX).search(q)
+
+            fragments: List[Dict[str, Any]] = []
+            for doc in result.docs:
+                frag: Dict[str, Any] = {}
+                for field in ("content", "tags", "category", "source", "created"):
+                    val = getattr(doc, field, None)
+                    if val is not None and val != "":
+                        if isinstance(val, bytes):
+                            val = val.decode("utf-8")
+                        frag[field] = val
+                if frag.get("content"):
+                    # BM25 score 越大越相关
+                    frag["_bm25_score"] = float(getattr(doc, "score", 0.0))
+                    fragments.append(frag)
+
+            fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
+            return fragments[: self._final_limit]
+
+        except Exception as e:
+            logger.debug("storage: BM25 search error: %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    # KNN 向量检索（可选，需 embedder）
+    # ------------------------------------------------------------------
+
+    def search_knn(
+        self,
+        query: str,
+        tag_filter: str = "",
+    ) -> List[Dict[str, Any]]:
+        """KNN 向量搜索，经时间衰减重排序后返回。"""
+        if not self._has_embedder():
+            return []
+
         blob = self._text_to_blob(query)
         if not blob:
             return []
@@ -231,9 +367,7 @@ class RedisStorage:
             return []
 
         try:
-            # 构建查询：可选标签过滤 + KNN
             if tag_filter:
-                # 注意：TAG 字段用大括号语法
                 tags = ",".join(t.strip() for t in tag_filter.split(",") if t.strip())
                 query_expr = f"@tags:{{{tags}}}=>[KNN $K @embed_bin $vec AS score]"
             else:
@@ -260,44 +394,69 @@ class RedisStorage:
                             val = val.decode("utf-8")
                         frag[field] = val
                 if frag.get("content"):
-                    # 记录原始向量距离（score 越小越近）
-                    frag["_raw_score"] = getattr(doc, "score", 1.0)
+                    frag["_knn_score"] = float(getattr(doc, "score", 1.0))
                     fragments.append(frag)
 
-            fragments = self._rerank_with_decay(fragments)
+            fragments = self._rerank_with_decay(fragments, score_key="_knn_score", is_knn=True)
             return fragments[: self._final_limit]
 
         except Exception as e:
-            logger.debug("storage: search error: %s", e)
+            logger.debug("storage: KNN search error: %s", e)
             return []
 
     # ------------------------------------------------------------------
-    # 综合得分重排序（向量距离 × 时间衰减）
+    # 统一检索入口
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        tag_filter: str = "",
+    ) -> List[Dict[str, Any]]:
+        """统一检索入口。
+
+        策略:
+          1. 先走 BM25 全文搜索（零成本，有同义词扩展）
+          2. 如果 BM25 无结果 且 embedder 可用，走 KNN 向量搜索
+          3. 返回合并后的去重结果
+        """
+        # BM25 全文搜索（默认）
+        results = self.search_bm25(query, tag_filter)
+        if results:
+            return results
+
+        # 无结果时尝试 KNN 向量搜索（如果 embedder 可用）
+        if self._has_embedder():
+            results = self.search_knn(query, tag_filter)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # 综合得分重排序
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _rerank_with_decay(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _rerank_with_decay(
+        fragments: List[Dict[str, Any]],
+        score_key: str = "_bm25_score",
+        is_knn: bool = False,
+    ) -> List[Dict[str, Any]]:
         """综合得分重排序。
 
-        综合得分 = 归一化向量相似度 × 时间衰减权重
-
-        向量距离（score）范围 0~2（余弦距离），先转为相似度：
-            sim = 1 - score / 2  （距离 0 → 1.0，距离 2 → 0.0）
-
-        时间衰减权重：
-            decay = 2^(-age_days / 60)
-
-        综合得分：
-            combined = sim × decay
-
-        无时间戳碎片排在最后。
+        BM25 模式: combined = BM25得分 × 时间衰减
+        KNN 模式:   combined = (1 - 余弦距离/2) × 时间衰减
         """
         now = datetime.now(timezone.utc)
 
         for frag in fragments:
-            # 向量相似度：score 是余弦距离（0~2），越小越近
-            raw = float(frag.get("_raw_score", 1.0))
-            sim = 1.0 - max(0.0, min(1.0, raw / 2.0))
+            # 获取原始分数并归一化到 0~1
+            raw = float(frag.get(score_key, 0.0))
+            if is_knn:
+                # KNN: score 是余弦距离（0~2），越小越近
+                sim = 1.0 - max(0.0, min(1.0, raw / 2.0))
+            else:
+                # BM25: score 越大越相关，归一化到 0~1
+                sim = min(1.0, max(0.0, raw / 10.0))
 
             # 时间衰减
             created_str = frag.get("created", "")
