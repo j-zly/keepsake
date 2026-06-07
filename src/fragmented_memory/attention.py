@@ -33,18 +33,14 @@ _ATTENTION_TTL = {
     ATTENTION_WEEKLY: 86400 * 14,    # 周榜：14天
 }
 
-# 基础关注增量（每次提及）
-BASE_ATTENTION_INCREMENT = 2.0
-
-# 情绪烈度放大系数
-EMOTION_BOOST_FACTOR = 1.5  # intensity × 此值加到增量
-
 
 def record_attention(
     client: redis.Redis,
     text: str,
     emotion_intensity: float = 0.0,
     keywords: Optional[List[str]] = None,
+    base_increment: float = 2.0,
+    emotion_factor: float = 1.5,
 ) -> None:
     """记录用户对一段文本中话题的关注。"""
     if not client or not text:
@@ -55,7 +51,7 @@ def record_attention(
         if not keywords:
             return
 
-        increment = BASE_ATTENTION_INCREMENT + emotion_intensity * EMOTION_BOOST_FACTOR
+        increment = base_increment + emotion_intensity * emotion_factor
 
         for kw in keywords:
             kw_lower = kw.lower().strip()

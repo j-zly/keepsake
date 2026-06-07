@@ -148,6 +148,11 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `consolidate_max_age_hours` | — | `72` | 碎片最少年龄（小时）后才参与合并 |
 | `forget_max_age_days` | — | `30` | 碎片保留天数后可能被遗忘 |
 | `forget_dry_run` | — | `true` | 遗忘安全模式：仅统计不删除 |
+| `hot_topic_decay_half_days` | — | `30` | 热门话题时间衰减半衰期（天） |
+| `emotion_intensity_factor` | — | `0.4` | 情绪烈度→权重系数（0=不启用，1=max） |
+| `attention_boost_max` | — | `1.5` | 注意力加权最大值 |
+| `attention_base_increment` | — | `2.0` | 每次提及的基础关注增量 |
+| `attention_emotion_factor` | — | `1.5` | 情绪烈度对注意力的放大系数 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 

@@ -268,6 +268,11 @@ class FragmentedMemoryProvider(MemoryProvider):
             feedback_positive_boost=float(cfg.get("feedback_positive_boost", 1.3)),
             feedback_negative_penalty=float(cfg.get("feedback_negative_penalty", 0.5)),
             hot_topic_boost=float(cfg.get("hot_topic_boost", 1.2)),
+            hot_topic_decay_half_days=int(cfg.get("hot_topic_decay_half_days", 30)),
+            emotion_intensity_factor=float(cfg.get("emotion_intensity_factor", 0.4)),
+            attention_boost_max=float(cfg.get("attention_boost_max", 1.5)),
+            attention_base_increment=float(cfg.get("attention_base_increment", 2.0)),
+            attention_emotion_factor=float(cfg.get("attention_emotion_factor", 1.5)),
         )
 
         # 自动创建/验证 index

@@ -56,6 +56,8 @@ HOT_TOPIC_SET = "fragmented:hot_topics"
 HOT_TOPIC_BOOST = 1.2           # 命中热门话题的碎片 ×1.2
 HOT_TOPIC_DAILY = "fragmented:hot_topics:daily"  # 日榜
 HOT_TOPIC_WEEKLY = "fragmented:hot_topics:weekly"  # 周榜
+HOT_TOPIC_LAST_SEEN = "fragmented:hot_topics:last_seen"  # 最后提及时间
+HOT_TOPIC_DECAY_HALF_DAYS = 30  # 热门话题时间衰减半衰期（天）
 
 SYNONYM_HASH_KEY = "fragmented:synonyms"
 
@@ -126,6 +128,11 @@ class RedisStorage:
         feedback_positive_boost: float = FEEDBACK_POSITIVE_BOOST,
         feedback_negative_penalty: float = FEEDBACK_NEGATIVE_PENALTY,
         hot_topic_boost: float = HOT_TOPIC_BOOST,
+        hot_topic_decay_half_days: int = HOT_TOPIC_DECAY_HALF_DAYS,
+        emotion_intensity_factor: float = 0.4,
+        attention_boost_max: float = 1.5,
+        attention_base_increment: float = 2.0,
+        attention_emotion_factor: float = 1.5,
     ):
         self._embedder = embedder
         self._host = host
@@ -142,6 +149,11 @@ class RedisStorage:
         self._feedback_positive_boost = feedback_positive_boost
         self._feedback_negative_penalty = feedback_negative_penalty
         self._hot_topic_boost = hot_topic_boost
+        self._hot_topic_decay_half_days = hot_topic_decay_half_days
+        self._emotion_intensity_factor = emotion_intensity_factor
+        self._attention_boost_max = attention_boost_max
+        self._attention_base_increment = attention_base_increment
+        self._attention_emotion_factor = attention_emotion_factor
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -370,7 +382,11 @@ class RedisStorage:
         if client:
             try:
                 keywords = extract_keywords(text, max_keywords=5)
-                record_attention(client, text, intensity, keywords)
+                record_attention(
+                    client, text, intensity, keywords,
+                    base_increment=getattr(self, '_attention_base_increment', 2.0),
+                    emotion_factor=getattr(self, '_attention_emotion_factor', 1.5),
+                )
             except Exception:
                 pass
 
@@ -453,44 +469,76 @@ class RedisStorage:
                     ttl = self._TOPIC_EXPIRE_SECONDS.get(topic_set, 86400)
                     client.expire(topic_set, ttl)
 
+            # 记录热门话题最后提及时间（用于时间衰减）
+            now_ts = datetime.now(timezone.utc).timestamp()
+            for kw in keywords:
+                client.hset(HOT_TOPIC_LAST_SEEN, kw, str(now_ts))
+            client.expire(HOT_TOPIC_LAST_SEEN, 86400 * 30)  # 30天过期
+
         except Exception as e:
             logger.debug("storage: _record_topics error: %s", e)
 
     def match_attention(self, content: str, top_n: int = 10) -> float:
-        """检查碎片内容命中多少高注意力话题，返回加权值（1.0~1.5）。"""
+        """检查碎片内容命中多少高注意力话题，返回加权值（1.0~max_boost）。"""
         client = self._get_client()
         if not client or not content:
             return 1.0
         try:
-            return match_attention_boost(client, content, top_n=top_n)
+            boost_max = getattr(self, '_attention_boost_max', 1.5)
+            return match_attention_boost(client, content, top_n=top_n, boost_max=boost_max)
         except Exception:
             return 1.0
 
-    def match_hot_topics(self, text: str, limit: int = 10) -> int:
-        """检查文本中包含多少个热门话题关键词。
+    def match_hot_topics(self, text: str, limit: int = 10) -> float:
+        """检查文本中包含多少个热门话题关键词（带时间衰减）。
 
-        直接扫 Redis 热门话题库，取 top N 逐一检查是否出现在文本中。
-        不依赖 extract_keywords，不怕噪声。
-
-        返回命中数（0 = 无热门话题）。
+        太久前的话题权重自动降低，最后提及时间越近权重越高。
+        返回衰减后的有效命中数（非整数，有小数部分）。
         """
         if not text:
-            return 0
+            return 0.0
         client = self._get_client()
         if not client:
-            return 0
+            return 0.0
         try:
             raw = client.zrevrange(HOT_TOPIC_SET, 0, limit - 1, withscores=True)
+            if not raw:
+                return 0.0
+
+            # 读取 last_seen 时间戳
+            last_seen_raw = client.hgetall(HOT_TOPIC_LAST_SEEN) or {}
+            last_seen = {}
+            for k_b, v_b in last_seen_raw.items():
+                k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
+                v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
+                try:
+                    last_seen[k] = float(v)
+                except (ValueError, TypeError):
+                    pass
+
+            now = datetime.now(timezone.utc).timestamp()
+            decay_half = float(getattr(self, '_hot_topic_decay_half_days', HOT_TOPIC_DECAY_HALF_DAYS))
+
             text_lower = text.lower()
-            hits = 0
-            for topic_b, score in raw:
+            weighted_hits = 0.0
+            for topic_b, score_raw in raw:
                 topic = topic_b.decode("utf-8") if isinstance(topic_b, bytes) else topic_b
+                if isinstance(score_raw, bytes):
+                    score_raw = score_raw.decode("utf-8")
                 if len(topic) >= 2 and topic in text_lower:
-                    hits += 1
-            return hits
+                    # 时间衰减：最近提及的权重高，久远的低
+                    seen_ts = last_seen.get(topic)
+                    if seen_ts and seen_ts > 0:
+                        days_ago = max(0, (now - seen_ts) / 86400.0)
+                        decay = 2.0 ** (-days_ago / decay_half)
+                    else:
+                        decay = 0.5  # 无时间戳的折半
+                    weighted_hits += decay
+
+            return weighted_hits
         except Exception as e:
             logger.debug("storage: match_hot_topics error: %s", e)
-            return 0
+            return 0.0
 
     def get_hot_topics(
         self,
@@ -791,8 +839,9 @@ class RedisStorage:
                 intensity = float(frag.get("sentiment_score", 0))
             except (ValueError, TypeError):
                 intensity = 0.0
-            # intensity 0.0~2.0 → 权重 1.0~1.8
-            emotion_w = 1.0 + min(intensity, 2.0) * 0.4
+            # intensity 0.0~2.0 → 权重 1.0~1.0+2.0*factor
+            emotion_factor = getattr(self, '_emotion_intensity_factor', 0.4)
+            emotion_w = 1.0 + min(intensity, 2.0) * emotion_factor
 
             # 3c: 反馈权重
             try:
