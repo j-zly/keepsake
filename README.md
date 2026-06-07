@@ -20,18 +20,23 @@
 
 | 特性 | 说明 |
 |------|------|
-| ✂️ **语义切分** | 对话内容按段落/句子边界自动拆分为独立碎片 |
-| 🔍 **向量搜索** | RediSearch KNN 语义检索，不止关键词匹配 |
+| ✂️ **语义切分** | 对话内容按段落/句子边界自动拆分为独立碎片，保护缩写/数字/省略号 |
+| 🔍 **BM25 全文搜索** | RediSearch 全文检索，零成本，同义词扩展 |
+| 🧠 **KNN 向量搜索** | 可选 Embedding（OpenAI / DashScope），动态维度适配 |
 | ⏳ **时间衰减** | 碎片按时间降权，旧记忆权重逐步降低（60天半衰期） |
 | 🔄 **自动写入** | `memory()` 操作和对话轮次自动存档，无需手动管理 |
-| ☁️ **零外部依赖** | 除嵌入模型 API 外无其他外部服务 |
+| 🏷️ **标签过滤** | 可选按标签范围搜索 |
+| 👍 **反馈加权** | 标记有用/没用的碎片会影响排序 |
+| 🔥 **热门话题** | 自动统计跨会话高频话题 |
+| 📖 **同义词表** | 存 Redis Hash，实时加载展开搜索，无需部署 |
 
 ## 依赖
 
 - **Python 3.10+**
 - **Hermes Agent 0.12+** — 提供 `MemoryProvider` 接口
 - **Redis 7+** — 带 RediSearch 模块（v2.6+）
-- **Embedding API** — OpenAI / DashScope / 任意兼容 `/v1/embeddings` 的服务
+- **jieba** — 中文分词（自动安装）
+- **Embedding API**（可选） — OpenAI / DashScope / 任意兼容 `/v1/embeddings` 的服务
 
 ## 安装
 
@@ -47,7 +52,11 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
 ## 配置
 
+配置优先级（高→低）：**环境变量 > JSON 配置文件 > config.yaml 内联 > 默认值**
+
 ### 1. 创建 Redis Index（首次使用）
+
+代码会自动创建（`ensure_index()`），也可以手动执行：
 
 ```bash
 redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
@@ -60,30 +69,47 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
 ```
 
-> 如果你用 Docker：`docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
+> 维度（DIM）根据实际使用的 Embedding 模型动态调整，默认 1536。
+> 如果用 Docker：`docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
 
 ### 2. Hermes 配置
 
-在 `~/.hermes/config.yaml` 中：
+在 `~/.hermes/config.yaml` 中开启：
 
 ```yaml
 memory:
   provider: fragmented
-  fragmented:
-    redis_host: 127.0.0.1
-    redis_port: 6379
-    embedder:
-      provider: openai            # openai | dashscope
-      api_key: sk-xxx             # 或设环境变量 OPENAI_API_KEY
-      model: text-embedding-3-small
 ```
 
-也可以通过环境变量配置：
+详细配置推荐写到 JSON 配置文件（不需要嵌在 config.yaml 里）：
+
+`~/.config/fragmented-memory/config.json`：
+
+```json
+{
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379,
+  "top_k": 5,
+  "candidate_k": 10,
+  "embedder": {
+    "provider": "dashscope",
+    "api_key": "sk-xxx",
+    "model": "text-embedding-v2"
+  }
+}
+```
+
+如果不配置 `embedder`，则只走 BM25 全文搜索模式。
+
+也支持通过环境变量配置（优先级最高）：
 
 ```bash
-export OPENAI_API_KEY=*** FRAGMENTED_REDIS_HOST=127.0.0.1
+export FRAGMENTED_REDIS_HOST=127.0.0.1
 export FRAGMENTED_REDIS_PORT=6379
-export FRAGMENTED_EMBEDDER=openai
+export FRAGMENTED_TOP_K=5
+export FRAGMENTED_EMBEDDER=dashscope
+export FRAGMENTED_EMBEDDER_MODEL=text-embedding-v2
+export OPENAI_API_KEY=sk-xxx        # embedder API key
 ```
 
 ### 3. 重启 Gateway
@@ -93,14 +119,49 @@ export FRAGMENTED_EMBEDDER=openai
 # Gateway 模式需要重启进程
 ```
 
+## 配置参考
+
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|--------|---------|--------|------|
+| `redis_host` | `FRAGMENTED_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
+| `redis_port` | `FRAGMENTED_REDIS_PORT` | `6379` | Redis 端口 |
+| `top_k` | `FRAGMENTED_TOP_K` | `5` | 最终返回碎片数 |
+| `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | 候选碎片数（KNN 用） |
+| `tag_filter` | `FRAGMENTED_TAG_FILTER` | `""` | 标签过滤（逗号分隔） |
+| `embedder.provider` | `FRAGMENTED_EMBEDDER` | `openai` | `openai` / `dashscope` |
+| `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
+| `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
+| `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
+
+### Embedding 模型与维度
+
+| 模型 | 维度 |
+|------|------|
+| OpenAI text-embedding-3-small | 1536 |
+| OpenAI text-embedding-3-large | 3072 |
+| OpenAI text-embedding-ada-002 | 1536 |
+| DashScope text-embedding-v2 | 1536 |
+| DashScope text-embedding-v3 | 1024 |
+
+维度自动检测，切换模型无需重建配置。
+
+### 同义词表
+
+存 Redis Hash `fragmented:synonyms`，搜索时实时加载：
+
+```bash
+redis-cli HSET fragmented:synonyms 背驰 '["顶背驰","底背驰"]'
+redis-cli HSET fragmented:synonyms memory '["记忆","存储","碎片"]'
+```
+
 ## 验证
 
 启动后检查日志：
 
 ```
 Memory provider 'fragmented' registered (0 tools)
-fragmented: connected (session=xxx)
-Memory provider 'fragmented' activated
+fragmented: connected (session=xxx, top_k=5, tag_filter=(none))
+fragmented: BM25-only mode (no embedder configured)
 ```
 
 ## 工作原理
@@ -113,13 +174,13 @@ Memory provider 'fragmented' activated
          ┌─────────▼─────────┐
          │   prefetch()       │  ← 自动触发
          │   ↓                │
-         │  text → Embedding  │  ← 调 API 转向量
+         │  BM25 全文搜索     │  ← 默认，零成本
+         │  (KNN 向量 search) │  ← 可选（需 embedder）
          │   ↓                │
-         │  FT.SEARCH KNN     │  ← RediSearch 语义检索
+         │  五维重排序        │  ← 相似度 × 时间衰减
+         │                    │    × 情感 × 反馈 × 热门话题
          │   ↓                │
-         │  时间衰减重排序     │  ← 新碎片优先
-         │   ↓                │
-         │  Top 5 注入上下文   │
+         │  Top N 注入上下文   │
          └─────────┬─────────┘
                    │
          ┌─────────▼─────────┐
@@ -128,30 +189,10 @@ Memory provider 'fragmented' activated
                    │
          ┌─────────▼─────────┐
          │   sync_turn()      │  ← 对话结束自动存档
-         │   段落切分          │
+         │   智能句子切分      │  ← 保护缩写/数字/引号
          │   ↓                │
          │   存入 Redis        │  ← 下次可被检索
          └───────────────────┘
-```
-
-## 配置参考
-
-| 配置项 | 环境变量 | 默认值 | 说明 |
-|--------|---------|--------|------|
-| `redis_host` | `FRAGMENTED_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
-| `redis_port` | `FRAGMENTED_REDIS_PORT` | `6379` | Redis 端口 |
-| `embedder.provider` | `FRAGMENTED_EMBEDDER` | `openai` | 嵌入 API 提供商 |
-| `embedder.api_key` | `OPENAI_API_KEY` | — | API 密钥 |
-| `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
-| `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
-
-### DashScope 用户
-
-```yaml
-embedder:
-  provider: dashscope
-  api_key: sk-xxx          # DashScope API Key
-  # base_url 和 model 可省略，自动适配
 ```
 
 ## 协议
