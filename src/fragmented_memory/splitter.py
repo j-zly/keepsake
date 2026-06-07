@@ -11,6 +11,22 @@ import jieba
 NEWLINE = "\n"
 
 # ---------------------------------------------------------------------------
+# 常见英文缩写（不在此边界断句）
+# ---------------------------------------------------------------------------
+
+_ABBREVIATIONS = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "dept",
+    "inc", "ltd", "co", "corp", "capt", "gen", "sgt", "lt", "maj", "col",
+    "gov", "rep", "sen", "pres", "vice", "pres", "hon", "esq", "phd", "md",
+    "ave", "blvd", "rd", "ct", "dr", "est", "inst", "univ",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "al", "fig", "vol", "no", "pp", "ex",
+})
+
+
+# ---------------------------------------------------------------------------
 # 情感关键词表（支持中英文）
 # ---------------------------------------------------------------------------
 
@@ -150,13 +166,95 @@ def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
     return [w for w, _ in sorted_words[:max_keywords]]
 
 
+# ---------------------------------------------------------------------------
+# 句子切分
+# ---------------------------------------------------------------------------
+
+# 预编译边界正则 — 同时匹配中文和英文句末标点
+# 中文：。！？ 后直接切（不跟在实际可能出现的引号后）
+# 英文：.！？后跟空白、大写字母、标点或行尾才切
+# 保护场景在后处理 _split_sentences 中处理
+_SENTENCE_SPLIT_RE = re.compile(
+    r'(?<=[。！？])'                                            # 中文句末标点
+    r'|'
+    r'(?<=[！？])'                                              # 中英文通用叹号/问号
+    r'|'
+    # 英文 .!? 后跟空白字符或文本结束才切
+    r'(?<=[.!?])(?=\s|$)'                                      # 仅空白或行尾
+)
+
+
+def _split_sentences(text: str) -> List[str]:
+    """将段落切分为句级片段，优先保留语义完整。
+
+    保护规则:
+      - 数字间句点（3.14、v1.0）
+      - 缩写句点（Mr.、Dr.、U.S.A.）
+      - 省略号（... → …）
+      - 中文 。 后跟引号不单独切
+    """
+    # 1. 归一化连点 → …（保留至少 3 个点时才归一化）
+    text = re.sub(r'\.{3,}', '…', text)
+    text = re.sub(r'…{2,}', '…', text)
+
+    # 2. 用正则切分
+    raw_parts = _SENTENCE_SPLIT_RE.split(text)
+
+    # 3. 后处理：合并因缩写/数字/单字母误切的部分
+    merged: List[str] = []
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if merged:
+            last = merged[-1]
+            # 如果上一片段的末尾看起像是一个缩写或数字（如 Mr、3.14、U.S.）
+            # 或者当前片段很短（<=3 字符）且不以大写字母开头 → 应合并
+            prev_tail = last.rstrip()
+            is_abbrev = (
+                _looks_like_abbreviation(prev_tail)
+                or _ends_with_digit_dot(prev_tail)
+            )
+            is_fragment = len(part) <= 3 and not part[0].isupper()
+            if is_abbrev or is_fragment:
+                merged[-1] = last + part
+                continue
+
+        merged.append(part)
+
+    return merged
+
+
+def _looks_like_abbreviation(text: str) -> bool:
+    """检查文本末尾是否像缩写（Mr.、Dr.、U.S.A.、etc.）。"""
+    # 去掉末尾空白
+    text = text.rstrip()
+    m = re.search(r'\b([A-Za-z]{1,5})\.$', text)
+    if not m:
+        return False
+    word = m.group(1).lower()
+    # 在缩写列表中，或是 1-2 个全大写字母（如 U.S. -> U 和 S 各一段）
+    return word in _ABBREVIATIONS or (word.isupper() and len(word) <= 2)
+
+
+def _ends_with_digit_dot(text: str) -> bool:
+    """检查文本是否以数字+句点结尾（如 '3.14' 中的 '3.'）。"""
+    return bool(re.search(r'\d\.$', text.rstrip()))
+
+
+# ---------------------------------------------------------------------------
+# 主切分入口
+# ---------------------------------------------------------------------------
+
+
 def split_text(text: str, max_chars: int = 500) -> List[str]:
     """按语义完整性切分文本。
 
     策略：
       1. 先按段落（连续空行）切分
-      2. 超长段落按句子边界（中英文句号/感叹号/问号）切分
-      3. 短碎片（<10 字）丢弃
+      2. 超长段落按智能句子边界切分（保护数字、缩写、引号）
+      3. 过短碎片（<10 字）与相邻片段合并
 
     参数:
         text: 要切分的文本
@@ -180,8 +278,8 @@ def split_text(text: str, max_chars: int = 500) -> List[str]:
             segments.append(para)
             continue
 
-        # 超长段落：按句子边界切
-        sentences = re.split(r"(?<=[。！？.!?\n])", para)
+        # 超长段落：按智能句子边界切
+        sentences = _split_sentences(para)
         chunk = ""
         for s in sentences:
             s = s.strip()
@@ -195,4 +293,12 @@ def split_text(text: str, max_chars: int = 500) -> List[str]:
         if chunk.strip():
             segments.append(chunk.strip())
 
-    return [s for s in segments if len(s) >= 10]
+    # 合并过短碎片（<10 字符）到前一个
+    final: List[str] = []
+    for seg in segments:
+        if len(seg) < 10 and final:
+            final[-1] += NEWLINE + seg
+        else:
+            final.append(seg)
+
+    return [s for s in final if len(s) >= 10]

@@ -237,9 +237,14 @@ class FragmentedMemoryProvider(MemoryProvider):
                 base_url=embed_cfg.get("base_url", ""),
                 model=embed_cfg.get("model", ""),
             )
-            logger.info("fragmented: embedder enabled (%s/%s)", embed_provider, embedder._model)
+            embed_dim = embedder.dimension
+            logger.info(
+                "fragmented: embedder enabled (%s, dim=%d)",
+                embed_provider, embed_dim,
+            )
         else:
             embedder = None
+            embed_dim = 1536
             logger.info("fragmented: BM25-only mode (no embedder configured)")
 
         self._storage = RedisStorage(
@@ -248,6 +253,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             port=redis_port,
             candidate_count=candidate_k,
             final_limit=top_k,
+            embed_dim=embed_dim,
         )
 
         # 自动创建/验证 index

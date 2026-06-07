@@ -12,6 +12,29 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# 模型 → 维度映射
+# ---------------------------------------------------------------------------
+
+_MODEL_DIMENSIONS: dict[str, int] = {
+    # OpenAI text-embedding-3 系列
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    # DashScope
+    "text-embedding-v2": 1536,
+    "text-embedding-v3": 1024,
+}
+
+_DEFAULT_DIM = 1536
+
+
+def resolve_dimension(model: str) -> int:
+    """根据模型名返回向量维度，未知模型返回默认值 1536。"""
+    model_key = model.strip().lower()
+    return _MODEL_DIMENSIONS.get(model_key, _DEFAULT_DIM)
+
+
+# ---------------------------------------------------------------------------
 # 抽象基类
 # ---------------------------------------------------------------------------
 
@@ -19,7 +42,13 @@ logger = logging.getLogger(__name__)
 class Embedder(ABC):
     @abstractmethod
     def get_embedding(self, text: str) -> Optional[list[float]]:
-        """输入文本，返回 1536 维 float 向量。"""
+        """输入文本，返回 float 向量。"""
+        ...
+
+    @property
+    @abstractmethod
+    def dimension(self) -> int:
+        """返回当前模型输出的向量维度。"""
         ...
 
 
@@ -46,6 +75,11 @@ class OpenAIEmbedder(Embedder):
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._dim = resolve_dimension(model)
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
 
     def get_embedding(self, text: str) -> Optional[list[float]]:
         if not self._api_key:
@@ -70,7 +104,15 @@ class OpenAIEmbedder(Embedder):
         try:
             with urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
-                return data["data"][0]["embedding"]
+                emb = data["data"][0]["embedding"]
+                # 如果服务返回的维度与预期不符，更新 self._dim
+                if len(emb) != self._dim:
+                    logger.info(
+                        "embedder: model %s returned %d dims (expected %d), updating",
+                        self._model, len(emb), self._dim,
+                    )
+                    self._dim = len(emb)
+                return emb
         except Exception as e:
             logger.debug("embedder: request failed: %s", e)
             return None

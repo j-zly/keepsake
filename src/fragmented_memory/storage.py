@@ -9,10 +9,10 @@ Redis + RediSearch 存储层 — 碎片的读写与检索。
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
 import os
 import struct
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -55,24 +55,11 @@ HOT_TOPIC_BOOST = 1.2           # 命中热门话题的碎片 ×1.2
 HOT_TOPIC_DAILY = "fragmented:hot_topics:daily"  # 日榜
 HOT_TOPIC_WEEKLY = "fragmented:hot_topics:weekly"  # 周榜
 
-# FT.CREATE 命令（首次使用自动执行）
-# 注意：用于 client.execute_command(*parts)，不要加引号（split 后引号变字面字符）
-_CREATE_INDEX_CMD = (
-    "FT.CREATE idx:memories ON HASH PREFIX 1 memory:frag: LANGUAGE chinese SCHEMA "
-    "content TEXT WEIGHT 1 "
-    "tags TAG SEPARATOR , "
-    "category TAG SEPARATOR , "
-    "source TEXT WEIGHT 1 "
-    "created TEXT WEIGHT 0 "
-    "fragment_type TAG SEPARATOR , "
-    "embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE"
-)
-
 SYNONYM_HASH_KEY = "fragmented:synonyms"
 
 
 # RediSearch 查询语法特殊字符（需要转义）
-_QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"')
+_QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"\\/')
 
 
 def _escape_query_term(term: str) -> str:
@@ -96,6 +83,26 @@ def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
     return expanded
 
 
+def _build_create_index_cmd(dim: int) -> str:
+    """根据实际向量维度构建 FT.CREATE 命令。
+
+    注意：返回命令字符串用于 split() 后 execute_command，不要加引号。
+    """
+    if dim < 1:
+        logger.warning("_build_create_index_cmd: invalid dim=%d, falling back to 1536", dim)
+        dim = 1536
+    return (
+        f"FT.CREATE {RS_INDEX} ON HASH PREFIX 1 memory:frag: LANGUAGE chinese SCHEMA "
+        f"content TEXT WEIGHT 1 "
+        f"tags TAG SEPARATOR , "
+        f"category TAG SEPARATOR , "
+        f"source TEXT WEIGHT 1 "
+        f"created TEXT WEIGHT 0 "
+        f"fragment_type TAG SEPARATOR , "
+        f"embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM {dim} DISTANCE_METRIC COSINE"
+    )
+
+
 class RedisStorage:
     """碎片存储与检索。
 
@@ -107,17 +114,21 @@ class RedisStorage:
         port: int = 6379,
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         final_limit: int = DEFAULT_FINAL_LIMIT,
+        embed_dim: int = 1536,
     ):
         self._embedder = embedder
         self._host = host
         self._port = port
         self._candidate_count = candidate_count
         self._final_limit = final_limit
+        self._embed_dim = embed_dim
+        # 使用连接池（所有实例共享）
+        self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
         self._synonym_cache: Optional[Dict[str, set]] = None
 
     # ------------------------------------------------------------------
-    # 连接管理
+    # 连接管理（连接池）
     # ------------------------------------------------------------------
 
     def _get_client(self) -> Optional[redis.Redis]:
@@ -127,15 +138,19 @@ class RedisStorage:
                 return self._client
             except redis.ConnectionError:
                 self._client = None
+                self._pool = None
         try:
-            self._client = redis.Redis(
-                host=self._host,
-                port=self._port,
-                socket_connect_timeout=3,
-                socket_timeout=5,
-                decode_responses=False,
-                protocol=2,
-            )
+            if self._pool is None:
+                self._pool = redis.ConnectionPool(
+                    host=self._host,
+                    port=self._port,
+                    socket_connect_timeout=3,
+                    socket_timeout=5,
+                    decode_responses=False,
+                    protocol=2,
+                    max_connections=10,
+                )
+            self._client = redis.Redis(connection_pool=self._pool)
             self._client.ping()
             return self._client
         except redis.ConnectionError as e:
@@ -147,7 +162,11 @@ class RedisStorage:
         return self._embedder is not None and hasattr(self._embedder, "get_embedding")
 
     def ensure_index(self) -> bool:
-        """初始化时自动创建/验证 RediSearch index + 注册同义词。"""
+        """初始化时自动创建/验证 RediSearch index。
+
+        如果 index 已存在但向量维度与当前配置不匹配，打印警告
+        但不自动重建（避免丢失已有数据）。
+        """
         client = self._get_client()
         if not client:
             return False
@@ -159,12 +178,42 @@ class RedisStorage:
         except Exception:
             idx_exists = False
 
+        # 如果 index 已存在，检查维度是否匹配
+        if idx_exists:
+            try:
+                info = client.execute_command("FT.INFO", RS_INDEX)
+                existing_dim = None
+                # FT.INFO 返回扁平列表 [field, val, field, val, ...]
+                for i in range(0, len(info) - 1, 2):
+                    if isinstance(info[i], bytes) and info[i].decode() == "attributes":
+                        attrs = info[i + 1]
+                        if attrs and isinstance(attrs, list):
+                            for attr in attrs:
+                                for j in range(0, len(attr) - 1, 2):
+                                    if isinstance(attr[j], bytes) and attr[j].decode() == "DIM":
+                                        existing_dim = int(attr[j + 1])
+                                        break
+                if existing_dim is not None and existing_dim != self._embed_dim:
+                    logger.warning(
+                        "storage: index '%s' has dim=%d but configured dim=%d. "
+                        "Index NOT rebuilt to preserve data. "
+                        "Vector search may produce incorrect results.",
+                        RS_INDEX, existing_dim, self._embed_dim,
+                    )
+            except Exception as e:
+                logger.debug("storage: FT.INFO check failed: %s", e)
+            return True
+
         # 创建 index（如果不存在）
         if not idx_exists:
             try:
-                parts = _CREATE_INDEX_CMD.split()
+                cmd = _build_create_index_cmd(self._embed_dim)
+                parts = cmd.split()
                 client.execute_command(*parts)
-                logger.info("storage: created RediSearch index '%s'", RS_INDEX)
+                logger.info(
+                    "storage: created RediSearch index '%s' (dim=%d)",
+                    RS_INDEX, self._embed_dim,
+                )
             except redis.ResponseError as e:
                 if "already exists" in str(e).lower():
                     logger.info("storage: index '%s' already exists", RS_INDEX)
@@ -195,7 +244,6 @@ class RedisStorage:
             if not raw:
                 self._synonym_cache = {}
                 return {}
-            import json as _json
             synonym_map: Dict[str, set] = {}
             for term_b, val_b in raw.items():
                 term = term_b.decode("utf-8").lower().strip()
@@ -224,12 +272,13 @@ class RedisStorage:
             return {}
 
     def close(self) -> None:
-        if self._client is not None:
+        if self._pool is not None:
             try:
-                self._client.close()
+                self._pool.disconnect()
             except Exception:
                 pass
-            self._client = None
+        self._client = None
+        self._pool = None
 
     # ------------------------------------------------------------------
     # 向量化（带 MD5 缓存，仅 embedding 模式使用）
@@ -508,8 +557,11 @@ class RedisStorage:
 
             # 构建全文查询
             if tag_filter:
-                tags = ",".join(t.strip() for t in tag_filter.split(",") if t.strip())
-                query_expr = f"@tags:{{{tags}}} @content:{safe_terms}"
+                safe_tags = ",".join(
+                    _escape_query_term(t.strip())
+                    for t in tag_filter.split(",") if t.strip()
+                )
+                query_expr = f"@tags:{{{safe_tags}}} @content:{safe_terms}"
             else:
                 query_expr = f"@content:{safe_terms}"
 
@@ -567,8 +619,11 @@ class RedisStorage:
 
         try:
             if tag_filter:
-                tags = ",".join(t.strip() for t in tag_filter.split(",") if t.strip())
-                query_expr = f"@tags:{{{tags}}}=>[KNN $K @embed_bin $vec AS score]"
+                safe_tags = ",".join(
+                    _escape_query_term(t.strip())
+                    for t in tag_filter.split(",") if t.strip()
+                )
+                query_expr = f"@tags:{{{safe_tags}}}=>[KNN $K @embed_bin $vec AS score]"
             else:
                 query_expr = "*=>[KNN $K @embed_bin $vec AS score]"
 
@@ -673,7 +728,7 @@ class RedisStorage:
                 raw = float(frag.get(score_key, 0.0))
                 frag["_sim"] = raw / max_raw
 
-        # ---- Step 3: 三维权重综合 ----
+        # ---- Step 3: 五维权重综合 ----
         for frag in fragments:
             # 取当前碎片自己的相似度
             sim = float(frag.get("_sim", 0.0))
