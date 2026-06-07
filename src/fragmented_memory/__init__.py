@@ -10,11 +10,17 @@ fragmented-memory — 碎片化记忆系统 for Hermes Agent.
 
 安装: pip install fragmented-memory
 激活: config.yaml 中设置 memory.provider: fragmented
+
+配置优先级: 环境变量 > 配置文件 > 默认值
+配置文件: ~/.config/fragmented-memory/config.json (或 FRAGMENTED_MEMORY_CONFIG 自定义路径)
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -25,6 +31,42 @@ from .storage import RedisStorage
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CONFIG_PATH = "~/.config/fragmented-memory/config.json"
+
+
+def _load_json_config() -> dict:
+    """从 JSON 配置文件加载配置。
+
+    路径来源（优先级高到低）:
+      1. 环境变量 FRAGMENTED_MEMORY_CONFIG
+      2. ~/.config/fragmented-memory/config.json
+    文件不存在时返回空 dict。
+    """
+    path_str = os.environ.get("FRAGMENTED_MEMORY_CONFIG") or _DEFAULT_CONFIG_PATH
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        logger.debug("fragmented: config file not found at %s", path)
+        return {}
+    try:
+        with open(path) as f:
+            cfg: dict = json.load(f)
+        logger.info("fragmented: loaded config from %s", path)
+        return cfg
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("fragmented: failed to load config from %s: %s", path, e)
+        return {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并两个 dict，override 覆盖 base。"""
+    result = base.copy()
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
 
 class FragmentedMemoryProvider(MemoryProvider):
     """
@@ -32,6 +74,12 @@ class FragmentedMemoryProvider(MemoryProvider):
 
     和 Hermes builtin 内存共存，不冲突。每轮对话自动检索相关碎片
     注入上下文，并自动将用户消息切分存档。
+
+    配置优先级（高→低）:
+      1. 环境变量 (FRAGMENTED_REDIS_HOST, FRAGMENTED_EMBEDDER 等)
+      2. JSON 配置文件 (~/.config/fragmented-memory/config.json)
+      3. config.yaml memory.fragmented 节（由 Hermes 传入）
+      4. 硬编码默认值
     """
 
     _initialized: bool = False
@@ -47,9 +95,9 @@ class FragmentedMemoryProvider(MemoryProvider):
               fragmented:
                 redis_host: 127.0.0.1
                 redis_port: 6379
-                top_k: 5                    # 可选，返回条数
-                candidate_k: 10             # 可选，KNN 候选数
-                tag_filter: ""              # 可选，只搜索特定标签
+                top_k: 5
+                candidate_k: 10
+                tag_filter: ""
                 embedder:
                   provider: openai
                   api_key: sk-xxx
@@ -58,6 +106,52 @@ class FragmentedMemoryProvider(MemoryProvider):
         """
         super().__init__()
         self._config = config
+
+    # ------------------------------------------------------------------
+    # 配置合并
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_config(inline_cfg: dict) -> dict:
+        """按优先级合并配置源，返回最终配置。
+
+        合并顺序（后覆盖前）: 默认值 ← JSON 文件 ← 环境变量 ← inline
+        inline = Hermes 的 config.yaml memory.fragmented 或 __init__ 传参
+        """
+        # 1. 硬编码默认值
+        cfg = {
+            "redis_host": "127.0.0.1",
+            "redis_port": 6379,
+            "top_k": 5,
+            "candidate_k": 10,
+            "tag_filter": "",
+            "embedder": {
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "text-embedding-3-small",
+            },
+        }
+
+        # 2. JSON 配置文件覆盖
+        json_cfg = _load_json_config()
+        cfg = _deep_merge(cfg, json_cfg)
+
+        # 3. 环境变量覆盖
+        env_overrides = {
+            "redis_host": os.environ.get("FRAGMENTED_REDIS_HOST"),
+            "redis_port": os.environ.get("FRAGMENTED_REDIS_PORT"),
+            "top_k": os.environ.get("FRAGMENTED_TOP_K"),
+            "candidate_k": os.environ.get("FRAGMENTED_CANDIDATE_K"),
+            "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
+        }
+        for key, val in env_overrides.items():
+            if val is not None:
+                cfg[key] = val
+
+        # 4. inline（Hermes 传入的 config.yaml 配置）覆盖
+        cfg = _deep_merge(cfg, inline_cfg)
+
+        return cfg
 
     # ------------------------------------------------------------------
     # MemoryProvider 接口
@@ -76,14 +170,15 @@ class FragmentedMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """初始化 — 加载配置、连接 Redis、自动创建 index。"""
-        frag_cfg = self._config.get("fragmented", {})
-        redis_host = frag_cfg.get("redis_host", "127.0.0.1")
-        redis_port = int(frag_cfg.get("redis_port", 6379))
-        top_k = int(frag_cfg.get("top_k", 5))
-        candidate_k = int(frag_cfg.get("candidate_k", 10))
-        self._tag_filter = frag_cfg.get("tag_filter", "")
+        cfg = self._resolve_config(self._config)
 
-        embed_cfg = frag_cfg.get("embedder", {})
+        redis_host = cfg.get("redis_host", "127.0.0.1")
+        redis_port = int(cfg.get("redis_port", 6379))
+        top_k = int(cfg.get("top_k", 5))
+        candidate_k = int(cfg.get("candidate_k", 10))
+        self._tag_filter = cfg.get("tag_filter", "")
+
+        embed_cfg = cfg.get("embedder", {})
         embedder = create_embedder(
             provider=embed_cfg.get("provider", ""),
             api_key=embed_cfg.get("api_key", ""),

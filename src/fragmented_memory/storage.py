@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import struct
 import uuid
 from datetime import datetime, timezone
@@ -30,14 +31,15 @@ DECAY_HALF_DAYS = 60
 EMBED_CACHE_TTL = 3600
 
 # FT.CREATE 命令（首次使用自动执行）
+# 注意：用于 client.execute_command(*parts)，不要加引号（split 后引号变字面字符）
 _CREATE_INDEX_CMD = (
-    'FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA '
+    "FT.CREATE idx:memories ON HASH PREFIX 1 memory:frag: SCHEMA "
     "content TEXT WEIGHT 1 "
-    'tags TAG SEPARATOR "," '
-    'category TAG SEPARATOR "," '
+    "tags TAG SEPARATOR , "
+    "category TAG SEPARATOR , "
     "source TEXT WEIGHT 1 "
     "created TEXT WEIGHT 0 "
-    'fragment_type TAG SEPARATOR "," '
+    "fragment_type TAG SEPARATOR , "
     "embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE"
 )
 
@@ -108,6 +110,12 @@ class RedisStorage:
             client.execute_command(*parts)
             logger.info("storage: created RediSearch index '%s'", RS_INDEX)
             return True
+        except redis.ResponseError as e:
+            if "already exists" in str(e).lower():
+                logger.info("storage: index '%s' already exists", RS_INDEX)
+                return True
+            logger.warning("storage: failed to create index: %s", e)
+            return False
         except Exception as e:
             logger.warning("storage: failed to create index: %s", e)
             return False
