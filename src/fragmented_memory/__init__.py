@@ -202,6 +202,7 @@ class FragmentedMemoryProvider(MemoryProvider):
         cfg: dict = {
             "redis_host": "127.0.0.1",
             "redis_port": 6379,
+            "redis_password": "",
             "top_k": 5,
             "candidate_k": 10,
             "tag_filter": "",
@@ -215,6 +216,7 @@ class FragmentedMemoryProvider(MemoryProvider):
         env_overrides = {
             "redis_host": os.environ.get("FRAGMENTED_REDIS_HOST"),
             "redis_port": os.environ.get("FRAGMENTED_REDIS_PORT"),
+            "redis_password": os.environ.get("FRAGMENTED_REDIS_PASSWORD"),
             "top_k": os.environ.get("FRAGMENTED_TOP_K"),
             "candidate_k": os.environ.get("FRAGMENTED_CANDIDATE_K"),
             "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
@@ -290,6 +292,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             embedder=embedder,
             host=redis_host,
             port=redis_port,
+            password=cfg.get("redis_password") or None,
             candidate_count=candidate_k,
             final_limit=top_k,
             embed_dim=embed_dim,

@@ -116,6 +116,7 @@ class RedisStorage:
         embedder: Optional[Embedder] = None,
         host: str = "127.0.0.1",
         port: int = 6379,
+        password: Optional[str] = None,
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         final_limit: int = DEFAULT_FINAL_LIMIT,
         embed_dim: int = 1536,
@@ -139,6 +140,7 @@ class RedisStorage:
         self._embedder = embedder
         self._host = host
         self._port = port
+        self._password = password
         self._candidate_count = candidate_count
         self._final_limit = final_limit
         self._embed_dim = embed_dim
@@ -180,6 +182,7 @@ class RedisStorage:
                 self._pool = redis.ConnectionPool(
                     host=self._host,
                     port=self._port,
+                    password=self._password,
                     socket_connect_timeout=3,
                     socket_timeout=5,
                     decode_responses=False,
