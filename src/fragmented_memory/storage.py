@@ -455,6 +455,43 @@ class RedisStorage:
             return False
 
     # ------------------------------------------------------------------
+    # 纠正标记 — 用户否定时降权前几轮碎片
+    # ------------------------------------------------------------------
+
+    def correct_fragments(self, keys: List[str]) -> int:
+        """标记一批碎片为已纠正，降权使其几乎不出现在搜索结果中。
+
+        做两件事：
+          1. tags 中添加 'corrected' 标签
+          2. feedback_score 设为 -1（已纠正标记，排序阶段直接压到最低）
+        """
+        client = self._get_client()
+        if not client:
+            return 0
+        count = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for key in keys:
+            try:
+                existing_tags = client.hget(key, "tags")
+                if existing_tags is None:
+                    continue
+                if isinstance(existing_tags, bytes):
+                    existing_tags = existing_tags.decode("utf-8")
+                tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
+                if "corrected" not in tag_list:
+                    tag_list.append("corrected")
+                    client.hset(key, "tags", ",".join(tag_list))
+                # 设 feedback_score 为负数，排序时大幅降权
+                client.hset(key, "feedback_score", "-1")
+                client.hset(key, "corrected_at", now)
+                count += 1
+            except Exception:
+                continue
+        if count:
+            logger.info("storage: corrected %d fragments", count)
+        return count
+
+    # ------------------------------------------------------------------
     # 热门话题统计
     # ------------------------------------------------------------------
 
@@ -878,6 +915,12 @@ class RedisStorage:
         # ---- Step 3: 六维权重综合 ----
         for frag in fragments:
             sim = float(frag.get("_sim", 0.0))
+
+            # 0: 已纠正碎片直接压到最低，永远不出现在 Top-K
+            tags = frag.get("tags", "")
+            if "corrected" in (tags if isinstance(tags, str) else ""):
+                frag["_combined_score"] = -1.0
+                continue
 
             # 3a: 时间衰减
             created_str = frag.get("created", "")
