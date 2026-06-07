@@ -52,25 +52,6 @@ _CREATE_INDEX_CMD = (
     "embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE"
 )
 
-# Redis key 前缀
-SYNONYM_HASH_KEY = "fragmented:synonyms"
-
-
-def _expand_terms_with_map(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
-    """用同义词表展开搜索词列表。
-
-    例: terms=["BTC", "支撑"], map={"btc": {"比特币"}} → ["BTC", "支撑", "比特币"]
-    """
-    expanded = list(terms)
-    for t in terms:
-        tl = t.lower()
-        if tl in synonym_map:
-            for syn in synonym_map[tl]:
-                if syn not in expanded:
-                    expanded.append(syn)
-    return expanded
-
-
 class RedisStorage:
     """碎片存储与检索。
 
@@ -159,52 +140,9 @@ class RedisStorage:
         """已迁移到 Redis Hash，此处保留作为兼容存根。"""
         pass
 
-    def _load_synonym_map(self) -> Dict[str, set]:
-        """从 Redis Hash 加载同义词表。
-
-        Redis Hash 结构: fragmented:synonyms
-          field: 词 (lowercase)
-          value: JSON 数组 [synonym1, synonym2, ...]
-
-        返回: {term_lower: {synonym_lower, ...}} 双向映射
-        """
-        client = self._get_client()
-        if not client:
-            return {}
-
-        try:
-            raw = client.hgetall(SYNONYM_HASH_KEY)
-            if not raw:
-                return {}
-
-            import json as _json
-            synonym_map: Dict[str, set] = {}
-            for term_bytes, val_bytes in raw.items():
-                term = term_bytes.decode("utf-8").lower().strip()
-                if not term:
-                    continue
-                try:
-                    syns = _json.loads(val_bytes.decode("utf-8"))
-                except (_json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                term_set = set()
-                for s in syns:
-                    s_lower = s.lower().strip()
-                    if s_lower and s_lower != term:
-                        term_set.add(s_lower)
-                if term_set:
-                    synonym_map[term] = term_set
-                    # 双向映射：每个同义词也映射到原词
-                    for s in term_set:
-                        if s not in synonym_map:
-                            synonym_map[s] = set()
-                        synonym_map[s].add(term)
-
-            logger.debug("storage: loaded %d synonym groups from Redis", len(synonym_map))
-            return synonym_map
-        except Exception as e:
-            logger.debug("storage: failed to load synonyms from Redis: %s", e)
-            return {}
+    def _ensure_synonyms(self, client: redis.Redis) -> None:
+        """同义词功能已移除，保留空方法避免调用处报错。"""
+        pass
 
     def close(self) -> None:
         if self._client is not None:
@@ -314,15 +252,12 @@ class RedisStorage:
             return []
 
         try:
-            # 从 Redis 加载同义词表 + 展开
-            synonym_map = self._load_synonym_map()
             raw_terms = query.strip().split()
-            expanded = _expand_terms_with_map(raw_terms, synonym_map)
-            if not expanded:
+            if not raw_terms:
                 return []
 
             # 用 | 连接所有词（OR 语义）
-            safe_terms = "|".join(expanded)
+            safe_terms = "|".join(raw_terms)
 
             # 构建全文查询
             if tag_filter:
