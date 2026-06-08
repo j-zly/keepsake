@@ -447,6 +447,8 @@ class FragmentedMemoryProvider(MemoryProvider):
                             raw_content = full_data.get(b"content")
                             full_content = raw_content.decode("utf-8") if isinstance(raw_content, bytes) else (raw_content or "")
                             if full_content:
+                                # 记录此次访问，保鲜该完整记忆
+                                client.hset(full_key, "last_accessed", str(_time.time()))
                                 related = self._storage.search(
                                     full_content[:200],
                                     tag_filter=self._tag_filter,

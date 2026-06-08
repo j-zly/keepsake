@@ -254,12 +254,12 @@ class Forgetter:
                 key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
                 stats["scanned"] += 1
                 try:
-                    created_data = client.hget(key, "created")
+                    created_data = client.hget(key, "last_accessed") or client.hget(key, "created")
                     if not created_data:
                         continue
                     created_ts = float(created_data)
                     if created_ts > cutoff_ts:
-                        continue  # 还不够老
+                        continue  # 最近被访问过或创建不久，保留
                     forgettable_keys.append(key)
                 except Exception as e:
                     logger.debug("forgetter: skip full memory key %s: %s", key, e)
