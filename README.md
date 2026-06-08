@@ -136,6 +136,7 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "consolidate_min_group": 2,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
+  "full_max_age_days": 60,
   "forget_dry_run": true,
   
   // 同义词发现配置
@@ -175,7 +176,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
 | `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum fragments to trigger consolidation |
 | `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before fragments can be consolidated |
-| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
+|| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
+|| `FRAGMENTED_FULL_MAX_AGE_DAYS` | `full_max_age_days` | Number of days before FULL memories (recalled via lineage) expire |
 | `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 
@@ -254,6 +256,7 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `consolidate_min_group` | — | `2` | Minimum fragments to trigger consolidation |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before fragments can be consolidated |
 | `forget_max_age_days` | — | `30` | Number of days before fragments might be forgotten |
+| `full_max_age_days` | — | `60` | Number of days before FULL memories (recalled via lineage) expire |
 | `forget_dry_run` | — | `true` | Safe mode for forgetting: only count, don't delete |
 | `hot_topic_decay_half_days` | — | `30` | Hot topic time decay half-life (days) |
 | `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
