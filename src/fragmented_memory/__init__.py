@@ -424,9 +424,9 @@ class FragmentedMemoryProvider(MemoryProvider):
     def _should_search(self, query: str) -> bool:
         """判断当前用户消息是否需要检索碎片。
 
-        跳过场景：
-          1. query 长度 < skip_min_length
-          2. query 精确匹配 skip_patterns 中的词（忽略大小写）
+        跳过条件：
+          1. query 长度过短（小于 skip_min_length）
+          2. query 精确匹配 skip_patterns 中的确认词（忽略大小写）
         """
         q = query.strip()
         if len(q) < self._skip_min_length:
