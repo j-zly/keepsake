@@ -209,6 +209,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             "synonym_min_word_freq": 10,
             "synonym_jaccard_threshold": 0.5,
             "synonym_min_co_occurrence": 3,
+            "skip_min_length": 2,
+            "skip_patterns_file": "",
         }
 
         # 2. JSON 配置文件覆盖
@@ -312,6 +314,22 @@ class FragmentedMemoryProvider(MemoryProvider):
         candidate_k = int(cfg.get("candidate_k", 10))
         self._tag_filter = cfg.get("tag_filter", "")
 
+        # 按需检索配置
+        self._skip_min_length = int(cfg.get("skip_min_length", 2))
+        self._skip_patterns: set = set()
+        patterns_file = cfg.get("skip_patterns_file", "")
+        if patterns_file:
+            p = Path(patterns_file).expanduser()
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        self._skip_patterns.add(line.lower())
+                logger.info(
+                    "fragmented: loaded %d skip patterns from %s",
+                    len(self._skip_patterns), patterns_file,
+                )
+
         embed_cfg = cfg.get("embedder", {})
         embed_provider = embed_cfg.get("provider", "").strip().lower()
         # 只有显式配置了 embedder provider 才创建，否则走 BM25-only 模式
@@ -394,7 +412,7 @@ class FragmentedMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         parts = [
             "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
-            "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。",
+            "每轮对话开始时，系统会根据当前用户消息实时检索相关碎片。",
             "相关碎片就在下面「相关碎片」段落里，直接使用即可。",
             "碎片综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
             "正反馈用 frag_memory_feedback(key, positive=True) 标记有用，",
@@ -403,11 +421,24 @@ class FragmentedMemoryProvider(MemoryProvider):
         ]
         return "\n".join(parts)
 
+    def _should_search(self, query: str) -> bool:
+        """判断当前用户消息是否需要检索碎片。
+
+        跳过场景：
+          1. query 长度 < skip_min_length
+          2. query 精确匹配 skip_patterns 中的词（忽略大小写）
+        """
+        q = query.strip()
+        if len(q) < self._skip_min_length:
+            return False
+        if q.lower() in self._skip_patterns:
+            return False
+        return True
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
         if not self._should_search(query):
             return ""
-
         if not query or len(query.strip()) < 2 or not self._storage:
             return ""
 

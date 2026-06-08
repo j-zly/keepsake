@@ -100,7 +100,11 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "candidate_k": 10,
   "bm25_limit": 10,
   "tag_filter": "",
-  
+
+  // 按需检索配置
+  "skip_min_length": 2,
+  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
+
   // 时间衰减配置
   "decay_half_days": 60,
   "hot_topic_decay_half_days": 30,
@@ -158,6 +162,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate fragments count (for KNN) |
 | `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
 | `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
+| `FRAGMENTED_SKIP_MIN_LENGTH` | `skip_min_length` | Min query length to trigger search (default: 2) |
+| `FRAGMENTED_SKIP_PATTERNS_FILE` | `skip_patterns_file` | Path to skip patterns text file |
 | `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
 | `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
 | `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
