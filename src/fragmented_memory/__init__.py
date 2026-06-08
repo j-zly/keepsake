@@ -244,7 +244,48 @@ class FragmentedMemoryProvider(MemoryProvider):
             is_primary = is_primary.lower() in ("true", "1", "yes", "on")
         cfg["is_primary"] = bool(is_primary)
 
+        # 7. 加载 skip patterns 配置
+        # skip_min_length: int，默认 2，从 config.json 的 skip_min_length 读取
+        skip_min_length = cfg.get("skip_min_length", 2)
+        cfg["skip_min_length"] = skip_min_length
+
+        # skip_patterns_file: str，默认空字符串，从 config.json 的 skip_patterns_file 读取
+        skip_patterns_file = cfg.get("skip_patterns_file", "")
+        if skip_patterns_file:
+            skip_patterns_file = Path(skip_patterns_file).expanduser()
+            if skip_patterns_file.exists():
+                try:
+                    with open(skip_patterns_file) as f:
+                        patterns = set()
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                patterns.add(line.lower())
+                    cfg["skip_patterns"] = patterns
+                except Exception as e:
+                    logger.warning("fragmented: failed to load skip patterns from %s: %s", skip_patterns_file, e)
+            else:
+                cfg["skip_patterns"] = set()
+        else:
+            cfg["skip_patterns"] = set()
+
         return cfg
+
+    def _should_search(self, query: str) -> bool:
+        """判断当前用户消息是否需要检索碎片。
+
+        跳过条件：
+          1. 长度 < skip_min_length（默认 2）
+          2. query 精确匹配外部文件中的 skip pattern（忽略大小写）
+        """
+        q = query.strip()
+        min_len = int(getattr(self, '_skip_min_length', 2))
+        if len(q) < min_len:
+            return False
+        patterns = getattr(self, '_skip_patterns', [])
+        if q.lower() in patterns:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # MemoryProvider 接口
@@ -333,6 +374,10 @@ class FragmentedMemoryProvider(MemoryProvider):
             session_id, top_k, self._tag_filter or "(none)",
         )
 
+        # 初始化 skip patterns 配置
+        self._skip_min_length = cfg.get("skip_min_length", 2)
+        self._skip_patterns = cfg.get("skip_patterns", set())
+
         # 初始化 Consolidator 和 Forgetter（守护模式）
         self._consolidator = Consolidator(
             storage=self._storage,
@@ -360,6 +405,9 @@ class FragmentedMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
+        if not self._should_search(query):
+            return ""
+
         if not query or len(query.strip()) < 2 or not self._storage:
             return ""
 

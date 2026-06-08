@@ -137,7 +137,11 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "synonym_min_co_occurrence": 3,
   
   // 情感强度因子
-  "emotion_intensity_factor": 0.4
+  "emotion_intensity_factor": 0.4,
+  
+  // 跳过检索的模式配置
+  "skip_min_length": 2,
+  "skip_patterns_file": ""
 }
 ```
 
@@ -165,8 +169,12 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
 | `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+| `FRAGMENTED_SKIP_MIN_LENGTH` | `skip_min_length` | Minimum query length to trigger search (default 2) |
+| `FRAGMENTED_SKIP_PATTERNS_FILE` | `skip_patterns_file` | Path to file containing patterns to skip search for (one per line, # for comments) |
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
+
+> Note: skip_patterns_file is a path to a text file that lists patterns to skip search for. Each line contains one pattern to skip. Lines starting with # are treated as comments. Empty lines are ignored. The patterns are compared in lowercase.  
 
 > Note: Changes to config.json take effect immediately without restarting (just send `/new`).
 
@@ -244,6 +252,8 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `forget_dry_run` | — | `true` | Safe mode for forgetting: only count, don't delete |
 | `hot_topic_decay_half_days` | — | `30` | Hot topic time decay half-life (days) |
 | `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+| `skip_min_length` | `FRAGMENTED_SKIP_MIN_LENGTH` | `2` | Minimum query length to trigger search |
+| `skip_patterns_file` | `FRAGMENTED_SKIP_PATTERNS_FILE` | `""` | Path to file containing patterns to skip search for (one per line, # for comments) |
 | `attention_boost_max` | — | `1.5` | Maximum attention weighting value |
 | `attention_base_increment` | — | `2.0` | Base attention increment per mention |
 | `attention_emotion_factor` | — | `1.5` | Emotion intensity amplification factor for attention |
