@@ -292,15 +292,15 @@ fragmented: BM25-only mode (no embedder configured)
 └──────────────────┬─────────────────────────────────────┘
                    │
          ┌─────────▼─────────┐
-         │   prefetch()       │  ← Automatically triggered
+         │   prefetch()       │  ← Automatically triggered on every user message
          │   ↓                │
-         │  BM25 Full-Text Search │  ← Default, zero cost
+         │  BM25 Full-Text Search │  ← Default, zero cost, triggered by user message keywords
          │  (KNN Vector search) │  ← Optional (needs embedder)
          │   ↓                │
          │  Six-dimensional Re-ranking │  ← Similarity × Time decay
          │                    │    × Emotion × Feedback × Hot Topic × Attention
          │   ↓                │
-         │  Top N Injected into Context   │
+         │  Top N Injected into Context   │  ← Search results injected as code block
          └─────────┬─────────┘
                    │
          ┌─────────▼─────────┐
