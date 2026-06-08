@@ -25,7 +25,10 @@ User: "How did we set up that React project structure last time?"
 - **Sentiment Weighting** — emotional fragments get priority
 - **User Feedback** — mark fragments useful/useless to improve ranking
 - **Hot Topic Boost** — frequently discussed topics rank higher
-- **Full Memory Recall** — fragments trace back to complete original text, then search again for associative recall
+- **Full Memory Injection** — each fragment traces back to its complete original text, shown inline as "(full memory: ...)"
+- **Associative Recall** — after retrieving a fragment's full memory, the system searches again to find more related fragments
+- **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
+- **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **Auto Sync** — every turn is archived automatically, memory tool writes are synced
 - **Auto Maintenance** — consolidation + selective forgetting to keep storage tidy
 
@@ -104,9 +107,9 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "bm25_limit": 10,
   "tag_filter": "",
 
-  // 按需检索配置
-  "enable_on_demand_search": true,
+  // 跳过检索配置
   "skip_min_length": 2,
+  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
 
   // 时间衰减配置
   "decay_half_days": 60,
@@ -136,7 +139,6 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "consolidate_min_group": 2,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
-  "full_max_age_days": 60,
   "forget_dry_run": true,
   
   // 同义词发现配置
@@ -145,11 +147,7 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "synonym_min_co_occurrence": 3,
   
   // 情感强度因子
-  "emotion_intensity_factor": 0.4,
-  
-  // 跳过检索的模式配置
-  "enable_on_demand_search": true,
-  "skip_min_length": 2
+  "emotion_intensity_factor": 0.4
 }
 ```
 
@@ -166,8 +164,6 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate fragments count (for KNN) |
 | `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
 | `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
-| `FRAGMENTED_SKIP_MIN_LENGTH` | `skip_min_length` | Min query length to trigger search (default: 2) |
-| `FRAGMENTED_ENABLE_ON_DEMAND_SEARCH` | `enable_on_demand_search` | Enable on-demand search skip patterns |
 | `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
 | `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
 | `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
@@ -176,13 +172,11 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
 | `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum fragments to trigger consolidation |
 | `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before fragments can be consolidated |
-|| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
-|| `FRAGMENTED_FULL_MAX_AGE_DAYS` | `full_max_age_days` | Number of days before FULL memories (recalled via lineage) expire |
+| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
 | `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
-
 > Note: Changes to config.json take effect immediately without restarting (just send `/new`).
 
 ### 4. Create Redis Index (first-time usage)
@@ -225,7 +219,47 @@ export FRAGMENTED_EMBEDDER_MODEL=text-embedding-v2
 export OPENAI_API_KEY=sk-xxx        # embedder API key
 ```
 
-### 3. Restart Gateway
+### 6. Workflow Lock
+
+Temporarily disable memory retrieval during automated workflows (like batch processing):
+
+```bash
+# Lock (3600s TTL)
+redis-cli SET fragmented:workflow_lock 1 EX 3600
+
+# Unlock
+redis-cli DEL fragmented:workflow_lock
+```
+
+### 7. Skip Patterns File
+
+Create a file (one pattern per line, `#` for comments):
+
+```text
+# ~/.config/fragmented-memory/skip_patterns.txt
+好的
+嗯
+对
+是
+哦
+可以
+没错
+ok
+okay
+yes
+yeah
+```
+
+Then reference it in config.json:
+
+```json
+{
+  "skip_min_length": 2,
+  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt"
+}
+```
+
+### 8. Restart Gateway
 
 ```bash
 # For CLI mode, restart session is sufficient
@@ -256,12 +290,11 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `consolidate_min_group` | — | `2` | Minimum fragments to trigger consolidation |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before fragments can be consolidated |
 | `forget_max_age_days` | — | `30` | Number of days before fragments might be forgotten |
-| `full_max_age_days` | — | `60` | Number of days before FULL memories (recalled via lineage) expire |
 | `forget_dry_run` | — | `true` | Safe mode for forgetting: only count, don't delete |
 | `hot_topic_decay_half_days` | — | `30` | Hot topic time decay half-life (days) |
 | `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
-| `skip_min_length` | `FRAGMENTED_SKIP_MIN_LENGTH` | `2` | Minimum query length to trigger search |
-| `skip_patterns_file` | `FRAGMENTED_SKIP_PATTERNS_FILE` | `""` | Path to file containing patterns to skip search for (one per line, # for comments) |
+| `skip_min_length` | — | `2` | Minimum query length to trigger search |
+| `skip_patterns_file` | — | `""` | Path to file containing skip patterns (one per line, # for comments) |
 | `attention_boost_max` | — | `1.5` | Maximum attention weighting value |
 | `attention_base_increment` | — | `2.0` | Base attention increment per mention |
 | `attention_emotion_factor` | — | `1.5` | Emotion intensity amplification factor for attention |
@@ -312,11 +345,18 @@ fragmented: BM25-only mode (no embedder configured)
          ┌─────────▼─────────┐
          │   prefetch()       │  ← Automatically triggered on every user message
          │   ↓                │
+         │  Workflow Lock?    │  ← Checks fragmented:workflow_lock
+         │   ↓                │
+         │  Skip patterns?    │  ← Length / exact match against skip list
+         │   ↓                │
          │  BM25 Full-Text Search │  ← Default, zero cost, triggered by user message keywords
          │  (KNN Vector search) │  ← Optional (needs embedder)
          │   ↓                │
          │  Six-dimensional Re-ranking │  ← Similarity × Time decay
          │                    │    × Emotion × Feedback × Hot Topic × Attention
+         │   ↓                │
+         │  Full Memory Injection     │  ← Top 3 fragments → trace full text → show inline
+         │  Associative Recall        │  ← Full text → search again → dedup append
          │   ↓                │
          │  Top N Injected into Context   │  ← Search results injected as code block
          └─────────┬─────────┘
@@ -327,6 +367,8 @@ fragmented: BM25-only mode (no embedder configured)
                    │
          ┌─────────▼─────────┐
          │   sync_turn()      │  ← Automatically archive at end of conversation
+         │   Store Full Text  │  ← memory:full:{hash} for fragment lineage
+         │   ↓                │
          │   Smart Sentence Splitting      │  ← Protect abbreviations/numbers/quotes
          │   Attention Tracking        │  ← Extract keywords and increase attention score
          │   ↓                │

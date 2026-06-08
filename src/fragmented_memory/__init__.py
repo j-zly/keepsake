@@ -209,8 +209,6 @@ class FragmentedMemoryProvider(MemoryProvider):
             "synonym_min_word_freq": 10,
             "synonym_jaccard_threshold": 0.5,
             "synonym_min_co_occurrence": 3,
-            "skip_min_length": 2,
-            "enable_on_demand_search": True,
         }
 
         # 2. JSON 配置文件覆盖
@@ -227,8 +225,6 @@ class FragmentedMemoryProvider(MemoryProvider):
             "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
             "agent_id": os.environ.get("FRAGMENTED_AGENT_ID"),
             "is_primary": os.environ.get("FRAGMENTED_IS_PRIMARY"),
-            "enable_on_demand_search": os.environ.get("FRAGMENTED_ENABLE_ON_DEMAND_SEARCH"),
-            "skip_min_length": os.environ.get("FRAGMENTED_SKIP_MIN_LENGTH"),
         }
         for key, val in env_overrides.items():
             if val is not None:
@@ -248,16 +244,48 @@ class FragmentedMemoryProvider(MemoryProvider):
             is_primary = is_primary.lower() in ("true", "1", "yes", "on")
         cfg["is_primary"] = bool(is_primary)
 
-        # 解析 enable_on_demand_search，默认为 true
-        eods = cfg.get("enable_on_demand_search", True)
-        if isinstance(eods, str):
-            eods = eods.lower() in ("true", "1", "yes", "on")
-        cfg["enable_on_demand_search"] = bool(eods)
+        # 7. 加载 skip patterns 配置
+        # skip_min_length: int，默认 2，从 config.json 的 skip_min_length 读取
+        skip_min_length = cfg.get("skip_min_length", 2)
+        cfg["skip_min_length"] = skip_min_length
 
-        # 7. skip_min_length（从 config.json 读取）
-        cfg["skip_min_length"] = int(cfg.get("skip_min_length", 2))
+        # skip_patterns_file: str，默认空字符串，从 config.json 的 skip_patterns_file 读取
+        skip_patterns_file = cfg.get("skip_patterns_file", "")
+        if skip_patterns_file:
+            skip_patterns_file = Path(skip_patterns_file).expanduser()
+            if skip_patterns_file.exists():
+                try:
+                    with open(skip_patterns_file) as f:
+                        patterns = set()
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                patterns.add(line.lower())
+                    cfg["skip_patterns"] = patterns
+                except Exception as e:
+                    logger.warning("fragmented: failed to load skip patterns from %s: %s", skip_patterns_file, e)
+            else:
+                cfg["skip_patterns"] = set()
+        else:
+            cfg["skip_patterns"] = set()
 
         return cfg
+
+    def _should_search(self, query: str) -> bool:
+        """判断当前用户消息是否需要检索碎片。
+
+        跳过条件：
+          1. 长度 < skip_min_length（默认 2）
+          2. query 精确匹配外部文件中的 skip pattern（忽略大小写）
+        """
+        q = query.strip()
+        min_len = int(getattr(self, '_skip_min_length', 2))
+        if len(q) < min_len:
+            return False
+        patterns = getattr(self, '_skip_patterns', [])
+        if q.lower() in patterns:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # MemoryProvider 接口
@@ -283,10 +311,6 @@ class FragmentedMemoryProvider(MemoryProvider):
         top_k = int(cfg.get("top_k", 5))
         candidate_k = int(cfg.get("candidate_k", 10))
         self._tag_filter = cfg.get("tag_filter", "")
-
-        # 按需检索配置
-        self._skip_min_length = int(cfg.get("skip_min_length", 2))
-        self._skip_patterns: set = set()
 
         embed_cfg = cfg.get("embedder", {})
         embed_provider = embed_cfg.get("provider", "").strip().lower()
@@ -336,25 +360,6 @@ class FragmentedMemoryProvider(MemoryProvider):
             synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
         )
 
-        # 按需检索：从 Redis Set fragmented:skip_patterns 加载确认词
-        enable_on_demand = cfg.get("enable_on_demand_search", True)
-        if enable_on_demand:
-            try:
-                client = self._storage._get_client()
-                if client:
-                    raw = client.smembers("fragmented:skip_patterns")
-                    if raw:
-                        self._skip_patterns = {m.decode() if isinstance(m, bytes) else m for m in raw}
-                    else:
-                        # 空集合时 seeding 默认词表
-                        defaults = {"好", "嗯", "对", "是", "哦", "可以", "好的", "行吧", "没错", "ok", "okay", "yes", "yeah"}
-                        client.sadd("fragmented:skip_patterns", *defaults)
-                        self._skip_patterns = defaults
-                        client.expire("fragmented:skip_patterns", 86400 * 365)  # 一年过期
-                    logger.info("fragmented: loaded %d skip patterns from Redis", len(self._skip_patterns))
-            except Exception as e:
-                logger.warning("fragmented: failed to load skip patterns from Redis: %s", e)
-
         # 自动创建/验证 index
         if not self._storage.ensure_index():
             logger.warning(
@@ -369,6 +374,10 @@ class FragmentedMemoryProvider(MemoryProvider):
             session_id, top_k, self._tag_filter or "(none)",
         )
 
+        # 初始化 skip patterns 配置
+        self._skip_min_length = cfg.get("skip_min_length", 2)
+        self._skip_patterns = cfg.get("skip_patterns", set())
+
         # 初始化 Consolidator 和 Forgetter（守护模式）
         self._consolidator = Consolidator(
             storage=self._storage,
@@ -379,14 +388,13 @@ class FragmentedMemoryProvider(MemoryProvider):
             storage=self._storage,
             max_age_days=int(cfg.get("forget_max_age_days", 30)),
             dry_run=bool(cfg.get("forget_dry_run", True)),
-            full_max_age_days=int(cfg.get("full_max_age_days", 60)),
         )
         logger.info("fragmented: maintenance engines initialized")
 
     def system_prompt_block(self) -> str:
         parts = [
             "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
-            "每轮对话开始时，系统会根据当前用户消息实时检索相关碎片。",
+            "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。",
             "相关碎片就在下面「相关碎片」段落里，直接使用即可。",
             "碎片综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
             "正反馈用 frag_memory_feedback(key, positive=True) 标记有用，",
@@ -395,28 +403,26 @@ class FragmentedMemoryProvider(MemoryProvider):
         ]
         return "\n".join(parts)
 
-    def _should_search(self, query: str) -> bool:
-        """判断当前用户消息是否需要检索碎片。
-
-        跳过条件：
-          1. query 长度过短（小于 skip_min_length）
-          2. query 精确匹配 skip_patterns 中的确认词（忽略大小写）
-        """
-        q = query.strip()
-        if len(q) < self._skip_min_length:
-            return False
-        if q.lower() in self._skip_patterns:
-            return False
-        return True
-
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
         if not self._should_search(query):
             return ""
-        if not query or len(query.strip()) < 2 or not self._storage:
+
+        if not query or not self._storage:
             return ""
 
         import time as _time
+
+        # 检查工作流锁（复用 Redis client）
+        lock_client = None
+        try:
+            lock_client = self._storage._get_client()
+            if lock_client and lock_client.exists("fragmented:workflow_lock"):
+                logger.debug("fragmented: workflow lock active, skipping search")
+                return ""
+        except Exception:
+            pass
+
         start = _time.time()
         fragments = self._storage.search(
             query.strip(),
@@ -427,29 +433,32 @@ class FragmentedMemoryProvider(MemoryProvider):
         if not fragments:
             return ""
 
-        # 碎片溯源联想：取 top 碎片的 source:full 标签，捞完整原文再搜关联碎片
-        full_ids = set()
-        for frag in fragments[:3]:
-            tags = frag.get("tags", "")
-            if isinstance(tags, str):
-                for tag in tags.split(","):
-                    tag = tag.strip()
-                    if tag.startswith("source:full:"):
-                        full_ids.add(tag.split(":", 2)[2])
+        # 获取完整记忆内容 + 溯源联想（取 top 3 碎片）
+        full_memories: Dict[str, str] = {}
+        try:
+            client = lock_client or self._storage._get_client()
+            if client:
+                full_ids = set()
+                for frag in fragments[:3]:  # 只处理前3个碎片
+                    tags = frag.get("tags", "")
+                    if isinstance(tags, str):
+                        for tag in tags.split(","):
+                            tag = tag.strip()
+                            if tag.startswith("source:full:"):
+                                full_ids.add(tag.split(":", 2)[2])
 
-        if full_ids:
-            try:
-                client = self._storage._get_client()
-                if client:
+                if full_ids:
                     for fid in full_ids:
                         full_key = f"memory:full:{fid}"
                         full_data = client.hgetall(full_key)
                         if full_data:
-                            raw_content = full_data.get(b"content")
+                            raw_content = full_data.get(b"content") or full_data.get("content")
                             full_content = raw_content.decode("utf-8") if isinstance(raw_content, bytes) else (raw_content or "")
                             if full_content:
+                                full_memories[f"source:full:{fid}"] = full_content
                                 # 记录此次访问，保鲜该完整记忆
                                 client.hset(full_key, "last_accessed", str(_time.time()))
+                                # 用完整记忆再搜关联碎片（保留原有溯源联想逻辑）
                                 related = self._storage.search(
                                     full_content[:200],
                                     tag_filter=self._tag_filter,
@@ -460,15 +469,24 @@ class FragmentedMemoryProvider(MemoryProvider):
                                         if r.get("content", "") not in existing:
                                             fragments.append(r)
                                             existing.add(r.get("content", ""))
-            except Exception:
-                logger.warning("fragmented: full memory recall failed", exc_info=True)
+        except Exception:
+            logger.warning("fragmented: full memory recall failed", exc_info=True)
 
         lines = ["<fragmented_memory>"]
         lines.append(f"# 相关碎片 (检索耗时 {elapsed:.1f}s)")
         lines.append("")
         for i, frag in enumerate(fragments, 1):
             lines.append(f"[{i}] {frag.get('content', '')}")
+            # 检查是否有完整记忆
             tags = frag.get("tags", "")
+            if isinstance(tags, str):
+                for tag in tags.split(","):
+                    tag = tag.strip()
+                    if tag in full_memories:
+                        text = full_memories[tag]
+                        if len(text) > 500:
+                            text = text[:500] + "..."
+                        lines.append(f"    (完整记忆: {text})")
             combined = frag.get("_combined_score", 0)
             weights = frag.get("_weights", {})
             info_parts = []
@@ -503,10 +521,12 @@ class FragmentedMemoryProvider(MemoryProvider):
         if not self._storage or not user_content or len(user_content.strip()) < 10:
             return
 
-        # 1. 存储完整原文到 Redis（供碎片溯源联想）
         raw_text = user_content.strip()
         full_id = hashlib.sha256(raw_text.encode()).hexdigest()[:8]
         full_key = f"memory:full:{full_id}"
+        full_tag = f"source:full:{full_id}"
+
+        # 存储完整原文到 Redis（供碎片溯源联想）
         try:
             client = self._storage._get_client()
             if client:
@@ -518,10 +538,10 @@ class FragmentedMemoryProvider(MemoryProvider):
                 })
         except Exception:
             logger.warning("fragmented: failed to store full memory", exc_info=True)
+
         segments = split_text(raw_text)
         sid_short = session_id[:8] if session_id else "unknown"
         current_keys: List[str] = []
-        full_tag = f"source:full:{full_id}"
         for seg in segments:
             content_hash = hashlib.sha256(seg.encode()).hexdigest()[:12]
             key = f"memory:frag:{content_hash}"
@@ -647,10 +667,28 @@ class FragmentedMemoryProvider(MemoryProvider):
         if action != "add" or not content or not self._storage:
             return
 
-        for seg in split_text(content):
+        raw_text = content.strip()
+        full_id = hashlib.sha256(raw_text.encode()).hexdigest()[:8]
+        full_key = f"memory:full:{full_id}"
+        full_tag = f"source:full:{full_id}"
+
+        # 存储完整原文到 Redis（供碎片溯源联想）
+        try:
+            client = self._storage._get_client()
+            if client:
+                import time as _time
+                client.hset(full_key, mapping={
+                    "content": raw_text,
+                    "created": str(_time.time()),
+                    "target": target,
+                })
+        except Exception:
+            logger.warning("fragmented: failed to store full memory on write", exc_info=True)
+
+        for seg in split_text(raw_text):
             self._storage.store(
                 text=seg,
-                tags=target,
+                tags=f"{target},{full_tag}",
                 category="memory_tool",
                 source="hermes_agent",
                 fragment_type="memory",

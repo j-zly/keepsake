@@ -25,6 +25,10 @@
 | 🧠 **KNN 向量搜索** | 可选 Embedding（OpenAI / DashScope），动态维度适配 |
 | ⏳ **时间衰减** | 碎片按时间降权，旧记忆权重逐步降低（60天半衰期） |
 | 🔄 **自动写入** | `memory()` 操作和对话轮次自动存档，无需手动管理 |
+| 📖 **完整记忆注入** | 每个碎片回溯其完整原文，在上下文行内展示 `(完整记忆: ...)` |
+| 🔗 **联想回忆** | 碎片完整原文再搜一轮，自动追加更多关联碎片 |
+| 🔒 **工作流锁** | 设置 `fragmented:workflow_lock` 全局禁用碎片检索，用于自动化流程 |
+| 🚫 **跳过模式** | 配置文件定义跳过词表，简单确认语（好的/嗯/ok）不触发检索 |
 | 🏷️ **标签过滤** | 可选按标签范围搜索 |
 | 👍 **反馈加权** | 标记有用/没用的碎片会影响排序 |
 | 🔥 **热门话题** | 自动统计跨会话高频话题 |
@@ -47,6 +51,8 @@
 | 用进废退 | 反馈正强化（frag_memory_feedback） |
 | 触类旁通、联想回忆 | 同义词自动发现（Jaccard 共现统计）—— "部署" ↔ "上线" |
 | 碎片化存储 | 对话按段落切分成原子碎片，不存完整 transcript |
+| 碎片溯源 | 每个碎片指向原始完整文本 —— "碎片A让我想起完整对话B" |
+| 联想回忆 | 搜碎片 → 回溯完整原文 → 再搜关联碎片（去重追加） |
 | 睡眠时整理记忆 | 每天凌晨 consolidation + 同义发现（03:00 cron）|
 | 不同场景记忆隔离 | agent_id 标签体系 —— 分身各自记忆不交叉 |
 | 模糊但够用 | BM25 全文搜索 —— 不需要精确匹配就能回想起来 |
@@ -107,6 +113,10 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
   "bm25_limit": 10,
   "tag_filter": "",
   
+  // 跳过检索配置
+  "skip_min_length": 2,
+  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
+
   // 时间衰减配置
   "decay_half_days": 60,
   "hot_topic_decay_half_days": 30,
@@ -173,7 +183,6 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | 情绪烈度→权重系数（0=禁用，1=最大） |
 
 > 注意：Redis 密码兼容空值（无认证）或提供密码进行 AUTH 认证。  
-
 > 注意：修改 config.json 立即生效（只需发送 `/new` 命令，无需重启）。
 
 ### 4. 创建 Redis Index（首次使用）
@@ -213,10 +222,50 @@ export FRAGMENTED_REDIS_PORT=6379
 export FRAGMENTED_TOP_K=5
 export FRAGMENTED_EMBEDDER=dashscope
 export FRAGMENTED_EMBEDDER_MODEL=text-embedding-v2
-export OPENAI_API_KEY=sk-xxx        # embedder API key
+export OPENAI_API_KEY=***        # embedder API key
 ```
 
-### 3. 重启 Gateway
+### 6. 工作流锁
+
+在自动化流程（如批量任务）时需要临时禁用碎片检索：
+
+```bash
+# 加锁（3600s TTL）
+redis-cli SET fragmented:workflow_lock 1 EX 3600
+
+# 解锁
+redis-cli DEL fragmented:workflow_lock
+```
+
+### 7. 跳过模式文件
+
+创建文本文件，每行一个跳过词，`#` 注释：
+
+```text
+# ~/.config/fragmented-memory/skip_patterns.txt
+好的
+嗯
+对
+是
+哦
+可以
+没错
+ok
+okay
+yes
+yeah
+```
+
+在 config.json 中引用：
+
+```json
+{
+  "skip_min_length": 2,
+  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt"
+}
+```
+
+### 8. 重启 Gateway
 
 ```bash
 # CLI 模式重启会话即可
@@ -250,6 +299,8 @@ export OPENAI_API_KEY=sk-xxx        # embedder API key
 | `forget_dry_run` | — | `true` | 遗忘安全模式：仅统计不删除 |
 | `hot_topic_decay_half_days` | — | `30` | 热门话题时间衰减半衰期（天） |
 | `emotion_intensity_factor` | — | `0.4` | 情绪烈度→权重系数（0=不启用，1=max） |
+| `skip_min_length` | — | `2` | 触发搜索的最小消息长度 |
+| `skip_patterns_file` | — | `""` | 跳过词文件路径（每行一词，# 注释） |
 | `attention_boost_max` | — | `1.5` | 注意力加权最大值 |
 | `attention_base_increment` | — | `2.0` | 每次提及的基础关注增量 |
 | `attention_emotion_factor` | — | `1.5` | 情绪烈度对注意力的放大系数 |
@@ -300,11 +351,18 @@ fragmented: BM25-only mode (no embedder configured)
          ┌─────────▼─────────┐
          │   prefetch()       │  ← 自动触发
          │   ↓                │
+         │  工作流锁检查       │  ← 检查 fragmented:workflow_lock
+         │   ↓                │
+         │  跳过模式检查       │  ← 短消息 / 确认词命中 skip list
+         │   ↓                │
          │  BM25 全文搜索     │  ← 默认，零成本
          │  (KNN 向量 search) │  ← 可选（需 embedder）
          │   ↓                │
          │  六维重排序        │  ← 相似度 × 时间衰减
          │                    │    × 情绪 × 反馈 × 热门 × 注意力
+         │   ↓                │
+         │  完整记忆注入       │  ← top 3 碎片 → 回溯完整原文 → 行内展示
+         │  联想回忆           │  ← 完整原文再搜 → 去重追加碎片
          │   ↓                │
          │  Top N 注入上下文   │
          └─────────┬─────────┘
@@ -315,6 +373,7 @@ fragmented: BM25-only mode (no embedder configured)
                    │
          ┌─────────▼─────────┐
          │   sync_turn()      │  ← 对话结束自动存档
+         │   存储完整原文      │  ← memory:full:{hash} 供碎片溯源
          │   智能句子切分      │  ← 保护缩写/数字/引号
          │   注意力追踪        │  ← 提取关键词计入关注度
          │   ↓                │
