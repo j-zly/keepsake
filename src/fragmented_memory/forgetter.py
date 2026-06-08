@@ -131,93 +131,83 @@ class Forgetter:
                 count=self._batch_size,
             )
 
+            if not keys:
+                if cursor == 0:
+                    break
+                continue
+
+            # 用 pipeline 批量 HMGET，减少网络往返
+            pipe = client.pipeline()
+            hmget_fields = ["created", "feedback_score", "sentiment_score",
+                            "fragment_type", "source", "category", "content"]
             for key_b in keys:
+                pipe.hmget(key_b, hmget_fields)
+            pipe_results = pipe.execute()
+
+            for key_b, fields in zip(keys, pipe_results):
                 key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
                 stats["scanned"] += 1
 
-                try:
-                    # 批量读取所有字段
-                    fields = client.hmget(
-                        key,
-                        ["created", "feedback_score", "sentiment_score",
-                         "fragment_type", "source", "category"],
-                    )
-                    if not fields or not any(fields):
-                        continue  # key 不存在或空
+                if not fields or not any(fields):
+                    continue  # key 不存在或空
 
-                    created_str = fields[0]
-                    fb_str = fields[1]
-                    sent_str = fields[2]
-                    frag_type = fields[3]
-                    source = fields[4]
-                    category = fields[5]
+                def _d(v):
+                    if v is None:
+                        return ""
+                    return v.decode("utf-8") if isinstance(v, bytes) else str(v)
 
-                    # 解码 bytes
-                    def _d(v):
-                        if v is None:
-                            return ""
-                        return v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                created_str = _d(fields[0])
+                fb_str = _d(fields[1])
+                sent_str = _d(fields[2])
+                frag_type = _d(fields[3])
+                source = _d(fields[4])
+                category = _d(fields[5])
+                content = _d(fields[6])
 
-                    created_str = _d(created_str)
-                    fb_str = _d(fb_str)
-                    sent_str = _d(sent_str)
-                    frag_type = _d(frag_type)
-                    source = _d(source)
-                    category = _d(category)
-
-                    # ---- 保护规则 ----
-                    # 1. 不删 consolidated 碎片
-                    if frag_type == "consolidated":
-                        protected += 1
-                        continue
-
-                    # 2. 不删用户手动存的 memory
-                    if source == "hermes_agent":
-                        # 只删有负反馈的
-                        fb = self._parse_float(fb_str, 0)
-                        if fb >= 0:
-                            protected += 1
-                            continue
-
-                    # 3. 不删正反馈碎片
-                    fb = self._parse_float(fb_str, 0)
-                    if fb > self._min_feedback_score:
-                        protected += 1
-                        continue
-
-                    # ---- 年龄检查 ----
-                    if created_str:
-                        try:
-                            created_ts = datetime.fromisoformat(created_str).timestamp()
-                            if created_ts > cutoff_ts:
-                                continue  # 还不够老
-                        except (ValueError, TypeError):
-                            pass
-
-                    # ---- 情绪烈度检查 ----
-                    intensity = self._parse_float(sent_str, 0)
-                    if intensity >= self._min_intensity:
-                        # 有情绪的内容保留
-                        continue
-
-                    # ---- 注意力检查 ----
-                    # 检查是否命中高注意力话题
-                    content_data = client.hget(key, "content")
-                    if content_data:
-                        content = content_data.decode("utf-8") if isinstance(content_data, bytes) else str(content_data)
-                        try:
-                            attn_w = self._storage.match_attention(content)
-                            if attn_w and attn_w > 1.1:
-                                continue  # 高关注度话题，保留
-                        except Exception:
-                            pass
-
-                    # 所有条件都满足 → 可遗忘
-                    forgettable_keys.append(key)
-
-                except Exception as e:
-                    logger.debug("forgetter: skip key %s: %s", key, e)
+                # ---- 保护规则 ----
+                # 1. 不删 consolidated 碎片
+                if frag_type == "consolidated":
+                    protected += 1
                     continue
+
+                # 2. 不删用户手动存的 memory
+                if source == "hermes_agent":
+                    fb = self._parse_float(fb_str, 0)
+                    if fb >= 0:
+                        protected += 1
+                        continue
+
+                # 3. 不删正反馈碎片
+                fb = self._parse_float(fb_str, 0)
+                if fb > self._min_feedback_score:
+                    protected += 1
+                    continue
+
+                # ---- 年龄检查 ----
+                if created_str:
+                    try:
+                        created_ts = datetime.fromisoformat(created_str).timestamp()
+                        if created_ts > cutoff_ts:
+                            continue  # 还不够老
+                    except (ValueError, TypeError):
+                        pass
+
+                # ---- 情绪烈度检查 ----
+                intensity = self._parse_float(sent_str, 0)
+                if intensity >= self._min_intensity:
+                    continue
+
+                # ---- 注意力检查 ----
+                if content:
+                    try:
+                        attn_w = self._storage.match_attention(content)
+                        if attn_w and attn_w > 1.1:
+                            continue  # 高关注度话题，保留
+                    except Exception:
+                        pass
+
+                # 所有条件都满足 → 可遗忘
+                forgettable_keys.append(key)
 
             if cursor == 0:
                 break

@@ -58,16 +58,21 @@ CONSOLIDATE_PROMPT = """你是一位知识提炼专家。以下是一组关于�
 def _get_api_key() -> str:
     """获取 DashScope API key。"""
     key = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-    # fallback: 从 config.yaml 尝试读
+    # fallback: 从 config.yaml 用 yaml 解析，优先取 providers.dashscope.api_key
     if not key:
         try:
-            import re
+            import yaml
             config_path = os.path.expanduser("~/.hermes/config.yaml")
             if os.path.isfile(config_path):
                 with open(config_path) as f:
-                    m = re.search(r"api_key:\s*(.+)$", f.read(), re.MULTILINE)
-                    if m:
-                        key = m.group(1).strip().strip("'\"")
+                    cfg = yaml.safe_load(f)
+                if cfg:
+                    key = (
+                        cfg.get("providers", {}).get("dashscope", {}).get("api_key")
+                        or cfg.get("model", {}).get("api_key")
+                        or ""
+                    )
+                    key = key.strip().strip("'\"")
         except Exception:
             pass
     return key
@@ -190,39 +195,45 @@ class Consolidator:
                     count=self._batch_size,
                 )
 
+                if not keys:
+                    if cursor == 0:
+                        break
+                    continue
+
+                # 用 pipeline 批量 HMGETALL，减少网络往返
+                pipe = client.pipeline()
                 for key_b in keys:
+                    pipe.hgetall(key_b)
+                pipe_results = pipe.execute()
+
+                for key_b, data in zip(keys, pipe_results):
                     key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
-                    try:
-                        data = client.hgetall(key)
-                        if not data:
-                            continue
-
-                        # 解码
-                        doc = {}
-                        for k_b, v_b in data.items():
-                            k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
-                            v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
-                            doc[k] = v
-
-                        # 跳过已被更高层合并吞掉的
-                        if doc.get("fragment_type", "") == "consumed":
-                            continue
-
-                        # 检查年龄
-                        created_str = doc.get("created", "")
-                        if created_str:
-                            try:
-                                created_ts = datetime.fromisoformat(created_str).timestamp()
-                                if created_ts > cutoff:
-                                    continue  # 太新，等下次
-                            except (ValueError, TypeError):
-                                pass
-
-                        doc["_key"] = key
-                        fragments.append(doc)
-
-                    except Exception:
+                    if not data:
                         continue
+
+                    # 解码
+                    doc = {}
+                    for k_b, v_b in data.items():
+                        k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
+                        v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
+                        doc[k] = v
+
+                    # 跳过已被更高层合并吞掉的
+                    if doc.get("fragment_type", "") == "consumed":
+                        continue
+
+                    # 检查年龄
+                    created_str = doc.get("created", "")
+                    if created_str:
+                        try:
+                            created_ts = datetime.fromisoformat(created_str).timestamp()
+                            if created_ts > cutoff:
+                                continue  # 太新，等下次
+                        except (ValueError, TypeError):
+                            pass
+
+                    doc["_key"] = key
+                    fragments.append(doc)
 
                 if cursor == 0:
                     break
