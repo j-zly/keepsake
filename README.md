@@ -25,6 +25,7 @@ User: "How did we set up that React project structure last time?"
 - **Sentiment Weighting** — emotional fragments get priority
 - **User Feedback** — mark fragments useful/useless to improve ranking
 - **Hot Topic Boost** — frequently discussed topics rank higher
+- **Full Memory Recall** — fragments trace back to complete original text, then search again for associative recall
 - **Auto Sync** — every turn is archived automatically, memory tool writes are synced
 - **Auto Maintenance** — consolidation + selective forgetting to keep storage tidy
 
@@ -41,6 +42,8 @@ Fragmented Memory takes a different approach. It's modeled after **how the human
 | Use It or Lose It | Feedback reinforcement (frag_memory_feedback) |
 | Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
 | Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
+| Fragment Lineage | Each fragment links back to its full original text — "fragment A reminds me of full conversation B" |
+| Associative Recall | Search a fragment → trace to full memory → search again for more related fragments |
 | Sleep Consolidation | Nightly cron: consolidation + synonym discovery at 3 AM |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
@@ -102,8 +105,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "tag_filter": "",
 
   // 按需检索配置
+  "enable_on_demand_search": true,
   "skip_min_length": 2,
-  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
 
   // 时间衰减配置
   "decay_half_days": 60,
@@ -144,8 +147,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "emotion_intensity_factor": 0.4,
   
   // 跳过检索的模式配置
-  "skip_min_length": 2,
-  "skip_patterns_file": ""
+  "enable_on_demand_search": true,
+  "skip_min_length": 2
 }
 ```
 
@@ -163,7 +166,7 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
 | `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
 | `FRAGMENTED_SKIP_MIN_LENGTH` | `skip_min_length` | Min query length to trigger search (default: 2) |
-| `FRAGMENTED_SKIP_PATTERNS_FILE` | `skip_patterns_file` | Path to skip patterns text file |
+| `FRAGMENTED_ENABLE_ON_DEMAND_SEARCH` | `enable_on_demand_search` | Enable on-demand search skip patterns |
 | `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
 | `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
 | `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
@@ -175,12 +178,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
 | `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
-| `FRAGMENTED_SKIP_MIN_LENGTH` | `skip_min_length` | Minimum query length to trigger search (default 2) |
-| `FRAGMENTED_SKIP_PATTERNS_FILE` | `skip_patterns_file` | Path to file containing patterns to skip search for (one per line, # for comments) |
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
-
-> Note: skip_patterns_file is a path to a text file that lists patterns to skip search for. Each line contains one pattern to skip. Lines starting with # are treated as comments. Empty lines are ignored. The patterns are compared in lowercase.  
 
 > Note: Changes to config.json take effect immediately without restarting (just send `/new`).
 

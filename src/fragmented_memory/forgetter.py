@@ -74,6 +74,11 @@ class Forgetter:
         }
 
         forgettable = self._find_forgettable(client, stats)
+
+        # 扫描完整记忆（memory:full:*），只按年龄判断
+        forgettable_full = self._find_forgettable_full(client, stats)
+        forgettable.extend(forgettable_full)
+
         stats["candidates"] = len(forgettable)
 
         if not forgettable:
@@ -227,3 +232,39 @@ class Forgetter:
             return float(val)
         except (ValueError, TypeError):
             return default
+
+    def _find_forgettable_full(
+        self,
+        client,
+        stats: Dict[str, Any],
+    ) -> List[str]:
+        """扫描完整记忆（memory:full:*），只按年龄判断是否可遗忘。"""
+        now = datetime.now(timezone.utc)
+        cutoff_ts = now.timestamp() - self._max_age_days * 86400
+        forgettable_keys: List[str] = []
+
+        cursor = 0
+        while True:
+            cursor, keys = client.scan(
+                cursor=cursor,
+                match="memory:full:*",
+                count=self._batch_size,
+            )
+            for key_b in keys:
+                key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
+                stats["scanned"] += 1
+                try:
+                    created_data = client.hget(key, "created")
+                    if not created_data:
+                        continue
+                    created_ts = float(created_data)
+                    if created_ts > cutoff_ts:
+                        continue  # 还不够老
+                    forgettable_keys.append(key)
+                except Exception as e:
+                    logger.debug("forgetter: skip full memory key %s: %s", key, e)
+                    continue
+            if cursor == 0:
+                break
+
+        return forgettable_keys
