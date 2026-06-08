@@ -379,6 +379,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             storage=self._storage,
             max_age_days=int(cfg.get("forget_max_age_days", 30)),
             dry_run=bool(cfg.get("forget_dry_run", True)),
+            full_max_age_days=int(cfg.get("full_max_age_days", 60)),
         )
         logger.info("fragmented: maintenance engines initialized")
 

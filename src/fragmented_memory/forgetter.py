@@ -44,6 +44,7 @@ class Forgetter:
         batch_size: int = DEFAULT_BATCH_SIZE,
         dry_run: bool = DEFAULT_DRY_RUN,
         min_intensity: float = DEFAULT_MIN_INTENSITY,
+        full_max_age_days: int = 60,
     ):
         self._storage = storage
         self._max_age_days = max_age_days
@@ -51,6 +52,7 @@ class Forgetter:
         self._batch_size = batch_size
         self._dry_run = dry_run
         self._min_intensity = min_intensity
+        self._full_max_age_days = full_max_age_days
 
     def forget(self, force: bool = False) -> Dict[str, Any]:
         """执行一轮遗忘操作。
@@ -240,7 +242,7 @@ class Forgetter:
     ) -> List[str]:
         """扫描完整记忆（memory:full:*），只按年龄判断是否可遗忘。"""
         now = datetime.now(timezone.utc)
-        cutoff_ts = now.timestamp() - self._max_age_days * 86400
+        cutoff_ts = now.timestamp() - self._full_max_age_days * 86400
         forgettable_keys: List[str] = []
 
         cursor = 0
