@@ -103,6 +103,7 @@ def _build_create_index_cmd(dim: int) -> str:
         f"source TEXT WEIGHT 1 "
         f"created TEXT WEIGHT 0 "
         f"fragment_type TAG SEPARATOR , "
+        f"invalid_at TAG SEPARATOR , "
         f"embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM {dim} DISTANCE_METRIC COSINE"
     )
 
@@ -251,6 +252,18 @@ class RedisStorage:
                     )
             except Exception as e:
                 logger.debug("storage: FT.INFO check failed: %s", e)
+
+            # 尝试添加 invalid_at 字段（已存在则忽略）
+            try:
+                client.execute_command(
+                    "FT.ALTER", RS_INDEX, "SCHEMA", "ADD", "invalid_at", "TAG", "SEPARATOR", ","
+                )
+                logger.info("storage: added invalid_at field to index '%s'", RS_INDEX)
+            except redis.ResponseError:
+                pass  # 字段已存在，忽略
+            except Exception as e:
+                logger.debug("storage: FT.ALTER failed (non-fatal): %s", e)
+
             return True
 
         # 创建 index（如果不存在）
@@ -742,7 +755,8 @@ class RedisStorage:
                 .paging(0, self._bm25_limit)
                 .dialect(2)
                 .return_fields("content", "tags", "category", "source", "created",
-                               "sentiment_score", "sentiment_label", "feedback_score")
+                               "sentiment_score", "sentiment_label", "feedback_score",
+                               "invalid_at")
             )
 
             result = client.ft(RS_INDEX).search(q)
@@ -756,6 +770,10 @@ class RedisStorage:
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                # 跳过已过期的碎片
+                invalid_at = getattr(doc, "invalid_at", None)
+                if invalid_at:
+                    continue
                 if frag.get("content"):
                     # BM25 score 越大越相关
                     frag["_bm25_score"] = float(getattr(doc, "score", 0.0))
@@ -820,7 +838,8 @@ class RedisStorage:
                 Query(query_expr)
                 .sort_by("score")
                 .return_fields("content", "tags", "category", "source", "created",
-                               "sentiment_score", "sentiment_label", "feedback_score")
+                               "sentiment_score", "sentiment_label", "feedback_score",
+                               "invalid_at")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )
@@ -837,6 +856,10 @@ class RedisStorage:
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                # 跳过已过期的碎片
+                invalid_at = getattr(doc, "invalid_at", None)
+                if invalid_at:
+                    continue
                 if frag.get("content"):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))
                     fragments.append(frag)

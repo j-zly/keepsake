@@ -30,7 +30,8 @@ User: "How did we set up that React project structure last time?"
 - **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **Auto Sync** — every turn is archived automatically, memory tool writes are synced
-- **Auto Maintenance** — consolidation + selective forgetting to keep storage tidy
+- **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the fragment is filtered out at search time (no data loss, can be reverted)
+- **Auto Maintenance** — consolidation (keyword clustering + LLM summarization) + selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy
 
 ## Design Philosophy: Brain-like Memory
 
@@ -47,7 +48,7 @@ Fragmented Memory takes a different approach. It's modeled after **how the human
 | Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
 | Fragment Lineage | Each fragment links back to its full original text — "fragment A reminds me of full conversation B" |
 | Associative Recall | Search a fragment → trace to full memory → search again for more related fragments |
-| Sleep Consolidation | Nightly cron: consolidation + synonym discovery at 3 AM |
+| Sleep Consolidation | Background maintenance every 2h: keyword-based clustering + LLM summarization + synonym discovery at 3 AM via cron |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
 
@@ -139,8 +140,13 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "consolidate_min_group": 2,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
-  "forget_dry_run": true,
-  
+  "full_max_age_days": 60,
+  "forget_dry_run": false,   // false = actually delete low-value fragments
+
+  // 代理隔离配置
+  "agent_id": "main-brain",
+  "is_primary": true,
+
   // 同义词发现配置
   "synonym_min_word_freq": 10,
   "synonym_jaccard_threshold": 0.5,
@@ -173,7 +179,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum fragments to trigger consolidation |
 | `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before fragments can be consolidated |
 | `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
-| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode for forgetting: only count, don't delete |
+| `FRAGMENTED_FULL_MAX_AGE_DAYS` | `full_max_age_days` | Number of days before full memories might be forgotten |
+| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode: `true` = count only, `false` = actually delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
@@ -191,6 +198,7 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     source TEXT WEIGHT 1 \
     created TEXT WEIGHT 0 \
     fragment_type TAG SEPARATOR "," \
+    invalid_at TAG SEPARATOR "," \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
 ```
 
@@ -290,7 +298,10 @@ Then reference it in config.json:
 | `consolidate_min_group` | — | `2` | Minimum fragments to trigger consolidation |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before fragments can be consolidated |
 | `forget_max_age_days` | — | `30` | Number of days before fragments might be forgotten |
-| `forget_dry_run` | — | `true` | Safe mode for forgetting: only count, don't delete |
+| `full_max_age_days` | — | `60` | Number of days before full memories (memory:full:*) might be forgotten |
+| `forget_dry_run` | — | `true` | Safe mode for forgetting: `true` = count only, `false` = actually delete |
+| `agent_id` | — | `""` | Agent identity tag for memory isolation (e.g. `"main-brain"`) |
+| `is_primary` | — | `false` | When `true`, agent sees all fragments; `false` = only tagged ones |
 | `hot_topic_decay_half_days` | — | `30` | Hot topic time decay half-life (days) |
 | `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 | `skip_min_length` | — | `2` | Minimum query length to trigger search |
@@ -377,8 +388,8 @@ fragmented: BM25-only mode (no embedder configured)
                    │
          ┌─────────▼─────────┐
          │   [cron] Every 2h     │  ← Background maintenance
-         │   ① Multi-level Consolidation       │  ← Same topic→LLM summarization→level+1
-         │   ② Selective Forgetting     │  ← Cleanup low-value fragments
+         │   ① Multi-level Consolidation  │  ← Same topic → keyword clustering → LLM → level+1
+         │   ② Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → actual delete
          └───────────────────┘
 ```
 
