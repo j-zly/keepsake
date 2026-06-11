@@ -26,5 +26,10 @@ store = mod.RedisStorage(
     synonym_min_co_occurrence=int(cfg.get('synonym_min_co_occurrence', 3)),
 )
 result = store.discover_synonyms()
+
+# 生成 jieba 自定义词典
+dict_result = store.generate_jieba_dict()
+
 store.close()
+result["jieba_dict"] = dict_result
 print(json.dumps(result, ensure_ascii=False))

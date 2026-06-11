@@ -14,13 +14,14 @@ import logging
 import os
 import struct
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder
-from .splitter import extract_keywords
+from .splitter import extract_keywords, extract_entities
 from .emotion import analyze_emotion
 from .attention import record_attention, match_attention_boost
 
@@ -104,7 +105,8 @@ def _build_create_index_cmd(dim: int) -> str:
         f"created TEXT WEIGHT 0 "
         f"fragment_type TAG SEPARATOR , "
         f"invalid_at TAG SEPARATOR , "
-        f"embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM {dim} DISTANCE_METRIC COSINE"
+        f"embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM {dim} DISTANCE_METRIC COSINE "
+        f"entities TAG SEPARATOR ,"
     )
 
 
@@ -259,6 +261,17 @@ class RedisStorage:
                     "FT.ALTER", RS_INDEX, "SCHEMA", "ADD", "invalid_at", "TAG", "SEPARATOR", ","
                 )
                 logger.info("storage: added invalid_at field to index '%s'", RS_INDEX)
+            except redis.ResponseError:
+                pass  # 字段已存在，忽略
+            except Exception as e:
+                logger.debug("storage: FT.ALTER failed (non-fatal): %s", e)
+
+            # 尝试添加 entities 字段（已存在则忽略）
+            try:
+                client.execute_command(
+                    "FT.ALTER", RS_INDEX, "SCHEMA", "ADD", "entities", "TAG", "SEPARATOR", ","
+                )
+                logger.info("storage: added entities field to index '%s'", RS_INDEX)
             except redis.ResponseError:
                 pass  # 字段已存在，忽略
             except Exception as e:
@@ -460,6 +473,11 @@ class RedisStorage:
                 "sentiment_label": label,
                 "feedback_score": existing_feedback,  # 保留已有反馈，不重置
             }
+
+            # 实体提取
+            entities = extract_entities(text)
+            if entities:
+                mapping["entities"] = ",".join(entities)
             if fragment_type:
                 mapping["fragment_type"] = fragment_type
 
@@ -726,15 +744,21 @@ class RedisStorage:
             # 用 | 连接所有词（OR 语义），每个词单独转义
             safe_terms = "|".join(_escape_query_term(t) for t in expanded)
 
-            # 构建基础查询表达式
+            # 构建基础查询表达式 — 同时搜 content 和 entities（OR 语义）
+            # content 用括号包裹 OR 术语，避免与外部 OR 歧义
             if tag_filter:
                 safe_tags = ",".join(
                     _escape_query_term(t.strip())
                     for t in tag_filter.split(",") if t.strip()
                 )
-                query_expr = f"@tags:{{{safe_tags}}} @content:{safe_terms}"
+                content_q = f"@tags:{{{safe_tags}}} @content:({safe_terms})"
             else:
-                query_expr = f"@content:{safe_terms}"
+                content_q = f"@content:({safe_terms})"
+
+            # entities 字段只搜原始搜索词（不同义词扩展，避免TAG查询长度超限）
+            raw_safe = "|".join(_escape_query_term(t) for t in raw_terms)
+            entities_q = f"@entities:{{{raw_safe}}}"
+            query_expr = f"({content_q} | {entities_q})"
 
             # 如果不是主脑且指定了 agent_id，则添加 agent 过滤条件
             effective_agent_id = agent_id if agent_id else self._agent_id
@@ -756,7 +780,7 @@ class RedisStorage:
                 .dialect(2)
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at")
+                               "invalid_at", "entities")
             )
 
             result = client.ft(RS_INDEX).search(q)
@@ -764,7 +788,9 @@ class RedisStorage:
             fragments: List[Dict[str, Any]] = []
             for doc in result.docs:
                 frag: Dict[str, Any] = {}
-                for field in ("content", "tags", "category", "source", "created"):
+                for field in ("content", "tags", "category", "source", "created",
+                             "sentiment_score", "sentiment_label", "feedback_score",
+                             "invalid_at", "entities"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
@@ -839,7 +865,7 @@ class RedisStorage:
                 .sort_by("score")
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at")
+                               "invalid_at", "entities")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )
@@ -850,7 +876,9 @@ class RedisStorage:
             fragments: List[Dict[str, Any]] = []
             for doc in result.docs:
                 frag: Dict[str, Any] = {}
-                for field in ("content", "tags", "category", "source", "created"):
+                for field in ("content", "tags", "category", "source", "created",
+                             "sentiment_score", "sentiment_label", "feedback_score",
+                             "invalid_at", "entities"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
@@ -1028,6 +1056,77 @@ class RedisStorage:
 
         fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
         return fragments
+
+    def generate_jieba_dict(self, output_path: str = None) -> Dict[str, Any]:
+        """从碎片库 + 同义词表生成 jieba 自定义词典。
+
+        扫描全库碎片统计词频，合并同义词表中的术语，
+        输出为 jieba.load_userdict() 可加载的词典文件。
+
+        Args:
+            output_path: 输出路径，默认 ~/.config/fragmented-memory/jieba_dict.txt
+
+        Returns:
+            统计信息
+        """
+        from .splitter import _STOP_WORDS
+        import jieba
+
+        if output_path is None:
+            output_path = str(Path.home() / '.config' / 'fragmented-memory' / 'jieba_dict.txt')
+
+        client = self._get_client()
+        if not client:
+            return {"written_terms": 0, "error": "no redis client"}
+
+        # 1. 扫碎片库统计词频
+        word_freq: Dict[str, int] = {}
+        cursor = "0"
+        while cursor != 0:
+            cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=1000)
+            for key in keys:
+                try:
+                    content = client.hget(key, "content")
+                    if content is None:
+                        continue
+                    if isinstance(content, bytes):
+                        content = content.decode("utf-8")
+                    words = jieba.lcut(content)
+                    filtered = [w for w in words
+                                if len(w) >= 2
+                                and w not in _STOP_WORDS
+                                and not w.isdigit()]
+                    for w in set(filtered):
+                        word_freq[w] = word_freq.get(w, 0) + 1
+                except Exception:
+                    continue
+
+        # 2. 读同义词表补全术语
+        try:
+            synonyms = client.hgetall(SYNONYM_HASH_KEY)
+            for term_b in synonyms.keys():
+                term = term_b.decode("utf-8").lower().strip()
+                if term and len(term) >= 2:
+                    word_freq[term] = max(word_freq.get(term, 0), 3)
+        except Exception:
+            pass
+
+        # 3. 过滤：至少出现 2 次
+        selected = [(w, f) for w, f in word_freq.items() if f >= 2]
+
+        # 4. 按词频降序写文件
+        selected.sort(key=lambda x: -x[1])
+
+        lines = [f"{word} {freq} nz\n" for word, freq in selected]
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("".join(lines), encoding="utf-8")
+
+        return {
+            "written_terms": len(lines),
+            "total_candidates": len(word_freq),
+        }
 
     def discover_synonyms(self) -> Dict[str, Any]:
         """自动发现同义词组。

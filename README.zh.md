@@ -27,6 +27,8 @@
 | 🔄 **自动写入** | `memory()` 操作和对话轮次自动存档，无需手动管理 |
 | 📖 **完整记忆注入** | 每个碎片回溯其完整原文，在上下文行内展示 `(完整记忆: ...)` |
 | 🔗 **联想回忆** | 碎片完整原文再搜一轮，自动追加更多关联碎片 |
+| 🏷️ **实体提取** | 自动提取人名/地名/项目名/术语存为 entities TAG 字段，搜索时 content 和 entities 双路召回提高命中率 |
+| 📖 **领域词典** | 从碎片语料+同义词表自动生成 jieba 自定义词典，发 `/new` 时自动加载，分词更准 |
 | 🔒 **工作流锁** | 设置 `fragmented:workflow_lock` 全局禁用碎片检索，用于自动化流程 |
 | 🚫 **跳过模式** | 配置文件定义跳过词表，简单确认语（好的/嗯/ok）不触发检索 |
 | 🏷️ **标签过滤** | 可选按标签范围搜索 |
@@ -53,6 +55,7 @@
 | 碎片化存储 | 对话按段落切分成原子碎片，不存完整 transcript |
 | 碎片溯源 | 每个碎片指向原始完整文本 —— "碎片A让我想起完整对话B" |
 | 联想回忆 | 搜碎片 → 回溯完整原文 → 再搜关联碎片（去重追加） |
+| 实体索引 | 就像人脑给记忆打标签 —— 自动提取实体名，搜索时双路召回提高命中率 |
 | 睡眠时整理记忆 | 每天凌晨 consolidation + 同义发现（03:00 cron）|
 | 不同场景记忆隔离 | agent_id 标签体系 —— 分身各自记忆不交叉 |
 | 模糊但够用 | BM25 全文搜索 —— 不需要精确匹配就能回想起来 |
@@ -197,6 +200,8 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     source TEXT WEIGHT 1 \
     created TEXT WEIGHT 0 \
     fragment_type TAG SEPARATOR "," \
+    invalid_at TAG SEPARATOR "," \
+    entities TAG SEPARATOR "," \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
 ```
 
@@ -375,6 +380,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   sync_turn()      │  ← 对话结束自动存档
          │   存储完整原文      │  ← memory:full:{hash} 供碎片溯源
          │   智能句子切分      │  ← 保护缩写/数字/引号
+         │   实体提取          │  ← jieba + regex → entities TAG 字段
          │   注意力追踪        │  ← 提取关键词计入关注度
          │   ↓                │
          │   存入 Redis        │  ← 下次可被检索

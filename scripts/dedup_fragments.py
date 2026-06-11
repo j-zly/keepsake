@@ -32,7 +32,7 @@ from redis.commands.search.query import Query
 # 配置
 # ──────────────────────────────────────────────
 
-REDIS_HOST = os.environ.get("FRAGMENTED_REDIS_HOST", "180.76.115.8")
+REDIS_HOST = os.environ.get("FRAGMENTED_REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.environ.get("FRAGMENTED_REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.environ.get("FRAGMENTED_REDIS_PASSWORD")
 if not REDIS_PASSWORD:

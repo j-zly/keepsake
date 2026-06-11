@@ -27,6 +27,8 @@ User: "How did we set up that React project structure last time?"
 - **Hot Topic Boost** — frequently discussed topics rank higher
 - **Full Memory Injection** — each fragment traces back to its complete original text, shown inline as "(full memory: ...)"
 - **Associative Recall** — after retrieving a fragment's full memory, the system searches again to find more related fragments
+- **Entity Extraction** — auto-tags fragments with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
+- **Domain Dictionary** — jieba user dictionary auto-generated from fragment corpus + synonym table, loaded on `/new` for better Chinese tokenization
 - **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **Auto Sync** — every turn is archived automatically, memory tool writes are synced
@@ -48,6 +50,7 @@ Fragmented Memory takes a different approach. It's modeled after **how the human
 | Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
 | Fragment Lineage | Each fragment links back to its full original text — "fragment A reminds me of full conversation B" |
 | Associative Recall | Search a fragment → trace to full memory → search again for more related fragments |
+| Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
 | Sleep Consolidation | Background maintenance every 2h: keyword-based clustering + LLM summarization + synonym discovery at 3 AM via cron |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
@@ -199,6 +202,7 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     created TEXT WEIGHT 0 \
     fragment_type TAG SEPARATOR "," \
     invalid_at TAG SEPARATOR "," \
+    entities TAG SEPARATOR "," \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
 ```
 
@@ -381,6 +385,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   Store Full Text  │  ← memory:full:{hash} for fragment lineage
          │   ↓                │
          │   Smart Sentence Splitting      │  ← Protect abbreviations/numbers/quotes
+         │   Entity Extraction        │  ← jieba + regex → entities TAG field
          │   Attention Tracking        │  ← Extract keywords and increase attention score
          │   ↓                │
          │   Stored in Redis        │  ← Available for next retrieval

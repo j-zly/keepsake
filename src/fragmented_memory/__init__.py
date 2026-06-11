@@ -306,6 +306,10 @@ class FragmentedMemoryProvider(MemoryProvider):
         """初始化 — 加载配置、连接 Redis、自动创建 index。"""
         cfg = self._resolve_config(self._config)
 
+        # 加载/重载 jieba 自定义词典（发 /new 时生效）
+        from .splitter import init_domain_dict
+        init_domain_dict()
+
         redis_host = cfg.get("redis_host", "127.0.0.1")
         redis_port = int(cfg.get("redis_port", 6379))
         top_k = int(cfg.get("top_k", 5))

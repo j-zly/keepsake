@@ -4,9 +4,28 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import jieba
+
+# 自定义领域词典路径（由 discover_synonyms 自动生成）
+_DOMAIN_DICT = Path.home() / '.config' / 'fragmented-memory' / 'jieba_dict.txt'
+
+
+def init_domain_dict() -> None:
+    """加载/重载自定义领域词典。
+
+    首次 import 时自动调用一次。插件 initialize() 时也调用一次，
+    确保发 /new 后词典被重新加载（此时词典文件可能已被 discover_synonyms 更新）。
+    重复调用安全（jieba.load_userdict 是累加的）。
+    """
+    if _DOMAIN_DICT.exists():
+        jieba.load_userdict(str(_DOMAIN_DICT))
+
+
+# 首次 import 时自动加载
+init_domain_dict()
 
 NEWLINE = "\n"
 
@@ -302,3 +321,116 @@ def split_text(text: str, max_chars: int = 500) -> List[str]:
             final.append(seg)
 
     return [s for s in final if len(s) >= 10]
+
+
+# ---------------------------------------------------------------------------
+# 实体提取 — 用于实体关系图
+# ---------------------------------------------------------------------------
+
+# 大写缩写/英文实体: BTC, ETH, ZG, MACD 等
+_ENTITY_ENGLISH_RE = re.compile(r"[A-Z][A-Z0-9]{1,}(?:/[A-Z0-9]+)*")  # BTC, ETH, ZG, ZD
+
+# 中文平台/项目名常见词缀
+_ENTITY_CHN_SUFFIXES = {"公司", "平台", "集团", "科技", "网络", "学院", "大学", "社区", "基金", "项目", "团队", "部门"}
+
+# 已知高频实体白名单（本领域常见名词）
+_ENTITY_KNOWN = frozenset({
+    "缠论", "中枢", "三买", "三卖", "顶背驰", "底背驰", "金叉", "死叉",
+    "以太坊", "比特币", "知乎", "B站", "抖音", "微博", "公众号", "视频号",
+    "微信", "QQ", "Telegram", "币安", "Bitget", "Binance",
+    "小红书", "TradeApi", "Hermes",
+})
+
+# 价格数字: 5-6位数（常见crypto价格）
+_ENTITY_PRICE_RE = re.compile(r"(?<!\d)([6-9]\d{4,5})(?!\d)")
+
+
+def extract_entities(text: str) -> list[str]:
+    """从文本中提取候选实体（零LLM，纯jieba + regex + 白名单）。
+
+    返回去重后的实体名列表，按出现顺序排列。
+    """
+    if not text or not text.strip():
+        return []
+
+    entities: list[str] = []
+    seen: set[str] = set()
+
+    # 0. 已知白名单实体
+    text_lower = text.lower()
+    for known in _ENTITY_KNOWN:
+        if known.lower() in text_lower:
+            key = known.lower()
+            if key not in seen:
+                entities.append(known)
+                seen.add(key)
+
+    # 1. jieba posseg 提取
+    try:
+        words = jieba.posseg.lcut(text)
+        for w, flag in words:
+            w_stripped = w.strip()
+            if len(w_stripped) < 2:
+                continue
+            # 人名/机构/地名/专名
+            if flag in ("nr", "nr1", "nr2", "nrj", "nrf", "nt", "ns", "nsf", "nz"):
+                key = w_stripped.lower()
+                if key not in seen:
+                    entities.append(w_stripped)
+                    seen.add(key)
+            # 英文词（BTC, ETH 等）
+            elif flag == "eng":
+                key = w_stripped.lower()
+                if len(key) >= 2 and key not in seen:
+                    entities.append(w_stripped.upper())
+                    seen.add(key)
+    except Exception:
+        pass
+
+    # 2. regex 补充 — 大写缩写
+    for m in _ENTITY_ENGLISH_RE.finditer(text):
+        token = m.group()
+        key = token.lower()
+        if len(token) >= 2 and key not in seen:
+            entities.append(token)
+            seen.add(key)
+
+    # 3. regex 补充 — 技术术语
+    for token in ("ZG", "ZD", "MACD", "DIF", "DEA", "HIST", "RSI", "OBV", "EMA", "SMA", "BOLL",
+                  "buy1", "sell1", "buy2", "sell2"):
+        if token.lower() in text_lower:
+            key = token.lower()
+            if key not in seen:
+                entities.append(token.upper())
+                seen.add(key)
+
+    # 4. 中文名+词缀组合: 如 "小米公司" 里的 "小米"
+    for suffix in _ENTITY_CHN_SUFFIXES:
+        idx = text.find(suffix)
+        if idx >= 1:
+            # 取 suffix 前一个词（1-6字）
+            start = max(0, idx - 12)
+            prefix = text[start:idx]
+            # 尝试用 jieba 分词找最后一个有意义的词
+            try:
+                words = jieba.lcut(prefix)
+                for w in reversed(words):
+                    w = w.strip()
+                    if len(w) >= 2 and w not in _STOP_WORDS:
+                        key = w.lower()
+                        if key not in seen:
+                            entities.append(w)
+                            seen.add(key)
+                        break
+            except Exception:
+                pass
+
+    # 5. 价格数字（5-6位数，如 63000）
+    for m in _ENTITY_PRICE_RE.finditer(text):
+        token = m.group()
+        key = token
+        if key not in seen:
+            entities.append(token)
+            seen.add(key)
+
+    return entities

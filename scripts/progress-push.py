@@ -13,13 +13,13 @@ def debug(msg: str):
 
 debug("STARTING")
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "180.76.115.8")
+REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "M/P8ps5H7V/zE1x6M0gosyhMmmj60Eu4")
-TELEGRAM_BOT_TOKEN = "8749508666:***"
-TELEGRAM_CHAT_ID = ""
-HERMES_HOME = os.environ.get("HERMES_HOME", "/root/.hermes")
-HERMES_BIN = "/usr/local/lib/hermes-agent/venv/bin/hermes"
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+HERMES_HOME = os.environ.get("HERMES_HOME", "~/.hermes")
+HERMES_BIN = os.environ.get("HERMES_BIN", "hermes")
 
 debug(f"ENV: HERMES_HOME={HERMES_HOME}, REDIS_HOST={REDIS_HOST}")
 
