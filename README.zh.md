@@ -28,6 +28,7 @@
 | 📖 **完整记忆注入** | 每个碎片回溯其完整原文，在上下文行内展示 `(完整记忆: ...)` |
 | 🔗 **联想回忆** | 碎片完整原文再搜一轮，自动追加更多关联碎片 |
 | 🏷️ **实体提取** | 自动提取人名/地名/项目名/术语存为 entities TAG 字段，搜索时 content 和 entities 双路召回提高命中率 |
+| 🔗 **实体共现** | 自动统计实体共现对，搜索时扩展召回关联实体（搜"BTC"同时带出"缠论"相关碎片） |
 | 📖 **领域词典** | 从碎片语料+同义词表自动生成 jieba 自定义词典，发 `/new` 时自动加载，分词更准 |
 | 🔒 **工作流锁** | 设置 `fragmented:workflow_lock` 全局禁用碎片检索，用于自动化流程 |
 | 🚫 **跳过模式** | 配置文件定义跳过词表，简单确认语（好的/嗯/ok）不触发检索 |
@@ -52,6 +53,7 @@
 | 被纠正后不再记错 | 纠正检测 —— 用户说「不对」，错误记忆自动降权 |
 | 用进废退 | 反馈正强化（frag_memory_feedback） |
 | 触类旁通、联想回忆 | 同义词自动发现（Jaccard 共现统计）—— "部署" ↔ "上线" |
+| 实体关联 | 实体共现追踪 —— "BTC"和"减半"无语义重叠但因共现被关联召回 |
 | 碎片化存储 | 对话按段落切分成原子碎片，不存完整 transcript |
 | 碎片溯源 | 每个碎片指向原始完整文本 —— "碎片A让我想起完整对话B" |
 | 联想回忆 | 搜碎片 → 回溯完整原文 → 再搜关联碎片（去重追加） |
@@ -154,6 +156,10 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
   "synonym_min_word_freq": 10,
   "synonym_jaccard_threshold": 0.5,
   "synonym_min_co_occurrence": 3,
+
+  // 实体共现配置
+  "entity_cooc_top_n": 3,
+  "entity_cooc_min_count": 2,
   
   // 情感强度因子
   "emotion_intensity_factor": 0.4
@@ -312,6 +318,8 @@ yeah
 | `synonym_min_word_freq` | — | `10` | 词至少出现在 N 条碎片里才考虑 |
 | `synonym_jaccard_threshold` | — | `0.5` | 两词 Jaccard 系数 ≥ 此值视为同义 |
 | `synonym_min_co_occurrence` | — | `3` | 两词绝对共现次数 ≥ 此值视为同义 |
+| `entity_cooc_top_n` | — | `3` | 搜索时扩展多少个关联实体 |
+| `entity_cooc_min_count` | — | `2` | 实体共现几次才算有效关联 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -362,6 +370,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   ↓                │
          │  BM25 全文搜索     │  ← 默认，零成本
          │  (KNN 向量 search) │  ← 可选（需 embedder）
+         │  实体共现扩展      │  ← 查询实体 → 召回关联实体碎片
          │   ↓                │
          │  六维重排序        │  ← 相似度 × 时间衰减
          │                    │    × 情绪 × 反馈 × 热门 × 注意力
@@ -381,6 +390,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   存储完整原文      │  ← memory:full:{hash} 供碎片溯源
          │   智能句子切分      │  ← 保护缩写/数字/引号
          │   实体提取          │  ← jieba + regex → entities TAG 字段
+         │   实体共现记录      │  ← 实体对 ZINCRBY 记共现
          │   注意力追踪        │  ← 提取关键词计入关注度
          │   ↓                │
          │   存入 Redis        │  ← 下次可被检索

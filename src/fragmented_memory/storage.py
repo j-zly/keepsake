@@ -62,6 +62,9 @@ HOT_TOPIC_DECAY_HALF_DAYS = 30  # 热门话题时间衰减半衰期（天）
 
 SYNONYM_HASH_KEY = "fragmented:synonyms"
 
+# 实体共现关联
+ENTITY_COOC_KEY = "fragmented:entity_cooc"
+ENTITY_COOC_TTL = 2592000  # 30 天 TTL
 
 # RediSearch 查询语法特殊字符（需要转义）
 _QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"\\/')
@@ -70,6 +73,13 @@ _QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"\\/')
 def _escape_query_term(term: str) -> str:
     """转义 RediSearch 查询语法中的特殊字符。"""
     for ch in _QUERY_SPECIAL_CHARS:
+        term = term.replace(ch, f"\\{ch}")
+    return term
+
+
+def _escape_glob(term: str) -> str:
+    """转义 Redis ZSCAN/ZSCAN MATCH 模式中的 glob 特殊字符。"""
+    for ch in ('*', '?', '[', ']', '\\'):
         term = term.replace(ch, f"\\{ch}")
     return term
 
@@ -142,6 +152,8 @@ class RedisStorage:
         synonym_min_word_freq: int = 10,
         synonym_jaccard_threshold: float = 0.5,
         synonym_min_co_occurrence: int = 3,
+        entity_cooc_top_n: int = 3,
+        entity_cooc_min_count: int = 2,
     ):
         self._embedder = embedder
         self._host = host
@@ -170,6 +182,9 @@ class RedisStorage:
         self._synonym_min_word_freq = synonym_min_word_freq
         self._synonym_jaccard_threshold = synonym_jaccard_threshold
         self._synonym_min_co_occurrence = synonym_min_co_occurrence
+        # 实体共现参数
+        self._entity_cooc_top_n = entity_cooc_top_n
+        self._entity_cooc_min_count = entity_cooc_min_count
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -478,6 +493,8 @@ class RedisStorage:
             entities = extract_entities(text)
             if entities:
                 mapping["entities"] = ",".join(entities)
+                # 记录实体共现
+                self._record_entity_cooccurrence(client, entities)
             if fragment_type:
                 mapping["fragment_type"] = fragment_type
 
@@ -578,6 +595,20 @@ class RedisStorage:
 
         except Exception as e:
             logger.debug("storage: _record_topics error: %s", e)
+
+    def _record_entity_cooccurrence(self, client: redis.Redis, entities: List[str]) -> None:
+        """记录实体共现对。"""
+        if len(entities) < 2:
+            return
+        try:
+            sorted_ents = sorted(e.lower().strip() for e in entities if e.strip())
+            for i in range(len(sorted_ents)):
+                for j in range(i + 1, len(sorted_ents)):
+                    pair = f"{sorted_ents[i]}||{sorted_ents[j]}"
+                    client.zincrby(ENTITY_COOC_KEY, 1.0, pair)
+                    client.expire(ENTITY_COOC_KEY, ENTITY_COOC_TTL)
+        except Exception as e:
+            logger.debug("storage: _record_entity_cooccurrence error: %s", e)
 
     def match_attention(self, content: str, top_n: int = 10) -> float:
         """检查碎片内容命中多少高注意力话题，返回加权值（1.0~max_boost）。"""
@@ -743,6 +774,50 @@ class RedisStorage:
 
             # 用 | 连接所有词（OR 语义），每个词单独转义
             safe_terms = "|".join(_escape_query_term(t) for t in expanded)
+
+            # 实体共现扩展 — 从查询中提取实体，找关联实体扩充 entities 召回
+            query_entities = extract_entities(query)
+            if query_entities and self._entity_cooc_top_n > 0:
+                try:
+                    cooc_entities: set = set()
+                    for ent in query_entities:
+                        el = ent.lower().strip()
+                        if not el:
+                            continue
+                        cursor = 0
+                        while True:
+                            cursor, members = client.zscan(
+                                ENTITY_COOC_KEY, cursor=cursor, match=f"*{_escape_glob(el)}*", count=50
+                            )
+                            if not members:
+                                break
+                            for member_b, score_b in members:
+                                pair = member_b.decode() if isinstance(member_b, bytes) else member_b
+                                score = float(score_b)
+                                if score < self._entity_cooc_min_count:
+                                    continue
+                                parts = pair.split("||")
+                                for p in parts:
+                                    if p != el:
+                                        cooc_entities.add(p)
+                            if cursor == 0:
+                                break
+                    # 按共现次数取 top-N
+                    if cooc_entities:
+                        scored = []
+                        for ce in cooc_entities:
+                            try:
+                                pair = "||".join(sorted([ce, query_entities[0].lower().strip()]))
+                                s = float(client.zscore(ENTITY_COOC_KEY, pair) or 0)
+                                scored.append((s, ce))
+                            except Exception:
+                                scored.append((0, ce))
+                        scored.sort(key=lambda x: -x[0])
+                        top_cooc = [ce for _, ce in scored[:self._entity_cooc_top_n]]
+                        raw_terms = list(raw_terms) + top_cooc
+                        logger.debug("storage: entity cooc expanded %s -> %s", query_entities, top_cooc)
+                except Exception as e:
+                    logger.debug("storage: entity cooc expansion error: %s", e)
 
             # 构建基础查询表达式 — 同时搜 content 和 entities（OR 语义）
             # content 用括号包裹 OR 术语，避免与外部 OR 歧义

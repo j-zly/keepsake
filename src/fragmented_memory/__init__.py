@@ -209,6 +209,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             "synonym_min_word_freq": 10,
             "synonym_jaccard_threshold": 0.5,
             "synonym_min_co_occurrence": 3,
+            "entity_cooc_top_n": 3,
+            "entity_cooc_min_count": 2,
         }
 
         # 2. JSON 配置文件覆盖
@@ -362,6 +364,8 @@ class FragmentedMemoryProvider(MemoryProvider):
             synonym_min_word_freq=int(cfg.get("synonym_min_word_freq", 10)),
             synonym_jaccard_threshold=float(cfg.get("synonym_jaccard_threshold", 0.5)),
             synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
+            entity_cooc_top_n=int(cfg.get("entity_cooc_top_n", 3)),
+            entity_cooc_min_count=int(cfg.get("entity_cooc_min_count", 2)),
         )
 
         # 自动创建/验证 index

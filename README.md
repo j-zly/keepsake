@@ -28,6 +28,7 @@ User: "How did we set up that React project structure last time?"
 - **Full Memory Injection** — each fragment traces back to its complete original text, shown inline as "(full memory: ...)"
 - **Associative Recall** — after retrieving a fragment's full memory, the system searches again to find more related fragments
 - **Entity Extraction** — auto-tags fragments with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
+- **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("BTC" → also finds fragments mentioning "缠论")
 - **Domain Dictionary** — jieba user dictionary auto-generated from fragment corpus + synonym table, loaded on `/new` for better Chinese tokenization
 - **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
@@ -47,6 +48,7 @@ Fragmented Memory takes a different approach. It's modeled after **how the human
 | Correction Works | Correction detection — user says "no", the wrong memory is suppressed |
 | Use It or Lose It | Feedback reinforcement (frag_memory_feedback) |
 | Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
+| Entity Association | Entity co-occurrence tracking — fragments mentioning "BTC" also recall "halving" without being synonyms |
 | Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
 | Fragment Lineage | Each fragment links back to its full original text — "fragment A reminds me of full conversation B" |
 | Associative Recall | Search a fragment → trace to full memory → search again for more related fragments |
@@ -154,6 +156,10 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
   "synonym_min_word_freq": 10,
   "synonym_jaccard_threshold": 0.5,
   "synonym_min_co_occurrence": 3,
+
+  // 实体共现配置
+  "entity_cooc_top_n": 3,
+  "entity_cooc_min_count": 2,
   
   // 情感强度因子
   "emotion_intensity_factor": 0.4
@@ -316,6 +322,8 @@ Then reference it in config.json:
 | `synonym_min_word_freq` | — | `10` | Minimum fragment frequency for word to be considered |
 | `synonym_jaccard_threshold` | — | `0.5` | Jaccard similarity threshold for synonym detection |
 | `synonym_min_co_occurrence` | — | `3` | Minimum co-occurrence count for synonym detection |
+| `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search with |
+| `entity_cooc_min_count` | — | `2` | Minimum co-occurrence count for entity association |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -366,6 +374,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   ↓                │
          │  BM25 Full-Text Search │  ← Default, zero cost, triggered by user message keywords
          │  (KNN Vector search) │  ← Optional (needs embedder)
+         │  Entity co-occurrence │  ← Expand query with co-occurring entities
          │   ↓                │
          │  Six-dimensional Re-ranking │  ← Similarity × Time decay
          │                    │    × Emotion × Feedback × Hot Topic × Attention
@@ -386,6 +395,7 @@ fragmented: BM25-only mode (no embedder configured)
          │   ↓                │
          │   Smart Sentence Splitting      │  ← Protect abbreviations/numbers/quotes
          │   Entity Extraction        │  ← jieba + regex → entities TAG field
+         │   Entity Co-occurrence     │  ← Track entity pairs in ZSET
          │   Attention Tracking        │  ← Extract keywords and increase attention score
          │   ↓                │
          │   Stored in Redis        │  ← Available for next retrieval
