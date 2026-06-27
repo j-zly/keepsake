@@ -1156,8 +1156,8 @@ class RedisStorage:
 
         # 1. 扫碎片库统计词频
         word_freq: Dict[str, int] = {}
-        cursor = "0"
-        while cursor != 0:
+        cursor = 0
+        while True:
             cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=1000)
             for key in keys:
                 try:
@@ -1224,8 +1224,8 @@ class RedisStorage:
         scanned_fragments = 0
 
         # 遍历所有碎片
-        cursor = "0"
-        while cursor != 0:
+        cursor = 0
+        while True:
             cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=1000)
             for key in keys:
                 try:

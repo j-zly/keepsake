@@ -7,9 +7,9 @@
   - score: 关注度累计值（每次提及 +2，情绪烈度加权）
 
 三套时间窗口（同 hot_topics 模式）:
-  - 全局: fractured:attention (7天)
-  - 日榜: fractured:attention:daily (2天)
-  - 周榜: fractured:attention:weekly (14天)
+  - 全局: keepsake:attention (7天)
+  - 日榜: keepsake:attention:daily (2天)
+  - 周榜: keepsake:attention:weekly (14天)
 """
 
 from __future__ import annotations

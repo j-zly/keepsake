@@ -142,10 +142,10 @@ def create_embedder(
         base_url: API 端点
         model: 模型名
     """
-    provider = provider or os.environ.get("FRAGMENTED_EMBEDDER", "openai").lower()
+    provider = provider or os.environ.get("KEEPSAKE_EMBEDDER", "openai").lower()
     api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-    base_url = base_url or os.environ.get("FRAGMENTED_EMBEDDER_URL", _DEFAULT_OPENAI_URL)
-    model = model or os.environ.get("FRAGMENTED_EMBEDDER_MODEL", _DEFAULT_OPENAI_MODEL)
+    base_url = base_url or os.environ.get("KEEPSAKE_EMBEDDER_URL", _DEFAULT_OPENAI_URL)
+    model = model or os.environ.get("KEEPSAKE_EMBEDDER_MODEL", _DEFAULT_OPENAI_MODEL)
 
     if provider == "dashscope":
         base_url = base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
