@@ -21,7 +21,7 @@ import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder
-from .splitter import extract_keywords, extract_entities
+from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
 from .attention import record_attention, match_attention_boost
 
@@ -767,7 +767,7 @@ class RedisStorage:
 
         try:
             synonym_map = self._load_synonym_map()
-            raw_terms = query.strip().split()
+            raw_terms = segment_query(query)
             expanded = _expand_terms(raw_terms, synonym_map)
             if not expanded:
                 return []

@@ -344,6 +344,29 @@ _ENTITY_KNOWN = frozenset({
 # 价格数字: 5-6位数（常见crypto价格）
 _ENTITY_PRICE_RE = re.compile(r"(?<!\d)([6-9]\d{4,5})(?!\d)")
 
+def segment_query(query: str) -> list[str]:
+    """对搜索查询进行分词。
+
+    对包含中文的查询使用 jieba 分词，英文按空格切分。
+    返回分词后的词条列表，用于 RediSearch 全文搜索。
+    """
+    if not query or not query.strip():
+        return []
+
+    query = query.strip()
+    # 检测是否包含中文
+    has_chinese = bool(re.search(r"[\u4e00-\u9fff]", query))
+
+    if not has_chinese:
+        # 纯英文/数字：按空格切分
+        return [t for t in query.split() if t.strip()]
+
+    # 中文：jieba 分词
+    words = jieba.lcut(query)
+    return [w for w in words if w.strip()]
+
+
+
 
 def extract_entities(text: str) -> list[str]:
     """从文本中提取候选实体（零LLM，纯jieba + regex + 白名单）。
@@ -434,3 +457,4 @@ def extract_entities(text: str) -> list[str]:
             seen.add(key)
 
     return entities
+
