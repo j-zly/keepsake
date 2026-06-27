@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fragmented-memory"
-version = "2.1.0"
-description = "Full-entry memory system for Hermes Agent — automatically retrieve relevant memories and inject complete context into conversations"
+name = "keepsake"
+version = "1.0.0"
+description = "Keepsake — full-entry memory system for Hermes Agent. On-demand storage of complete memories with semantic search."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

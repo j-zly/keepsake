@@ -1,5 +1,5 @@
 """
-fragmented-memory — 碎片化记忆系统 for Hermes Agent.
+keepsake — Keepsake记忆系统 for Hermes Agent.
 
 每次对话自动检索相关记忆注入上下文，支持：
   - 🔍 向量搜索 — RediSearch KNN 语义检索
@@ -7,11 +7,11 @@ fragmented-memory — 碎片化记忆系统 for Hermes Agent.
   - 📝 自动写入 — memory(action='add') 操作自动存档完整内容
   - 🏷️ 标签过滤 — 可选按标签范围搜索
 
-安装: pip install fragmented-memory
-激活: config.yaml 中设置 memory.provider: fragmented
+安装: pip install keepsake
+激活: config.yaml 中设置 memory.provider: keepsake
 
 配置优先级: 环境变量 > 配置文件 > 默认值
-配置文件: ~/.config/fragmented-memory/config.json (或 FRAGMENTED_MEMORY_CONFIG 自定义路径)
+配置文件: ~/.config/keepsake/config.json (或 KEEPSAKE_CONFIG 自定义路径)
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from .forgetter import Forgetter
 # ---------------------------------------------------------------------------
 
 FEEDBACK_SCHEMA = {
-    "name": "frag_memory_feedback",
+    "name": "keepsake_feedback",
     "description": (
         "记录用户对一条记忆的反馈 — 标记有用/没用。"
         "正反馈让该记忆在未来搜索中排名更高，"
@@ -58,7 +58,7 @@ FEEDBACK_SCHEMA = {
 }
 
 HOT_TOPICS_SCHEMA = {
-    "name": "frag_hot_topics",
+    "name": "keepsake_topics",
     "description": (
         "查询全局热门话题统计。返回跨会话出现最频繁的话题词。"
         "可选日榜/周榜/全局。"
@@ -85,29 +85,29 @@ HOT_TOPICS_SCHEMA = {
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CONFIG_PATH = "~/.config/fragmented-memory/config.json"
+_DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 
 
 def _load_json_config() -> dict:
     """从 JSON 配置文件加载配置。
 
     路径来源（优先级高到低）:
-      1. 环境变量 FRAGMENTED_MEMORY_CONFIG
-      2. ~/.config/fragmented-memory/config.json
+      1. 环境变量 KEEPSAKE_CONFIG
+      2. ~/.config/keepsake/config.json
     文件不存在时返回空 dict。
     """
-    path_str = os.environ.get("FRAGMENTED_MEMORY_CONFIG") or _DEFAULT_CONFIG_PATH
+    path_str = os.environ.get("KEEPSAKE_CONFIG") or _DEFAULT_CONFIG_PATH
     path = Path(path_str).expanduser()
     if not path.exists():
-        logger.debug("fragmented: config file not found at %s", path)
+        logger.debug("keepsake: config file not found at %s", path)
         return {}
     try:
         with open(path) as f:
             cfg: dict = json.load(f)
-        logger.info("fragmented: loaded config from %s", path)
+        logger.info("keepsake: loaded config from %s", path)
         return cfg
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning("fragmented: failed to load config from %s: %s", path, e)
+        logger.warning("keepsake: failed to load config from %s: %s", path, e)
         return {}
 
 
@@ -122,17 +122,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-class FragmentedMemoryProvider(MemoryProvider):
+class KeepsakeProvider(MemoryProvider):
     """
-    碎片化记忆提供者。
+    Keepsake记忆提供者。
 
     和 Hermes builtin 内存共存，不冲突。每轮对话自动检索相关记忆
     注入上下文。仅 memory(action='add') 操作时存储完整内容。
 
     配置优先级（高→低）:
-      1. 环境变量 (FRAGMENTED_REDIS_HOST, FRAGMENTED_EMBEDDER 等)
-      2. JSON 配置文件 (~/.config/fragmented-memory/config.json)
-      3. config.yaml memory.fragmented 节（由 Hermes 传入）
+      1. 环境变量 (KEEPSAKE_REDIS_HOST, KEEPSAKE_EMBEDDER 等)
+      2. JSON 配置文件 (~/.config/keepsake/config.json)
+      3. config.yaml memory.keepsake 节（由 Hermes 传入）
       4. 硬编码默认值
     """
 
@@ -149,8 +149,7 @@ class FragmentedMemoryProvider(MemoryProvider):
         参数（通过 config.yaml memory 节传入）:
 
             memory:
-              provider: fragmented
-              fragmented:
+              provider: keepsake
                 redis_host: 127.0.0.1
                 redis_port: 6379
                 top_k: 5
@@ -197,14 +196,14 @@ class FragmentedMemoryProvider(MemoryProvider):
 
         # 3. 环境变量覆盖
         env_overrides = {
-            "redis_host": os.environ.get("FRAGMENTED_REDIS_HOST"),
-            "redis_port": os.environ.get("FRAGMENTED_REDIS_PORT"),
-            "redis_password": os.environ.get("FRAGMENTED_REDIS_PASSWORD"),
-            "top_k": os.environ.get("FRAGMENTED_TOP_K"),
-            "candidate_k": os.environ.get("FRAGMENTED_CANDIDATE_K"),
-            "tag_filter": os.environ.get("FRAGMENTED_TAG_FILTER"),
-            "agent_id": os.environ.get("FRAGMENTED_AGENT_ID"),
-            "is_primary": os.environ.get("FRAGMENTED_IS_PRIMARY"),
+            "redis_host": os.environ.get("KEEPSAKE_REDIS_HOST"),
+            "redis_port": os.environ.get("KEEPSAKE_REDIS_PORT"),
+            "redis_password": os.environ.get("KEEPSAKE_REDIS_PASSWORD"),
+            "top_k": os.environ.get("KEEPSAKE_TOP_K"),
+            "candidate_k": os.environ.get("KEEPSAKE_CANDIDATE_K"),
+            "tag_filter": os.environ.get("KEEPSAKE_TAG_FILTER"),
+            "agent_id": os.environ.get("KEEPSAKE_AGENT_ID"),
+            "is_primary": os.environ.get("KEEPSAKE_IS_PRIMARY"),
         }
         for key, val in env_overrides.items():
             if val is not None:
@@ -243,7 +242,7 @@ class FragmentedMemoryProvider(MemoryProvider):
                                 patterns.add(line.lower())
                     cfg["skip_patterns"] = patterns
                 except Exception as e:
-                    logger.warning("fragmented: failed to load skip patterns from %s: %s", skip_patterns_file, e)
+                    logger.warning("keepsake: failed to load skip patterns from %s: %s", skip_patterns_file, e)
             else:
                 cfg["skip_patterns"] = set()
         else:
@@ -273,7 +272,7 @@ class FragmentedMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "fragmented"
+        return "keepsake"
 
     def is_available(self) -> bool:
         try:
@@ -308,13 +307,13 @@ class FragmentedMemoryProvider(MemoryProvider):
             )
             embed_dim = embedder.dimension
             logger.info(
-                "fragmented: embedder enabled (%s, dim=%d)",
+                "keepsake: embedder enabled (%s, dim=%d)",
                 embed_provider, embed_dim,
             )
         else:
             embedder = None
             embed_dim = 1536
-            logger.info("fragmented: BM25-only mode (no embedder configured)")
+            logger.info("keepsake: BM25-only mode (no embedder configured)")
 
         self._storage = RedisStorage(
             embedder=embedder,
@@ -349,14 +348,14 @@ class FragmentedMemoryProvider(MemoryProvider):
         # 自动创建/验证 index
         if not self._storage.ensure_index():
             logger.warning(
-                "fragmented: Redis / RediSearch not ready at %s:%s",
+                "keepsake: Redis / RediSearch not ready at %s:%s",
                 redis_host, redis_port,
             )
             return
 
         self._initialized = True
         logger.info(
-            "fragmented: connected (session=%s, top_k=%d, tag_filter=%s)",
+            "keepsake: connected (session=%s, top_k=%d, tag_filter=%s)",
             session_id, top_k, self._tag_filter or "(none)",
         )
 
@@ -375,17 +374,17 @@ class FragmentedMemoryProvider(MemoryProvider):
             max_age_days=int(cfg.get("forget_max_age_days", 30)),
             dry_run=bool(cfg.get("forget_dry_run", True)),
         )
-        logger.info("fragmented: maintenance engines initialized")
+        logger.info("keepsake: maintenance engines initialized")
 
     def system_prompt_block(self) -> str:
         parts = [
-            "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
+            "你有Keepsake记忆系统（keepsake），连接在 Redis + RediSearch 上。",
             "当执行 memory(action='add') 操作时，系统会自动存储完整内容并支持后续检索。",
             "相关的记忆条目就在下面「相关记忆」段落里，直接使用即可。",
             "记忆综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
-            "正反馈用 frag_memory_feedback(key, positive=True) 标记有用，",
-            "负反馈用 frag_memory_feedback(key, positive=False) 标记没用。",
-            "热门话题用 frag_hot_topics() 查询。",
+            "正反馈用 keepsake_feedback(key, positive=True) 标记有用，",
+            "负反馈用 keepsake_feedback(key, positive=False) 标记没用。",
+            "热门话题用 keepsake_topics() 查询。",
         ]
         return "\n".join(parts)
 
@@ -403,8 +402,8 @@ class FragmentedMemoryProvider(MemoryProvider):
         lock_client = None
         try:
             lock_client = self._storage._get_client()
-            if lock_client and lock_client.exists("fragmented:workflow_lock"):
-                logger.debug("fragmented: workflow lock active, skipping search")
+            if lock_client and lock_client.exists("keepsake:workflow_lock"):
+                logger.debug("keepsake: workflow lock active, skipping search")
                 return ""
         except Exception:
             pass
@@ -419,7 +418,7 @@ class FragmentedMemoryProvider(MemoryProvider):
         if not fragments:
             return ""
 
-        lines = ["<fragmented_memory>"]
+        lines = ["<keepsake>"]
         lines.append(f"# 相关记忆 (检索耗时 {elapsed:.1f}s)")
         lines.append("")
         for i, frag in enumerate(fragments, 1):
@@ -444,7 +443,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             lines.append(f"    ({', '.join(info_parts)})")
             lines.append("")
 
-        lines.append("</fragmented_memory>")
+        lines.append("</keepsake>")
         return "\\n".join(lines)
 
     def _maybe_maintain(self) -> None:
@@ -472,9 +471,9 @@ class FragmentedMemoryProvider(MemoryProvider):
             try:
                 result = self._consolidator.consolidate()
                 stats["consolidator"] = result
-                logger.info("fragmented: consolidation done — %s", result)
+                logger.info("keepsake: consolidation done — %s", result)
             except Exception as e:
-                logger.warning("fragmented: consolidation error: %s", e)
+                logger.warning("keepsake: consolidation error: %s", e)
                 stats["consolidator"] = {"status": "error", "reason": str(e)}
 
         # Step 2: Selective Forgetting
@@ -482,9 +481,9 @@ class FragmentedMemoryProvider(MemoryProvider):
             try:
                 result = self._forgetter.forget()
                 stats["forgetter"] = result
-                logger.info("fragmented: forgetting done — %s", result)
+                logger.info("keepsake: forgetting done — %s", result)
             except Exception as e:
-                logger.warning("fragmented: forgetting error: %s", e)
+                logger.warning("keepsake: forgetting error: %s", e)
                 stats["forgetter"] = {"status": "error", "reason": str(e)}
 
 
@@ -502,11 +501,11 @@ class FragmentedMemoryProvider(MemoryProvider):
         """Route tool calls to the appropriate handler."""
         import json as _json
 
-        if tool_name == "frag_memory_feedback":
+        if tool_name == "keepsake_feedback":
             return self._handle_feedback(args, _json)
-        elif tool_name == "frag_hot_topics":
+        elif tool_name == "keepsake_topics":
             return self._handle_hot_topics(args, _json)
-        return tool_error(f"Unknown fragmented memory tool: '{tool_name}'")
+        return tool_error(f"Unknown keepsake memory tool: '{tool_name}'")
 
     # ------------------------------------------------------------------
     # Tool handlers
@@ -536,7 +535,7 @@ class FragmentedMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._storage:
             self._storage.close()
-        logger.info("fragmented memory provider shutdown")
+        logger.info("keepsake memory provider shutdown")
 
     def on_memory_write(
         self,

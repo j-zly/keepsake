@@ -2,7 +2,7 @@
 
 用户反复提起某个话题 -> 该话题关注度上升 -> 相关碎片在搜索中权重更高。
 
-存储: Redis Sorted Set `fragmented:attention`
+存储: Redis Sorted Set `keepsake:attention`
   - member: 话题词（由 jieba/关键词提取来）
   - score: 关注度累计值（每次提及 +2，情绪烈度加权）
 
@@ -22,9 +22,9 @@ import redis
 logger = logging.getLogger(__name__)
 
 # Redis key 前缀
-ATTENTION_SET = "fragmented:attention"
-ATTENTION_DAILY = "fragmented:attention:daily"
-ATTENTION_WEEKLY = "fragmented:attention:weekly"
+ATTENTION_SET = "keepsake:attention"
+ATTENTION_DAILY = "keepsake:attention:daily"
+ATTENTION_WEEKLY = "keepsake:attention:weekly"
 
 # 过期时间
 _ATTENTION_TTL = {

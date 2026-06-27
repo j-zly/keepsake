@@ -53,17 +53,17 @@ FEEDBACK_POSITIVE_BOOST = 1.3    # 正反馈 ×1.3
 FEEDBACK_NEGATIVE_PENALTY = 0.5  # 负反馈 ×0.5（标记没用的大幅降权）
 
 # 热门话题加权
-HOT_TOPIC_SET = "fragmented:hot_topics"
+HOT_TOPIC_SET = "keepsake:hot_topics"
 HOT_TOPIC_BOOST = 1.2           # 命中热门话题的碎片 ×1.2
-HOT_TOPIC_DAILY = "fragmented:hot_topics:daily"  # 日榜
-HOT_TOPIC_WEEKLY = "fragmented:hot_topics:weekly"  # 周榜
-HOT_TOPIC_LAST_SEEN = "fragmented:hot_topics:last_seen"  # 最后提及时间
+HOT_TOPIC_DAILY = "keepsake:hot_topics:daily"  # 日榜
+HOT_TOPIC_WEEKLY = "keepsake:hot_topics:weekly"  # 周榜
+HOT_TOPIC_LAST_SEEN = "keepsake:hot_topics:last_seen"  # 最后提及时间
 HOT_TOPIC_DECAY_HALF_DAYS = 30  # 热门话题时间衰减半衰期（天）
 
-SYNONYM_HASH_KEY = "fragmented:synonyms"
+SYNONYM_HASH_KEY = "keepsake:synonyms"
 
 # 实体共现关联
-ENTITY_COOC_KEY = "fragmented:entity_cooc"
+ENTITY_COOC_KEY = "keepsake:entity_cooc"
 ENTITY_COOC_TTL = 2592000  # 30 天 TTL
 
 # RediSearch 查询语法特殊字符（需要转义）
@@ -323,7 +323,7 @@ class RedisStorage:
         pass
 
     def _load_synonym_map(self) -> Dict[str, set]:
-        """从 Redis Hash fragmented:synonyms 加载同义词表（带实例级缓存）。"""
+        """从 Redis Hash keepsake:synonyms 加载同义词表（带实例级缓存）。"""
         if self._synonym_cache is not None:
             return self._synonym_cache
         client = self._get_client()
@@ -1139,7 +1139,7 @@ class RedisStorage:
         输出为 jieba.load_userdict() 可加载的词典文件。
 
         Args:
-            output_path: 输出路径，默认 ~/.config/fragmented-memory/jieba_dict.txt
+            output_path: 输出路径，默认 ~/.config/keepsake/jieba_dict.txt
 
         Returns:
             统计信息

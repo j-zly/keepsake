@@ -1,11 +1,11 @@
-# Fragmented Memory Plugin for Hermes Agent
+# Keepsake — Memory Plugin for Hermes Agent
 
-The Fragmented Memory system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
+The Keepsake system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
 
 ```text
 User: "How did we set up that React project structure last time?"
                       ↓
-         Fragmented Memory System     ← Redis + RediSearch
+         Keepsake System     ← Redis + RediSearch
                       ↓
     ┌─────────────────────────────────────┐
     │  [1] User prefers TypeScript + Vite    │
@@ -28,7 +28,7 @@ User: "How did we set up that React project structure last time?"
 - **Entity Extraction** — auto-tags entries with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
 - **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("Python" → also finds entries mentioning "Django")
 - **Domain Dictionary** — jieba user dictionary auto-generated from corpus + synonym table, loaded on `/new` for better Chinese tokenization
-- **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
+- **Workflow Lock** — set `keepsake:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
@@ -36,7 +36,7 @@ User: "How did we set up that React project structure last time?"
 
 ## Design Philosophy: Clean Memory for LLMs
 
-Fragmented Memory stores **full, self-contained memory entries** — not fragmented conversation snippets. The key insight is that LLMs need complete context to make use of stored information. A fragment like "prefers TypeScript + Vite" without its surrounding context is useless; the full entry "User prefers TypeScript + Vite for frontend projects" is immediately actionable.
+Keepsake stores **full, self-contained entries** — not entryed conversation snippets. The key insight is that LLMs need complete context to make use of stored information. A entry like "prefers TypeScript + Vite" without its surrounding context is useless; the full entry "User prefers TypeScript + Vite for frontend projects" is immediately actionable.
 
 | Mechanism | Implementation |
 |-----------|---------------|
@@ -44,7 +44,7 @@ Fragmented Memory stores **full, self-contained memory entries** — not fragmen
 | Forgetting Curve | Time decay (60-day half-life) — old memories fade naturally |
 | Emotion Deepens Memory | Emotional weight boost — intense moments stick |
 | Repetition Reinforces | Attention tracking + hot topic scoring |
-| Use It or Lose It | Feedback reinforcement (frag_memory_feedback) |
+| Use It or Lose It | Feedback reinforcement (keepsake_feedback) |
 | Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
 | Entity Association | Entity co-occurrence tracking — entries mentioning "BTC" also recall "halving" without being synonyms |
 | Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
@@ -66,13 +66,13 @@ No vector database. No embedding API calls. No LLM inference for memory operatio
 ## Installation
 
 ```bash
-pip install fragmented-memory
+pip install keepsake
 ```
 
 Or install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/j-zly/fragmented-memory.git
+pip install git+https://github.com/j-zly/keepsake.git
 ```
 
 ## Configuration
@@ -81,12 +81,12 @@ Configuration precedence (high to low): **Environment variables > JSON config fi
 
 ### 1. Configuration Methods
 
-There are three ways to configure Fragmented Memory, listed in order of priority:
+There are three ways to configure Keepsake, listed in order of priority:
 
 1. **Environment Variables** (Highest precedence)  
-   Set environment variables like `FRAGMENTED_REDIS_HOST`, `FRAGMENTED_REDIS_PASSWORD`, etc.
+   Set environment variables like `KEEPSAKE_REDIS_HOST`, `KEEPSAKE_REDIS_PASSWORD`, etc.
 
-2. **JSON Config File** (~/.config/fragmented-memory/config.json)  
+2. **JSON Config File** (~/.config/keepsake/config.json)  
    A complete JSON configuration file for all settings.
 
 3. **Code Defaults** (Lowest precedence)  
@@ -94,7 +94,7 @@ There are three ways to configure Fragmented Memory, listed in order of priority
 
 ### 2. Complete Configuration Example
 
-Here's a comprehensive example of the configuration file `~/.config/fragmented-memory/config.json` with all available options:
+Here's a comprehensive example of the configuration file `~/.config/keepsake/config.json` with all available options:
 
 ```json
 {
@@ -111,7 +111,7 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 
   // Skip patterns
   "skip_min_length": 2,
-  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
+  "skip_patterns_file": "~/.config/keepsake/skip_patterns.txt",
 
   // Time decay
   "decay_half_days": 60,
@@ -167,24 +167,24 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 
 | Environment Variable | Corresponding Config Item | Description |
 |----------------------|----------------------------|-------------|
-| `FRAGMENTED_REDIS_HOST` | `redis_host` | Redis server host |
-| `FRAGMENTED_REDIS_PORT` | `redis_port` | Redis server port |
-| `FRAGMENTED_REDIS_PASSWORD` | `redis_password` | Redis password for authentication |
-| `FRAGMENTED_TOP_K` | `top_k` | Number of final entries returned |
-| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate entries count (for KNN) |
-| `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
-| `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
-| `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
-| `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
-| `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
-| `FRAGMENTED_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
-| `FRAGMENTED_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
-| `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
-| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum entries to trigger consolidation |
-| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before entries can be consolidated |
-| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before entries might be forgotten |
-| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode: `true` = count only, `false` = actually delete |
-| `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+| `KEEPSAKE_REDIS_HOST` | `redis_host` | Redis server host |
+| `KEEPSAKE_REDIS_PORT` | `redis_port` | Redis server port |
+| `KEEPSAKE_REDIS_PASSWORD` | `redis_password` | Redis password for authentication |
+| `KEEPSAKE_TOP_K` | `top_k` | Number of final entries returned |
+| `KEEPSAKE_CANDIDATE_K` | `candidate_k` | Candidate entries count (for KNN) |
+| `KEEPSAKE_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
+| `KEEPSAKE_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
+| `KEEPSAKE_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
+| `KEEPSAKE_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
+| `KEEPSAKE_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
+| `KEEPSAKE_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
+| `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
+| `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
+| `KEEPSAKE_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum entries to trigger consolidation |
+| `KEEPSAKE_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before entries can be consolidated |
+| `KEEPSAKE_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before entries might be forgotten |
+| `KEEPSAKE_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode: `true` = count only, `false` = actually delete |
+| `KEEPSAKE_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
 > Note: Changes to config.json take effect immediately without restarting (just send `/new`).
@@ -200,7 +200,7 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     category TAG SEPARATOR "," \
     source TEXT WEIGHT 1 \
     created TEXT WEIGHT 0 \
-    fragment_type TAG SEPARATOR "," \
+    entry_type TAG SEPARATOR "," \
     invalid_at TAG SEPARATOR "," \
     entities TAG SEPARATOR "," \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
@@ -215,7 +215,7 @@ Enable in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: fragmented
+  provider: keepsake
 ```
 
 If `embedder` is not configured, only BM25 full-text search mode will be used.
@@ -223,11 +223,11 @@ If `embedder` is not configured, only BM25 full-text search mode will be used.
 Also supports environment variable configuration (highest precedence):
 
 ```bash
-export FRAGMENTED_REDIS_HOST=127.0.0.1
-export FRAGMENTED_REDIS_PORT=6379
-export FRAGMENTED_TOP_K=5
-export FRAGMENTED_EMBEDDER=dashscope
-export FRAGMENTED_EMBEDDER_MODEL=text-embedding-v2
+export KEEPSAKE_REDIS_HOST=127.0.0.1
+export KEEPSAKE_REDIS_PORT=6379
+export KEEPSAKE_TOP_K=5
+export KEEPSAKE_EMBEDDER=dashscope
+export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
 export OPENAI_API_KEY=sk-xxx        # embedder API key
 ```
 
@@ -237,10 +237,10 @@ Temporarily disable memory retrieval during automated workflows (like batch proc
 
 ```bash
 # Lock (3600s TTL)
-redis-cli SET fragmented:workflow_lock 1 EX 3600
+redis-cli SET keepsake:workflow_lock 1 EX 3600
 
 # Unlock
-redis-cli DEL fragmented:workflow_lock
+redis-cli DEL keepsake:workflow_lock
 ```
 
 ### 7. Skip Patterns File
@@ -248,7 +248,7 @@ redis-cli DEL fragmented:workflow_lock
 Create a file (one pattern per line, `#` for comments):
 
 ```text
-# ~/.config/fragmented-memory/skip_patterns.txt
+# ~/.config/keepsake/skip_patterns.txt
 好的
 嗯
 对
@@ -267,7 +267,7 @@ Then reference it in config.json:
 ```json
 {
   "skip_min_length": 2,
-  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt"
+  "skip_patterns_file": "~/.config/keepsake/skip_patterns.txt"
 }
 ```
 
@@ -282,23 +282,23 @@ Then reference it in config.json:
 
 | Config Item | Environment Variable | Default Value | Description |
 |-------------|---------------------|---------------|-------------|
-| `redis_host` | `FRAGMENTED_REDIS_HOST` | `127.0.0.1` | Redis address |
-| `redis_port` | `FRAGMENTED_REDIS_PORT` | `6379` | Redis port |
-| `top_k` | `FRAGMENTED_TOP_K` | `5` | Number of final entries returned |
-| `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | Candidate entries count (for KNN) |
-| `tag_filter` | `FRAGMENTED_TAG_FILTER` | `""` | Tag filtering (comma-separated) |
-| `bm25_limit` | `FRAGMENTED_BM25_LIMIT` | `10` | BM25 search candidate count |
-| `decay_half_days` | `FRAGMENTED_DECAY_HALF_DAYS` | `60` | Time decay half-life (days) |
-| `embed_cache_ttl` | `FRAGMENTED_EMBED_CACHE_TTL` | `3600` | Embedding cache TTL (seconds) |
+| `redis_host` | `KEEPSAKE_REDIS_HOST` | `127.0.0.1` | Redis address |
+| `redis_port` | `KEEPSAKE_REDIS_PORT` | `6379` | Redis port |
+| `top_k` | `KEEPSAKE_TOP_K` | `5` | Number of final entries returned |
+| `candidate_k` | `KEEPSAKE_CANDIDATE_K` | `10` | Candidate entries count (for KNN) |
+| `tag_filter` | `KEEPSAKE_TAG_FILTER` | `""` | Tag filtering (comma-separated) |
+| `bm25_limit` | `KEEPSAKE_BM25_LIMIT` | `10` | BM25 search candidate count |
+| `decay_half_days` | `KEEPSAKE_DECAY_HALF_DAYS` | `60` | Time decay half-life (days) |
+| `embed_cache_ttl` | `KEEPSAKE_EMBED_CACHE_TTL` | `3600` | Embedding cache TTL (seconds) |
 | `sentiment_boost_positive` | — | `1.5` | Positive entry weight multiplier |
 | `sentiment_boost_negative` | — | `1.3` | Negative entry weight multiplier |
 | `feedback_positive_boost` | — | `1.3` | Positive feedback bonus weight |
 | `feedback_negative_penalty` | — | `0.5` | Negative feedback penalty coefficient |
 | `hot_topic_boost` | — | `1.2` | Hot topic weighting multiplier |
-| `embedder.provider` | `FRAGMENTED_EMBEDDER` | `openai` | `openai` / `dashscope` |
+| `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API key |
-| `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API endpoint |
-| `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
+| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API endpoint |
+| `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `consolidate_min_group` | — | `2` | Minimum entries to trigger consolidation |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation |
 | `forget_max_age_days` | — | `30` | Max age (days) before deletion |
@@ -334,11 +334,11 @@ Dimensions are automatically detected, switching models doesn't require reconfig
 
 ### Synonym Table
 
-Stored in Redis Hash `fragmented:synonyms`, expanded at search time to improve recall:
+Stored in Redis Hash `keepsake:synonyms`, expanded at search time to improve recall:
 
 ```bash
-redis-cli HSET fragmented:synonyms setup '["install","configure","deploy","setup"]'
-redis-cli HSET fragmented:synonyms fix '["fix","modify","correct","repair","solve"]'
+redis-cli HSET keepsake:synonyms setup '["install","configure","deploy","setup"]'
+redis-cli HSET keepsake:synonyms fix '["fix","modify","correct","repair","solve"]'
 ```
 
 ## Verification
@@ -346,9 +346,9 @@ redis-cli HSET fragmented:synonyms fix '["fix","modify","correct","repair","solv
 Check logs after startup:
 
 ```
-Memory provider 'fragmented' registered (0 tools)
-fragmented: connected (session=xxx, top_k=5, tag_filter=(none))
-fragmented: BM25-only mode (no embedder configured)
+Memory provider 'entryed' registered (0 tools)
+entryed: connected (session=xxx, top_k=5, tag_filter=(none))
+entryed: BM25-only mode (no embedder configured)
 ```
 
 ## Architecture
@@ -361,7 +361,7 @@ fragmented: BM25-only mode (no embedder configured)
          ┌─────────▼─────────┐
          │   prefetch()       │  ← Automatically triggered on every user message
          │   ↓                │
-         │  Workflow Lock?    │  ← Checks fragmented:workflow_lock
+         │  Workflow Lock?    │  ← Checks keepsake:workflow_lock
          │   ↓                │
          │  Skip patterns?    │  ← Length / exact match against skip list
          │   ↓                │

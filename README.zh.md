@@ -1,4 +1,4 @@
-# Fragmented Memory Plugin for Hermes Agent
+# Keepsake — Memory Plugin for Hermes Agent
 
 碎片化记忆系统 — 每次对话自动检索相关记忆注入上下文。
 
@@ -28,7 +28,7 @@
 | 🏷️ **实体提取** | 自动提取人名/地名/项目名/术语存为 entities TAG 字段，搜索时 content 和 entities 双路召回提高命中率 |
 | 🔗 **实体共现** | 自动统计实体共现对，搜索时扩展召回关联实体（搜"Python"同时带出"Django"相关条目） |
 | 📖 **领域词典** | 从语料+同义词表自动生成 jieba 自定义词典，发 `/new` 时自动加载，分词更准 |
-| 🔒 **工作流锁** | 设置 `fragmented:workflow_lock` 全局禁用检索，用于自动化流程 |
+| 🔒 **工作流锁** | 设置 `keepsake:workflow_lock` 全局禁用检索，用于自动化流程 |
 | 🚫 **跳过模式** | 配置文件定义跳过词表，简单确认语（好的/嗯/ok）不触发检索 |
 | 🏷️ **标签过滤** | 可选按标签范围搜索 |
 | 👍 **反馈加权** | 标记有用/没用的条目会影响排序 |
@@ -49,7 +49,7 @@
 | 遗忘曲线 | 时间衰减（60天半衰期）—— 旧记忆自然淡去 |
 | 情绪加深记忆 | 情感权重加权 —— 情绪强烈的经历记得更牢 |
 | 反复提及则强化 | 注意力追踪 + 热词统计 |
-| 用进废退 | 反馈正强化（frag_memory_feedback） |
+| 用进废退 | 反馈正强化（keepsake_feedback） |
 | 触类旁通、联想回忆 | 同义词自动发现（Jaccard 共现统计）—— "部署" ↔ "上线" |
 | 实体关联 | 实体共现追踪 —— "BTC"和"减半"无语义重叠但因共现被关联召回 |
 | 实体索引 | 就像人脑给记忆打标签 —— 自动提取实体名，搜索时双路召回 |
@@ -71,13 +71,13 @@
 ## 安装
 
 ```bash
-pip install fragmented-memory
+pip install keepsake
 ```
 
 或者从 GitHub 直装：
 
 ```bash
-pip install git+https://github.com/j-zly/fragmented-memory.git
+pip install git+https://github.com/j-zly/keepsake.git
 ```
 
 ## 配置
@@ -89,9 +89,9 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 配置碎片化记忆有三种方式，按优先级从高到低排列：
 
 1. **环境变量**（优先级最高）  
-   设置如 `FRAGMENTED_REDIS_HOST`、`FRAGMENTED_REDIS_PASSWORD` 等环境变量。
+   设置如 `KEEPSAKE_REDIS_HOST`、`KEEPSAKE_REDIS_PASSWORD` 等环境变量。
 
-2. **JSON 配置文件**（~/.config/fragmented-memory/config.json）  
+2. **JSON 配置文件**（~/.config/keepsake/config.json）  
    完整的 JSON 配置文件，用于所有设置。
 
 3. **代码默认值**（优先级最低）  
@@ -99,7 +99,7 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
 ### 2. 完整配置示例
 
-以下是配置文件 `~/.config/fragmented-memory/config.json` 的完整示例，包含所有可用选项：
+以下是配置文件 `~/.config/keepsake/config.json` 的完整示例，包含所有可用选项：
 
 ```json
 {
@@ -116,7 +116,7 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
   // 跳过检索配置
   "skip_min_length": 2,
-  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
+  "skip_patterns_file": "~/.config/keepsake/skip_patterns.txt",
 
   // 时间衰减配置
   "decay_half_days": 60,
@@ -168,24 +168,24 @@ pip install git+https://github.com/j-zly/fragmented-memory.git
 
 | 环境变量 | 对应配置项 | 说明 |
 |----------|------------|------|
-| `FRAGMENTED_REDIS_HOST` | `redis_host` | Redis 服务器地址 |
-| `FRAGMENTED_REDIS_PORT` | `redis_port` | Redis 服务器端口 |
-| `FRAGMENTED_REDIS_PASSWORD` | `redis_password` | Redis 认证密码 |
-| `FRAGMENTED_TOP_K` | `top_k` | 最终返回条目数 |
-| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | 候选条目数（用于 KNN） |
-| `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 搜索候选数 |
-| `FRAGMENTED_TAG_FILTER` | `tag_filter` | 标签过滤（逗号分隔） |
-| `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | 时间衰减半衰期（天） |
-| `FRAGMENTED_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | 热门话题时间衰减半衰期（天） |
-| `FRAGMENTED_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding 缓存时间（秒） |
-| `FRAGMENTED_EMBEDDER` | `embedder.provider` | 嵌入模型提供商（`openai`、`dashscope`） |
-| `FRAGMENTED_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
-| `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
-| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | 触发合并的最少条目数 |
-| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | 条目参与合并的最小年龄（小时） |
-| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | 条目保留天数后可能被遗忘 |
-| `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | 遗忘安全模式：仅统计不删除 |
-| `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | 情绪烈度→权重系数（0=禁用，1=最大） |
+| `KEEPSAKE_REDIS_HOST` | `redis_host` | Redis 服务器地址 |
+| `KEEPSAKE_REDIS_PORT` | `redis_port` | Redis 服务器端口 |
+| `KEEPSAKE_REDIS_PASSWORD` | `redis_password` | Redis 认证密码 |
+| `KEEPSAKE_TOP_K` | `top_k` | 最终返回条目数 |
+| `KEEPSAKE_CANDIDATE_K` | `candidate_k` | 候选条目数（用于 KNN） |
+| `KEEPSAKE_BM25_LIMIT` | `bm25_limit` | BM25 搜索候选数 |
+| `KEEPSAKE_TAG_FILTER` | `tag_filter` | 标签过滤（逗号分隔） |
+| `KEEPSAKE_DECAY_HALF_DAYS` | `decay_half_days` | 时间衰减半衰期（天） |
+| `KEEPSAKE_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | 热门话题时间衰减半衰期（天） |
+| `KEEPSAKE_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding 缓存时间（秒） |
+| `KEEPSAKE_EMBEDDER` | `embedder.provider` | 嵌入模型提供商（`openai`、`dashscope`） |
+| `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
+| `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
+| `KEEPSAKE_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | 触发合并的最少条目数 |
+| `KEEPSAKE_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | 条目参与合并的最小年龄（小时） |
+| `KEEPSAKE_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | 条目保留天数后可能被遗忘 |
+| `KEEPSAKE_FORGET_DRY_RUN` | `forget_dry_run` | 遗忘安全模式：仅统计不删除 |
+| `KEEPSAKE_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | 情绪烈度→权重系数（0=禁用，1=最大） |
 
 > 注意：Redis 密码兼容空值（无认证）或提供密码进行 AUTH 认证。  
 > 注意：修改 config.json 立即生效（只需发送 `/new` 命令，无需重启）。
@@ -201,7 +201,7 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     category TAG SEPARATOR "," \
     source TEXT WEIGHT 1 \
     created TEXT WEIGHT 0 \
-    fragment_type TAG SEPARATOR "," \
+    entry_type TAG SEPARATOR "," \
     invalid_at TAG SEPARATOR "," \
     entities TAG SEPARATOR "," \
     embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
@@ -216,7 +216,7 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
 
 ```yaml
 memory:
-  provider: fragmented
+  provider: keepsake
 ```
 
 如果不配置 `embedder`，则只走 BM25 全文搜索模式。
@@ -224,11 +224,11 @@ memory:
 也支持通过环境变量配置（优先级最高）：
 
 ```bash
-export FRAGMENTED_REDIS_HOST=127.0.0.1
-export FRAGMENTED_REDIS_PORT=6379
-export FRAGMENTED_TOP_K=5
-export FRAGMENTED_EMBEDDER=dashscope
-export FRAGMENTED_EMBEDDER_MODEL=text-embedding-v2
+export KEEPSAKE_REDIS_HOST=127.0.0.1
+export KEEPSAKE_REDIS_PORT=6379
+export KEEPSAKE_TOP_K=5
+export KEEPSAKE_EMBEDDER=dashscope
+export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
 export OPENAI_API_KEY=***        # embedder API key
 ```
 
@@ -238,10 +238,10 @@ export OPENAI_API_KEY=***        # embedder API key
 
 ```bash
 # 加锁（3600s TTL）
-redis-cli SET fragmented:workflow_lock 1 EX 3600
+redis-cli SET keepsake:workflow_lock 1 EX 3600
 
 # 解锁
-redis-cli DEL fragmented:workflow_lock
+redis-cli DEL keepsake:workflow_lock
 ```
 
 ### 7. 跳过模式文件
@@ -249,7 +249,7 @@ redis-cli DEL fragmented:workflow_lock
 创建文本文件，每行一个跳过词，`#` 注释：
 
 ```text
-# ~/.config/fragmented-memory/skip_patterns.txt
+# ~/.config/keepsake/skip_patterns.txt
 好的
 嗯
 对
@@ -268,7 +268,7 @@ yeah
 ```json
 {
   "skip_min_length": 2,
-  "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt"
+  "skip_patterns_file": "~/.config/keepsake/skip_patterns.txt"
 }
 ```
 
@@ -283,23 +283,23 @@ yeah
 
 | 配置项 | 环境变量 | 默认值 | 说明 |
 |--------|---------|--------|------|
-| `redis_host` | `FRAGMENTED_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
-| `redis_port` | `FRAGMENTED_REDIS_PORT` | `6379` | Redis 端口 |
-| `top_k` | `FRAGMENTED_TOP_K` | `5` | 最终返回条目数 |
-| `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | 候选条目数（KNN 用） |
-| `tag_filter` | `FRAGMENTED_TAG_FILTER` | `""` | 标签过滤（逗号分隔） |
-| `bm25_limit` | `FRAGMENTED_BM25_LIMIT` | `10` | BM25 搜索候选数 |
-| `decay_half_days` | `FRAGMENTED_DECAY_HALF_DAYS` | `60` | 时间衰减半衰期（天） |
-| `embed_cache_ttl` | `FRAGMENTED_EMBED_CACHE_TTL` | `3600` | Embedding 缓存时间（秒） |
+| `redis_host` | `KEEPSAKE_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
+| `redis_port` | `KEEPSAKE_REDIS_PORT` | `6379` | Redis 端口 |
+| `top_k` | `KEEPSAKE_TOP_K` | `5` | 最终返回条目数 |
+| `candidate_k` | `KEEPSAKE_CANDIDATE_K` | `10` | 候选条目数（KNN 用） |
+| `tag_filter` | `KEEPSAKE_TAG_FILTER` | `""` | 标签过滤（逗号分隔） |
+| `bm25_limit` | `KEEPSAKE_BM25_LIMIT` | `10` | BM25 搜索候选数 |
+| `decay_half_days` | `KEEPSAKE_DECAY_HALF_DAYS` | `60` | 时间衰减半衰期（天） |
+| `embed_cache_ttl` | `KEEPSAKE_EMBED_CACHE_TTL` | `3600` | Embedding 缓存时间（秒） |
 | `sentiment_boost_positive` | — | `1.5` | 正面条目权重乘数 |
 | `sentiment_boost_negative` | — | `1.3` | 负面条目权重乘数 |
 | `feedback_positive_boost` | — | `1.3` | 正反馈加分权重 |
 | `feedback_negative_penalty` | — | `0.5` | 负反馈降权系数 |
 | `hot_topic_boost` | — | `1.2` | 热门话题加权乘数 |
-| `embedder.provider` | `FRAGMENTED_EMBEDDER` | `openai` | `openai` / `dashscope` |
+| `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
-| `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
-| `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
+| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
+| `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
 | `consolidate_min_group` | — | `2` | 合并触发最少条目数 |
 | `consolidate_max_age_hours` | — | `72` | 条目最少年龄（小时）后才参与合并 |
 | `forget_max_age_days` | — | `30` | 条目保留天数后可能被遗忘 |
@@ -333,11 +333,11 @@ yeah
 
 ### 同义词表
 
-存 Redis Hash `fragmented:synonyms`，搜索时实时展开同义词，提高召回率：
+存 Redis Hash `keepsake:synonyms`，搜索时实时展开同义词，提高召回率：
 
 ```bash
-redis-cli HSET fragmented:synonyms setup '["安装","配置","部署","搭建"]'
-redis-cli HSET fragmented:synonyms fix '["修","改","补","修复","解决"]'
+redis-cli HSET keepsake:synonyms setup '["安装","配置","部署","搭建"]'
+redis-cli HSET keepsake:synonyms fix '["修","改","补","修复","解决"]'
 ```
 
 ## 验证
@@ -345,9 +345,9 @@ redis-cli HSET fragmented:synonyms fix '["修","改","补","修复","解决"]'
 启动后检查日志：
 
 ```
-Memory provider 'fragmented' registered (0 tools)
-fragmented: connected (session=xxx, top_k=5, tag_filter=(none))
-fragmented: BM25-only mode (no embedder configured)
+Memory provider 'entryed' registered (0 tools)
+entryed: connected (session=xxx, top_k=5, tag_filter=(none))
+entryed: BM25-only mode (no embedder configured)
 ```
 
 ## 工作原理
@@ -360,7 +360,7 @@ fragmented: BM25-only mode (no embedder configured)
          ┌─────────▼─────────┐
          │   prefetch()       │  ← 自动触发
          │   ↓                │
-         │  工作流锁检查       │  ← 检查 fragmented:workflow_lock
+         │  工作流锁检查       │  ← 检查 keepsake:workflow_lock
          │   ↓                │
          │  跳过模式检查       │  ← 短消息 / 确认词命中 skip list
          │   ↓                │
