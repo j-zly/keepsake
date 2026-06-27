@@ -26,7 +26,7 @@ User: "How did we set up that React project structure last time?"
 - **User Feedback** — mark entries useful/useless to improve ranking
 - **Hot Topic Boost** — frequently discussed topics rank higher
 - **Entity Extraction** — auto-tags entries with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
-- **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("BTC" → also finds entries mentioning "缠论")
+- **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("Python" → also finds entries mentioning "Django")
 - **Domain Dictionary** — jieba user dictionary auto-generated from corpus + synonym table, loaded on `/new` for better Chinese tokenization
 - **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
