@@ -444,7 +444,29 @@ class KeepsakeProvider(MemoryProvider):
             lines.append("")
 
         lines.append("</keepsake>")
-        return "\\n".join(lines)
+        return "\n".join(lines)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """每轮对话结束后自动存储用户消息到记忆库。"""
+        if not self._storage or not user_content or not user_content.strip():
+            return
+        try:
+            self._storage.store(
+                text=user_content.strip(),
+                tags="conversation",
+                category="turn_memory",
+                source="hermes_agent",
+                fragment_type="memory",
+            )
+        except Exception as e:
+            logger.warning("keepsake: sync_turn store failed: %s", e)
 
     def _maybe_maintain(self) -> None:
         """检查是否该执行维护，执行 Consolidation + Forget。"""
