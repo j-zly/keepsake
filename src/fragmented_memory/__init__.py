@@ -1,11 +1,10 @@
 """
 fragmented-memory — 碎片化记忆系统 for Hermes Agent.
 
-每次对话自动检索相关记忆碎片注入上下文，支持：
-  - ✂️ 语义切分 — 按段落/句子边界自动拆分成独立碎片
+每次对话自动检索相关记忆注入上下文，支持：
   - 🔍 向量搜索 — RediSearch KNN 语义检索
-  - ⏳ 时间衰减 — 新碎片权重高，旧碎片逐步降权
-  - 🔄 自动写入 — memory() 操作和对话轮次自动存档
+  - ⏳ 时间衰减 — 新记忆权重高，旧记忆逐步降权
+  - 📝 自动写入 — memory(action='add') 操作自动存档完整内容
   - 🏷️ 标签过滤 — 可选按标签范围搜索
 
 安装: pip install fragmented-memory
@@ -17,7 +16,6 @@ fragmented-memory — 碎片化记忆系统 for Hermes Agent.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -28,27 +26,9 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 from .embedder import create_embedder
-from .splitter import split_text
 from .storage import RedisStorage
 from .consolidator import Consolidator
 from .forgetter import Forgetter
-
-# ---------------------------------------------------------------------------
-# 纠正检测 — 用户否定/纠正时降权前几轮碎片
-# ---------------------------------------------------------------------------
-
-_CORRECTION_PATTERNS = [
-    '不对', '不是', '错了', '删除了', '回退',
-    '不是这样', '说错了', '搞错了', '弄错了',
-    '不对啊', '不对呀', '不对吧',
-]
-
-def _is_correction(text: str) -> bool:
-    """检测用户消息是否为纠正/否定语气。"""
-    for pattern in _CORRECTION_PATTERNS:
-        if pattern in text:
-            return True
-    return False
 
 # ---------------------------------------------------------------------------
 # 工具扇区（供 Hermes MemoryProvider 注册）
@@ -57,9 +37,9 @@ def _is_correction(text: str) -> bool:
 FEEDBACK_SCHEMA = {
     "name": "frag_memory_feedback",
     "description": (
-        "记录用户对一条碎片的反馈 — 标记有用/没用。"
-        "正反馈让该碎片在未来搜索中排名更高，"
-        "负反馈大幅降权（标记为没用的碎片几乎不会再出现）。"
+        "记录用户对一条记忆的反馈 — 标记有用/没用。"
+        "正反馈让该记忆在未来搜索中排名更高，"
+        "负反馈大幅降权（标记为没用的记忆几乎不会再出现）。"
     ),
     "parameters": {
         "type": "object",
@@ -146,8 +126,8 @@ class FragmentedMemoryProvider(MemoryProvider):
     """
     碎片化记忆提供者。
 
-    和 Hermes builtin 内存共存，不冲突。每轮对话自动检索相关碎片
-    注入上下文，并自动将用户消息切分存档。
+    和 Hermes builtin 内存共存，不冲突。每轮对话自动检索相关记忆
+    注入上下文。仅 memory(action='add') 操作时存储完整内容。
 
     配置优先级（高→低）:
       1. 环境变量 (FRAGMENTED_REDIS_HOST, FRAGMENTED_EMBEDDER 等)
@@ -163,8 +143,6 @@ class FragmentedMemoryProvider(MemoryProvider):
     _forgetter: Optional[Forgetter] = None
     _last_maintenance: float = 0.0
     _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
-    _recent_fragment_keys: List[str] = []
-    _max_recent_keys: int = 30
 
     def __init__(self, **config):
         """
@@ -402,9 +380,9 @@ class FragmentedMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         parts = [
             "你有碎片化记忆系统（fragmented-memory），连接在 Redis + RediSearch 上。",
-            "每次对话或 memory(action='add') 操作时，系统会自动检索或存储相关碎片。",
-            "相关碎片就在下面「相关碎片」段落里，直接使用即可。",
-            "碎片综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
+            "当执行 memory(action='add') 操作时，系统会自动存储完整内容并支持后续检索。",
+            "相关的记忆条目就在下面「相关记忆」段落里，直接使用即可。",
+            "记忆综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
             "正反馈用 frag_memory_feedback(key, positive=True) 标记有用，",
             "负反馈用 frag_memory_feedback(key, positive=False) 标记没用。",
             "热门话题用 frag_hot_topics() 查询。",
@@ -441,60 +419,12 @@ class FragmentedMemoryProvider(MemoryProvider):
         if not fragments:
             return ""
 
-        # 获取完整记忆内容 + 溯源联想（取 top 3 碎片）
-        full_memories: Dict[str, str] = {}
-        try:
-            client = lock_client or self._storage._get_client()
-            if client:
-                full_ids = set()
-                for frag in fragments[:3]:  # 只处理前3个碎片
-                    tags = frag.get("tags", "")
-                    if isinstance(tags, str):
-                        for tag in tags.split(","):
-                            tag = tag.strip()
-                            if tag.startswith("source:full:"):
-                                full_ids.add(tag.split(":", 2)[2])
-
-                if full_ids:
-                    for fid in full_ids:
-                        full_key = f"memory:full:{fid}"
-                        full_data = client.hgetall(full_key)
-                        if full_data:
-                            raw_content = full_data.get(b"content") or full_data.get("content")
-                            full_content = raw_content.decode("utf-8") if isinstance(raw_content, bytes) else (raw_content or "")
-                            if full_content:
-                                full_memories[f"source:full:{fid}"] = full_content
-                                # 记录此次访问，保鲜该完整记忆
-                                client.hset(full_key, "last_accessed", str(_time.time()))
-                                # 用完整记忆再搜关联碎片（保留原有溯源联想逻辑）
-                                related = self._storage.search(
-                                    full_content[:200],
-                                    tag_filter=self._tag_filter,
-                                )
-                                if related:
-                                    existing = {f.get("content", "") for f in fragments}
-                                    for r in related:
-                                        if r.get("content", "") not in existing:
-                                            fragments.append(r)
-                                            existing.add(r.get("content", ""))
-        except Exception:
-            logger.warning("fragmented: full memory recall failed", exc_info=True)
-
         lines = ["<fragmented_memory>"]
-        lines.append(f"# 相关碎片 (检索耗时 {elapsed:.1f}s)")
+        lines.append(f"# 相关记忆 (检索耗时 {elapsed:.1f}s)")
         lines.append("")
         for i, frag in enumerate(fragments, 1):
             lines.append(f"[{i}] {frag.get('content', '')}")
-            # 检查是否有完整记忆
             tags = frag.get("tags", "")
-            if isinstance(tags, str):
-                for tag in tags.split(","):
-                    tag = tag.strip()
-                    if tag in full_memories:
-                        text = full_memories[tag]
-                        if len(text) > 500:
-                            text = text[:500] + "..."
-                        lines.append(f"    (完整记忆: {text})")
             combined = frag.get("_combined_score", 0)
             weights = frag.get("_weights", {})
             info_parts = []
@@ -515,63 +445,7 @@ class FragmentedMemoryProvider(MemoryProvider):
             lines.append("")
 
         lines.append("</fragmented_memory>")
-        return "\n".join(lines)
-
-    def sync_turn(
-        self,
-        user_content: str,
-        assistant_content: str,
-        *,
-        session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """对话每轮结束后，将用户消息切分存档，并检测纠正标记。"""
-        if not self._storage or not user_content or len(user_content.strip()) < 10:
-            return
-
-        raw_text = user_content.strip()
-        full_id = hashlib.sha256(raw_text.encode()).hexdigest()[:8]
-        full_key = f"memory:full:{full_id}"
-        full_tag = f"source:full:{full_id}"
-
-        # 存储完整原文到 Redis（供碎片溯源联想）
-        try:
-            client = self._storage._get_client()
-            if client:
-                import time as _time
-                client.hset(full_key, mapping={
-                    "content": raw_text,
-                    "created": str(_time.time()),
-                    "session_id": session_id,
-                })
-        except Exception:
-            logger.warning("fragmented: failed to store full memory", exc_info=True)
-
-        segments = split_text(raw_text)
-        sid_short = session_id[:8] if session_id else "unknown"
-        current_keys: List[str] = []
-        for seg in segments:
-            content_hash = hashlib.sha256(seg.encode()).hexdigest()[:12]
-            key = f"memory:frag:{content_hash}"
-            current_keys.append(key)
-            self._storage.store(
-                text=seg,
-                tags=f"session:{sid_short},{full_tag}",
-                category="conversation",
-                source="sync_turn",
-                fragment_type="conversation",
-            )
-
-        # 纠正检测：如果用户否定了前面的内容，降权 ring buffer 中之前的碎片
-        if _is_correction(user_content) and self._recent_fragment_keys:
-            self._storage.correct_fragments(self._recent_fragment_keys)
-
-        # 更新 ring buffer（当前轮次加入，限制最大条目数）
-        self._recent_fragment_keys.extend(current_keys)
-        self._recent_fragment_keys = self._recent_fragment_keys[-self._max_recent_keys:]
-
-        # 定期触发维护（Consolidation + Forget）
-        self._maybe_maintain()
+        return "\\n".join(lines)
 
     def _maybe_maintain(self) -> None:
         """检查是否该执行维护，执行 Consolidation + Forget。"""
@@ -671,33 +545,15 @@ class FragmentedMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """builtin memory 写入时同步存到碎片库。"""
+        """builtin memory 写入时同步存到碎片库（完整内容，不做切分）。"""
         if action != "add" or not content or not self._storage:
             return
 
         raw_text = content.strip()
-        full_id = hashlib.sha256(raw_text.encode()).hexdigest()[:8]
-        full_key = f"memory:full:{full_id}"
-        full_tag = f"source:full:{full_id}"
-
-        # 存储完整原文到 Redis（供碎片溯源联想）
-        try:
-            client = self._storage._get_client()
-            if client:
-                import time as _time
-                client.hset(full_key, mapping={
-                    "content": raw_text,
-                    "created": str(_time.time()),
-                    "target": target,
-                })
-        except Exception:
-            logger.warning("fragmented: failed to store full memory on write", exc_info=True)
-
-        for seg in split_text(raw_text):
-            self._storage.store(
-                text=seg,
-                tags=f"{target},{full_tag}",
-                category="memory_tool",
-                source="hermes_agent",
-                fragment_type="memory",
-            )
+        self._storage.store(
+            text=raw_text,
+            tags=target,
+            category="memory_tool",
+            source="hermes_agent",
+            fragment_type="memory",
+        )

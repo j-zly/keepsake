@@ -1,6 +1,6 @@
 # Fragmented Memory Plugin for Hermes Agent
 
-The Fragmented Memory system automatically retrieves relevant memory fragments and injects them into the conversation context for each dialogue.
+The Fragmented Memory system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
 
 ```text
 User: "How did we set up that React project structure last time?"
@@ -13,47 +13,43 @@ User: "How did we set up that React project structure last time?"
     │  [3] Backend suggested using .NET 10 implementation       │
     └─────────────────────────────────────┘
                       ↓
-         Model directly uses fragments to answer
+         Model directly uses memories to answer
 ```
 
 ## Features
 
-- **Semantic Splitting** — auto-split conversations into standalone fragments
+- **Full Entry Storage** — stores complete text as-is, no semantic splitting
 - **BM25 Full-Text Search** — works out of the box with no external API
 - **Optional Vector Search** — KNN via RediSearch (OpenAI / DashScope embedder)
-- **Time Decay** — newer fragments rank higher (60-day half-life configurable)
-- **Sentiment Weighting** — emotional fragments get priority
-- **User Feedback** — mark fragments useful/useless to improve ranking
+- **Time Decay** — newer entries rank higher (60-day half-life configurable)
+- **Sentiment Weighting** — emotional entries get priority
+- **User Feedback** — mark entries useful/useless to improve ranking
 - **Hot Topic Boost** — frequently discussed topics rank higher
-- **Full Memory Injection** — each fragment traces back to its complete original text, shown inline as "(full memory: ...)"
-- **Associative Recall** — after retrieving a fragment's full memory, the system searches again to find more related fragments
-- **Entity Extraction** — auto-tags fragments with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
-- **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("BTC" → also finds fragments mentioning "缠论")
-- **Domain Dictionary** — jieba user dictionary auto-generated from fragment corpus + synonym table, loaded on `/new` for better Chinese tokenization
+- **Entity Extraction** — auto-tags entries with entities (people, places, crypto tickers, domain terms) at store time; searched alongside content text for higher recall
+- **Entity Co-occurrence** — auto-track which entities appear together, expand search to co-occurring entities for associative recall ("BTC" → also finds entries mentioning "缠论")
+- **Domain Dictionary** — jieba user dictionary auto-generated from corpus + synonym table, loaded on `/new` for better Chinese tokenization
 - **Workflow Lock** — set `fragmented:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
-- **Auto Sync** — every turn is archived automatically, memory tool writes are synced
-- **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the fragment is filtered out at search time (no data loss, can be reverted)
+- **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
+- **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
 - **Auto Maintenance** — consolidation (keyword clustering + LLM summarization) + selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy
 
-## Design Philosophy: Brain-like Memory
+## Design Philosophy: Clean Memory for LLMs
 
-Fragmented Memory takes a different approach. It's modeled after **how the human brain actually remembers**:
+Fragmented Memory stores **full, self-contained memory entries** — not fragmented conversation snippets. The key insight is that LLMs need complete context to make use of stored information. A fragment like "prefers TypeScript + Vite" without its surrounding context is useless; the full entry "User prefers TypeScript + Vite for frontend projects" is immediately actionable.
 
-| Brain Mechanism | Implementation |
-|----------------|---------------|
+| Mechanism | Implementation |
+|-----------|---------------|
+| Complete Context | Stores full text entries, no splitting |
 | Forgetting Curve | Time decay (60-day half-life) — old memories fade naturally |
 | Emotion Deepens Memory | Emotional weight boost — intense moments stick |
 | Repetition Reinforces | Attention tracking + hot topic scoring |
-| Correction Works | Correction detection — user says "no", the wrong memory is suppressed |
 | Use It or Lose It | Feedback reinforcement (frag_memory_feedback) |
 | Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
-| Entity Association | Entity co-occurrence tracking — fragments mentioning "BTC" also recall "halving" without being synonyms |
-| Fragmented Storage | Split conversations into atomic pieces, not full transcripts |
-| Fragment Lineage | Each fragment links back to its full original text — "fragment A reminds me of full conversation B" |
-| Associative Recall | Search a fragment → trace to full memory → search again for more related fragments |
+| Entity Association | Entity co-occurrence tracking — entries mentioning "BTC" also recall "halving" without being synonyms |
 | Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
-| Sleep Consolidation | Background maintenance every 2h: keyword-based clustering + LLM summarization + synonym discovery at 3 AM via cron |
+| On-Demand Storage | No automatic archiving; only saves when explicitly told to (memory tool) |
+| Sleep Consolidation | Background maintenance every 2h: keyword-based clustering + LLM summarization |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
 
@@ -102,38 +98,38 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 
 ```json
 {
-  // Redis 连接配置
+  // Redis connection
   "redis_host": "127.0.0.1",
   "redis_port": 6379,
   "redis_password": "",
   
-  // 搜索相关配置
+  // Search settings
   "top_k": 5,
   "candidate_k": 10,
   "bm25_limit": 10,
   "tag_filter": "",
 
-  // 跳过检索配置
+  // Skip patterns
   "skip_min_length": 2,
   "skip_patterns_file": "~/.config/fragmented-memory/skip_patterns.txt",
 
-  // 时间衰减配置
+  // Time decay
   "decay_half_days": 60,
   "hot_topic_decay_half_days": 30,
   
-  // 排序权重配置
+  // Ranking weights
   "sentiment_boost_positive": 1.5,
   "sentiment_boost_negative": 1.3,
   "feedback_positive_boost": 1.3,
   "feedback_negative_penalty": 0.5,
   "hot_topic_boost": 1.2,
   
-  // 注意力机制配置
+  // Attention
   "attention_boost_max": 1.5,
   "attention_base_increment": 2.0,
   "attention_emotion_factor": 1.5,
   
-  // 嵌入配置（可选）
+  // Embedding (optional)
   "embedder": {
     "provider": "dashscope",
     "api_key": "sk-xxx",
@@ -141,27 +137,26 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
     "model": "text-embedding-v2"
   },
   
-  // 自动维护配置
+  // Auto maintenance
   "consolidate_min_group": 2,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
-  "full_max_age_days": 60,
-  "forget_dry_run": false,   // false = actually delete low-value fragments
+  "forget_dry_run": false,
 
-  // 代理隔离配置
+  // Agent isolation
   "agent_id": "main-brain",
   "is_primary": true,
 
-  // 同义词发现配置
+  // Synonym discovery
   "synonym_min_word_freq": 10,
   "synonym_jaccard_threshold": 0.5,
   "synonym_min_co_occurrence": 3,
 
-  // 实体共现配置
+  // Entity co-occurrence
   "entity_cooc_top_n": 3,
   "entity_cooc_min_count": 2,
   
-  // 情感强度因子
+  // Emotion intensity factor
   "emotion_intensity_factor": 0.4
 }
 ```
@@ -175,8 +170,8 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_REDIS_HOST` | `redis_host` | Redis server host |
 | `FRAGMENTED_REDIS_PORT` | `redis_port` | Redis server port |
 | `FRAGMENTED_REDIS_PASSWORD` | `redis_password` | Redis password for authentication |
-| `FRAGMENTED_TOP_K` | `top_k` | Number of final fragments returned |
-| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate fragments count (for KNN) |
+| `FRAGMENTED_TOP_K` | `top_k` | Number of final entries returned |
+| `FRAGMENTED_CANDIDATE_K` | `candidate_k` | Candidate entries count (for KNN) |
 | `FRAGMENTED_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
 | `FRAGMENTED_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
 | `FRAGMENTED_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
@@ -185,10 +180,9 @@ Here's a comprehensive example of the configuration file `~/.config/fragmented-m
 | `FRAGMENTED_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
 | `FRAGMENTED_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
 | `FRAGMENTED_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
-| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum fragments to trigger consolidation |
-| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before fragments can be consolidated |
-| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before fragments might be forgotten |
-| `FRAGMENTED_FULL_MAX_AGE_DAYS` | `full_max_age_days` | Number of days before full memories might be forgotten |
+| `FRAGMENTED_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum entries to trigger consolidation |
+| `FRAGMENTED_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before entries can be consolidated |
+| `FRAGMENTED_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before entries might be forgotten |
 | `FRAGMENTED_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode: `true` = count only, `false` = actually delete |
 | `FRAGMENTED_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
 
@@ -290,14 +284,14 @@ Then reference it in config.json:
 |-------------|---------------------|---------------|-------------|
 | `redis_host` | `FRAGMENTED_REDIS_HOST` | `127.0.0.1` | Redis address |
 | `redis_port` | `FRAGMENTED_REDIS_PORT` | `6379` | Redis port |
-| `top_k` | `FRAGMENTED_TOP_K` | `5` | Number of final fragments returned |
-| `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | Candidate fragments count (for KNN) |
+| `top_k` | `FRAGMENTED_TOP_K` | `5` | Number of final entries returned |
+| `candidate_k` | `FRAGMENTED_CANDIDATE_K` | `10` | Candidate entries count (for KNN) |
 | `tag_filter` | `FRAGMENTED_TAG_FILTER` | `""` | Tag filtering (comma-separated) |
 | `bm25_limit` | `FRAGMENTED_BM25_LIMIT` | `10` | BM25 search candidate count |
 | `decay_half_days` | `FRAGMENTED_DECAY_HALF_DAYS` | `60` | Time decay half-life (days) |
 | `embed_cache_ttl` | `FRAGMENTED_EMBED_CACHE_TTL` | `3600` | Embedding cache TTL (seconds) |
-| `sentiment_boost_positive` | — | `1.5` | Positive fragment weight multiplier |
-| `sentiment_boost_negative` | — | `1.3` | Negative fragment weight multiplier |
+| `sentiment_boost_positive` | — | `1.5` | Positive entry weight multiplier |
+| `sentiment_boost_negative` | — | `1.3` | Negative entry weight multiplier |
 | `feedback_positive_boost` | — | `1.3` | Positive feedback bonus weight |
 | `feedback_negative_penalty` | — | `0.5` | Negative feedback penalty coefficient |
 | `hot_topic_boost` | — | `1.2` | Hot topic weighting multiplier |
@@ -305,25 +299,24 @@ Then reference it in config.json:
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API key |
 | `embedder.base_url` | `FRAGMENTED_EMBEDDER_URL` | `https://api.openai.com/v1` | API endpoint |
 | `embedder.model` | `FRAGMENTED_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
-| `consolidate_min_group` | — | `2` | Minimum fragments to trigger consolidation |
-| `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before fragments can be consolidated |
-| `forget_max_age_days` | — | `30` | Number of days before fragments might be forgotten |
-| `full_max_age_days` | — | `60` | Number of days before full memories (memory:full:*) might be forgotten |
-| `forget_dry_run` | — | `true` | Safe mode for forgetting: `true` = count only, `false` = actually delete |
-| `agent_id` | — | `""` | Agent identity tag for memory isolation (e.g. `"main-brain"`) |
-| `is_primary` | — | `false` | When `true`, agent sees all fragments; `false` = only tagged ones |
+| `consolidate_min_group` | — | `2` | Minimum entries to trigger consolidation |
+| `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation |
+| `forget_max_age_days` | — | `30` | Max age (days) before deletion |
+| `forget_dry_run` | — | `true` | Safe mode: `true` = count only, `false` = delete |
+| `agent_id` | — | `""` | Agent identity tag for isolation (e.g. `"main-brain"`) |
+| `is_primary` | — | `false` | `true` = sees all entries; `false` = only tagged ones |
 | `hot_topic_decay_half_days` | — | `30` | Hot topic time decay half-life (days) |
-| `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+| `emotion_intensity_factor` | — | `0.4` | Emotion intensity → weight coefficient |
 | `skip_min_length` | — | `2` | Minimum query length to trigger search |
-| `skip_patterns_file` | — | `""` | Path to file containing skip patterns (one per line, # for comments) |
-| `attention_boost_max` | — | `1.5` | Maximum attention weighting value |
+| `skip_patterns_file` | — | `""` | Path to skip patterns file |
+| `attention_boost_max` | — | `1.5` | Max attention weighting value |
 | `attention_base_increment` | — | `2.0` | Base attention increment per mention |
-| `attention_emotion_factor` | — | `1.5` | Emotion intensity amplification factor for attention |
-| `synonym_min_word_freq` | — | `10` | Minimum fragment frequency for word to be considered |
-| `synonym_jaccard_threshold` | — | `0.5` | Jaccard similarity threshold for synonym detection |
-| `synonym_min_co_occurrence` | — | `3` | Minimum co-occurrence count for synonym detection |
-| `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search with |
-| `entity_cooc_min_count` | — | `2` | Minimum co-occurrence count for entity association |
+| `attention_emotion_factor` | — | `1.5` | Emotion amplification for attention |
+| `synonym_min_word_freq` | — | `10` | Min frequency for synonym candidate |
+| `synonym_jaccard_threshold` | — | `0.5` | Jaccard threshold for synonym detection |
+| `synonym_min_co_occurrence` | — | `3` | Min co-occurrence for synonym detection |
+| `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search |
+| `entity_cooc_min_count` | — | `2` | Min co-occurrence for entity association |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -372,39 +365,34 @@ fragmented: BM25-only mode (no embedder configured)
          │   ↓                │
          │  Skip patterns?    │  ← Length / exact match against skip list
          │   ↓                │
-         │  BM25 Full-Text Search │  ← Default, zero cost, triggered by user message keywords
+         │  BM25 Full-Text Search │  ← Default, zero cost, searches full entries
          │  (KNN Vector search) │  ← Optional (needs embedder)
          │  Entity co-occurrence │  ← Expand query with co-occurring entities
          │   ↓                │
          │  Six-dimensional Re-ranking │  ← Similarity × Time decay
          │                    │    × Emotion × Feedback × Hot Topic × Attention
          │   ↓                │
-         │  Full Memory Injection     │  ← Top 3 fragments → trace full text → show inline
-         │  Associative Recall        │  ← Full text → search again → dedup append
-         │   ↓                │
-         │  Top N Injected into Context   │  ← Search results injected as code block
+         │  Top N Injected into Context   │  ← Full entries returned as-is
          └─────────┬─────────┘
                    │
          ┌─────────▼─────────┐
-         │   Model Response   │  ← Fragments can be used as reference
+         │   Model Response   │  ← Entries used directly (complete text)
          └───────────────────┘
                    │
          ┌─────────▼─────────┐
-         │   sync_turn()      │  ← Automatically archive at end of conversation
-         │   Store Full Text  │  ← memory:full:{hash} for fragment lineage
+         │   on_memory_write()│  ← Only on memory(action='add')
+         │   Stores Full Text │  ← Complete entry, no splitting
+         │   Entity Extraction│  ← jieba + regex → entities TAG field
+         │   Entity Co-occur. │  ← Track entity pairs in ZSET
+         │   Attention Track  │  ← Extract keywords, increase attention score
          │   ↓                │
-         │   Smart Sentence Splitting      │  ← Protect abbreviations/numbers/quotes
-         │   Entity Extraction        │  ← jieba + regex → entities TAG field
-         │   Entity Co-occurrence     │  ← Track entity pairs in ZSET
-         │   Attention Tracking        │  ← Extract keywords and increase attention score
-         │   ↓                │
-         │   Stored in Redis        │  ← Available for next retrieval
+         │   Stored in Redis  │  ← Available for next retrieval as full text
          └───────────────────┘
                    │
          ┌─────────▼─────────┐
          │   [cron] Every 2h     │  ← Background maintenance
          │   ① Multi-level Consolidation  │  ← Same topic → keyword clustering → LLM → level+1
-         │   ② Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → actual delete
+         │   ② Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → delete
          └───────────────────┘
 ```
 
