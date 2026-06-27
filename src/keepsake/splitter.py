@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 import jieba
 
 # 自定义领域词典路径（由 discover_synonyms 自动生成）
-_DOMAIN_DICT = Path.home() / '.config' / 'fragmented-memory' / 'jieba_dict.txt'
+_DOMAIN_DICT = Path.home() / '.config' / 'keepsake' / 'jieba_dict.txt'
 
 
 def init_domain_dict() -> None:

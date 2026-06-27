@@ -6,7 +6,7 @@
 import tempfile
 import os
 from pathlib import Path
-from fragmented_memory import FragmentedMemoryProvider
+from keepsake import KeepsakeProvider
 
 def test_skip_patterns():
     """测试 skip patterns 功能"""
@@ -32,7 +32,7 @@ def test_skip_patterns():
     
     try:
         # 初始化 provider
-        provider = FragmentedMemoryProvider(**config_content)
+        provider = KeepsakeProvider(**config_content)
         
         # 测试应该跳过的短查询
         print("测试跳过的查询:")

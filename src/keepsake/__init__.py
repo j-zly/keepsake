@@ -173,7 +173,7 @@ class KeepsakeProvider(MemoryProvider):
         """按优先级合并配置源，返回最终配置。
 
         合并顺序（后覆盖前）: 默认值 ← JSON 文件 ← 环境变量 ← inline
-        inline = Hermes 的 config.yaml memory.fragmented 或 __init__ 传参
+        inline = Hermes 的 config.yaml memory.keepsake 或 __init__ 传参
         """
         # 1. 硬编码默认值（不含 embedder — 由配置文件/环境变量按需开启）
         cfg: dict = {

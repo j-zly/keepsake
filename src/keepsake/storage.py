@@ -1148,7 +1148,7 @@ class RedisStorage:
         import jieba
 
         if output_path is None:
-            output_path = str(Path.home() / '.config' / 'fragmented-memory' / 'jieba_dict.txt')
+            output_path = str(Path.home() / '.config' / 'keepsake' / 'jieba_dict.txt')
 
         client = self._get_client()
         if not client:
