@@ -5,16 +5,16 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent.parent / 'src'
 sys.path.insert(0, str(SRC))
 
-from fragmented_memory import splitter, emotion, embedder
+from keepsake import splitter, emotion, embedder
 
 _loader = importlib.machinery.SourceFileLoader(
-    'fragmented_memory.storage',
-    str(SRC / 'fragmented_memory' / 'storage.py')
+    'keepsake.storage',
+    str(SRC / 'keepsake' / 'storage.py')
 )
-mod = type(sys)('fragmented_memory.storage')
+mod = type(sys)('keepsake.storage')
 _loader.exec_module(mod)
 
-cfg_p = Path('~/.config/fragmented-memory/config.json').expanduser()
+cfg_p = Path('~/.config/keepsake/config.json').expanduser()
 cfg = json.loads(cfg_p.read_text()) if cfg_p.exists() else {}
 
 store = mod.RedisStorage(

@@ -32,14 +32,14 @@ from redis.commands.search.query import Query
 # 配置
 # ──────────────────────────────────────────────
 
-REDIS_HOST = os.environ.get("FRAGMENTED_REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("FRAGMENTED_REDIS_PORT", "6379"))
-REDIS_PASSWORD = os.environ.get("FRAGMENTED_REDIS_PASSWORD")
+REDIS_HOST = os.environ.get("KEEPSAKE_REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("KEEPSAKE_REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("KEEPSAKE_REDIS_PASSWORD")
 if not REDIS_PASSWORD:
     REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
 
 # 同义词表 key
-SYNONYM_KEY = "fragmented:synonyms"
+SYNONYM_KEY = "keepsake:synonyms"
 
 # 情感极性门 — 同一情感类碎片极性差超过此值，直接不算同一事
 POLARITY_GATE = 0.8
@@ -255,7 +255,7 @@ def calc_fusion_score(
 # ══════════════════════════════════════════════
 
 # 已检查的碎片 set key
-CHECKED_SET_KEY = "fragmented:dedup:checked"
+CHECKED_SET_KEY = "keepsake:dedup:checked"
 
 
 def scan_fragments(
