@@ -1176,6 +1176,9 @@ class RedisStorage:
                 except Exception:
                     continue
 
+            if cursor == 0:
+                break
+
         # 2. 读同义词表补全术语
         try:
             synonyms = client.hgetall(SYNONYM_HASH_KEY)
@@ -1269,6 +1272,10 @@ class RedisStorage:
                     # 某条碎片解析失败跳过
                     logger.debug("storage: skip fragment %s due to parsing error: %s", key, e)
                     continue
+
+            # SCAN 游标归零表示遍历完成
+            if cursor == 0:
+                break
 
         # 过滤候选词
         candidates = {word for word, freq in word_freq.items()
