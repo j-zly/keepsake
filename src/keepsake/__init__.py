@@ -376,6 +376,122 @@ class KeepsakeProvider(MemoryProvider):
         )
         logger.info("keepsake: maintenance engines initialized")
 
+        # 自动注册定时任务（仅在首次启动时创建）
+        self._ensure_cron_jobs()
+
+    # ------------------------------------------------------------------
+    # 定时任务自动注册
+    # ------------------------------------------------------------------
+
+    CRON_JOBS = [
+        {
+            "name": "memory-maintenance",
+            "script": "memory-maintenance.py",
+            "schedule": {"kind": "interval", "minutes": 120, "display": "every 120m"},
+        },
+        {
+            "name": "synonym-discovery-daily",
+            "script": "discover_synonyms.py",
+            "schedule": {"kind": "cron", "expr": "0 */8 * * *", "display": "0 */8 * * *"},
+        },
+        {
+            "name": "记忆去重",
+            "script": "dedup-memory.sh",
+            "schedule": {"kind": "cron", "expr": "0 * * * *", "display": "0 * * * *"},
+        },
+    ]
+
+    @staticmethod
+    def _ensure_cron_jobs() -> None:
+        """启动时自动注册三条定时任务（不存在才创建），并确保脚本文件到位。"""
+        cron_dir = Path("~/.hermes/cron").expanduser()
+        scripts_dir = Path("~/.hermes/scripts").expanduser()
+        jobs_file = cron_dir / "jobs.json"
+
+        if not jobs_file.exists():
+            logger.info("keepsake: cron jobs.json not found, skipping auto-register")
+            return
+
+        # 读取现有任务
+        try:
+            data = json.loads(jobs_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning("keepsake: failed to read jobs.json")
+            return
+
+        jobs = data.get("jobs", [])
+        existing_names = {j.get("name") for j in jobs}
+
+        # 获取插件包的 cron/ 目录（作为脚本源）
+        pkg_cron = Path(__file__).resolve().parent.parent.parent / "cron"
+
+        import uuid as _uuid
+
+        now = "2026-06-28T16:00:00+08:00"
+
+        for jdef in KeepsakeProvider.CRON_JOBS:
+            name = jdef["name"]
+            script = jdef["script"]
+            if name in existing_names:
+                continue
+
+            # 确保脚本文件存在
+            target = scripts_dir / script
+            if not target.exists() and pkg_cron.exists():
+                src = pkg_cron / script
+                if src.exists():
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(src.read_text())
+                        target.chmod(0o755)
+                        logger.info("keepsake: installed cron script %s", script)
+                    except OSError as e:
+                        logger.warning("keepsake: failed to install %s: %s", script, e)
+
+            new_job = {
+                "id": _uuid.uuid4().hex[:12],
+                "name": name,
+                "prompt": "",
+                "skills": [],
+                "skill": None,
+                "model": None,
+                "provider": None,
+                "base_url": None,
+                "script": script,
+                "no_agent": True,
+                "context_from": None,
+                "schedule": jdef["schedule"].copy(),
+                "schedule_display": jdef["schedule"]["display"],
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": now,
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "last_delivery_error": None,
+                "deliver": "local",
+                "origin": None,
+                "enabled_toolsets": None,
+                "workdir": None,
+                "profile": None,
+                "fire_claim": None,
+            }
+            jobs.append(new_job)
+            logger.info("keepsake: auto-registered cron job '%s'", name)
+
+        if any(jdef["name"] not in existing_names for jdef in KeepsakeProvider.CRON_JOBS):
+            data["jobs"] = jobs
+            data["updated_at"] = now
+            try:
+                jobs_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+                logger.info("keepsake: cron jobs.json updated")
+            except OSError as e:
+                logger.warning("keepsake: failed to write jobs.json: %s", e)
+
     def system_prompt_block(self) -> str:
         parts = [
             "你有Keepsake记忆系统（keepsake），连接在 Redis + RediSearch 上。",
