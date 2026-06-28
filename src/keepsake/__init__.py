@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -425,9 +427,7 @@ class KeepsakeProvider(MemoryProvider):
         # 获取插件包的 cron/ 目录（作为脚本源）
         pkg_cron = Path(__file__).resolve().parent.parent.parent / "cron"
 
-        import uuid as _uuid
-
-        now = "2026-06-28T16:00:00+08:00"
+        now = datetime.now(timezone.utc).isoformat()
 
         for jdef in KeepsakeProvider.CRON_JOBS:
             name = jdef["name"]
@@ -449,7 +449,7 @@ class KeepsakeProvider(MemoryProvider):
                         logger.warning("keepsake: failed to install %s: %s", script, e)
 
             new_job = {
-                "id": _uuid.uuid4().hex[:12],
+                "id": uuid.uuid4().hex[:12],
                 "name": name,
                 "prompt": "",
                 "skills": [],
