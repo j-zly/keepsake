@@ -38,7 +38,7 @@ def load_config() -> dict:
 
 def main():
     cfg = load_config()
-    redis_host = cfg.get("redis_host", "180.76.115.8")
+    redis_host = cfg.get("redis_host", "127.0.0.1")
     redis_port = int(cfg.get("redis_port", 6379))
 
     try:
