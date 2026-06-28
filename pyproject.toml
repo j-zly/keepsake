@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepsake-memory"
-version = "1.0.1"
+version = "1.1.0"
 description = "Keepsake — full-entry memory system for Hermes Agent. On-demand storage of complete memories with semantic search."
 readme = "README.md"
 license = {text = "MIT"}
