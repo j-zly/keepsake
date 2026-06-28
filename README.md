@@ -33,6 +33,8 @@ User: "How did we set up that React project structure last time?"
 - **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
 - **Auto Maintenance** — consolidation (keyword clustering + LLM summarization) + selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy
+- **Auto-Registered Cron Jobs** — when used as a Hermes plugin, three cron jobs (memory maintenance every 2h, deduplication every 1h, synonym discovery every 8h) are automatically registered on plugin initialization — zero manual setup
+- **Hermes Plugin Wrapper** — ready-to-use `hermes-plugin/` directory with `plugin.yaml` and `__init__.py` for drop-in installation
 
 ## Design Philosophy: Clean Memory for LLMs
 
@@ -346,10 +348,32 @@ redis-cli HSET keepsake:synonyms fix '["fix","modify","correct","repair","solve"
 Check logs after startup:
 
 ```
-Memory provider 'entryed' registered (0 tools)
-entryed: connected (session=xxx, top_k=5, tag_filter=(none))
-entryed: BM25-only mode (no embedder configured)
+Memory provider 'keepsake' registered (0 tools)
+keepsake: connected (session=xxx, top_k=5, tag_filter=(none))
+keepsake: BM25-only mode (no embedder configured)
+keepsake: auto-registered cron job 'memory-maintenance'
+keepsake: auto-registered cron job 'synonym-discovery-daily'
+keepsake: auto-registered cron job '记忆去重'
 ```
+
+## Project Structure
+
+```
+keepsake/
+├── src/keepsake/         # Python package — the memory provider
+├── hermes-plugin/        # Hermes plugin wrapper (drop-in for ~/.hermes/plugins/)
+│   ├── plugin.yaml
+│   └── __init__.py
+├── cron/                 # Cron wrapper scripts for scheduled tasks
+│   ├── memory-maintenance.py   # Every 2h — consolidation + forgetting
+│   ├── dedup-memory.sh         # Every 1h — deduplication
+│   └── discover-synonyms.py    # Every 8h — synonym auto-discovery
+├── scripts/              # Standalone utility scripts (dev/test)
+├── README.md
+└── pyproject.toml
+```
+
+The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin initializes (on `/new` or gateway restart). No manual `hermes cron create` needed.
 
 ## Architecture
 

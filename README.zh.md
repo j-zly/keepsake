@@ -38,6 +38,8 @@
 | 👁️ **注意力追踪** | 用户反复提起的话题自动标记为高关注，相关条目在搜索中排名上升 |
 | 🧬 **多级合并** | 每 2 小时自动将同主题条目合并提炼为高层记忆，支持 level 1→2→3 多级蒸馏 |
 | 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简 |
+| ⏰ **定时任务自动注册** | 作为 Hermes 插件使用时，初始化自动注册三条 cron（记忆维护 2h/去重 1h/同义词 8h），零手动配置 |
+| 🧩 **Hermes 插件壳** | 内含 `hermes-plugin/` 目录（plugin.yaml + __init__.py），即拷即用 |
 
 ## 设计哲学：为 LLM 优化的干净记忆
 
@@ -345,11 +347,32 @@ redis-cli HSET keepsake:synonyms fix '["修","改","补","修复","解决"]'
 启动后检查日志：
 
 ```
-Memory provider 'entryed' registered (0 tools)
-entryed: connected (session=xxx, top_k=5, tag_filter=(none))
-entryed: BM25-only mode (no embedder configured)
+Memory provider 'keepsake' registered (0 tools)
+keepsake: connected (session=xxx, top_k=5, tag_filter=(none))
+keepsake: BM25-only mode (no embedder configured)
+keepsake: auto-registered cron job 'memory-maintenance'
+keepsake: auto-registered cron job 'synonym-discovery-daily'
+keepsake: auto-registered cron job '记忆去重'
 ```
 
+## 项目结构
+
+```
+keepsake/
+├── src/keepsake/         # Python 包 — 记忆提供者核心
+├── hermes-plugin/        # Hermes 插件壳（拷到 ~/.hermes/plugins/ 即用）
+│   ├── plugin.yaml
+│   └── __init__.py
+├── cron/                 # 定时任务包装脚本
+│   ├── memory-maintenance.py   # 每 2h — 记忆合并 + 遗忘
+│   ├── dedup-memory.sh         # 每 1h — 去重
+│   └── discover-synonyms.py    # 每 8h — 同义词自动发现
+├── scripts/              # 独立工具脚本（开发/测试）
+├── README.md
+└── pyproject.toml
+```
+
+三条定时任务由插件初始化时**自动注册**（发 `/new` 或重启 gateway），无需手动 `hermes cron create`。
 ## 工作原理
 
 ```
