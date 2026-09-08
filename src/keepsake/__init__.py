@@ -642,11 +642,22 @@ class KeepsakeProvider(MemoryProvider):
         return decide(text, category, existing_meta, getattr(self, "_gate_cfg", None)), existing_meta
 
     def _v1_store_after_decide(self, text, decision, existing_meta, category, source, extra_tags) -> None:
-        """decide() 之后直存（含 update_state 闭环；v1 与 v2 兜底共享）。"""
-        from .ingest_gate import update_state_only
+        """decide() 之后直存（含 update_state 闭环；v1 与 v2 兜底共享）。
+
+        R7 接线：store 路径入库前先 scrub_secrets（仅 store 路径；
+        update_state 路径只刷时间戳，按任务书约定不 scrub）。
+        """
+        from .ingest_gate import scrub_secrets, update_state_only
         if decision.action == "update_state":
             update_state_only(self._storage, existing_meta)
             return
+        # R7：入库前凭据打码（sync_turn v1 + v2 兜底共用此点）
+        try:
+            scrubbed_text, _n_masks = scrub_secrets(text)
+            if scrubbed_text:
+                text = scrubbed_text
+        except Exception as e:
+            logger.debug("keepsake: scrub_secrets failed in _v1_store_after_decide: %s", e)
         try:
             tags = "conversation" + ("," + extra_tags if extra_tags else "")
             self._storage.store(text=text, tags=tags, category=category, source=source,

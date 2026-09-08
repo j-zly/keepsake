@@ -531,10 +531,20 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _do_add(self, fact: Fact) -> None:
-        """ADD：直接写新碎片（category=fact_v2 让消费侧可识别）。"""
+        """ADD：直接写新碎片（category=fact_v2 让消费侧可识别）。
+
+        R7 接线：写库前先 scrub_secrets（凭据打码源头闸门）。
+        """
+        from .ingest_gate import scrub_secrets
+        try:
+            scrubbed, _ = scrub_secrets(fact.content)
+            content = scrubbed if scrubbed else fact.content
+        except Exception as e:
+            logger.debug("pipeline: scrub_secrets failed for ADD: %s; storing raw", e)
+            content = fact.content
         try:
             self._storage.store(
-                text=fact.content,
+                text=content,
                 tags=self._tags_for(fact),
                 category="fact_v2",
                 source="pipeline_v2",
@@ -548,15 +558,25 @@ class Pipeline:
 
         target_key 由 _update_phase 的 LLM 提供（已过 _sane_target 校验）；
         若为 None（LLM 没给 / 幻觉被拒）→ 走 _find_supersede_target（同样过 exists 校验）。
+
+        R7 接线：新碎片写库前 scrub_secrets；supersedes 链路仍用 scrubbed
+        后的内容计算 Redis key（否则新 key 与原 key 不一致，封边断裂）。
         """
+        from .ingest_gate import scrub_secrets
         old_key = target_key or self._find_supersede_target(fact.content)
         if not old_key:
             # 找不到候选 → 退化 ADD（避免静默丢）
             self._do_add(fact)
             return
         try:
+            scrubbed, _ = scrub_secrets(fact.content)
+            content = scrubbed if scrubbed else fact.content
+        except Exception as e:
+            logger.debug("pipeline: scrub_secrets failed for UPDATE: %s; storing raw", e)
+            content = fact.content
+        try:
             self._storage.store(
-                text=fact.content,
+                text=content,
                 tags=self._tags_for(fact),
                 category="fact_v2",
                 source="pipeline_v2",
@@ -565,7 +585,7 @@ class Pipeline:
         except Exception as e:
             logger.warning("pipeline: UPDATE store failed: %s", e)
             return
-        new_key = self._key_for_content(fact.content)
+        new_key = self._key_for_content(content)
         if new_key:
             try:
                 # 新碎片加 supersedes 字段（store 不支持 → 直接 hset）
@@ -691,9 +711,17 @@ class Pipeline:
                 except Exception as e:
                     logger.debug("pipeline: gate_fallback raised: %s; trying raw store", e)
             # 最后兜底：直接存（不经过闸门 — 风险高，但保证不丢）
+            # R7 接线：raw store 前 scrub_secrets（保持写侧源头闸门一致性）
+            from .ingest_gate import scrub_secrets
+            try:
+                scrubbed, _ = scrub_secrets(t.user)
+                content = scrubbed if scrubbed else t.user
+            except Exception as e:
+                logger.debug("pipeline: scrub_secrets failed in fallback: %s; storing raw", e)
+                content = t.user
             try:
                 self._storage.store(
-                    text=t.user,
+                    text=content,
                     tags="conversation,fallback:v1",
                     category="turn_memory",
                     source="pipeline_v2_fallback",

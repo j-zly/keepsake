@@ -356,7 +356,29 @@ redis-cli HSET keepsake:synonyms fix '["fix","modify","correct","repair","solve"
 
 ### Ingest Gate v1 (2026-09)
 
-Write-side gate (`src/keepsake/ingest_gate.py`) intercepts every `sync_turn()` call before storage. Rules short-circuit in order: **R1** `[CONTEXT COMPACTION` prefix → reject; **R2** `len > max_len` (default 2000) → reject; **R3** blacklist / status questions / stripped length < 8 → reject; **R4** no letter/Chinese/digit at all → reject; **R5** `category="memory_tool"` → reject (MEMORY.md ↔ fragment library decoupled); **R6** same content hash already exists for `turn_memory`/`conversation` → `update_state` only (bump `updated_at`/`touch_count`, never overwrite `content`); **R7** else → store. Toggle in `config.json` under `"ingest_gate": {"enabled": true, "max_len": 2000}`. Defaults: enabled.
+Write-side gate (`src/keepsake/ingest_gate.py`) intercepts every `sync_turn()` call before storage. Rules short-circuit in order: **R1** `[CONTEXT COMPACTION` prefix → reject; **R2** `len > max_len` (default 2000) → reject; **R3** blacklist / status questions / stripped length < 8 → reject; **R4** no letter/Chinese/digit at all → reject; **R5** `category="memory_tool"` → reject (MEMORY.md ↔ fragment library decoupled); **R6** same content hash already exists for `turn_memory`/`conversation` → `update_state` only (bump `updated_at`/`touch_count`, never overwrite `content`); **R7** else → store (with secrets scrubbed at every `storage.store()` call site — see R7 below). Toggle in `config.json` under `"ingest_gate": {"enabled": true, "max_len": 2000}`. Defaults: enabled.
+
+#### R7 — Secret Scrubbing (2026-09, write-side source gate)
+
+Before any `storage.store()` call, `scrub_secrets(text) -> (cleaned_text, n_masks)` masks obvious credentials so they never enter the fragment library. Pure function, idempotent (calling twice returns `n_masks=0` on the second call). Wired at every store point: `sync_turn` v1 path (`_v1_store_after_decide` in `__init__.py`), v2 pipeline `_do_add` / `_do_update` / `_fallback_to_v1` raw-store in `pipeline.py`. The R6 `update_state` path is intentionally **not** scrubbed (only timestamps are bumped; original `content` is preserved).
+
+| Category | Pattern | Example → Masked |
+|---|---|---|
+| 1 | `(密码\|口令\|password\|passwd) [是为:：=] value` | `密码是FAKEpw9` → `密码是***[REDACTED]` |
+| 2 | `(api[_-]?key\|token\|secret\|密钥) [是为:：=] value` | `token: FAKEtok+enABCDEF0123456789xyzXYZaaaa==` → `token: ***[REDACTED]` |
+| 3 | `Password=value` (case-insensitive; value stops at `; " ' &`) | `Password=FAKEpw1;` → `Password=***[REDACTED];` |
+| 4 | `Bearer value` (value ≥ 16 base64 chars) | `Bearer abc123def456ghi789jkl0123456789` → `Bearer ***[REDACTED]` |
+| 5 | Fallback: 12+ consecutive `[A-Za-z0-9+=_.-]` with conservative filter (reject pure-digit-dot strings like IPv4 / URL host parts / file paths) | `sk-FAKE0123456789ab` → `***[REDACTED]` |
+
+Mask format: keep the matching prefix (label + separator), replace the value with `***[REDACTED]`. Categories 3 (Password=xxx) runs first to preserve `;` and other DSN terminators.
+
+Conservative filtering of the high-entropy fallback (Category 5) avoids false positives on:
+
+- **IPv4 addresses** — `154.219.96.202` → no mask
+- **URL host / paths** — `https://api.example.com/v1/users`, `/var/log/keepsake/server.log` → no mask
+- **Plain English** — `thequickbrownfoxjumpsoverthelazydog` → no mask
+- **Chinese text** — `我的密码本很厚` (no separator) → no mask
+- **Common `key=value` pairs** — `Server=localhost`, `Database=mydb` in DSN strings → no mask
 
 ## Verification
 
