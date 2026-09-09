@@ -32,7 +32,7 @@ User: "How did we set up that React project structure last time?"
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
-- **Auto Maintenance** — consolidation (keyword clustering + LLM summarization) + selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy
+- **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation retired 2026-09 — see below.
 - **RRF Fusion Ranking (v1.3)** — Reciprocal Rank Fusion combines BM25 full-text and semantic KNN results into a single ranked list for better recall
 - **Local Semantic Search** — optional ollama `nomic-embed-text` embedder (768-dim) runs fully on-premise, no external embedding API needed
 - **Time-Aware Recall (v1.5)** — entity timelines (`keepsake:entity_timeline`) + versioned facts let searches leverage *when* things happened, not just what was said
@@ -57,7 +57,7 @@ Keepsake stores **full, self-contained entries** — not split conversation snip
 | Entity Association | Entity co-occurrence tracking — entries mentioning "BTC" also recall "halving" without being synonyms |
 | Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
 | On-Demand Storage | No automatic archiving; only saves when explicitly told to (memory tool) |
-| Sleep Consolidation | Background maintenance every 2h: keyword-based clustering + LLM summarization |
+| Sleep Consolidation | Background maintenance every 2h: selective forgetting (multi-dimension low-value detection). Consolidator retired 2026-09. |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
 
@@ -402,7 +402,7 @@ keepsake/
 │   ├── plugin.yaml
 │   └── __init__.py
 ├── cron/                 # Cron wrapper scripts for scheduled tasks
-│   ├── memory-maintenance.py   # Every 2h — consolidation + forgetting
+│   ├── memory-maintenance.py   # Every 2h — selective forgetting (consolidation retired 2026-09)
 │   ├── dedup-memory.sh         # Every 1h — deduplication
 │   └── discover-synonyms.py    # Every 8h — synonym auto-discovery
 ├── scripts/              # Standalone utility scripts (dev/test)
@@ -415,6 +415,25 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 ## v2 Two-Phase Pipeline (2026-09)
 
 每轮对话走两相 LLM：**提取相**从窗口提炼长期事实（废话/纯确认自然无事实可提而消亡），**更新相**对每条 fact 拿 top-5 相似旧记忆做 ADD / UPDATE / DELETE / NOOP —— UPDATE/DELETE 给旧碎片只打 `superseded_by` 封边不物理删，检索侧统一排除；窗口内 LLM 调用硬顶 `llm_pipeline.max_calls_per_window`（默认 8），任一 LLM/JSON 失败或超预算 → 窗口整体回落 v1 规则闸门直存原文，**绝不静默丢消息**。配置键：`llm_pipeline.{enabled, model, window_pairs, window_seconds, max_calls_per_window, update_top_k, recent_context_size}`、`v2_min_score`。
+
+## Consolidator Retirement (2026-09-09)
+
+`Consolidator`（基于 jieba 关键词聚类 + LLM 多级缝合的离线合并引擎）已被退役。运行接线在 v2 两相管线接管后被彻底摘除。
+
+**为什么退役：**
+- 输出质量差：LLM 多级合并产生的「无时态散文」与 v2 封边链（`superseded_by`）互不相认 —— 旧合并产物会被 v2 检索侧的封边过滤误伤或绕过。
+- 职责重叠：v2 两相管线的「提取相」窗口级事实提炼 +「更新相」supersede 封边，已全面覆盖 Consolidator 的碎片提纯职能。
+- 维护成本：双管线并存需要为同一份碎片库维护两套并查链路，得不偿失。
+
+**替代者：** `pipeline.py`（v2 两相管线）。每个 turn 窗口触发提取相 → 更新相，原地 supersede 旧碎片；运行时无独立合并 cron 任务。
+
+**如何复活（若需要）：**
+1. `src/keepsake/consolidator.py` 类源码完整保留（含 `Consolidator`、`resolve_llm_channel`、`_call_llm` 全部函数），git 可溯。
+2. 在 `src/keepsake/__init__.py` 的 `KeepsakeProvider.initialize()` 中恢复 `Consolidator(...)` 构造块，并在 `maintenance()` 中恢复 `if self._consolidator:` 分支。
+3. 在 `_maybe_maintain` / `maintenance` 的 docstring 恢复「Consolidation + Forget」描述。
+4. 重跑 `tests/test_consolidator_retired.py` —— 退役接线断言会自然报错提示回退。
+
+**运行时观测：** `maintenance()` 返回 stats 仍保留 `consolidator` 字段（`{"status": "retired", "reason": "v2 pipeline takeover"}`），便于 cron 探针 / 健康检查观测退役状态而非误报 missing-key。
 
 ## Architecture
 
@@ -456,8 +475,8 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
                    │
          ┌─────────▼─────────┐
          │   [cron] Every 2h     │  ← Background maintenance
-         │   ① Multi-level Consolidation  │  ← Same topic → keyword clustering → LLM → level+1
-         │   ② Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → delete
+         │   ① Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → delete
+         │   (Consolidator retired 2026-09 — see section above)
          └───────────────────┘
 ```
 

@@ -38,10 +38,15 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
 
 from .embedder import create_embedder
 from .storage import RedisStorage
-from .consolidator import Consolidator
 from .forgetter import Forgetter
 # v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
 from .pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
+
+# consolidator.py 的运行时接线已于 2026-09-09 退役：
+#   * 两相管线 pipeline.py 已全面接管碎片提纯（提取相+更新相，封边取代旧合并）
+#   * Consolidator 的「相似度分组 → LLM 缝合多级合并」与 v2 supersede 链互不相认
+#   * 类源码保留（git 可溯），仅摘掉运行接线；resolve_llm_channel / _call_llm
+#     仍从 keepsake.consolidator 模块按需导入，供 v2 pipeline 复用
 
 # ---------------------------------------------------------------------------
 # 工具扇区（供 Hermes MemoryProvider 注册）
@@ -152,7 +157,6 @@ class KeepsakeProvider(MemoryProvider):
     _initialized: bool = False
     _storage: Optional[RedisStorage] = None
     _tag_filter: str = ""
-    _consolidator: Optional[Consolidator] = None
     _forgetter: Optional[Forgetter] = None
     _last_maintenance: float = 0.0
     _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
@@ -390,23 +394,20 @@ class KeepsakeProvider(MemoryProvider):
         self._gate_cfg = cfg.get("ingest_gate", {"enabled": True, "max_len": 2000})
 
         # 解析 LLM 通道（base_url/model/api_key）—— 零配置回落 dashscope
-        from .consolidator import resolve_llm_channel as _resolve_llm_channel
-        llm_channel = _resolve_llm_channel(cfg)
+        # Consolidator 退役后保留此单独 import：函数仍从 consolidator 模块取，
+        # 但不再构造 Consolidator 实例。
+        from .consolidator import resolve_llm_channel
+        llm_channel = resolve_llm_channel(cfg)
 
-        # 初始化 Consolidator 和 Forgetter（守护模式）
-        self._consolidator = Consolidator(
-            storage=self._storage,
-            min_group_size=int(cfg.get("consolidate_min_group", 2)),
-            max_age_hours=int(cfg.get("consolidate_max_age_hours", 72)),
-            llm_model=llm_channel.get("model") or "qwen-plus",
-            channel=llm_channel,
-        )
+        # Consolidator 退役（2026-09-09）：提纯职能由 v2 两相管线（pipeline.py）接管，
+        # 其 supersede 封边链与 Consolidator 的「相似度分组 → LLM 缝合」互不相认。
+        # 仅保留 Forgetter（守护模式）。
         self._forgetter = Forgetter(
             storage=self._storage,
             max_age_days=int(cfg.get("forget_max_age_days", 30)),
             dry_run=bool(cfg.get("forget_dry_run", True)),
         )
-        logger.info("keepsake: maintenance engines initialized")
+        logger.info("keepsake: maintenance engines initialized (Consolidator retired)")
 
         # v2（2026-09）：写侧两相管线 — 仅在 enabled 且有 LLM 时启动
         self._init_pipeline(cfg.get("llm_pipeline", {}) or {})
@@ -693,7 +694,7 @@ class KeepsakeProvider(MemoryProvider):
         logger.info("keepsake: v2 pipeline started")
 
     def _maybe_maintain(self) -> None:
-        """检查是否该执行维护，执行 Consolidation + Forget。"""
+        """检查是否该执行维护，执行 Forget（Consolidator 已退役）。"""
         import time as _time
         now = _time.time()
         if now - self._last_maintenance < self._maintenance_interval:
@@ -702,27 +703,22 @@ class KeepsakeProvider(MemoryProvider):
         self.maintenance()
 
     def maintenance(self) -> Dict[str, Any]:
-        """执行一轮完整维护：Consolidation → Forget。
+        """执行一轮完整维护：Forget（Consolidator 已退役）。
+
+        Consolidator 退役（2026-09-09）：提纯职能由 v2 两相管线（pipeline.py）接管。
+        这里仍保留 `consolidator` 字段以便 cron/health 探针可观测（status=retired），
+        不再触发任何合并循环。
 
         返回:
             维护统计
         """
         stats: Dict[str, Any] = {
-            "consolidator": {"status": "skipped"},
+            # Consolidator 退役（2026-09-09）：保留字段供观测，无运行接线
+            "consolidator": {"status": "retired", "reason": "v2 pipeline takeover"},
             "forgetter": {"status": "skipped"},
         }
 
-        # Step 1: Consolidation
-        if self._consolidator:
-            try:
-                result = self._consolidator.consolidate()
-                stats["consolidator"] = result
-                logger.info("keepsake: consolidation done — %s", result)
-            except Exception as e:
-                logger.warning("keepsake: consolidation error: %s", e)
-                stats["consolidator"] = {"status": "error", "reason": str(e)}
-
-        # Step 2: Selective Forgetting
+        # Step 1: Selective Forgetting（Consolidator 已摘除，仅剩 Forget）
         if self._forgetter:
             try:
                 result = self._forgetter.forget()
