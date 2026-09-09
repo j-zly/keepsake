@@ -46,6 +46,32 @@ class TestR1Compaction:
         d = decide("   \n[CONTEXT COMPACTION] 摘要正文", "turn_memory")
         assert d == IngestDecision("reject", "compaction")
 
+    def test_r1_system_note_gateway_restart_rejects(self):
+        """9/10 实锤：网关重启注入的 [System note: ...] 必须 R1 拒收。"""
+        d = decide(
+            "[System note: The previous turn was interrupted by a gateway restart (pid 1234).",
+            "turn_memory",
+        )
+        assert d == IngestDecision("reject", "compaction")
+
+    def test_r1_system_note_leading_whitespace_rejects(self):
+        """[System note 前导空白 / 换行也应被 lstrip 后命中。"""
+        d = decide("   \n[System note: leading ws variant", "turn_memory")
+        assert d == IngestDecision("reject", "compaction")
+
+    def test_r1_chinese_system_note_phrase_does_not_match(self):
+        """中文「系统笔记」字样的正常文本不被误拦 —— R1 前缀是严格英文 [System note。"""
+        d = decide("[重要：系统笔记] 用户配置了 MySQL 每日备份到 180", "turn_memory")
+        assert d.action == "store"
+
+    def test_r1_system_note_with_extra_content_still_rejects(self):
+        """[System note 后接多段内容：只判前缀，不读后文。"""
+        d = decide(
+            "[System note: gateway restart]\n后续内容继续，用户问怎么办",
+            "turn_memory",
+        )
+        assert d == IngestDecision("reject", "compaction")
+
 
 # ===========================================================================
 # R2 — 超长

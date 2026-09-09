@@ -76,6 +76,14 @@ class IngestDecision:
 
 
 # ---------------------------------------------------------------------------
+# R1 拒收前缀表（case-sensitive, lstrip 后 startswith）：
+#   - [CONTEXT COMPACTION   : 压缩摘要（9/8 事故源头）
+#   - [System note          : 网关重启/中断等系统注入提示（9/10 实锤漏网）
+# ---------------------------------------------------------------------------
+
+_REJECT_PREFIXES = ("[CONTEXT COMPACTION", "[System note")
+
+# ---------------------------------------------------------------------------
 # R3 黑名单 + 状态问句正则（固定写全，禁止自作主张扩）
 # ---------------------------------------------------------------------------
 
@@ -325,8 +333,10 @@ def decide(
     if not cfg.get("enabled", True):
         return IngestDecision("store", "")
 
-    # R1: compaction 摘要（lstrip 后前缀匹配，case-sensitive）
-    if text.lstrip().startswith("[CONTEXT COMPACTION"):
+    # R1: compaction 摘要 / 网关系统注入（lstrip 后前缀匹配，case-sensitive）
+    #   - [CONTEXT COMPACTION : 压缩摘要（9/8 事故源头）
+    #   - [System note        : 网关重启/中断等系统注入提示（9/10 实锤漏网）
+    if text.lstrip().startswith(_REJECT_PREFIXES):
         return IngestDecision("reject", "compaction")
 
     # R2: 超长
