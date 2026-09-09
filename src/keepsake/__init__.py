@@ -16,6 +16,7 @@ keepsake — Keepsake记忆系统 for Hermes Agent.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -309,8 +310,19 @@ class KeepsakeProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """初始化 — 加载配置、连接 Redis、自动创建 index。"""
+        """初始化 — 加载配置、连接 Redis、自动创建 index。
+
+        2026-09 ks_pipefix：把合并完成的 cfg 深拷贝存到 self._resolved_config。
+        修复前 _init_pipeline 用 self._config（Hermes 传入的 inline 原始配置，
+        不带 llm 节）解析 channel，导致 v2 pipeline 错判 unconfigured 不启动。
+        修复后 _init_pipeline 读 self._resolved_config，与日志/同步链保持单源。
+        _channel_refresher / resolve_llm_channel_cached 按文件路径 mtime 重读，
+        不依赖此属性，不受影响。
+        """
         cfg = self._resolve_config(self._config)
+        # 深拷贝：防后续步骤或外部测试修改 cfg 时反向污染 _config 链
+        # （测试里 monkeypatch inline 后再 resolve 会得到新 dict，本属性不变）
+        self._resolved_config = copy.deepcopy(cfg)
 
         # 加载/重载 jieba 自定义词典（发 /new 时生效）
         from .splitter import init_domain_dict
@@ -675,12 +687,22 @@ class KeepsakeProvider(MemoryProvider):
           * 移除硬编码 model 字段兜底；配置无效直接走 v1 fallback
           * 注入 channel_refresher 给 Pipeline，每次 _drain_now 开头按 mtime 重读
             config.json → 改完下一处理窗口生效，无需重启网关
+
+        2026-09 ks_pipefix 变更：
+          * channel 解析源由 self._config（Hermes 传入的 inline 原始配置，
+            通常无 llm 节）改为 self._resolved_config（initialize() 里合并完成的
+            cfg，含 config.json 的 llm 节）。这是关键修复——修前 inline 空 + 文件
+            有节时会被错判 unconfigured，v2 pipeline 永不启动。
+          * _channel_refresher / resolve_llm_channel_cached 按文件路径 mtime
+            重读，不依赖 self._resolved_config，不受影响。
         """
         self._pipeline = None
         if not llm_pipe_cfg.get("enabled", True):
             return
         from .consolidator import _call_llm, resolve_llm_channel
-        llm_channel = resolve_llm_channel(self._config)
+        # ks_pipefix：用合并后的 cfg（含 config.json 的 llm 节）解析 channel，
+        # 不要再用 self._config（仅含 inline）
+        llm_channel = resolve_llm_channel(self._resolved_config)
         if not llm_channel.get("valid"):
             # 缺 base_url/model/api_key 之一 → 无 LLM 通道 → pipeline 不启动
             logger.warning(
