@@ -20,7 +20,7 @@ User: "How did we set up that React project structure last time?"
 
 - **Full Entry Storage** — stores complete text as-is, no semantic splitting
 - **BM25 Full-Text Search** — works out of the box with no external API
-- **Optional Vector Search** — KNN via RediSearch (OpenAI / DashScope embedder)
+- **Optional Vector Search** — KNN via RediSearch (OpenAI / DashScope / local Ollama embedder; model must be registered in `_MODEL_DIMENSIONS`, see Embedding Models)
 - **Time Decay** — newer entries rank higher (60-day half-life configurable)
 - **Sentiment Weighting** — emotional entries get priority
 - **User Feedback** — mark entries useful/useless to improve ranking
@@ -30,14 +30,15 @@ User: "How did we set up that React project structure last time?"
 - **Domain Dictionary** — jieba user dictionary auto-generated from corpus + synonym table, loaded on `/new` for better Chinese tokenization
 - **Workflow Lock** — set `keepsake:workflow_lock` in Redis to globally disable memory retrieval (e.g. during automated workflows)
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
-- **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
+- **Memory Intake** — explicit `memory(action='add')` entries plus per-turn text screened by the v1 ingest gate (R1–R8); junk/system-injected content is rejected before storage, and the v2 pipeline distills turns into facts
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
 - **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation retired 2026-09 — see below.
 - **RRF Fusion Ranking (v1.3)** — Reciprocal Rank Fusion combines BM25 full-text and semantic KNN results into a single ranked list for better recall
-- **Local Semantic Search** — optional ollama `nomic-embed-text` embedder (768-dim) runs fully on-premise, no external embedding API needed
+- **Local Semantic Search** — optional self-hosted Ollama embedder (e.g. `bge-m3`, 1024-dim) runs fully on-premise via the OpenAI-compatible `/v1/embeddings` endpoint — no external embedding API needed
+- **LLM Query Expansion (2026-09)** — when BM25 recalls fewer than `min_results` hits, a free-tier chat LLM quietly generates synonymous short phrases (2–8 chars) into a Redis cache (24h TTL). Runs on a background thread: **zero added latency on the hot path**; disabled automatically when no `llm` channel is configured
 - **Time-Aware Recall (v1.5)** — entity timelines (`keepsake:entity_timeline`) + versioned facts let searches leverage *when* things happened, not just what was said
 - **Local Memory Distillation** — `scripts/memory_distill.py` uses a local model (qwen3:8b) to distill stale entries into compact summaries with watermark incremental updates (toggleable, ComfyUI off-peak aware)
-- **Retrieval Quality Spot Checks** — `scripts/eval_spotcheck.py` runs 20 real-query regression tests to track search quality (v1.4: 60% → 67%)
+- **Retrieval Quality Spot Checks** — `scripts/eval_spotcheck.py` runs 30 real-query regression tests to track search quality (v1.4 BM25-only: 60% → 67%; +vector KNN fusion 2026-09: 73%)
 - **Auto-Registered Cron Jobs** — when used as a Hermes plugin, three cron jobs (memory maintenance every 2h, deduplication every 1h, synonym discovery every 8h) are automatically registered on plugin initialization — zero manual setup
 - **Hermes Plugin Wrapper** — ready-to-use `hermes-plugin/` directory with `plugin.yaml` and `__init__.py` for drop-in installation
 - **Two-Phase Pipeline (v2, 2026-09)** — Mem0-style extract/update phases run async on a daemon thread, sealing old facts via `superseded_by` edges (not physical delete) so stale snapshots (e.g. completed tasks marked pending) never reappear. Cost-capped at `llm_pipeline.max_calls_per_window`; any LLM/JSON failure or budget breach falls back to v1 rule-gate storage — messages are never silently dropped.
@@ -56,12 +57,12 @@ Keepsake stores **full, self-contained entries** — not split conversation snip
 | Association & Analogy | Synonym discovery (Jaccard co-occurrence statistics) — "deploy" ↔ "release" |
 | Entity Association | Entity co-occurrence tracking — entries mentioning "BTC" also recall "halving" without being synonyms |
 | Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
-| On-Demand Storage | No automatic archiving; only saves when explicitly told to (memory tool) |
+| Memory Intake | Explicit `memory(action='add')` writes, plus per-turn text screened by the ingest gate and distilled by the v2 pipeline |
 | Sleep Consolidation | Background maintenance every 2h: selective forgetting (multi-dimension low-value detection). Consolidator retired 2026-09. |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
 
-No vector database. No embedding API calls. No LLM inference for memory operations. Just **pure statistical methods** running on Redis + RediSearch — the same techniques the brain uses: frequency, recency, emotional salience, association, and feedback.
+By default (BM25-only mode) Keepsake needs no vector database, no embedding API and no LLM: **pure statistical methods** run on Redis + RediSearch — the same signals the brain uses: frequency, recency, emotional salience, association, and feedback. Optional layers plug in without replacing this baseline: a self-hosted or hosted **embedding API** adds KNN semantic recall fused via RRF, and an **LLM** powers the v2 write pipeline and query expansion. Every optional layer has an explicit degrade path — missing config never silently enables a fallback provider.
 
 ## Requirements
 
@@ -69,7 +70,7 @@ No vector database. No embedding API calls. No LLM inference for memory operatio
 - **Hermes Agent 0.12+** — provides `MemoryProvider` interface
 - **Redis 7+** — with RediSearch module (v2.6+)
 - **jieba** — Chinese tokenization (auto-installed)
-- **Embedding API** (optional) — OpenAI / DashScope / any compatible `/v1/embeddings` service
+- **Embedding API** (optional) — OpenAI / DashScope / any compatible `/v1/embeddings` service, including self-hosted [Ollama](https://ollama.com) (e.g. `bge-m3`)
 
 ## Installation
 
@@ -137,19 +138,25 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   "attention_base_increment": 2.0,
   "attention_emotion_factor": 1.5,
   
-  // Embedding (optional)
+  // Embedding (optional) — model MUST be registered in embedder.py _MODEL_DIMENSIONS;
+  // unregistered model = explicit degrade to BM25-only (never a silent default dim).
+  // Example: self-hosted Ollama bge-m3 (OpenAI-compatible endpoint, api_key any non-empty)
   "embedder": {
-    "provider": "dashscope",
-    "api_key": "sk-xxx",
-    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "model": "text-embedding-v2"
+    "provider": "openai",
+    "api_key": "***",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "model": "bge-m3"
   },
 
-  // LLM channel (consolidator + v2 pipeline) — empty/unconfigured = no LLM, v1 fallback
+  // LLM channel (v2 two-phase pipeline + query expansion share this)
+  // — unconfigured = no LLM = v1 rule-gate fallback, never a silent paid provider
   // base_url: chat completions endpoint root (no trailing /v1 for zhipu etc.)
   // model: e.g. glm-4-flash (REQUIRED — missing = channel invalid, v1 fallback)
   // api_key (testing) OR key_file (prod, supports hot-rotation)
   "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
+
+  // Query expansion (optional, on by default) — background LLM synonyms when BM25 hits < min_results
+  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
 
   // Auto maintenance
   "consolidate_min_group": 2,
@@ -217,10 +224,10 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     entry_type TAG SEPARATOR "," \
     invalid_at TAG SEPARATOR "," \
     entities TAG SEPARATOR "," \
-    embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
+    embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
 ```
 
-> Dimension (DIM) is dynamically adjusted based on the embedding model used, default 1536.
+> The vector DIM must match the registered dimension of your embedding model (see Embedding Models below; `bge-m3`=1024, `nomic-embed-text`=768, `text-embedding-3-small`=1536). `ensure_index()` handles this automatically from the configured embedder. Changing models requires: purge old `embed_bin` + `embed_cache:*` → `FT.DROPINDEX` (without DD, data survives) → recreate with the new DIM.
 > For Docker: `docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
 
 ### 5. Hermes Configuration
@@ -336,6 +343,8 @@ Then reference it in config.json:
 
 ### Embedding Models and Dimensions
 
+Embedding models must be **registered** in `embedder.py:_MODEL_DIMENSIONS` — an unregistered model is rejected with a clear log line and degrades to BM25-only, never a guessed default dimension (this prevents silent index corruption from dim mismatch).
+
 | Model | Dimensions |
 |-------|------------|
 | OpenAI text-embedding-3-small | 1536 |
@@ -343,8 +352,14 @@ Then reference it in config.json:
 | OpenAI text-embedding-ada-002 | 1536 |
 | DashScope text-embedding-v2 | 1536 |
 | DashScope text-embedding-v3 | 1024 |
+| BAAI bge-m3 (local Ollama) | 1024 |
+| BAAI bge-large-zh-v1.5 / bge-large-en-v1.5 | 1024 |
+| BAAI bge-base-zh-v1.5 | 768 |
+| nomic-embed-text (local Ollama) | 768 |
+| mxbai-embed-large (local Ollama) | 1024 |
+| snowflake-arctic-embed (local Ollama) | 1024 |
 
-Dimensions are automatically detected, switching models doesn't require reconfiguration.
+> ⚠️ Switching models requires a dimension change procedure: purge existing `embed_bin` values and `embed_cache:*` keys, then `FT.DROPINDEX` + recreate the index with the new DIM (see Redis Index section). Old vectors are incompatible with a new index DIM and will fail indexing silently otherwise.
 
 ### Synonym Table
 
@@ -357,7 +372,7 @@ redis-cli HSET keepsake:synonyms fix '["fix","modify","correct","repair","solve"
 
 ### Ingest Gate v1 (2026-09)
 
-Write-side gate (`src/keepsake/ingest_gate.py`) intercepts every `sync_turn()` call before storage. Rules short-circuit in order: **R1** `[CONTEXT COMPACTION` prefix → reject; **R2** `len > max_len` (default 2000) → reject; **R3** blacklist / status questions / stripped length < 8 → reject; **R4** no letter/Chinese/digit at all → reject; **R5** `category="memory_tool"` → reject (MEMORY.md ↔ fragment library decoupled); **R6** same content hash already exists for `turn_memory`/`conversation` → `update_state` only (bump `updated_at`/`touch_count`, never overwrite `content`); **R7** else → store (with secrets scrubbed at every `storage.store()` call site — see R7 below). Toggle in `config.json` under `"ingest_gate": {"enabled": true, "max_len": 2000}`. Defaults: enabled.
+Write-side gate (`src/keepsake/ingest_gate.py`) intercepts every `sync_turn()` call before storage. Rules short-circuit in order: **R1** system-injection prefixes (`[CONTEXT COMPACTION`, `[System note`) → reject; **R2** `len > max_len` (default 2000) → reject; **R3** blacklist / status questions / stripped length < 8 → reject; **R4** no letter/Chinese/digit at all → reject; **R5** `category="memory_tool"` → reject (MEMORY.md ↔ fragment library decoupled); **R6** same content hash already exists for `turn_memory`/`conversation` → `update_state` only (bump `updated_at`/`touch_count`, never overwrite `content`); **R7** else → store (with secrets scrubbed at every `storage.store()` call site — see R7 below). Toggle in `config.json` under `"ingest_gate": {"enabled": true, "max_len": 2000}`. Defaults: enabled. When Hermes adds a new kind of system-injected message text, its prefix must be added to `R1 _REJECT_PREFIXES`.
 
 #### R7 — Secret Scrubbing (2026-09, write-side source gate)
 
@@ -388,11 +403,22 @@ Check logs after startup:
 ```
 Memory provider 'keepsake' registered (0 tools)
 keepsake: connected (session=xxx, top_k=5, tag_filter=(none))
-keepsake: BM25-only mode (no embedder configured)
+keepsake: embedder enabled (openai, dim=1024)      # KNN active
+# OR: keepsake: BM25-only mode (no embedder configured)
 keepsake: auto-registered cron job 'memory-maintenance'
 keepsake: auto-registered cron job 'synonym-discovery-daily'
 keepsake: auto-registered cron job '记忆去重'
 ```
+
+## Semantic Search Upgrade (2026-09)
+
+The optional semantic layer was reworked around three principles:
+
+1. **No silent defaults on the embedding side.** Model dimensions must be registered in `_MODEL_DIMENSIONS`; unknown models now fail *visibly* (embedder marked unregistered → `storage._embed_enabled=False` → BM25-only, with an actionable log line). A live index whose DIM differs from the configured embedder disables vector writes instead of accumulating `hash_indexing_failures`. Switching to a new model = purge `embed_bin` + `embed_cache:*`, `FT.DROPINDEX` (no DD), recreate with the new DIM, backfill existing entries (`scripts/backfill_embeddings.py`; note `--limit` defaults to 500 — raise it for full backfills). Self-hosted Ollama works out of the box via the OpenAI-compatible endpoint (e.g. `bge-m3`, 1024-dim).
+2. **LLM channels are config-only.** The `llm` section in `config.json` is the single source of truth for both the v2 write pipeline and query expansion — hard-coded provider fallbacks were removed (missing config = feature off, never a surprise paid call). Changes hot-reload at the next pipeline drain window via mtime detection.
+3. **Write-side data hygiene.** The R1 gate rejects system-injected texts (compaction summaries, gateway-restart notes) before they pollute recall; the hot-topic pipeline drops jieba ASCII fragments (CJK-only gate on the jieba branch) and English function words while deliberately *keeping* technical tokens (`api`, `ssh`, `log`…); `scripts/cleanup_hot_topics.py` scrubs existing pollution (dry-run by default).
+
+Measured effect on the 30-query regression suite (`scripts/eval_spotcheck.py`): BM25-only 67% → BM25 + KNN (bge-m3, RRF fusion) 73%.
 
 ## Project Structure
 

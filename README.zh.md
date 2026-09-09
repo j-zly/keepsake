@@ -22,9 +22,9 @@
 |------|------|
 | 📝 **完整条目存储** | 直接存完整文本，不做语义切分 |
 | 🔍 **BM25 全文搜索** | RediSearch 全文检索，零成本，同义词扩展 |
-| 🧠 **KNN 向量搜索** | 可选 Embedding（OpenAI / DashScope），动态维度适配 |
+| 🧠 **KNN 向量搜索** | 可选 Embedding（OpenAI / DashScope / 本地 Ollama），模型需登记维度（见下文） |
 | ⏳ **时间衰减** | 条目按时间降权，旧记忆权重逐步降低（60天半衰期） |
-| 🔄 **按需存储** | 仅 `memory(action='add')` 时存档，不自动保存对话轮次 |
+| 🔄 **记忆准入** | `memory(action='add')` 显式写入 + 每轮原文过 v1 写闸门（R1-R8）筛除垃圾/系统注入，v2 两相管线再提纯为事实 |
 | 🏷️ **实体提取** | 自动提取人名/地名/项目名/术语存为 entities TAG 字段，搜索时 content 和 entities 双路召回提高命中率 |
 | 🔗 **实体共现** | 自动统计实体共现对，搜索时扩展召回关联实体（搜"Python"同时带出"Django"相关条目） |
 | 📖 **领域词典** | 从语料+同义词表自动生成 jieba 自定义词典，发 `/new` 时自动加载，分词更准 |
@@ -36,14 +36,14 @@
 | 📖 **同义词表** | 存 Redis Hash，实时加载展开搜索，无需部署 |
 | 😡 **情绪烈度** | 检测用户表达激烈程度，烈度高的条目权重更高 |
 | 👁️ **注意力追踪** | 用户反复提起的话题自动标记为高关注，相关条目在搜索中排名上升 |
-| 🧬 **多级合并** | 每 2 小时自动将同主题条目合并提炼为高层记忆，支持 level 1→2→3 多级蒸馏 |
-| 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简 |
+| 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简。（多级合并 Consolidator 已于 2026-09 退役，提纯职能归 v2 两相管线） |
 | ⏰ **定时任务自动注册** | 作为 Hermes 插件使用时，初始化自动注册三条 cron（记忆维护 2h/去重 1h/同义词 8h），零手动配置 |
 | 🔀 **RRF 融合排序（v1.3）** | Reciprocal Rank Fusion 将 BM25 全文 + 语义 KNN 结果融合为单一排序，召回更准 |
-| 💻 **本地语义检索** | 可选 ollama `nomic-embed-text` 嵌入（768 维）完全本地运行，无需外部 Embedding API |
+| 💻 **本地语义检索** | 可选自托管 Ollama 嵌入模型（如 `bge-m3`，1024 维）走 OpenAI 兼容 `/v1/embeddings` 端点，完全本地运行 |
+| 🪄 **LLM 查询扩展（2026-09）** | BM25 命中不足 `min_results` 条时，后台用免费档 chat LLM 悄悄生成 2-8 字同义短词写入 Redis 缓存（24h TTL）。**热路径零延迟增加**；未配置 `llm` 通道时自动停用 |
 | ⏱️ **时间感知召回（v1.5）** | 实体时间线（`keepsake:entity_timeline`）+ 事实版本化——搜索不仅看「说了什么」还看「什么时候发生」 |
 | 🧪 **本地记忆提炼** | `scripts/memory_distill.py` 用本地模型（qwen3:8b）把陈旧条目蒸馏为精简摘要，watermark 增量更新（可开关、ComfyUI 错峰） |
-| 📊 **检索质量抽查集** | `scripts/eval_spotcheck.py` 20 条真实查询回归测试持续追踪检索质量（v1.4：60% → 67%） |
+| 📊 **检索质量抽查集** | `scripts/eval_spotcheck.py` 30 条真实查询回归测试持续追踪检索质量（v1.4 BM25-only：60% → 67%；+向量 KNN 融合 2026-09：73%） |
 | 🧩 **Hermes 插件壳** | 内含 `hermes-plugin/` 目录（plugin.yaml + __init__.py），即拷即用 |
 
 ## 设计哲学：为 LLM 优化的干净记忆
@@ -60,12 +60,12 @@
 | 触类旁通、联想回忆 | 同义词自动发现（Jaccard 共现统计）—— "部署" ↔ "上线" |
 | 实体关联 | 实体共现追踪 —— "BTC"和"减半"无语义重叠但因共现被关联召回 |
 | 实体索引 | 就像人脑给记忆打标签 —— 自动提取实体名，搜索时双路召回 |
-| 按需存储 | 不自动存档，仅 memory 工具写入时才存 |
-| 睡眠时整理记忆 | 每 2h consolidation + 同义发现 |
+| 记忆准入 | 显式 `memory(action='add')` 写入 + 每轮原文过写闸门、由 v2 管线提纯 |
+| 睡眠时整理记忆 | 每 2h 选择性遗忘 + 同义发现；v2 两相管线窗口级提纯（取代原 Consolidator） |
 | 不同场景记忆隔离 | agent_id 标签体系 —— 分身各自记忆不交叉 |
 | 模糊但够用 | BM25 全文搜索 —— 不需要精确匹配就能回想起来 |
 
-没有向量数据库。没有 Embedding API 调用。没有 LLM 参与记忆操作。**纯统计方法**跑在 Redis + RediSearch 上——频率、时效、情绪烈度、关联性、反馈——跟人脑用的是一套东西。
+**默认形态（BM25-only）不需要向量数据库、不需要 Embedding API、不需要 LLM 参与记忆操作**——纯统计方法跑在 Redis + RediSearch 上：频率、时效、情绪烈度、关联性、反馈，跟人脑用的是一套东西。可选层（KNN 语义召回、LLM 写入管线、查询扩展）即插即用且各有显式降级路径——缺配置就是关，绝不悄悄调用付费服务。
 
 ## 依赖
 
@@ -73,7 +73,7 @@
 - **Hermes Agent 0.12+** — 提供 `MemoryProvider` 接口
 - **Redis 7+** — 带 RediSearch 模块（v2.6+）
 - **jieba** — 中文分词（自动安装）
-- **Embedding API**（可选） — OpenAI / DashScope / 任意兼容 `/v1/embeddings` 的服务
+- **Embedding API**（可选） — OpenAI / DashScope / 任意兼容 `/v1/embeddings` 的服务，含自托管 [Ollama](https://ollama.com)（如 `bge-m3`）
 
 ## 安装
 
@@ -141,13 +141,21 @@ pip install git+https://github.com/j-zly/keepsake.git
   "attention_base_increment": 2.0,
   "attention_emotion_factor": 1.5,
   
-  // 嵌入配置（可选）
+  // 嵌入配置（可选）— 模型必须已在 embedder.py 的 _MODEL_DIMENSIONS 登记维度，
+  // 未登记模型 = 显式降级 BM25-only（绝不静默兜底默认维度）。
+  // 例：自托管 Ollama bge-m3（OpenAI 兼容端点，api_key 任意非空值）
   "embedder": {
-    "provider": "dashscope",
-    "api_key": "sk-xxx",
-    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "model": "text-embedding-v2"
+    "provider": "openai",
+    "api_key": "***",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "model": "bge-m3"
   },
+
+  // LLM 通道（v2 两相管线 + 查询扩展共用）— 无配置 = 无 LLM = v1 规则直存降级
+  "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
+
+  // 查询扩展（可选，默认开）— BM25 命中 < min_results 时后台 LLM 生成同义短词入缓存
+  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
   
   // 自动维护配置
   "consolidate_min_group": 2,
@@ -211,10 +219,10 @@ redis-cli FT.CREATE idx:memories ON HASH PREFIX 1 "memory:frag:" SCHEMA \
     entry_type TAG SEPARATOR "," \
     invalid_at TAG SEPARATOR "," \
     entities TAG SEPARATOR "," \
-    embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
+    embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
 ```
 
-> 维度（DIM）根据实际使用的 Embedding 模型动态调整，默认 1536。
+> 维度（DIM）由 embedder 模型的登记维度决定（见「Embedding 模型与维度」表；`bge-m3`=1024，`nomic-embed-text`=768，`text-embedding-3-small`=1536）。换模型/换维度必须：清旧 `embed_bin` 与 `embed_cache:*` → `FT.DROPINDEX`（不带 DD，数据保留）→ 按新维度重建。
 > 如果用 Docker：`docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest`
 
 ### 5. Hermes 配置
@@ -328,6 +336,8 @@ yeah
 
 ### Embedding 模型与维度
 
+Embedding 模型必须先在 `embedder.py:_MODEL_DIMENSIONS` **登记维度**——未登记的模型会被显式拒绝并降级为 BM25-only（日志给出登记指引），绝不按猜测的默认维度建索引（防止维度错配导致的静默索引损坏）。
+
 | 模型 | 维度 |
 |------|------|
 | OpenAI text-embedding-3-small | 1536 |
@@ -335,8 +345,14 @@ yeah
 | OpenAI text-embedding-ada-002 | 1536 |
 | DashScope text-embedding-v2 | 1536 |
 | DashScope text-embedding-v3 | 1024 |
+| BAAI bge-m3（本地 Ollama） | 1024 |
+| BAAI bge-large-zh-v1.5 / bge-large-en-v1.5 | 1024 |
+| BAAI bge-base-zh-v1.5 | 768 |
+| nomic-embed-text（本地 Ollama） | 768 |
+| mxbai-embed-large（本地 Ollama） | 1024 |
+| snowflake-arctic-embed（本地 Ollama） | 1024 |
 
-维度自动检测，切换模型无需重建配置。
+> ⚠️ 换模型 = 换维度，必须走迁移流程：清空存量 `embed_bin` 与 `embed_cache:*` → `FT.DROPINDEX`（不带 DD，数据保留）→ 按新 DIM 重建。旧向量与新索引维度不兼容，不清理会造成 hash_indexing_failures 静默堆积。
 
 ### 同义词表
 
@@ -354,11 +370,24 @@ redis-cli HSET keepsake:synonyms fix '["修","改","补","修复","解决"]'
 ```
 Memory provider 'keepsake' registered (0 tools)
 keepsake: connected (session=xxx, top_k=5, tag_filter=(none))
-keepsake: BM25-only mode (no embedder configured)
+keepsake: embedder enabled (openai, dim=1024)      # KNN 已通电
+# 或：keepsake: BM25-only mode (no embedder configured)
 keepsake: auto-registered cron job 'memory-maintenance'
 keepsake: auto-registered cron job 'synonym-discovery-daily'
 keepsake: auto-registered cron job '记忆去重'
 ```
+
+> 生效判据核到子功能：看到 `embedder enabled (dim=N)` 才算向量检索在跑；若配置了模型却看到 `dim=1536` 且日志伴随 `not registered in _MODEL_DIMENSIONS`，说明模型未登记、已显式降级 BM25-only（属预期保护行为，去登记表加一行即可启用）。
+
+## 语义检索升级（2026-09）
+
+可选语义层围绕三条原则重做：
+
+1. **Embedding 侧零静默兜底。** 模型维度必须在 `_MODEL_DIMENSIONS` 登记；未登记模型显式失败（embedder 标记不可用 → `storage._embed_enabled=False` → BM25-only，日志给出登记指引）。线上索引 DIM 与 embedder 不符时**拒写向量**并 ERROR 提示重建，而非静默堆积 `hash_indexing_failures`。换模型迁移流程 = 清 `embed_bin`+`embed_cache:*` → `FT.DROPINDEX`（不带 DD）→ 按新 DIM 重建 → 回填存量（`scripts/backfill_embeddings.py`，`--limit` 默认 500，全量记得放大）。自托管 Ollama 走 OpenAI 兼容端点即插即用（如 `bge-m3`，1024 维）。
+2. **LLM 通道纯配置化。** v2 写入管线与查询扩展共用 `config.json` 的 `llm` 节，唯一配置源——硬编码付费模型兜底链已移除（缺配置=功能关闭，绝不产生意外计费调用）；mtime 感知，下一处理窗口热生效免重启。
+3. **写侧数据卫生。** R1 闸门拒收系统注入文本（compaction 摘要、网关重启提示 `[System note`）；热门话题链路 jieba 分支只收含 CJK 的 token（英文碎渣绝迹）+ 英文虚词表过滤，技术词（`api`/`ssh`/`log`…）刻意保留防误杀；存量污染用 `scripts/cleanup_hot_topics.py` 清洗（默认 dry-run）。
+
+实测效果：30 条真实查询回归集（`scripts/eval_spotcheck.py`）BM25-only 67% → BM25+KNN（bge-m3，RRF 融合）73%。
 
 ## 项目结构
 
@@ -418,8 +447,8 @@ keepsake/
                    │
          ┌─────────▼─────────┐
          │   [cron] 每 2h     │  ← 后台 maintenance
-         │   ① 多级合并       │  ← 同主题→LLM提炼→level+1
-         │   ② 选择性遗忘     │  ← 低价值条目清理
+         │   ① 选择性遗忘     │  ← 低价值条目清理
+         │   (Consolidator 已于 2026-09 退役，提纯归 v2 两相管线)
          └───────────────────┘
 ```
 
