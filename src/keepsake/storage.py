@@ -16,7 +16,7 @@ import struct
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import redis
 from redis.commands.search.query import Query
@@ -25,6 +25,14 @@ from .embedder import Embedder
 from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
 from .attention import record_attention, match_attention_boost
+from .query_expansion import (
+    DEFAULT_QEXP_MIN_RESULTS,
+    DEFAULT_QEXP_MAX_TERMS,
+    DEFAULT_QEXP_TTL,
+    lookup_terms_for_search,
+    normalize_query,
+    schedule_background_expansion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +167,12 @@ class RedisStorage:
         entity_cooc_top_n: int = 3,
         entity_cooc_min_count: int = 2,
         v2_min_score: float = 0.05,
+        # 2026-09 ks_retr: LLM 查询扩展（治词汇鸿沟；热路径零拖慢）
+        query_expansion_enabled: bool = True,
+        query_expansion_min_results: int = DEFAULT_QEXP_MIN_RESULTS,
+        query_expansion_max_terms: int = DEFAULT_QEXP_MAX_TERMS,
+        query_expansion_ttl: int = DEFAULT_QEXP_TTL,
+        query_expansion_llm_fn: Optional[Callable[..., Optional[str]]] = None,
     ):
         self._embedder = embedder
         # 加固: embedder 存在时优先用它的真实维度，防止调用方漏传 embed_dim 建错索引
@@ -195,6 +209,12 @@ class RedisStorage:
         self._entity_cooc_min_count = entity_cooc_min_count
         # v2 检索侧：注入相似度地板（按 _sim 归一化值）
         self._v2_min_score = float(v2_min_score)
+        # 2026-09 ks_retr: LLM 查询扩展配置（热路径零延迟；缓存未命中且结果 < min 才起后台）
+        self._qexp_enabled = bool(query_expansion_enabled)
+        self._qexp_min_results = int(query_expansion_min_results)
+        self._qexp_max_terms = int(query_expansion_max_terms)
+        self._qexp_ttl = int(query_expansion_ttl)
+        self._qexp_llm_fn = query_expansion_llm_fn
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -881,8 +901,18 @@ class RedisStorage:
             if not expanded:
                 return []
 
+            # 2026-09 ks_retr: LLM 查询扩展 — 缓存命中则同步并入；未命中走原结果
+            # 热路径零延迟：缓存命中一次 HGET（<1ms）；缓存未命中直接走原结果
+            normalized = normalize_query(query)
+            search_terms, cache_was_hit = lookup_terms_for_search(
+                client,
+                normalized,
+                list(expanded),
+                enabled=self._qexp_enabled,
+            )
+
             # 用 | 连接所有词（OR 语义），每个词单独转义
-            safe_terms = "|".join(_escape_query_term(t) for t in expanded)
+            safe_terms = "|".join(_escape_query_term(t) for t in search_terms)
 
             # 实体共现扩展 — 从查询中提取实体，找关联实体扩充 entities 召回
             query_entities = extract_entities(query)
@@ -1008,7 +1038,38 @@ class RedisStorage:
                     fragments.append(frag)
 
             fragments = self._rerank_with_decay(fragments, score_key="_bm25_score", storage=self)
-            return fragments[: self._final_limit]
+            final_fragments = fragments[: self._final_limit]
+
+            # 2026-09 ks_retr: 召回分数分布记录（为 min_score 调参攒数据）
+            # 设计点：只打 query 长度 + 命中数 + 分数，不打查询原文防隐私
+            try:
+                bm25_scores = [float(f.get("_bm25_score", 0.0)) for f in fragments]
+                hits_count = len(fragments)
+                top_score = max(bm25_scores) if bm25_scores else 0.0
+                top5 = sorted(bm25_scores, reverse=True)[:5]
+                logger.info(
+                    "keepsake recall stats: query_len=%d hits=%d top_score=%.4f scores=%s",
+                    len(query), hits_count, top_score, top5,
+                )
+            except Exception as e:
+                logger.debug("storage: recall stats logging failed: %s", e)
+
+            # 2026-09 ks_retr: 缓存未命中 + 结果 < min → 起后台线程调 glm 扩展
+            # 热路径零成本：后台 daemon=True，失败静默
+            if not cache_was_hit:
+                schedule_background_expansion(
+                    client,
+                    normalized,
+                    query,
+                    enabled=self._qexp_enabled,
+                    fragments_count=len(final_fragments),
+                    min_results=self._qexp_min_results,
+                    llm_call_fn=self._qexp_llm_fn,
+                    max_terms=self._qexp_max_terms,
+                    ttl=self._qexp_ttl,
+                )
+
+            return final_fragments
 
         except Exception as e:
             logger.debug("storage: BM25 search error: %s", e)
@@ -1480,20 +1541,67 @@ class RedisStorage:
             "total_candidates": len(word_freq),
         }
 
-    def discover_synonyms(self) -> Dict[str, Any]:
+    def discover_synonyms(self, rebuild: bool = False) -> Dict[str, Any]:
         """自动发现同义词组。
 
         扫描全库碎片，统计词频和共现关系，生成同义词组并写入 Redis Hash。
 
+        2026-09 ks_retr 降噪（[碎渣]→[干净]）:
+          * 纯 ASCII 词长度 < 3 → 排除（jieba 把长英文切成 in/an/ce 等碎块）
+          * 含 2 字母高频虚词的内置 stopwords 黑名单（eg/us/too/no/of/to/in/...）
+            —— jieba 把 embedding→em/be/dd/in/g 这类拆碎出来的噪音
+          * 中文对至少一方长度≥2 字（单字连词/语气词靠现有 _STOP_WORDS 排除）
+          * 每词条同义表上限 8（防 hub 式泛连；按共现度排序截断）
+          * rebuild=True → 清空现有 hash 后重建（用于洗掉历史累积的碎渣）
+            —— 默认增量（手动添加优先）
+
+        Args:
+            rebuild: True → 先 DEL SYNONYM_HASH_KEY 再建（彻底洗表）
+
         Returns:
             统计信息字典
         """
+        import re as _re_mod
         from .splitter import _STOP_WORDS
         import jieba
 
         client = self._get_client()
         if not client:
-            return {"discovered_groups": 0, "total_terms": 0, "scanned_fragments": 0}
+            return {"discovered_groups": 0, "total_terms": 0, "scanned_fragments": 0,
+                    "rebuild": rebuild}
+
+        # 2026-09 ks_retr：rebuild 模式 → 先清 hash 再建（洗掉累积碎渣）
+        if rebuild:
+            try:
+                client.delete(SYNONYM_HASH_KEY)
+            except Exception as e:
+                logger.warning("storage: rebuild delete synonyms failed: %s", e)
+
+        # 2026-09 ks_retr：内置 denoise stopwords（高频英文虚词 + jieba 碎块）
+        # 与 splitter._STOP_WORDS 不重；这些词即使满足 min_word_freq 也进垃圾候选
+        _DENOISE_STOPWORDS = frozenset({
+            # 2 字母高频虚词（discover_synonyms 抽查实锤：eg->[max,ssh,ter] / us->... / Too->[Two,Observ]）
+            "eg", "us", "ok", "no", "of", "to", "in", "an", "be", "by",
+            "it", "is", "as", "at", "or", "so", "if", "do", "on", "up",
+            "he", "we", "me", "my", "am", "go",
+            # jieba 切英文常见碎块（em/be/dd/ce/...）
+            "em", "be", "dd", "ce", "ng", "st", "th", "nt", "ab", "cd",
+            "ef", "gh", "ij", "kl", "mn", "op", "qr", "uv", "wx", "yz",
+        })
+
+        def _is_pure_ascii_short(w: str) -> bool:
+            """纯 ASCII 词长度 < 3 → 视为碎渣。"""
+            try:
+                return w.isascii() and len(w) < 3
+            except Exception:
+                return False
+
+        def _is_chinese_char(c: str) -> bool:
+            cp = ord(c)
+            return 0x4e00 <= cp <= 0x9fff
+
+        def _has_chinese(w: str) -> bool:
+            return any(_is_chinese_char(c) for c in w)
 
         # 统计词频和共现
         word_freq: Dict[str, int] = {}
@@ -1519,11 +1627,18 @@ class RedisStorage:
                     # 过滤停用词（复用 splitter.py 的 _STOP_WORDS）
                     stop_words = _STOP_WORDS
 
-                    # 过滤长度≥2 且不在停用词中的词
+                    # 过滤：
+                    #   * 长度>=2（中文最低门槛）
+                    #   * 不在 _STOP_WORDS 中（中文语气/虚词 + 英文停用词）
+                    #   * 不在 _DENOISE_STOPWORDS 中（碎渣词）
+                    #   * 不是纯数字
+                    #   * 不是纯 ASCII 短词（<3 字）—— 2026-09 ks_retr 降噪
                     filtered_words = [w for w in words
                                       if len(w) >= 2
                                       and w not in stop_words
-                                      and not w.isdigit()]
+                                      and w not in _DENOISE_STOPWORDS
+                                      and not w.isdigit()
+                                      and not _is_pure_ascii_short(w)]
 
                     if not filtered_words:
                         continue
@@ -1557,13 +1672,29 @@ class RedisStorage:
 
         # 找出同义词组
         discovered_groups = 0
-        new_synonym_map = {}
+        new_synonym_map: Dict[str, set] = {}
+        # 2026-09 ks_retr：每对记录一个「强度」分（用于每词条 8 上限的截断排序）
+        pair_score: Dict[Tuple[str, str], float] = {}
 
         # 对候选集中每一对词
         for word_a in candidates:
             for word_b in candidates:
                 if word_a >= word_b:
                     continue
+
+                # 2026-09 ks_retr 中文对长度门槛：至少一方是中文且长度>=2
+                # （双方非中文 = 纯英文/数字 → 允许；任一方是单字中文 → 拒绝）
+                a_ch = _has_chinese(word_a)
+                b_ch = _has_chinese(word_b)
+                if a_ch or b_ch:
+                    # 任一方是中文：中文方必须长度 >= 2（单字=语气词/连词，靠 _STOP_WORDS 但兜底）
+                    ch_ok = False
+                    for w in (word_a, word_b):
+                        if _has_chinese(w) and len(w) >= 2:
+                            ch_ok = True
+                            break
+                    if not ch_ok:
+                        continue
 
                 # 获取共现次数
                 c = co_occur.get((word_a, word_b), 0)
@@ -1585,12 +1716,32 @@ class RedisStorage:
                     new_synonym_map[word_a].add(word_b)
                     new_synonym_map[word_b].add(word_a)
                     discovered_groups += 1
+                    # 用 Jaccard 作为强度分（更稳健于共现绝对数）
+                    pair_score[(word_a, word_b)] = max(
+                        pair_score.get((word_a, word_b), 0.0), jaccard
+                    )
+
+        # 2026-09 ks_retr：每词条同义表上限 8（防 hub 式泛连）
+        # 按 Jaccard 分降序截断 —— 高分词对保留；hub 式高频泛连被剪掉
+        _MAX_SYNS_PER_WORD = 8
+        capped_synonym_map: Dict[str, set] = {}
+        for word, syns in new_synonym_map.items():
+            if len(syns) <= _MAX_SYNS_PER_WORD:
+                capped_synonym_map[word] = syns
+                continue
+            # 按 Jaccard 分排序
+            def _score(s):
+                a, b = (word, s) if word < s else (s, word)
+                return pair_score.get((a, b), 0.0)
+            top = sorted(syns, key=_score, reverse=True)[:_MAX_SYNS_PER_WORD]
+            capped_synonym_map[word] = set(top)
+        new_synonym_map = capped_synonym_map
 
         # 合并新发现的同义词到现有映射
         existing = client.hgetall(SYNONYM_HASH_KEY)
         merged_synonym_map = {}
 
-        # 加载现有的同义词映射
+        # 加载现有的同义词映射（rebuild=True 时 existing 已空）
         for term_b, val_b in existing.items():
             term = term_b.decode("utf-8").lower().strip()
             if not term:
@@ -1637,5 +1788,6 @@ class RedisStorage:
         return {
             "discovered_groups": discovered_groups,
             "total_terms": len(merged_synonym_map),
-            "scanned_fragments": scanned_fragments
+            "scanned_fragments": scanned_fragments,
+            "rebuild": rebuild,
         }

@@ -141,6 +141,36 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _build_query_expansion_llm_fn(cfg: dict):
+    """构造一个 LLM callable 给 query_expansion 用。
+
+    返回 (messages, model) -> Optional[str]。失败时返回 None（不抛），
+    避免后台线程把 daemon 拖死。
+
+    实现：
+        * 复用 consolidator.resolve_llm_channel_cached（按 mtime 热生效）
+        * 复用 consolidator._call_llm（统一错误处理 / 重试）
+        * 通道 unconfigured 或 key 缺失 → 返回 None
+    """
+    from .consolidator import resolve_llm_channel_cached, _call_llm
+
+    def _call(messages, model):
+        try:
+            ch = resolve_llm_channel_cached(cfg)
+        except Exception as e:
+            logger.debug("keepsake: qexp resolve_llm_channel failed: %s", e)
+            return None
+        if not ch.get("valid"):
+            return None
+        try:
+            return _call_llm(messages, model, channel=ch, max_retries=0)
+        except Exception as e:
+            logger.debug("keepsake: qexp _call_llm raised: %s", e)
+            return None
+
+    return _call
+
+
 class KeepsakeProvider(MemoryProvider):
     """
     Keepsake记忆提供者。
@@ -216,6 +246,16 @@ class KeepsakeProvider(MemoryProvider):
             # 空节/缺字段 = 无有效 LLM 通道 → pipeline 不启动 + 调用方走 v1 兜底
             # （不再硬编码回落付费模型——见 consolidator.resolve_llm_channel）
             "llm": {},
+            # 2026-09 ks_retr：LLM 查询扩展（治词汇鸿沟；热路径零拖慢）
+            # enabled 默认开；缓存未命中且结果 < min_results 才起后台扩展
+            "retrieval": {
+                "query_expansion": {
+                    "enabled": True,
+                    "min_results": 3,
+                    "max_terms": 6,
+                    "cache_ttl": 86400,
+                },
+            },
         }
 
         # 2. JSON 配置文件覆盖
@@ -384,6 +424,22 @@ class KeepsakeProvider(MemoryProvider):
             entity_cooc_min_count=int(cfg.get("entity_cooc_min_count", 2)),
             # v2（2026-09）：检索侧相似度地板，按 _sim 归一化值过滤
             v2_min_score=float(cfg.get("v2_min_score", 0.05)),
+            # 2026-09 ks_retr：LLM 查询扩展配置（热路径零延迟）
+            query_expansion_enabled=bool(
+                cfg.get("retrieval", {}).get("query_expansion", {}).get("enabled", True)
+            ),
+            query_expansion_min_results=int(
+                cfg.get("retrieval", {}).get("query_expansion", {}).get("min_results", 3)
+            ),
+            query_expansion_max_terms=int(
+                cfg.get("retrieval", {}).get("query_expansion", {}).get("max_terms", 6)
+            ),
+            query_expansion_ttl=int(
+                cfg.get("retrieval", {}).get("query_expansion", {}).get("cache_ttl", 86400)
+            ),
+            # 2026-09 ks_retr：把 LLM 通道绑成 query_expansion_llm_fn
+            # （通道未配置/无效 → 传 None → 后台扩展调用静默失败，不影响热路径）
+            query_expansion_llm_fn=_build_query_expansion_llm_fn(cfg),
         )
 
         # 自动创建/验证 index
