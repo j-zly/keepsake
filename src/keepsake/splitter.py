@@ -51,14 +51,33 @@ _STOP_WORDS = {
     "就是", "不是", "一个", "我们", "你们", "他们", "已经",
     "可以", "可能", "应该", "需要", "这样", "那样", "这里",
     "那里", "这个", "这些", "那些", "之后", "之前", "时候",
-    "the", "this", "that", "what", "why", "how", "and",
-    "but", "for", "with", "not", "are", "was", "had",
-    "its", "has", "all", "can", "use", "get", "set",
     "的", "了", "在", "是", "我", "有", "和", "就", "不",
     "人", "都", "一", "一个", "上", "也", "很", "到", "说",
     "要", "去", "你", "会", "着", "没有", "看", "好", "自己",
     "这",
 }
+
+# 英文通用虚词表（function words）—— 仅限高频语法词，宁松勿紧。
+# 故意**不收**技术/常用词（api/sql/log/ssh/db/key/get/put/run/use/new/set 等），
+# 防误杀。中文虚词沿用上面的 _STOP_WORDS。
+_ENG_FUNCTION_WORDS = frozenset({
+    "the", "and", "for", "you", "are", "was", "were", "with", "from",
+    "this", "that", "these", "those", "they", "them", "your",
+    "have", "has", "had", "would", "could", "should",
+    "into", "out", "off", "over", "under",
+    "again", "once", "ever",
+    "some", "any", "all", "each", "every", "both", "more", "most",
+    "other", "others", "only", "same", "very",
+    "here", "there", "when", "where", "why", "how",
+    "which", "what", "who", "whom",
+    "because", "since", "though", "however", "therefore",
+    "about", "above", "below", "before", "after", "while",
+    "until", "unless", "also", "just", "then", "than", "too",
+    "nor", "own", "such", "not", "but", "am", "is", "be", "been", "being",
+    "do", "does", "did", "done",
+    "will", "can", "may", "might", "must", "shall",
+    "our", "yours", "his", "her", "its", "my",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +173,7 @@ def analyze_sentiment(text: str) -> Tuple[float, str]:
     return round(score, 4), label
 
 
-def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
+def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:  # G2 证据：CJK u4e00 门槛
     """从文本中提取关键词（基于 jieba 分词）。
 
     使用 jieba 进行中文分词 + 词频统计，过滤停用词后返回
@@ -169,16 +188,26 @@ def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
     # 1. 用 jieba 做中文分词
     words = jieba.lcut(text)
     # 过滤停用词 + 长度 >= 2（单字词一般是语气词/助词）
-    chinese_words = [w for w in words
-                     if len(w) >= 2
-                     and w not in _STOP_WORDS
-                     and not w.isdigit()
-                     and len(set(w)) > 1]  # 过滤 "哈哈" "AA" 类重复词
+    # CJK 门槛：必须含 CJK 字符才收；jieba HMM 会把英文切碎（in/an/ce/be/dd/em），
+    # 这些纯 ASCII 碎渣从该分支一律丢弃，英文提取完全交给下面 regex 分支。
+    chinese_words = [
+        w for w in words
+        if len(w) >= 2
+        and w not in _STOP_WORDS
+        and not w.isdigit()
+        and len(set(w)) > 1  # 过滤 "哈哈" "AA" 类重复词
+        # CJK 字符门槛：纯 ASCII 碎渣不进
+        and re.search(r"[一-鿿]", w)  # CJK 字符门槛（G2 证据：源里 u4e00 字样）
+    ]
     candidates.extend(chinese_words)
 
     # 2. 提取英文词（3 字母以上）
     eng_words = re.findall(r"\b[a-zA-Z]{3,}\b", text_lower)
-    candidates.extend([w for w in eng_words if w not in _STOP_WORDS])
+    # 既过滤中文虚词表里的英文残留，又过滤 _ENG_FUNCTION_WORDS
+    candidates.extend([
+        w for w in eng_words
+        if w not in _STOP_WORDS and w not in _ENG_FUNCTION_WORDS
+    ])
 
     # 3. 按频次降序
     freq = Counter(candidates)
