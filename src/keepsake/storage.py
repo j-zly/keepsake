@@ -174,10 +174,32 @@ class RedisStorage:
         query_expansion_ttl: int = DEFAULT_QEXP_TTL,
         query_expansion_llm_fn: Optional[Callable[..., Optional[str]]] = None,
     ):
+        # 2026-09 ks_embed_dim：embedding 写开关 — 默认开；以下两种情况自动关：
+        #   1) embedder 未登记（_registered=False；dimension 返回 0 哨兵）
+        #   2) ensure_index 检测到线上索引 DIM 与 embed_dim 不符（= 历史事故保护）
+        # 关掉后 _text_to_blob 不写向量 → 不会产生 hash_indexing_failures
+        self._embed_enabled = True
         self._embedder = embedder
         # 加固: embedder 存在时优先用它的真实维度，防止调用方漏传 embed_dim 建错索引
         if embedder is not None:
-            embed_dim = embedder.dimension
+            # 用 _registered 判定（不要用 `dimension == 0` —— 0 是哨兵但语义上是
+            # 「未登记」，靠 _registered 显式判断最稳）
+            if not getattr(embedder, "_registered", True):
+                # 未知模型 → 禁止写向量；RedisStorage 退化为 BM25-only 存储
+                logger.error(
+                    "storage: embedder %r is unregistered (dimension=0 sentinel). "
+                    "EMBEDDING DISABLED — vector writes will be skipped. "
+                    "Add the model to src/keepsake/embedder.py:_MODEL_DIMENSIONS.",
+                    getattr(embedder, "_model", "<unknown>"),
+                )
+                self._embed_enabled = False
+                # _embed_dim 仅用于索引 schema（实际不写 VECTOR），兜底 1536 防 TypeError
+                embed_dim = embed_dim if embed_dim and embed_dim > 0 else 1536
+            else:
+                embed_dim = embedder.dimension
+        # caller 漏传 embed_dim 且 embedder 也未配置 → 兜底 1536（保持原契约）
+        if not self._embedder and (embed_dim is None or embed_dim < 1):
+            embed_dim = 1536
         self._host = host
         self._port = port
         self._password = password
@@ -252,8 +274,18 @@ class RedisStorage:
             return None
 
     def _has_embedder(self) -> bool:
-        """检查 embedder 是否可用。"""
-        return self._embedder is not None and hasattr(self._embedder, "get_embedding")
+        """检查 embedder 是否可用。
+
+        2026-09 ks_embed_dim：新增 _embed_enabled 闸门 — 三种情况视作不可用：
+          - embedder 自身未配置
+          - embedder.dimension 为 None（未登记模型）
+          - ensure_index 检测到线上索引 DIM 与 embed_dim 不符（避免写错维向量）
+        """
+        return (
+            self._embed_enabled
+            and self._embedder is not None
+            and hasattr(self._embedder, "get_embedding")
+        )
 
     def ensure_index(self) -> bool:
         """初始化时自动创建/验证 RediSearch index。
@@ -291,12 +323,19 @@ class RedisStorage:
                                         existing_dim = int(attr[j + 1])
                                         break
                 if existing_dim is not None and existing_dim != self._embed_dim:
-                    logger.warning(
+                    # 2026-09 ks_embed_dim：不再静默 WARN — 显式拒写向量 + ERROR 提示重建
+                    # 历史坑：旧版只打 WARN 仍继续写 embed_bin → RediSearch 拒收 → 上游
+                    # 累积 hash_indexing_failures，索引与数据漂移无人察觉。
+                    logger.error(
                         "storage: index '%s' has dim=%d but configured dim=%d. "
-                        "Index NOT rebuilt to preserve data. "
-                        "Vector search may produce incorrect results.",
+                        "EMBEDDING DISABLED for this storage instance — vector "
+                        "writes (embed_bin) will be SKIPPED to avoid corrupting "
+                        "the index. To rebuild: drop the index and restart with "
+                        "the new dim (existing fragments will be lost). BM25 "
+                        "search continues to work.",
                         RS_INDEX, existing_dim, self._embed_dim,
                     )
+                    self._embed_enabled = False
             except Exception as e:
                 logger.debug("storage: FT.INFO check failed: %s", e)
 
