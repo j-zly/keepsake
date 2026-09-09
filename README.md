@@ -145,9 +145,10 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
     "model": "text-embedding-v2"
   },
 
-  // LLM channel (consolidator + v2 pipeline) — empty = dashscope fallback
+  // LLM channel (consolidator + v2 pipeline) — empty/unconfigured = no LLM, v1 fallback
   // base_url: chat completions endpoint root (no trailing /v1 for zhipu etc.)
-  // model: e.g. glm-4-flash, qwen-plus. api_key (testing) OR key_file (prod)
+  // model: e.g. glm-4-flash (REQUIRED — missing = channel invalid, v1 fallback)
+  // api_key (testing) OR key_file (prod, supports hot-rotation)
   "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
 
   // Auto maintenance
@@ -415,6 +416,53 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 ## v2 Two-Phase Pipeline (2026-09)
 
 每轮对话走两相 LLM：**提取相**从窗口提炼长期事实（废话/纯确认自然无事实可提而消亡），**更新相**对每条 fact 拿 top-5 相似旧记忆做 ADD / UPDATE / DELETE / NOOP —— UPDATE/DELETE 给旧碎片只打 `superseded_by` 封边不物理删，检索侧统一排除；窗口内 LLM 调用硬顶 `llm_pipeline.max_calls_per_window`（默认 8），任一 LLM/JSON 失败或超预算 → 窗口整体回落 v1 规则闸门直存原文，**绝不静默丢消息**。配置键：`llm_pipeline.{enabled, model, window_pairs, window_seconds, max_calls_per_window, update_top_k, recent_context_size}`、`v2_min_score`。
+
+## LLM 通道（2026-09 ks_noqwen 重写）
+
+**唯一配置源：`config.json` 的 `llm` 节**。无 `llm` 节 / 缺字段 = 该通道无效 = v2 管线不启动 + 调用方按既有 v1 规则闸门直存原文，**绝不悄悄用付费模型**。
+
+### 配置字段（全部必填，缺一即通道无效）
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `base_url` | 是 | chat completions 端点根 URL，rstrip `/`。智谱路径不需 `/v1` |
+| `model` | 是 | 模型名（如 `glm-4-flash`）—— 缺该字段 = 通道无效 |
+| `api_key` | 二选一 | 直填 key（仅测试用） |
+| `key_file` | 二选一 | 文件路径，生产推荐；支持运行时轮换（hot-rotation） |
+
+`api_key` 与 `key_file` 同时配置时，`api_key` 直填优先。
+
+### 无效通道的兜底行为
+
+| 场景 | 行为 |
+|------|------|
+| 无 `llm` 节 | pipeline 不启动；sync_turn 走 v1 decide() 直存 |
+| 缺 `base_url` 或 `model` | 同上 |
+| `key_file` 不存在 / 不可读 | api_key="" 但 base_url/model 保留；valid=False |
+| `config.json` 中途损坏 | 本窗按 unconfigured；不抛穿 daemon |
+| 仅 `OPENAI_API_KEY` env 有值 | 旧调用方兜底（生产禁用；仅 env-only 测试场景） |
+
+### 热生效（hot reload）
+
+`resolve_llm_channel_cached` 按 `(mtime_ns, size)` 缓存解析结果：
+
+- v2 管线每次 `_drain_now` 开头调一次 → **改完 `config.json` 下一处理窗口生效，无需重启网关**
+- `key_file` 内容轮换同理窗口级生效
+- 中途坏 JSON → 本窗 unconfigured，下窗文件被改回自动恢复
+
+### 完整配置示例
+
+```json
+{
+  "llm": {
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-4-flash",
+    "key_file": "/etc/keepsake/zhipu.pass"
+  }
+}
+```
+
+> 不再支持「零配置=硬编码付费模型兜底」（2026-09 移除）。要跑 v2 管线就必须显式给 `llm` 节；缺它就回到纯 v1 规则闸门路径。
 
 ## Consolidator Retirement (2026-09-09)
 

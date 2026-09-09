@@ -59,7 +59,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PIPELINE_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "model": "qwen-plus",         # 默认复用 consolidator 的 DEFAULT_LLM_MODEL
+    # 2026-09 移除硬编码模型兜底 —— 空串表示「由 config.json 的 llm.model 字段提供」；
+    # 若 config.json 也没给，pipeline 启动时检测不到有效 channel → 跳过 daemon 启动，
+    # 调用方按既有「no-LLM 降级」路径（v1 规则闸门直存原文）走。
+    "model": "",
     "window_pairs": 4,
     "window_seconds": 30.0,
     "max_calls_per_window": 8,
@@ -195,6 +198,10 @@ class Pipeline:
         update_top_k: int = DEFAULT_PIPELINE_CONFIG["update_top_k"],
         recent_context_size: int = DEFAULT_PIPELINE_CONFIG["recent_context_size"],
         gate_fallback: Optional[Callable[[str, str], None]] = None,
+        # 2026-09 热生效：可选通道刷新回调。每次 _drain_now 开头调用一次；
+        # 返回新 channel 字典（resolved llm channel），无值时返回 None → 走构造时绑定的 llm_fn。
+        # 单测可 monkeypatch 此回调以验证 mtime 感知 + 中途换 model 生效。
+        channel_refresher: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     ):
         """
         参数:
@@ -207,6 +214,7 @@ class Pipeline:
             update_top_k: 更新相每条 fact 取的相似旧碎片数
             recent_context_size: 提取相注入的会话内环形缓冲大小
             gate_fallback: v1 兜底函数 (text, category) -> None（通常就是 sync_turn 走 decide() 的那段）
+            channel_refresher: 通道刷新回调 → 返回 (channel_dict, llm_fn)；用于热生效
         """
         self._storage = storage
         self._llm_fn = llm_fn
@@ -217,6 +225,8 @@ class Pipeline:
         self._update_top_k = int(update_top_k)
         self._recent_size = int(recent_context_size)
         self._gate_fallback = gate_fallback
+        # 热生效：回调返回 (channel_dict, llm_fn)；None 表示本窗不刷新（保留原 llm_fn）
+        self._channel_refresher = channel_refresher
 
         self._queue: Deque[Turn] = deque()
         self._lock = threading.Lock()
@@ -308,7 +318,14 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _drain_now(self) -> DrainResult:
-        """立即排空一次窗口。无 turn 也返回空结果。"""
+        """立即排空一次窗口。无 turn 也返回空结果。
+
+        2026-09 起：开头调一次 channel_refresher → 拿到新 channel / llm_fn 后用本窗。
+        若回调返回 None → 沿用构造时绑定的 llm_fn（向后兼容）。
+        channel 不存在（unconfigured）→ self._llm_fn 暂置 None → 后续走 llm_unavailable 兜底。
+        """
+        # 1. 热生效：窗口开头刷一次 channel
+        self._refresh_channel()
         with self._lock:
             turns = list(self._queue)
             self._queue.clear()
@@ -317,6 +334,36 @@ class Pipeline:
         if not turns:
             return DrainResult()
         return self._process_window(turns, recent)
+
+    def _refresh_channel(self) -> None:
+        """调 channel_refresher 把最新 channel 绑到本窗 llm_fn。
+
+        回调约定：返回 (channel_dict, llm_fn)；None 表示本窗不刷新（保留原 llm_fn）。
+        channel_dict.valid=False → 视同无 LLM → self._llm_fn = None（v1 兜底）。
+        channel_dict.valid=True → 用回调给的 llm_fn（已 partial 绑定新 channel）。
+        """
+        if self._channel_refresher is None:
+            return
+        try:
+            result = self._channel_refresher()
+        except Exception as e:
+            logger.warning("pipeline: channel_refresher raised: %s — keeping previous llm_fn", e)
+            return
+        if result is None:
+            return  # 本窗不刷新（保留原 llm_fn + channel）
+        channel, llm_fn = result
+        if channel is None:
+            return
+        # channel 解析为 unconfigured → 关掉本窗 LLM 通道（走 v1 兜底）
+        if not channel.get("valid"):
+            logger.debug("pipeline: channel invalid (source=%s) — using v1 fallback", channel.get("source"))
+            self._llm_fn = None
+            return
+        self._llm_fn = llm_fn
+        # model 也跟着刷新（让本窗用新 model 值）
+        new_model = channel.get("model") or self._model
+        if new_model:
+            self._model = new_model
 
     def _process_window(self, turns: List[Turn], recent: List[Tuple[str, str]]) -> DrainResult:
         """处理一个窗口：提取相 → 更新相；任何一步失败整体兜底 v1。"""

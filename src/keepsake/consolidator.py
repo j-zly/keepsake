@@ -10,7 +10,13 @@
 配置参数:
   - min_group_size: 最少多少条碎片才触发合并（默认 3）
   - max_age_hours: 只合并超过此年龄的碎片（给新碎片时间积累，默认 72h）
-  - llm_model: DashScope 模型名（默认 qwen-turbo，便宜够用）
+  - llm_model: LLM 模型名（2026-09 起不再硬编码默认值——须由 config.json 的 llm 节提供）
+
+2026-09 重大变更（任务 ks_noqwen）：
+  * 移除硬编码 base_url / 默认 model 兜底 —— 无 llm 节 = 无 LLM 通道
+    = 「unconfigured」返回，调用方按既有 v1 兜底路径走，绝不悄悄用付费模型
+  * 移除 _get_api_key() 的多 provider env 兜底链 —— 仅保留 OPENAI_API_KEY 通用项
+  * resolve_llm_channel 增加 mtime 感知缓存 → 改 config.json 后下一处理窗口生效
 """
 
 from __future__ import annotations
@@ -23,17 +29,13 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
-# DashScope API 端点
-DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # 默认参数
 DEFAULT_MIN_GROUP_SIZE = 2  # 有重复内容就合
 DEFAULT_MAX_AGE_HOURS = 72
-DEFAULT_LLM_MODEL = "qwen-plus"
 DEFAULT_BATCH_SIZE = 200  # 每次 consolidate 扫描的碎片数
 
 # LLM 超时
@@ -56,38 +58,32 @@ CONSOLIDATE_PROMPT = """你是一位知识提炼专家。以下是一组关于�
 
 
 def _get_api_key() -> str:
-    """获取 DashScope API key。"""
-    key = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-    # fallback: 从 config.yaml 用 yaml 解析，优先取 providers.dashscope.api_key
-    if not key:
-        try:
-            import yaml
-            config_path = os.path.expanduser("~/.hermes/config.yaml")
-            if os.path.isfile(config_path):
-                with open(config_path) as f:
-                    cfg = yaml.safe_load(f)
-                if cfg:
-                    key = (
-                        cfg.get("providers", {}).get("dashscope", {}).get("api_key")
-                        or cfg.get("model", {}).get("api_key")
-                        or ""
-                    )
-                    key = key.strip().strip("'\"")
-        except Exception:
-            pass
-    return key
+    """获取 API key（2026-09 仅保留 OPENAI_API_KEY 通用 env）。
+
+    设计点：
+      * 仅 OPENAI_API_KEY —— 它是 Hermes 通用 OpenAI 兼容 key 的事实标准
+      * 配置唯一源是 config.json 的 llm 节；本函数仅在 env 显式给 key 时才返回非空
+      * key_file 路径由 resolve_llm_channel 直接读取，不由本函数介入
+    """
+    return os.environ.get("OPENAI_API_KEY", "")
 
 
 def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """解析 LLM 通道配置 —— base_url / model / api_key。
 
     优先级（高→低）:
-      1. `cfg["llm"]` 节存在 → 取 base_url / model / api_key（直填优先）或 key_file（读文件）
-      2. 无 `llm` 节或字段缺失 → 缺省回落现有 dashscope 路径（DASHSCOPE_BASE + DEFAULT_LLM_MODEL + _get_api_key）
-      3. key_file 读失败 → 视同无 key，回落 _get_api_key（不抛）
+      1. `cfg["llm"]` 节存在且 base_url/model/api_key（或 key_file）齐全 → 完整通道
+      2. `cfg["llm"]` 节缺失/字段缺失 → 视为无有效 LLM 通道，返回 source="unconfigured"
+      3. key_file 读失败 → api_key="" 但其它字段保留；source 反映读文件失败
+      4. 配置文件中途损坏（非法 JSON） → 本窗按 unconfigured 处理，不抛穿
 
-    返回 dict 字段: base_url, model, api_key, source, key_file。
+    返回 dict 字段: base_url, model, api_key, source, key_file, valid。
     日志安全：logger 只允许出现 key_file 路径 / 端点 host，绝不打印 key 内容。
+
+    热生效（2026-09 起）：
+      * 缓存按 (config_path 的 mtime_ns, size) 命中；变了才重读重解析
+      * 调一次 = O(stat)，无 IO 放大；pipeline 每次 _drain_now 开头调用即可窗口级生效
+      * 缓存清理：invalidate_channel_cache() 给测试 / 强刷场景用
     """
     llm_cfg: Dict[str, Any] = {}
     if cfg and isinstance(cfg, dict):
@@ -95,25 +91,46 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(llm_cfg, dict):
             llm_cfg = {}
 
-    # 0. 缺省回落：dashscope 现状 —— 零配置=原样，行为向后兼容
+    # 0. 缺节 → 无有效 LLM 通道（2026-09 起移除付费模型硬编码兜底）
     if not llm_cfg:
         return {
-            "base_url": DASHSCOPE_BASE,
-            "model": DEFAULT_LLM_MODEL,
-            "api_key": _get_api_key(),
-            "source": "dashscope_legacy",
+            "base_url": "",
+            "model": "",
+            "api_key": "",
+            "source": "unconfigured",
             "key_file": "",
+            "valid": False,
         }
 
-    # 1. base_url —— rstrip("/") 防用户手抖
-    base_url = (llm_cfg.get("base_url") or DASHSCOPE_BASE).rstrip("/")
+    # 1. base_url —— 必填；缺则视为无有效通道
+    base_url_raw = llm_cfg.get("base_url") or ""
+    base_url = base_url_raw.rstrip("/")
+    if not base_url:
+        return {
+            "base_url": "",
+            "model": (llm_cfg.get("model") or "").strip(),
+            "api_key": "",
+            "source": "unconfigured",
+            "key_file": llm_cfg.get("key_file") or "",
+            "valid": False,
+        }
 
-    # 2. model —— 缺省用模块常量，缺省语义保持 qwen-plus
-    model = (llm_cfg.get("model") or DEFAULT_LLM_MODEL).strip()
+    # 2. model —— 缺 model = 该通道无效
+    model = (llm_cfg.get("model") or "").strip()
+    if not model:
+        return {
+            "base_url": base_url,
+            "model": "",
+            "api_key": "",
+            "source": "unconfigured",
+            "key_file": llm_cfg.get("key_file") or "",
+            "valid": False,
+        }
 
-    # 3. api_key：api_key 直填 > key_file 读取 > _get_api_key() 兜底链
+    # 3. api_key：api_key 直填 > key_file 读取 > OPENAI_API_KEY env 兜底
     api_key = (llm_cfg.get("api_key") or "").strip()
     key_file_path = llm_cfg.get("key_file") or ""
+    key_file_failed = False
     if not api_key and key_file_path:
         try:
             with open(key_file_path) as f:
@@ -124,22 +141,21 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 key_file_path, len(api_key),
             )
         except (OSError, IOError) as e:
-            # 读文件失败 → 视同无 key，走原回落链，不抛
+            # 读文件失败 → 视同无 key，不抛
             logger.debug(
-                "resolve_llm_channel: key_file=%s unreadable: %s — fallback",
+                "resolve_llm_channel: key_file=%s unreadable: %s — no key",
                 key_file_path, e,
             )
             api_key = ""
+            key_file_failed = True
     if not api_key:
-        # 最后兜底：原 hermes/env 链（dashscope 等）
+        # 最后兜底：OPENAI_API_KEY env（2026-09 起仅此一项）
         api_key = _get_api_key()
 
     # 4. source 仅用于日志/监控归类（不影响行为）
     source = "configured"
     if "bigmodel.cn" in base_url:
         source = "bigmodel"
-    elif "dashscope" in base_url:
-        source = "dashscope"
     elif "openai.com" in base_url:
         source = "openai"
 
@@ -149,20 +165,125 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "api_key": api_key,
         "source": source,
         "key_file": key_file_path,
+        "valid": bool(api_key) and not key_file_failed,
     }
 
 
-def _call_llm(messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
+# ---------------------------------------------------------------------------
+# 热生效缓存（2026-09）
+# ---------------------------------------------------------------------------
+# 路径 → (mtime_ns, size, cached_dict)
+# 当 config.json 被改写（v2 pipeline 下一处理窗口开始时）→ stat 变了就重读
+_channel_cache: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+
+
+def _config_path() -> str:
+    """KEEPSAKE_CONFIG 环境变量优先，其次默认 ~/.config/keepsake/config.json。"""
+    return os.environ.get("KEEPSAKE_CONFIG") or "~/.config/keepsake/config.json"
+
+
+def _stat_fingerprint(path: str) -> Optional[Tuple[int, int]]:
+    """拿 (mtime_ns, size)；文件不存在/不可读 → None（视同无效）。"""
+    try:
+        st = os.stat(path)
+    except (OSError, FileNotFoundError):
+        return None
+    # st_mtime_ns 在 py3.7+ 可用
+    return (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+
+
+def resolve_llm_channel_cached(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """resolve_llm_channel 的 mtime 缓存版。
+
+    调用约定：pipeline._drain_now 开头调用一次；其它路径保持走
+    resolve_llm_channel 直接解析（行为不变）。
+
+    缓存粒度：按 KEEPSAKE_CONFIG 路径（或默认值）做 (mtime_ns, size) 比对。
+    缓存命中 → 直接返回旧 dict；未命中 → 重读文件 + 重解析 + 写入缓存。
+
+    文件读取失败（OSError / 损坏 JSON） → 不抛，本窗返回 unconfigured。
+    """
+    path = os.path.expanduser(_config_path())
+    fp = _stat_fingerprint(path)
+
+    # 文件不存在 / 不可读 → 视同 unconfigured（不抛穿 daemon）
+    if fp is None:
+        return {
+            "base_url": "",
+            "model": "",
+            "api_key": "",
+            "source": "unconfigured",
+            "key_file": "",
+            "valid": False,
+        }
+
+    cached = _channel_cache.get(path)
+    if cached is not None and cached[0] == fp[0] and cached[1] == fp[1]:
+        return cached[2]
+
+    # 缓存 miss → 重读文件 + 重解析
+    try:
+        with open(path) as f:
+            raw = f.read()
+        on_disk_cfg = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, OSError) as e:
+        # 配置文件中途损坏 → 本窗按 unconfigured → 调用方按既有 v1 兜底走
+        logger.warning(
+            "resolve_llm_channel_cached: config %s unreadable/JSON-broken: %s — window uses unconfigured",
+            path, e,
+        )
+        result: Dict[str, Any] = {
+            "base_url": "",
+            "model": "",
+            "api_key": "",
+            "source": "unconfigured",
+            "key_file": "",
+            "valid": False,
+        }
+        _channel_cache[path] = (fp[0], fp[1], result)
+        return result
+
+    # cfg 参数若显式传入则覆盖磁盘（兼容测试 inline 场景）；默认用磁盘值
+    effective_cfg = cfg if cfg is not None else on_disk_cfg
+    result = resolve_llm_channel(effective_cfg)
+    _channel_cache[path] = (fp[0], fp[1], result)
+    return result
+
+
+def invalidate_channel_cache(path: Optional[str] = None) -> None:
+    """清空缓存（测试 / 强刷场景）。path=None → 清全部。"""
+    global _channel_cache
+    if path is None:
+        _channel_cache = {}
+    else:
+        _channel_cache.pop(path, None)
+
+
+def _call_llm(messages: List[Dict[str, str]], model: str = "",
               *, channel: Optional[Dict[str, Any]] = None,
               max_retries: int = 2) -> Optional[str]:
     """调用 chat API 获取 LLM 回复。带重试。
 
     channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key）；
-             None → 走 dashscope 兜底链（向后兼容）。
-    channel['model'] 优先于入参 model；二者都不存在时用 DEFAULT_LLM_MODEL。
+             None → 仅查 OPENAI_API_KEY env（无任何付费模型硬编码兜底）。
+    channel['model'] 优先于入参 model；二者都缺 → 返回 None（不静默用付费模型）。
     """
     if channel is None:
-        channel = resolve_llm_channel(None)
+        # 旧调用方兜底：仅查 OPENAI_API_KEY
+        # base_url/model 仍要求调用方提供——保留 compat 仅给 env-only 测试场景
+        channel = {
+            "base_url": "",
+            "model": "",
+            "api_key": _get_api_key(),
+            "source": "env_only",
+            "key_file": "",
+            "valid": False,
+        }
+        if not channel["api_key"]:
+            logger.warning(
+                "consolidator: _call_llm called with channel=None and no OPENAI_API_KEY env",
+            )
+            return None
 
     api_key = channel.get("api_key", "")
     if not api_key:
@@ -173,7 +294,15 @@ def _call_llm(messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
         return None
 
     base_url = channel["base_url"]
-    actual_model = channel.get("model") or model or DEFAULT_LLM_MODEL
+    # 2026-09：移除硬编码 model 兜底；channel/model 都缺 → 直接返回 None
+    # （不静默用付费模型）—— 调用方按既有 v1 兜底路径走
+    actual_model = channel.get("model") or model or ""
+    if not actual_model:
+        logger.warning(
+            "consolidator: no model configured (source=%s); refusing to use paid fallback",
+            channel.get("source", "?"),
+        )
+        return None
     url = f"{base_url}/chat/completions"
     payload = json.dumps({
         "model": actual_model,
@@ -222,7 +351,7 @@ class Consolidator:
         storage: Any,  # RedisStorage instance (avoid circular import)
         min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
         max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
-        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_model: str = "",  # 2026-09 移除硬编码模型兜底；须由 channel 解析提供
         batch_size: int = DEFAULT_BATCH_SIZE,
         channel: Optional[Dict[str, Any]] = None,
     ):

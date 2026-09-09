@@ -655,7 +655,8 @@ class TestDefaults:
         assert DEFAULT_PIPELINE_CONFIG["window_pairs"] == 4
         assert DEFAULT_PIPELINE_CONFIG["window_seconds"] == 30.0
         assert DEFAULT_PIPELINE_CONFIG["max_calls_per_window"] == 8
-        assert DEFAULT_PIPELINE_CONFIG["model"] == "qwen-plus"
+        # 2026-09 ks_noqwen：移除硬编码 model 兜底，默认值为空（由 config.json 提供）
+        assert DEFAULT_PIPELINE_CONFIG["model"] == ""
 
     def test_pipeline_does_not_import_redis(self):
         """约束：pipeline.py 内不 import redis（存储操作全走注入的 storage）。"""

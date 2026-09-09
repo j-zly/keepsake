@@ -269,23 +269,32 @@ class TestResolveLLMChannelStillImportable:
     def test_resolve_llm_channel_importable(self):
         """向后兼容：resolve_llm_channel 仍从 keepsake.consolidator 导出。"""
         from keepsake.consolidator import resolve_llm_channel
-        # 行为不变：传 None 仍返回 dashscope 兜底 dict
+        # 2026-09 行为变更：传 None 返回 unconfigured（不再是 dashscope 兜底）
         ch = resolve_llm_channel(None)
         assert "base_url" in ch
         assert "model" in ch
         assert "api_key" in ch
+        assert ch["source"] == "unconfigured"
+        assert ch["valid"] is False
 
     def test_call_llm_importable(self):
         """v2 pipeline 复用的 _call_llm 仍可从 consolidator 模块导入。"""
         from keepsake.consolidator import _call_llm
         assert callable(_call_llm)
 
-    def test_module_constants_intact(self):
-        """模块常量 DASHSCOPE_BASE / DEFAULT_LLM_MODEL 保留（外部测试 + 文档示例引用）。"""
+    def test_dashscope_base_constant_removed(self):
+        """2026-09 ks_noqwen：DASHSCOPE_BASE 常量已被移除（不应再存在硬编码兜底）。"""
         from keepsake import consolidator as cm
-        assert cm.DASHSCOPE_BASE.startswith("https://")
-        assert isinstance(cm.DEFAULT_LLM_MODEL, str)
-        assert len(cm.DEFAULT_LLM_MODEL) > 0
+        assert not hasattr(cm, "DASHSCOPE_BASE"), (
+            "DASHSCOPE_BASE 常量应已被移除（无 dashscope 兜底）"
+        )
+
+    def test_default_llm_model_constant_removed(self):
+        """2026-09 ks_noqwen：DEFAULT_LLM_MODEL 常量已被移除。"""
+        from keepsake import consolidator as cm
+        assert not hasattr(cm, "DEFAULT_LLM_MODEL"), (
+            "DEFAULT_LLM_MODEL 常量应已被移除（无硬编码 model 兜底）"
+        )
 
     def test_resolve_llm_channel_used_by_initialize_pipeline(
         self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,

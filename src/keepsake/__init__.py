@@ -211,7 +211,9 @@ class KeepsakeProvider(MemoryProvider):
             "llm_pipeline": dict(_LLM_PIPELINE_DEFAULTS),
             # v2 检索侧相似度地板（按 _sim 归一化）
             "v2_min_score": 0.05,
-            # LLM 通道配置（2026-09）：base_url/model/key_file/api_key；空节=回落 dashscope
+            # LLM 通道配置（2026-09 ks_noqwen）：base_url/model/key_file/api_key；
+            # 空节/缺字段 = 无有效 LLM 通道 → pipeline 不启动 + 调用方走 v1 兜底
+            # （不再硬编码回落付费模型——见 consolidator.resolve_llm_channel）
             "llm": {},
         }
 
@@ -393,7 +395,7 @@ class KeepsakeProvider(MemoryProvider):
         # 写闸门配置（ingest_gate v1，2026-09）
         self._gate_cfg = cfg.get("ingest_gate", {"enabled": True, "max_len": 2000})
 
-        # 解析 LLM 通道（base_url/model/api_key）—— 零配置回落 dashscope
+        # 解析 LLM 通道（base_url/model/api_key）—— 2026-09 ks_noqwen 起无 llm 节 = unconfigured
         # Consolidator 退役后保留此单独 import：函数仍从 consolidator 模块取，
         # 但不再构造 Consolidator 实例。
         from .consolidator import resolve_llm_channel
@@ -667,31 +669,60 @@ class KeepsakeProvider(MemoryProvider):
             logger.warning("keepsake: _v1_store_after_decide failed: %s", e)
 
     def _init_pipeline(self, llm_pipe_cfg: dict) -> None:
-        """v2（2026-09）：构建 Pipeline 实例并启动 daemon（LLM 不可用则跳过）。"""
+        """v2（2026-09）：构建 Pipeline 实例并启动 daemon（LLM 不可用则跳过）。
+
+        2026-09 ks_noqwen 变更：
+          * 移除硬编码 model 字段兜底；配置无效直接走 v1 fallback
+          * 注入 channel_refresher 给 Pipeline，每次 _drain_now 开头按 mtime 重读
+            config.json → 改完下一处理窗口生效，无需重启网关
+        """
         self._pipeline = None
         if not llm_pipe_cfg.get("enabled", True):
             return
         from .consolidator import _call_llm, resolve_llm_channel
-        # 复用已经解析过的 channel；缺省回落 dashscope（向后兼容）
         llm_channel = resolve_llm_channel(self._config)
-        if not llm_channel.get("api_key"):
-            logger.warning("keepsake: v2 pipeline disabled (no LLM API key); falls back to v1")
+        if not llm_channel.get("valid"):
+            # 缺 base_url/model/api_key 之一 → 无 LLM 通道 → pipeline 不启动
+            logger.warning(
+                "keepsake: v2 pipeline disabled (llm channel unconfigured, source=%s); falls back to v1",
+                llm_channel.get("source", "?"),
+            )
             return
+
         # functools.partial 绑定 channel —— llm_fn 仍为 callable，测试 mock 不受影响
         import functools
         llm_fn = functools.partial(_call_llm, channel=llm_channel)
+
+        # 热生效：每次 _drain_now 开头按 mtime 重读 config.json，重解析 channel，
+        # 用新 channel 跑本窗。channel_refresher 返回 (channel_dict, llm_fn)。
+        from .consolidator import resolve_llm_channel_cached
+
+        def _channel_refresher():
+            # 显式读磁盘 → 走 mtime 缓存路径
+            fresh = resolve_llm_channel_cached()
+            new_llm_fn = functools.partial(_call_llm, channel=fresh)
+            return (fresh, new_llm_fn)
+
+        # model 默认值：config.json llm.model 优先；管道配置项次之；空 → 不预设
+        initial_model = (
+            llm_pipe_cfg.get("model")
+            or llm_channel.get("model")
+            or ""
+        )
+
         self._pipeline = Pipeline(
             storage=self._storage, llm_fn=llm_fn,
-            model=llm_pipe_cfg.get("model") or llm_channel.get("model") or "qwen-plus",
+            model=initial_model,
             window_pairs=int(llm_pipe_cfg.get("window_pairs", 4)),
             window_seconds=float(llm_pipe_cfg.get("window_seconds", 30.0)),
             max_calls_per_window=int(llm_pipe_cfg.get("max_calls_per_window", 8)),
             update_top_k=int(llm_pipe_cfg.get("update_top_k", 5)),
             recent_context_size=int(llm_pipe_cfg.get("recent_context_size", 8)),
             gate_fallback=self._v1_fallback_store,
+            channel_refresher=_channel_refresher,
         )
         self._pipeline.start()
-        logger.info("keepsake: v2 pipeline started")
+        logger.info("keepsake: v2 pipeline started (channel=%s)", llm_channel.get("source", "?"))
 
     def _maybe_maintain(self) -> None:
         """检查是否该执行维护，执行 Forget（Consolidator 已退役）。"""
