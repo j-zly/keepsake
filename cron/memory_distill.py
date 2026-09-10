@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""本地模型自动记忆提炼 — 扫最近会话 → qwen3:8b 提炼 → 写入 Keepsake
+"""自动记忆提炼 — 扫最近会话 → keepsake LLM 通道提炼 → 写入 Keepsake
+
+通道来源：keepsake.consolidator.resolve_llm_channel_cached（读 config.json 的 llm 节，
+mtime 缓存热生效）。通道未配置 (valid=False) → 本轮跳过，不调 LLM、不推 watermark，
+exit 0（cron 不报红）。
 
 用法: python3 memory_distill.py [--hours 2] [--max-chars 4000] [--dry-run]
 """
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
 import urllib.request
-import subprocess
-import os
-import yaml
+from urllib.parse import urlparse
 
-OLLAMA = "http://127.0.0.1:11434"
-MODEL = "qwen3:8b"
+from keepsake.consolidator import resolve_llm_channel_cached
+
 DB = "/root/.hermes/state.db"
 WATERMARK_FILE = "/tmp/memory_distill_watermark"
 CONF_FILE = os.path.expanduser("~/scripts/memory_distill.conf")
-PVE_SSH = ["ssh", "-p", "2224", "-o", "StrictHostKeyChecking=no",
-           "-o", "ConnectTimeout=8", "root@127.0.0.1"]
 
 
 def load_conf():
@@ -29,6 +30,7 @@ def load_conf():
             return json.load(f)
     except Exception:
         return {}
+
 
 DISTILL_PROMPT = """你是记忆提炼助手。从下面的对话中提炼「值得长期记住」的信息，输出 JSON 数组。
 只提炼：用户偏好/习惯、项目事实、环境配置、技术决策、踩坑教训、用户身份信息。
@@ -68,22 +70,43 @@ def get_recent_messages(hours, last_id=0):
     return "\n".join(out), max_id
 
 
-def distill(conversation, max_chars):
-    """调 qwen3:8b 提炼记忆"""
+def build_chat_request(channel, prompt):
+    """构造 OpenAI 兼容 chat completions 请求 (url, body, headers)。纯函数，方便测试。
+
+    channel: resolve_llm_channel_cached() 的返回 dict（必含 base_url/model/api_key）。
+    prompt: user-role 单轮内容。
+    返回: (url, body_bytes, headers_dict)。
+    """
+    url = channel["base_url"].rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": channel["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1024,
+    }).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {channel['api_key']}",
+        "Content-Type": "application/json",
+    }
+    return url, body, headers
+
+
+def distill(conversation, max_chars, channel):
+    """走 keepsake 通道调 LLM 提炼记忆。失败返回 []，永不抛穿 cron。"""
     if len(conversation) > max_chars:
         conversation = conversation[-max_chars:]
     prompt = DISTILL_PROMPT.replace("{conversation}", conversation)
-    body = json.dumps({"model": MODEL, "prompt": prompt, "stream": False,
-                       "options": {"temperature": 0.2, "num_predict": 1024}}).encode()
-    req = urllib.request.Request(OLLAMA + "/api/generate", data=body,
-                                 headers={"Content-Type": "application/json"})
+    url, body, headers = build_chat_request(channel, prompt)
+    host = urlparse(url).netloc  # 仅 host 用于日志，绝不带 key/路径
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        resp = json.loads(urllib.request.urlopen(req, timeout=240).read())
-        text = resp.get("response", "")
+        resp = urllib.request.urlopen(req, timeout=120)
+        data = json.loads(resp.read())
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
     except Exception as e:
-        print(f"ollama 调用失败: {e}")
+        print(f"llm 调用失败 ({host}): {e}")
         return []
-    # 提取 JSON 数组（容错：可能有多余文字）
+    # 提取 JSON 数组（容错：可能有多余文字/code fence）
     start, end = text.find("["), text.rfind("]")
     if start == -1 or end == -1:
         return []
@@ -168,6 +191,12 @@ def main():
     hours = args.hours or conf.get("hours", 2)
     max_chars = args.max_chars or conf.get("max_chars", 4000)
 
+    # 通道解析：未配置 → 本轮跳过，不调 LLM、不推 watermark（cron 报绿）
+    channel = resolve_llm_channel_cached()
+    if not channel.get("valid"):
+        print("llm channel unconfigured — skip (watermark held)")
+        return
+
     last_id = read_watermark()
     conv, max_id = get_recent_messages(hours, last_id)
     if not conv:
@@ -175,19 +204,7 @@ def main():
         return
     print(f"对话长度: {len(conv)} 字符 (watermark {last_id} → {max_id})")
 
-    # 冲突检查: ComfyUI 队列在跑图时跳过 (qwen3:8b 自己常驻5.5GB, 不能用显存阈值判断)
-    try:
-        q = subprocess.run(PVE_SSH + ["curl", "-s", "-m", "8", "http://127.0.0.1:8188/queue"],
-                           capture_output=True, text=True, timeout=15)
-        import json as _json
-        qd = _json.loads(q.stdout or "{}")
-        if qd.get("queue_running") or qd.get("queue_pending"):
-            print("ComfyUI 队列忙, 跳过(可能跑图中)")
-            return
-    except Exception:
-        pass
-
-    items = distill(conv, max_chars)
+    items = distill(conv, max_chars, channel)
     print(f"提炼出 {len(items)} 条记忆")
     if not items:
         return
