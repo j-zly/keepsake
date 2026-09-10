@@ -216,7 +216,45 @@ class TestBuildChatRequest:
         _, body, _ = memory_distill.build_chat_request(fake_channel, "x")
         payload = json.loads(body)
         assert payload["temperature"] == 0.2
-        assert payload["max_tokens"] == 1024
+        # r2: 1024 → 4096，预算不足让思考段吃掉 → 截断 0 条
+        assert payload["max_tokens"] == 4096
+
+    def test_default_body_has_no_thinking_field(self, fake_channel):
+        """默认 body 不含厂商特异字段（保持 OpenAI 兼容通道通用）。"""
+        _, body, _ = memory_distill.build_chat_request(fake_channel, "hi")
+        payload = json.loads(body)
+        # 不应自动塞入 thinking / extra 字段
+        assert "thinking" not in payload
+        # 标准字段都还在
+        assert payload["model"] == fake_channel["model"]
+        assert payload["temperature"] == 0.2
+
+    def test_extra_body_merged_into_body(self, fake_channel):
+        """传 extra_body 时合并进 body（厂商特异字段走配置注入）。"""
+        extra = {"thinking": {"type": "disabled"}, "top_p": 0.9}
+        _, body, _ = memory_distill.build_chat_request(fake_channel, "hi", extra_body=extra)
+        payload = json.loads(body)
+        assert payload["thinking"] == {"type": "disabled"}
+        assert payload["top_p"] == 0.9
+        # 标准字段不被覆盖
+        assert payload["max_tokens"] == 4096
+        assert payload["temperature"] == 0.2
+
+    def test_extra_body_none_does_not_merge(self, fake_channel):
+        """extra_body=None → 不合并任何字段（默认调用方不传也安全）。"""
+        _, body, _ = memory_distill.build_chat_request(fake_channel, "hi", extra_body=None)
+        payload = json.loads(body)
+        assert "thinking" not in payload
+        assert "top_p" not in payload
+
+    def test_extra_body_overrides_defaults(self, fake_channel):
+        """extra_body 字段与默认冲突时以 extra 为准（调用方意图优先）。"""
+        # 注意：max_tokens 在 extra 中覆盖（极端场景）
+        _, body, _ = memory_distill.build_chat_request(
+            fake_channel, "hi", extra_body={"max_tokens": 2048}
+        )
+        payload = json.loads(body)
+        assert payload["max_tokens"] == 2048  # extra 覆盖默认 4096
 
     def test_no_hardcoded_model_in_source(self, fake_channel):
         """防御性：源码扫描 —— build_chat_request 不接受也不允许出现任何旧硬编码模型名。"""
@@ -354,6 +392,122 @@ class TestDistillResponseParsing:
         # DISTILL_PROMPT 模板替换后会保留对话部分（最后 1000 X）
         assert prompt_text.endswith("X" * 1000)
         assert len(prompt_text) < 5000  # 截断生效
+
+    def test_truncated_response_logs_and_returns_empty(
+        self, monkeypatch, fake_channel, capsys
+    ):
+        """r2 截断防御：响应只有 `[` 无 `]` → 打 JSON extract failed 日志 + 返 []。
+
+        真实场景：max_tokens 1024 + 思考段 → JSON 数组被截断 → text.rfind(']')=-1
+        → 不推 watermark，但日志必须记录 finish_reason 便于排查预算/截断。
+        """
+        fake_resp = MagicMock()
+        # 模拟截断：finish_reason=length，content 只有 '[' 开头没 ']' 收尾
+        fake_resp.read = lambda: json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": '[{"content": "用户偏好 Vim 编辑器"}, '},
+                    }
+                ]
+            }
+        ).encode()
+        monkeypatch.setattr(
+            memory_distill.urllib.request,
+            "urlopen",
+            lambda req, **kw: fake_resp,
+        )
+
+        items = memory_distill.distill("对话" * 50, 4000, fake_channel)
+        assert items == []  # 截断 → 0 条
+
+        out = capsys.readouterr().out
+        assert "JSON extract failed" in out
+        assert "finish=length" in out  # finish_reason 透传进日志
+        assert "len=" in out  # len 字段
+        # api_key 仍不出现在日志
+        assert fake_channel["api_key"] not in out
+
+    def test_channel_request_extra_consumed_in_distill(
+        self, monkeypatch, fake_channel
+    ):
+        """channel["request_extra"] 字段被 distill() 消费 → 请求体含之。
+
+        不改 consolidator 也能让厂商特异字段经 config.json llm.request_extra 注入；
+        若 consolidator 后续透传该字段，本链路即生效；当前测试用 mock channel 直接验证。
+        """
+        captured = {}
+
+        def fake_urlopen(req, **kw):
+            captured["body"] = req.data
+            fake_resp = MagicMock()
+            fake_resp.read = lambda: json.dumps(
+                {"choices": [{"message": {"content": "[]"}}]}
+            ).encode()
+            return fake_resp
+
+        monkeypatch.setattr(memory_distill.urllib.request, "urlopen", fake_urlopen)
+
+        # mock channel 含 request_extra（厂商特异参数走该字段注入）
+        ch_with_extra = dict(fake_channel)
+        ch_with_extra["request_extra"] = {"thinking": {"type": "disabled"}}
+        memory_distill.distill("对话" * 50, 4000, ch_with_extra)
+
+        sent = json.loads(captured["body"])
+        assert sent["thinking"] == {"type": "disabled"}
+        # 标准字段不被覆盖
+        assert sent["max_tokens"] == 4096
+
+    def test_channel_without_request_extra_no_thinking_field(
+        self, monkeypatch, fake_channel
+    ):
+        """channel 无 request_extra 字段 → 不注入 thinking（默认 OpenAI 兼容 body）。"""
+        captured = {}
+
+        def fake_urlopen(req, **kw):
+            captured["body"] = req.data
+            fake_resp = MagicMock()
+            fake_resp.read = lambda: json.dumps(
+                {"choices": [{"message": {"content": "[]"}}]}
+            ).encode()
+            return fake_resp
+
+        monkeypatch.setattr(memory_distill.urllib.request, "urlopen", fake_urlopen)
+
+        # fake_channel 本身没 request_extra
+        assert "request_extra" not in fake_channel
+        memory_distill.distill("对话" * 50, 4000, fake_channel)
+
+        sent = json.loads(captured["body"])
+        assert "thinking" not in sent  # 没注入，保持通道通用
+
+    def test_json_load_failure_logs_finish_reason(
+        self, monkeypatch, fake_channel, capsys
+    ):
+        """截断致 json.loads 抛 → 仍打 JSON extract failed 日志（与无 ] 同分支）。"""
+        fake_resp = MagicMock()
+        fake_resp.read = lambda: json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        # 形似有 ] 但 JSON 本身不合法（缺引号）
+                        "message": {"content": '[{"content": unterminated'},
+                    }
+                ]
+            }
+        ).encode()
+        monkeypatch.setattr(
+            memory_distill.urllib.request,
+            "urlopen",
+            lambda req, **kw: fake_resp,
+        )
+        items = memory_distill.distill("对话" * 50, 4000, fake_channel)
+        assert items == []
+        out = capsys.readouterr().out
+        assert "JSON extract failed" in out
+        assert "finish=length" in out
 
 
 # ===========================================================================

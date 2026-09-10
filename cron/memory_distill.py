@@ -70,20 +70,28 @@ def get_recent_messages(hours, last_id=0):
     return "\n".join(out), max_id
 
 
-def build_chat_request(channel, prompt):
+def build_chat_request(channel, prompt, extra_body=None):
     """构造 OpenAI 兼容 chat completions 请求 (url, body, headers)。纯函数，方便测试。
 
     channel: resolve_llm_channel_cached() 的返回 dict（必含 base_url/model/api_key）。
     prompt: user-role 单轮内容。
+    extra_body: 可选 dict，合并进请求 body（厂商特异字段如 thinking 由此注入）。
+                None/空 → 不合并，body 只含 OpenAI 标准字段。通道保持通用，厂商特异
+                参数走配置（由调用方从 channel.get("request_extra") 取）。
     返回: (url, body_bytes, headers_dict)。
     """
     url = channel["base_url"].rstrip("/") + "/chat/completions"
-    body = json.dumps({
+    body_dict = {
         "model": channel["model"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 1024,
-    }).encode("utf-8")
+        # 4096 足够装下 8 条记忆 + JSON 数组包装，留出思考段冗余
+        "max_tokens": 4096,
+    }
+    if extra_body:
+        # extra 覆盖默认（如有冲突；None/空 dict 跳过）
+        body_dict.update(extra_body)
+    body = json.dumps(body_dict).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {channel['api_key']}",
         "Content-Type": "application/json",
@@ -96,12 +104,18 @@ def distill(conversation, max_chars, channel):
     if len(conversation) > max_chars:
         conversation = conversation[-max_chars:]
     prompt = DISTILL_PROMPT.replace("{conversation}", conversation)
-    url, body, headers = build_chat_request(channel, prompt)
+    # 厂商特异字段走配置 llm.request_extra 注入；缺省/未配置 → {} 不合并
+    extra_body = channel.get("request_extra") or {}
+    url, body, headers = build_chat_request(channel, prompt, extra_body)
     host = urlparse(url).netloc  # 仅 host 用于日志，绝不带 key/路径
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    finish_reason = "?"  # 用于截断日志，区分 stop/length/...
     try:
         resp = urllib.request.urlopen(req, timeout=120)
         data = json.loads(resp.read())
+        finish_reason = (
+            (data.get("choices") or [{}])[0].get("finish_reason") or "?"
+        )
         text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
     except Exception as e:
         print(f"llm 调用失败 ({host}): {e}")
@@ -109,6 +123,10 @@ def distill(conversation, max_chars, channel):
     # 提取 JSON 数组（容错：可能有多余文字/code fence）
     start, end = text.find("["), text.rfind("]")
     if start == -1 or end == -1:
+        # 截断防御：不推 watermark 但记录 finish_reason 便于排查预算/截断
+        print(
+            f"distill: JSON extract failed (len={len(text)} finish={finish_reason})"
+        )
         return []
     try:
         items = json.loads(text[start:end + 1])
@@ -124,6 +142,10 @@ def distill(conversation, max_chars, channel):
             out.append(i)
         return out
     except Exception:
+        # json.loads 抛（如截断导致非闭合数组）同样记录 finish_reason
+        print(
+            f"distill: JSON extract failed (len={len(text)} finish={finish_reason})"
+        )
         return []
 
 
