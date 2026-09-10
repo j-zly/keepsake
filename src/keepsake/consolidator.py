@@ -33,6 +33,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_request_extra(llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """从 llm 节解析 request_extra —— 配错类型降级为 {}。
+
+    设计点：
+      * 仅 dict 类型被接受；非 dict（字符串/列表/int 等配错）→ 视为空 dict
+      * 日志含 cfg host 而非 key 值，绝不打 raw payload 内容
+      * 调用方按既有 schema 拿空 dict 不会 KeyError
+    """
+    raw = llm_cfg.get("request_extra") if llm_cfg else None
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    logger.warning(
+        "resolve_llm_channel: llm.request_extra 非 dict 类型（%s）— 视为空 dict",
+        type(raw).__name__,
+    )
+    return {}
+
+
 # 默认参数
 DEFAULT_MIN_GROUP_SIZE = 2  # 有重复内容就合
 DEFAULT_MAX_AGE_HOURS = 72
@@ -77,8 +98,13 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
       3. key_file 读失败 → api_key="" 但其它字段保留；source 反映读文件失败
       4. 配置文件中途损坏（非法 JSON） → 本窗按 unconfigured 处理，不抛穿
 
-    返回 dict 字段: base_url, model, api_key, source, key_file, valid。
+    返回 dict 字段: base_url, model, api_key, source, key_file, valid, request_extra。
     日志安全：logger 只允许出现 key_file 路径 / 端点 host，绝不打印 key 内容。
+
+    request_extra（r3 起新增）:
+      * 取自 llm_cfg["request_extra"]；厂商特异字段（如 thinking 开关）走该 dict 注入
+      * 非 dict 类型 → 视为 {} 并 logger.warning（保持 schema 稳定防 KeyError）
+      * unconfigured 各早退分支也带 request_extra={} —— schema 一致，调用方安全
 
     热生效（2026-09 起）：
       * 缓存按 (config_path 的 mtime_ns, size) 命中；变了才重读重解析
@@ -100,6 +126,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": "",
             "valid": False,
+            "request_extra": _resolve_request_extra(llm_cfg),
         }
 
     # 1. base_url —— 必填；缺则视为无有效通道
@@ -113,6 +140,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": llm_cfg.get("key_file") or "",
             "valid": False,
+            "request_extra": _resolve_request_extra(llm_cfg),
         }
 
     # 2. model —— 缺 model = 该通道无效
@@ -125,6 +153,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": llm_cfg.get("key_file") or "",
             "valid": False,
+            "request_extra": _resolve_request_extra(llm_cfg),
         }
 
     # 3. api_key：api_key 直填 > key_file 读取 > OPENAI_API_KEY env 兜底
@@ -166,6 +195,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "source": source,
         "key_file": key_file_path,
         "valid": bool(api_key) and not key_file_failed,
+        "request_extra": _resolve_request_extra(llm_cfg),
     }
 
 
@@ -264,9 +294,12 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
               max_retries: int = 2) -> Optional[str]:
     """调用 chat API 获取 LLM 回复。带重试。
 
-    channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key）；
+    channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key/request_extra）；
              None → 仅查 OPENAI_API_KEY env（无任何付费模型硬编码兜底）。
     channel['model'] 优先于入参 model；二者都缺 → 返回 None（不静默用付费模型）。
+    channel['request_extra']（r3 起消费）: 非空 dict → 合并进请求 body，厂商特异字段
+        （如 {"thinking": {"type": "disabled"}}）走配置注入；缺/非 dict → 不合并，
+        body 保持 OpenAI 兼容基线。
     """
     if channel is None:
         # 旧调用方兜底：仅查 OPENAI_API_KEY
@@ -304,12 +337,18 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
         )
         return None
     url = f"{base_url}/chat/completions"
-    payload = json.dumps({
+    # r3：构造 body 后合并 channel.request_extra（厂商特异字段走 config 注入，
+    # 与 cron/memory_distill.build_chat_request 语义一致 —— extra 可覆盖默认参数）。
+    body_dict = {
         "model": actual_model,
         "messages": messages,
         "max_tokens": 512,
         "temperature": 0.3,
-    }).encode("utf-8")
+    }
+    request_extra = channel.get("request_extra")
+    if isinstance(request_extra, dict) and request_extra:
+        body_dict.update(request_extra)
+    payload = json.dumps(body_dict).encode("utf-8")
 
     for attempt in range(1 + max_retries):
         if attempt > 0:

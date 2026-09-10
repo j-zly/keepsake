@@ -656,3 +656,339 @@ class TestPipelineChannelRefresherHotReload:
         # llm_fn 不变
         assert p._llm_fn is original_llm
         assert p._model == "glm-4-flash"
+
+
+# ===========================================================================
+# NEW (2026-09 ks_request_extra_r3): request_extra 透传 + _call_llm 消费
+# ===========================================================================
+
+class TestRequestExtraPassThrough:
+    """resolve_llm_channel 在所有 return 路径都携带 request_extra 字段。
+
+    设计点：
+      * 配置有 → 原样回传（厂商特异 dict）
+      * 未配置 → 空 dict（schema 一致防 KeyError）
+      * 配错类型（字符串/列表等） → 空 dict + logger.warning
+      * unconfigured 早退分支同样携带 request_extra={}
+    """
+
+    def test_configured_passes_request_extra_through(self):
+        """config llm.request_extra 原样透传 → resolve 返回 dict 携带之。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4-flash",
+                "api_key": "inline-fake",
+                "request_extra": {"thinking": {"type": "disabled"}},
+            }
+        }
+        ch = resolve_llm_channel(cfg)
+        assert ch["request_extra"] == {"thinking": {"type": "disabled"}}
+        # 标准字段不被覆盖
+        assert ch["model"] == "glm-4-flash"
+        assert ch["api_key"] == "inline-fake"
+        assert ch["valid"] is True
+
+    def test_unconfigured_returns_empty_request_extra(self):
+        """未配 llm.request_extra → {}（不是缺失，是空 dict）。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4-flash",
+                "api_key": "inline-fake",
+                # 故意没 request_extra
+            }
+        }
+        ch = resolve_llm_channel(cfg)
+        assert ch["request_extra"] == {}
+        # 关键 schema 断言：键必须存在（不存在会 KeyError）
+        assert "request_extra" in ch
+
+    def test_empty_cfg_unconfigured_returns_empty_request_extra(self):
+        """空 cfg → unconfigured → request_extra={}（schema 一致）。"""
+        ch = resolve_llm_channel({})
+        assert "request_extra" in ch
+        assert ch["request_extra"] == {}
+
+    def test_none_cfg_unconfigured_returns_empty_request_extra(self):
+        """cfg=None → unconfigured → request_extra={}。"""
+        ch = resolve_llm_channel(None)
+        assert "request_extra" in ch
+        assert ch["request_extra"] == {}
+
+    def test_llm_empty_dict_unconfigured_returns_empty_request_extra(self):
+        """cfg 存在但 llm 节是空 dict → unconfigured → request_extra={}。"""
+        ch = resolve_llm_channel({"llm": {}})
+        assert "request_extra" in ch
+        assert ch["request_extra"] == {}
+
+    def test_missing_base_url_unconfigured_returns_empty_request_extra(self):
+        """有 llm 节但缺 base_url → unconfigured → request_extra={}。"""
+        cfg = {"llm": {"model": "glm-4-flash", "api_key": "k"}}
+        ch = resolve_llm_channel(cfg)
+        assert "request_extra" in ch
+        assert ch["request_extra"] == {}
+
+    def test_missing_model_unconfigured_returns_empty_request_extra(self):
+        """有 llm 节但缺 model → unconfigured → request_extra={}。"""
+        cfg = {"llm": {"base_url": "https://x", "api_key": "k"}}
+        ch = resolve_llm_channel(cfg)
+        assert "request_extra" in ch
+        assert ch["request_extra"] == {}
+
+    def test_wrong_type_request_extra_falls_back_to_empty_with_warning(self):
+        """配错类型（如字符串 "x"）→ {} 并 logger.warning（schema 安全）。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4-flash",
+                "api_key": "inline-fake",
+                "request_extra": "x",  # ← 配错
+            }
+        }
+        # 不抛穿
+        ch = resolve_llm_channel(cfg)
+        # 视为空 dict（标准字段保留）
+        assert ch["request_extra"] == {}
+        assert ch["model"] == "glm-4-flash"
+        assert ch["valid"] is True
+
+    def test_wrong_type_list_request_extra_falls_back_to_empty(self):
+        """配错类型（list）→ {} —— 任意非 dict 都降级。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4-flash",
+                "api_key": "inline-fake",
+                "request_extra": ["thinking"],  # ← 配错
+            }
+        }
+        ch = resolve_llm_channel(cfg)
+        assert ch["request_extra"] == {}
+
+    def test_warning_does_not_leak_value(self, fake_key_file, caplog):
+        """logger.warning 内容不含 raw payload 值（仅类型名）。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4-flash",
+                "key_file": fake_key_file,
+                "request_extra": "leaky-payload-XYZ",  # 故意含可识别字面
+            }
+        }
+        with caplog.at_level(logging.WARNING, logger="keepsake.consolidator"):
+            resolve_llm_channel(cfg)
+        all_text = "\n".join(rec.getMessage() for rec in caplog.records)
+        # raw payload 字符串不应出现在日志（仅类型名 "str"）
+        assert "leaky-payload-XYZ" not in all_text
+        # 但应记录降级事件
+        assert any("request_extra" in r.getMessage() for r in caplog.records), (
+            "预期有 logger.warning 提及 request_extra 降级"
+        )
+
+    def test_nested_complex_request_extra_preserved(self):
+        """复杂嵌套 dict 原样透传（不做扁平化/重命名）。"""
+        nested = {
+            "thinking": {"type": "disabled"},
+            "top_p": 0.9,
+            "tools": [{"name": "x"}],
+        }
+        cfg = {
+            "llm": {
+                "base_url": "https://x",
+                "model": "m",
+                "api_key": "k",
+                "request_extra": nested,
+            }
+        }
+        ch = resolve_llm_channel(cfg)
+        assert ch["request_extra"] == nested
+
+    def test_explicit_none_request_extra_returns_empty(self):
+        """request_extra 显式为 None → 视为未配置 → {}。"""
+        cfg = {
+            "llm": {
+                "base_url": "https://x",
+                "model": "m",
+                "api_key": "k",
+                "request_extra": None,
+            }
+        }
+        ch = resolve_llm_channel(cfg)
+        assert ch["request_extra"] == {}
+
+
+class TestCallLlmConsumesRequestExtra:
+    """_call_llm 合并 channel.request_extra 进请求 body（与 distill 语义一致）。
+
+    设计点：
+      * channel["request_extra"] 非空 dict → body.update() 之（extra 覆盖默认）
+      * 缺/非 dict/空 dict → 不合并，body 保持 OpenAI 兼容基线
+      * 全 mock urlopen 零网络（任务书红线）
+    """
+
+    def _channel(self, **overrides):
+        """最小假通道 —— base_url 用 127.0.0.1:9 (RFC discard) + fake key。"""
+        ch = {
+            "base_url": "http://127.0.0.1:9/v1",
+            "model": "FAKE-m",
+            "api_key": "FAKE_KEY_DO_NOT_LEAK",
+            "source": "test",
+            "key_file": "",
+            "valid": True,
+        }
+        ch.update(overrides)
+        return ch
+
+    def _capture_urlopen(self, monkeypatch, payload):
+        """把 urlopen 换成返回 payload 的 fake；req.data 暴露给断言。"""
+        captured = {}
+
+        class _FakeResp:
+            def __init__(self, body_bytes):
+                self._body = body_bytes
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, **kw):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.headers)
+            captured["body"] = req.data
+            return _FakeResp(json.dumps(payload).encode())
+
+        monkeypatch.setattr(
+            "keepsake.consolidator.urllib.request.urlopen", fake_urlopen
+        )
+        return captured
+
+    def test_request_extra_merged_into_body(self, monkeypatch):
+        """channel 含 request_extra → body 合并之；标准字段不被覆盖。"""
+        from keepsake.consolidator import _call_llm
+
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        ch = self._channel(request_extra={"thinking": {"type": "disabled"}})
+        _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+
+        sent = json.loads(captured["body"])
+        assert sent["thinking"] == {"type": "disabled"}
+        # 标准字段不被覆盖
+        assert sent["model"] == "FAKE-m"
+        assert sent["max_tokens"] == 512
+        assert sent["temperature"] == 0.3
+        assert sent["messages"] == [{"role": "user", "content": "hi"}]
+
+    def test_request_extra_can_override_default_params(self, monkeypatch):
+        """request_extra 与默认冲突时以 extra 为准（与 build_chat_request 同语义）。"""
+        from keepsake.consolidator import _call_llm
+
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        # 极端场景：max_tokens 被 extra 覆盖
+        ch = self._channel(request_extra={"max_tokens": 2048, "top_p": 0.7})
+        _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+
+        sent = json.loads(captured["body"])
+        assert sent["max_tokens"] == 2048  # extra 覆盖默认 512
+        assert sent["top_p"] == 0.7
+
+    def test_no_request_extra_field_keeps_baseline_body(self, monkeypatch):
+        """channel 无 request_extra 字段 → body 保持 OpenAI 兼容基线（不注入 thinking）。"""
+        from keepsake.consolidator import _call_llm
+
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        ch = self._channel()  # 没 request_extra
+        assert "request_extra" not in ch
+        _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+
+        sent = json.loads(captured["body"])
+        # 关键负向：thinking 不应出现
+        assert "thinking" not in sent
+        # 标准字段全在
+        assert sent["model"] == "FAKE-m"
+        assert sent["max_tokens"] == 512
+        assert sent["temperature"] == 0.3
+        assert "messages" in sent
+
+    def test_empty_request_extra_dict_does_not_merge(self, monkeypatch):
+        """request_extra={}（resolve 默认值）→ 不合并，body 保持基线。"""
+        from keepsake.consolidator import _call_llm
+
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        ch = self._channel(request_extra={})
+        _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+
+        sent = json.loads(captured["body"])
+        # 不应注入 thinking（即使 request_extra 字段存在也是空）
+        assert "thinking" not in sent
+        assert sent["max_tokens"] == 512
+
+    def test_wrong_type_request_extra_does_not_merge(self, monkeypatch):
+        """request_extra 配错类型（字符串）→ 不合并；调用方不抛。"""
+        from keepsake.consolidator import _call_llm
+
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        ch = self._channel(request_extra="bad-type")
+        # 不抛穿
+        result = _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+        assert result == "ok"
+
+        sent = json.loads(captured["body"])
+        # 错误类型不合并 → body 不含 raw payload 内容
+        assert "bad-type" not in json.dumps(sent)
+        assert sent["max_tokens"] == 512
+
+    def test_request_extra_does_not_leak_into_logs(self, monkeypatch, caplog):
+        """request_extra 合并后的请求体不进日志；api_key 仍不打。"""
+        from keepsake.consolidator import _call_llm
+
+        # 路径 A：成功响应（caplog 应为空；body 不应被记）
+        captured = self._capture_urlopen(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        ch = self._channel(
+            request_extra={"thinking": {"type": "disabled"}},
+            api_key="FAKE_KEY_DO_NOT_LEAK_42",
+        )
+        with caplog.at_level(logging.DEBUG):
+            result = _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+        assert result == "ok"
+        all_text = "\n".join(rec.getMessage() for rec in caplog.records)
+        # body 字段不应出现在日志
+        assert "thinking" not in all_text
+        assert "disabled" not in all_text
+        # api_key 仍不打
+        assert "FAKE_KEY_DO_NOT_LEAK_42" not in all_text
+
+        # 路径 B：urlopen 抛错 → 错误日志绝不打 api_key/request_extra 字段
+        caplog.clear()
+        from urllib.error import URLError
+
+        def boom(req, **kw):
+            raise URLError("connection refused")
+
+        monkeypatch.setattr(
+            "keepsake.consolidator.urllib.request.urlopen", boom
+        )
+        with caplog.at_level(logging.DEBUG):
+            _call_llm([{"role": "user", "content": "hi"}], channel=ch)
+        err_text = "\n".join(rec.getMessage() for rec in caplog.records)
+        # api_key / request_extra 字段值仍不出现在错误日志
+        assert "FAKE_KEY_DO_NOT_LEAK_42" not in err_text
+        assert "thinking" not in err_text
+        assert "disabled" not in err_text
