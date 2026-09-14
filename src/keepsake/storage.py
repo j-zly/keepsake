@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 import redis
 from redis.commands.search.query import Query
 
-from .embedder import Embedder
+from .embedder import Embedder, create_embedder
 from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
 from .attention import record_attention, match_attention_boost
@@ -106,6 +106,56 @@ def _hot_topic_snapshot(client, limit: int):
     return raw[:limit], last_seen
 
 SYNONYM_HASH_KEY = "keepsake:synonyms"
+
+# 一次性告警状态（避免无 embedder 时每次写入都刷日志）
+_WARN_STATE: Dict[str, bool] = {"no_embedder": False}
+
+DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.json")
+
+
+def storage_from_config(config_path: Optional[str] = None) -> "RedisStorage":
+    """按 config.json 构造 RedisStorage（**含 embedder**）——cron/脚本统一入口。
+
+    2026-09-15 实锤：`cron/memory_distill.py`（线上 /root/scripts/ 同款）与
+    `scripts/memory_distill.py` 各自手搓 `RedisStorage(host=..., port=..., password=...)`
+    **漏传 embedder** ⇒ 每小时提炼写入的记忆没有 embed_bin（库内 439/3057 无向量，
+    且全部是提炼产物）。统一走本函数，避免「东补西补」式的重复接线。
+    """
+    path = Path(config_path or DEFAULT_KEEPSAKE_CONFIG)
+    cfg: Dict[str, Any] = {}
+    try:
+        cfg = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("storage: 读配置失败 %s: %s", path, e)
+
+    embedder: Optional[Embedder] = None
+    emb_cfg = dict(cfg.get("embedder") or {})
+    if emb_cfg.get("model"):
+        try:
+            embedder = create_embedder(
+                provider=emb_cfg.get("provider", "openai"),
+                api_key=emb_cfg.get("api_key", ""),
+                base_url=emb_cfg.get("base_url", ""),
+                model=emb_cfg.get("model", ""),
+            )
+        except Exception as e:
+            logger.warning("storage: embedder 构造失败（本次写入将无向量）: %s", e)
+            embedder = None
+    if embedder is None:
+        logger.warning("storage: %s 无可用 embedder 段 → 写入的记忆不会有向量", path)
+
+    return RedisStorage(
+        host=cfg.get("redis_host", "127.0.0.1"),
+        port=int(cfg.get("redis_port", 6379)),
+        password=cfg.get("redis_password") or None,
+        embedder=embedder,
+        embed_dim=embedder.dimension if embedder is not None else 1536,
+        agent_id=cfg.get("agent_id", ""),
+        is_primary=bool(cfg.get("is_primary", False)),
+        final_limit=int(cfg.get("top_k", 15)),
+        bm25_limit=int(cfg.get("bm25_limit", 20)),
+        candidate_count=int(cfg.get("candidate_k", 20)),
+    )
 
 # ---- 2026-09-14 延迟修复：同义词表四级缓存 ----
 # 背景：provider 每个会话都会 new 一个 RedisStorage（见 __init__.py 的 initialize），
@@ -739,6 +789,14 @@ class RedisStorage:
                 blob = self._text_to_blob(text)
                 if blob:
                     mapping["embed_bin"] = blob
+            elif not _WARN_STATE["no_embedder"]:
+                # 2026-09-15：无 embedder 时静默写库 ⇒ 该条记忆永远进不了 KNN 路。
+                # 实测库内 439/3057 无向量，全部来自漏传 embedder 的提炼脚本。
+                _WARN_STATE["no_embedder"] = True
+                logger.warning(
+                    "storage: 本实例没有 embedder，写入的记忆不含 embed_bin（KNN 搜不到）。"
+                    "cron/脚本请改用 keepsake.storage.storage_from_config() 构造。"
+                )
 
             # HSET（去重：同 hash 会覆盖已有字段）
             client.hset(key, mapping=mapping)

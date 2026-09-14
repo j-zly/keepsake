@@ -50,15 +50,21 @@ def main():
     print(f"embedder: {stor._embedder.__class__.__name__} dim={stor._embedder.dimension}")
 
     # 遍历所有碎片，找缺 embed_bin 的
+    # 2026-09-15：改用 pipeline 批量 HEXISTS —— 逐 key 往返在公网 Redis 上是 N+1
+    #（3057 次 × ~170ms ≈ 8.7 分钟），批处理后降到秒级。
     cursor = 0
     missing = []
     total = 0
     while True:
         cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=200)
-        for k in keys:
-            total += 1
-            if client.hexists(k, "embed_bin") == 0:
-                missing.append(k)
+        if keys:
+            total += len(keys)
+            pipe = client.pipeline()
+            for k in keys:
+                pipe.hexists(k, "embed_bin")
+            for k, exists in zip(keys, pipe.execute()):
+                if not exists:
+                    missing.append(k)
         if cursor == 0:
             break
 
@@ -68,6 +74,7 @@ def main():
         return
 
     done, fail = 0, 0
+    pending = []
     for k in missing[: args.limit]:
         content = client.hget(k, "content")
         if not content:
@@ -76,13 +83,26 @@ def main():
             content = content.decode("utf-8")
         blob = stor._text_to_blob(content)
         if blob:
-            client.hset(k, "embed_bin", blob)
-            done += 1
+            pending.append((k, blob))
         else:
             fail += 1
-        if (done + fail) % 50 == 0:
+        # 批量写回（每 20 条一个 pipeline，减少公网往返）
+        if len(pending) >= 20:
+            pipe = client.pipeline()
+            for kk, bb in pending:
+                pipe.hset(kk, "embed_bin", bb)
+            pipe.execute()
+            done += len(pending)
+            pending = []
             print(f"进度: {done + fail}/{min(len(missing), args.limit)}")
-        time.sleep(0.05)  # 避免打爆 ollama
+        time.sleep(0.02)  # 避免打爆 ollama
+    if pending:
+        pipe = client.pipeline()
+        for kk, bb in pending:
+            pipe.hset(kk, "embed_bin", bb)
+        pipe.execute()
+        done += len(pending)
+        pending = []
 
     print(f"完成: 回填 {done} 条, 失败 {fail} 条")
 

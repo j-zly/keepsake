@@ -180,8 +180,10 @@ def store_to_keepsake(items, dry_run):
     sys.path.insert(0, "/opt/fragmented-memory/src")
     from keepsake.storage import RedisStorage
     pwd, r_host, r_port = get_redis_password()
-    stor = RedisStorage(host=r_host, port=r_port,
-                        password=pwd or None)
+    # 2026-09-15：统一走 storage_from_config() —— 原实现漏传 embedder，
+    # 导致每小时提炼写入的记忆没有 embed_bin（KNN 永远搜不到它）。
+    from keepsake.storage import storage_from_config
+    stor = storage_from_config()
     saved = 0
     for it in items:
         cat = it.get("category", "fact")
