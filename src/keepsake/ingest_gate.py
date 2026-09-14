@@ -79,9 +79,20 @@ class IngestDecision:
 # R1 拒收前缀表（case-sensitive, lstrip 后 startswith）：
 #   - [CONTEXT COMPACTION   : 压缩摘要（9/8 事故源头）
 #   - [System note          : 网关重启/中断等系统注入提示（9/10 实锤漏网）
+#   - [IMPORTANT: Background process : 后台进程完成通知（2026-09-14 实锤漏网：存量噪音里
+#                                      8 件是它，已清；机器文本按前缀单独圈，别扩大成
+#                                      "[IMPORTANT" 全前缀）
+#   - [The user sent an image but I couldn't quite see it : 视觉失败模板句（零信息量）。
+#                                      注意：含真实描述的 "[The user sent an image~ Here's
+#                                      what I can see" 是人话，故意不放行
 # ---------------------------------------------------------------------------
 
-_REJECT_PREFIXES = ("[CONTEXT COMPACTION", "[System note")
+_REJECT_PREFIXES = (
+    "[CONTEXT COMPACTION",
+    "[System note",
+    "[IMPORTANT: Background process",
+    "[The user sent an image but I couldn't quite see it",
+)
 
 # ---------------------------------------------------------------------------
 # R3 黑名单 + 状态问句正则（固定写全，禁止自作主张扩）

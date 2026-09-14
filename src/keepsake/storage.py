@@ -13,6 +13,7 @@ import json as _json
 import logging
 import os
 import struct
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,7 +73,50 @@ HOT_TOPIC_WEEKLY = "keepsake:hot_topics:weekly"  # 周榜
 HOT_TOPIC_LAST_SEEN = "keepsake:hot_topics:last_seen"  # 最后提及时间
 HOT_TOPIC_DECAY_HALF_DAYS = 30  # 热门话题时间衰减半衰期（天）
 
+# ---- 2026-09-14 延迟修复：热门话题榜单进程级 TTL 缓存 ----
+# 背景：rerank 对**每条候选**都调 match_hot_topics，而它取的是「全局榜单」
+# （与候选内容无关）⇒ 单次检索 99 次 Redis 往返 × ~170 ms ≈ 16.8 s（cProfile 实证）。
+# 榜单是滚动聚合，秒级陈旧无影响，故缓存 60 s。
+_HOT_SNAPSHOT_TTL = 60.0
+_HOT_SNAPSHOT: Dict[str, Any] = {"raw": None, "last_seen": None, "limit": 0, "ts": 0.0}
+_HOT_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _hot_topic_snapshot(client, limit: int):
+    """取热门话题 top-N 与 last_seen（60 秒进程级缓存，避免逐候选重复拉取）。"""
+    now = time.time()
+    snap = _HOT_SNAPSHOT
+    if (snap["raw"] is not None
+            and (now - float(snap["ts"] or 0.0)) < _HOT_SNAPSHOT_TTL
+            and int(snap["limit"] or 0) >= int(limit)):
+        return snap["raw"][:limit], (snap["last_seen"] or {})
+
+    fetch_n = max(int(limit), 50)
+    raw = client.zrevrange(HOT_TOPIC_SET, 0, fetch_n - 1, withscores=True)
+    last_seen: Dict[str, float] = {}
+    for k_b, v_b in (client.hgetall(HOT_TOPIC_LAST_SEEN) or {}).items():
+        k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
+        v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
+        try:
+            last_seen[k] = float(v)
+        except (ValueError, TypeError):
+            pass
+    with _HOT_SNAPSHOT_LOCK:
+        _HOT_SNAPSHOT.update({"raw": raw, "last_seen": last_seen, "limit": fetch_n, "ts": now})
+    return raw[:limit], last_seen
+
 SYNONYM_HASH_KEY = "keepsake:synonyms"
+
+# ---- 2026-09-14 延迟修复：同义词表四级缓存 ----
+# 背景：provider 每个会话都会 new 一个 RedisStorage（见 __init__.py 的 initialize），
+# 原实现只有实例级缓存 ⇒ 每个会话的首次召回都要重拉全表 HGETALL
+# （实测 4–15 s；1662 条约 100 KB 打公网 Redis，小包 PING 仅 22 ms）。
+# 现改为：实例缓存 → 模块级 TTL 缓存 → 本地文件 TTL 缓存 → Redis。
+# 只有本地文件也过期时才真正打 Redis；Redis 不可用时回退本地文件。
+_SYN_TTL_SECONDS = 3600.0
+_SYN_CACHE_FILE = str(Path.home() / ".hermes" / "cache" / "keepsake_synonyms.json")
+_SYN_CACHE: Dict[str, Any] = {"map": None, "ts": 0.0}
+_SYN_CACHE_LOCK = threading.Lock()
 
 # 实体共现关联
 ENTITY_COOC_KEY = "keepsake:entity_cooc"
@@ -83,10 +127,44 @@ _QUERY_SPECIAL_CHARS = frozenset('@|()!*%~"\\/')
 
 
 def _escape_query_term(term: str) -> str:
-    """转义 RediSearch 查询语法中的特殊字符。"""
-    for ch in _QUERY_SPECIAL_CHARS:
-        term = term.replace(ch, f"\\{ch}")
-    return term
+    """转义 RediSearch 查询语法中的特殊字符。
+
+    2026-09-14: 改为「白名单式」转义 —— 除字母/数字/下划线/汉字外**全部**加反斜杠。
+    为什么：旧实现只转义 '@|()!*%~"\\\\/'，漏掉连字符 —— `agent-worker` 会被 RediSearch
+    解析成 `agent` MINUS `worker`（`-` 是否定算符）→ Syntax error → 整条查询被拒 →
+    静默 0 召回。同批漏网的还有 {}[]:;.,+=$^#&?' 等（例如查询式里出现 `--`/`&&`）。
+    白名单式可以从根上不再逐个漏。
+    """
+    out = []
+    for ch in term:
+        if ch.isalnum() or ch == "_":
+            out.append(ch)
+        else:
+            out.append("\\" + ch)
+    return "".join(out)
+
+
+def _tag_safe(term: str) -> str:
+    """TAG 字段（@tags / @entities 的 `{...}`）专用清理：先剔除结构性字符，再转义特殊字符。
+
+    2026-09-14 实测（本机 RediSearch 版本）：
+      `@tags:{agent-worker}`   → Syntax error near agent（裸 `-` 被当否定算符）
+      `@tags:{agentworker}`    → 合法但 total=0（值被改坏，匹配不到）
+      `@tags:{agent\\-worker}`  → 合法且 total=2 ✓
+    `{}|,` 属结构字符，无法转义只能剔除；其余（- : . 等）按 @content 同规则转义。
+    """
+    for ch in ('\\', '{', '}', '|', ',', '"', "'"):
+        term = term.replace(ch, '')
+    term = term.strip()
+    if not term:
+        return ''
+    out = []
+    for ch in term:
+        if ch.isalnum() or ch == '_':
+            out.append(ch)
+        else:
+            out.append('\\' + ch)
+    return ''.join(out)
 
 
 def _escape_glob(term: str) -> str:
@@ -94,6 +172,37 @@ def _escape_glob(term: str) -> str:
     for ch in ('*', '?', '[', ']', '\\'):
         term = term.replace(ch, f"\\{ch}")
     return term
+
+
+def _sanitize_terms(terms: List[str], limit: int = 40) -> List[str]:
+    """清理查询词，专治「扩展把查询式拼坏」这一类静默空召回。
+
+    为什么需要（2026-09-14 定位）：同义词/共现/LLM 扩展会把「通过 验证」这类带空格的
+    短语、`--` / `&&` 这类纯符号、`ge` / `br` 这类 jieba 英文碎渣一并拼进
+    RediSearch 查询式 → RediSearch 报 Syntax error → 查询被拒 → search_bm25
+    返回空列表（异常还被 logger.debug 吞掉）。症状=整类查询召回为 0 而看不出原因。
+
+    规则：按空白拆开（短语拆成词）→ 丢纯符号 → 丢小写英文短碎渣 → 去重 → 限数。
+    """
+    out: List[str] = []
+    seen = set()
+    for t in terms or []:
+        for piece in str(t).split():
+            piece = piece.strip()
+            if not piece or piece in seen:
+                continue
+            # 至少含一个字母/数字/汉字，否则是纯符号（--、&&、###）
+            if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in piece):
+                continue
+            # 小写英文且 <=2 字符 = jieba 切英文的碎渣（ge/br/an/rm/io…），
+            # 大写短词（IP/PVE）和纯数字（88）保留
+            if len(piece) <= 2 and piece.isascii() and piece.islower():
+                continue
+            seen.add(piece)
+            out.append(piece)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
@@ -392,9 +501,37 @@ class RedisStorage:
         pass
 
     def _load_synonym_map(self) -> Dict[str, set]:
-        """从 Redis Hash keepsake:synonyms 加载同义词表（带实例级缓存）。"""
+        """加载同义词表（四级缓存：实例 → 模块 → 本地文件 → Redis）。
+
+        2026-09-14 延迟修复：原实现只有实例级缓存，而 provider 每个会话都会 new
+        一个 RedisStorage ⇒ 每个会话的首次召回都要重拉全表（实测 4–15 s）。
+        """
         if self._synonym_cache is not None:
             return self._synonym_cache
+        now = time.time()
+
+        # 第二级：模块级 TTL 缓存（同进程跨会话共享）
+        cached = _SYN_CACHE.get("map")
+        if cached is not None and (now - float(_SYN_CACHE.get("ts") or 0.0)) < _SYN_TTL_SECONDS:
+            self._synonym_cache = cached
+            return cached
+
+        # 第三级：本地文件 TTL 缓存（进程冷启动/网关重启后免跨网拉取）
+        try:
+            if (now - os.stat(_SYN_CACHE_FILE).st_mtime) < _SYN_TTL_SECONDS:
+                with open(_SYN_CACHE_FILE, "r", encoding="utf-8") as fh:
+                    data = _json.load(fh)
+                file_map = {k: set(v) for k, v in (data.get("map") or {}).items()}
+                if file_map:
+                    with _SYN_CACHE_LOCK:
+                        _SYN_CACHE["map"], _SYN_CACHE["ts"] = file_map, now
+                    self._synonym_cache = file_map
+                    logger.debug("storage: synonym map from local cache (%d terms)", len(file_map))
+                    return file_map
+        except (OSError, ValueError, AttributeError, TypeError) as e:
+            logger.debug("storage: local synonym cache miss: %s", e)
+
+        # 第四级：Redis
         client = self._get_client()
         if not client:
             return {}
@@ -424,9 +561,21 @@ class RedisStorage:
                             synonym_map[s] = set()
                         synonym_map[s].add(term)
             self._synonym_cache = synonym_map
+            # 回填模块缓存 + 本地文件缓存（下一次冷启动/新会话免跨网拉取）
+            with _SYN_CACHE_LOCK:
+                _SYN_CACHE["map"], _SYN_CACHE["ts"] = synonym_map, time.time()
+            try:
+                os.makedirs(os.path.dirname(_SYN_CACHE_FILE), exist_ok=True)
+                tmp_path = _SYN_CACHE_FILE + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    _json.dump({"ts": time.time(),
+                                "map": {k: sorted(v) for k, v in synonym_map.items()}}, fh)
+                os.replace(tmp_path, _SYN_CACHE_FILE)
+            except (OSError, TypeError, ValueError) as e:
+                logger.debug("storage: write local synonym cache failed: %s", e)
             return synonym_map
         except Exception as e:
-            logger.debug("storage: load synonyms error: %s", e)
+            logger.warning("storage: load synonyms error: %s", e)
             self._synonym_cache = {}
             return {}
 
@@ -801,20 +950,9 @@ class RedisStorage:
         if not client:
             return 0.0
         try:
-            raw = client.zrevrange(HOT_TOPIC_SET, 0, limit - 1, withscores=True)
+            raw, last_seen = _hot_topic_snapshot(client, limit)
             if not raw:
                 return 0.0
-
-            # 读取 last_seen 时间戳
-            last_seen_raw = client.hgetall(HOT_TOPIC_LAST_SEEN) or {}
-            last_seen = {}
-            for k_b, v_b in last_seen_raw.items():
-                k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
-                v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
-                try:
-                    last_seen[k] = float(v)
-                except (ValueError, TypeError):
-                    pass
 
             now = datetime.now(timezone.utc).timestamp()
             decay_half = float(getattr(self, '_hot_topic_decay_half_days', HOT_TOPIC_DECAY_HALF_DAYS))
@@ -951,6 +1089,11 @@ class RedisStorage:
             )
 
             # 用 | 连接所有词（OR 语义），每个词单独转义
+            # 2026-09-14: 必须先 sanitize — 扩展词里可能混入带空格短语/纯符号/英文碎渣，
+            # 直接拼进查询式会被 RediSearch 判语法错 → 整条查询被拒 → 静默空召回
+            search_terms = _sanitize_terms(search_terms)
+            if not search_terms:
+                return []
             safe_terms = "|".join(_escape_query_term(t) for t in search_terms)
 
             # 实体共现扩展 — 从查询中提取实体，找关联实体扩充 entities 召回
@@ -1001,46 +1144,85 @@ class RedisStorage:
             # content 用括号包裹 OR 术语，避免与外部 OR 歧义
             if tag_filter:
                 safe_tags = ",".join(
-                    _escape_query_term(t.strip())
-                    for t in tag_filter.split(",") if t.strip()
+                    t for t in (_tag_safe(x.strip()) for x in tag_filter.split(",")) if t
                 )
                 content_q = f"@tags:{{{safe_tags}}} @content:({safe_terms})"
             else:
                 content_q = f"@content:({safe_terms})"
 
             # entities 字段只搜原始搜索词（不同义词扩展，避免TAG查询长度超限）
-            raw_safe = "|".join(_escape_query_term(t) for t in raw_terms)
+            raw_terms = _sanitize_terms(raw_terms)
+            # @tags/@entities 走 TAG 语义：不能加反斜杠转义（会让整条查询报语法错），
+            # 只做字符剔除
+            raw_safe = "|".join(
+                t for t in (_tag_safe(x) for x in raw_terms) if t
+            )
             entities_q = f"@entities:{{{raw_safe}}}"
             # v1.4: tags 字段也参与检索 — 查询词精确匹配 tag（embedding/lesson 等分类词常在 tags）
             tags_q = f"@tags:{{{raw_safe}}}"
-            query_expr = f"({content_q} | {entities_q} | {tags_q})"
+            # 2026-09-14: 空花括号（@entities:{} / @tags:{}）本身也是语法错，raw_safe 为空时
+            # 必须整段省略，否则查询被拒 → 又一路静默空召回
+            clause_parts = [content_q]
+            if raw_safe:
+                clause_parts += [entities_q, tags_q]
+            body_expr = "(" + " | ".join(clause_parts) + ")"
 
             # 如果不是主脑且指定了 agent_id，则添加 agent 过滤条件
             effective_agent_id = agent_id if agent_id else self._agent_id
             effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
+            filter_clause = ""
             if not effective_is_primary and effective_agent_id:
                 # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
-                agent_filter = f"@tags:{{agent:{effective_agent_id}}}"
+                # 2026-09-14: agent id 可能含 `-`/`:`，TAG 花括号内裸 `-` 会报语法错 → 过 _tag_safe
+                agent_filter = f"@tags:{{agent:{_tag_safe(effective_agent_id)}}}"
                 shared_filter = f"@tags:{{shared}}"
                 # 两者之一即可
-                query_expr = f"({agent_filter} || {shared_filter}) AND {query_expr}"
+                filter_clause = f"({agent_filter} || {shared_filter}) AND "
             elif not effective_is_primary and not effective_agent_id:
                 # 如果没有 agent_id，只搜索 shared 标签
-                query_expr = f"@tags:{{shared}} AND {query_expr}"
+                filter_clause = "@tags:{shared} AND "
+            query_expr = f"{filter_clause}{body_expr}"
 
             q = (
                 Query(query_expr)
                 .paging(0, self._bm25_limit)
                 .dialect(2)
+                # 2026-09 ks_recall 修复：RediSearch 的 BM25 分数必须显式 WITHSCORES 才随结果返回，
+                # 否则 doc.score 取不到 → _bm25_score 恒 0.0 → _sim=0 → 被 v2 相似度地板整批剔除，
+                # 融合结果只剩 KNN 一路（表现为"召回与查询无关"）。KNN 查询无需此参数（KNN 自动带分）。
+                .with_scores()
                 # v2: 加 fragment_type 让消费侧可剔除已 consumed 碎片；__key 让消费侧能批量读 superseded_by
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
                                "invalid_at", "valid_until", "entities",
-                               "fragment_type", "__key")
+                               "fragment_type", "__key", "score")
             )
 
-            result = client.ft(RS_INDEX).search(q)
+            try:
+                result = client.ft(RS_INDEX).search(q)
+            except Exception as e:
+                # 2026-09-14: RediSearch 语法类拒绝不再静默吞掉（曾长期让整类查询 0 召回）。
+                # 退一步：只用原始词重建最小查询（保留 agent/tag 过滤），保证仍有召回。
+                logger.warning(
+                    "storage: BM25 query rejected (%s); retry with raw terms only. expr=%.200s",
+                    e, query_expr,
+                )
+                simple = _sanitize_terms(raw_terms)
+                if not simple:
+                    return []
+                simple_expr = f"{filter_clause}@content:({'|'.join(_escape_query_term(t) for t in simple)})"
+                q = (
+                    Query(simple_expr)
+                    .paging(0, self._bm25_limit)
+                    .dialect(2)
+                    .with_scores()
+                    .return_fields("content", "tags", "category", "source", "created",
+                                   "sentiment_score", "sentiment_label", "feedback_score",
+                                   "invalid_at", "valid_until", "entities",
+                                   "fragment_type", "__key", "score")
+                )
+                result = client.ft(RS_INDEX).search(q)
 
             fragments: List[Dict[str, Any]] = []
             for doc in result.docs:
@@ -1111,7 +1293,8 @@ class RedisStorage:
             return final_fragments
 
         except Exception as e:
-            logger.debug("storage: BM25 search error: %s", e)
+            # 2026-09-14: 从 debug 提到 warning — debug 级让「整类查询静默空召回」长期不可见
+            logger.warning("storage: BM25 search error: %s", e)
             return []
 
     # ------------------------------------------------------------------
@@ -1141,8 +1324,7 @@ class RedisStorage:
             # 构建基础查询表达式
             if tag_filter:
                 safe_tags = ",".join(
-                    _escape_query_term(t.strip())
-                    for t in tag_filter.split(",") if t.strip()
+                    t for t in (_tag_safe(x.strip()) for x in tag_filter.split(",")) if t
                 )
                 query_expr = f"@tags:{{{safe_tags}}}=>[KNN $K @embed_bin $vec AS score]"
             else:
@@ -1168,7 +1350,7 @@ class RedisStorage:
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
                                "invalid_at", "valid_until", "entities",
-                               "fragment_type", "__key")
+                               "fragment_type", "__key", "score")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )

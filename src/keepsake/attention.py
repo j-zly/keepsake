@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import redis
@@ -32,6 +33,26 @@ _ATTENTION_TTL = {
     ATTENTION_DAILY: 86400 * 2,      # 日榜：2天
     ATTENTION_WEEKLY: 86400 * 14,    # 周榜：14天
 }
+
+# ---- 2026-09-14 延迟修复：注意力榜单进程级 TTL 缓存 ----
+# rerank 对**每条候选**都调 match_attention_boost，而它取的是全局榜单
+# （与候选内容无关）⇒ 单次检索数十次 Redis 往返（实测链路 ~170 ms/次）。
+# 榜单是滚动聚合，秒级陈旧无影响，故缓存 60 s。
+_ATTN_SNAPSHOT_TTL = 60.0
+_ATTN_SNAPSHOT: Dict[str, Any] = {"raw": None, "top_n": 0, "ts": 0.0}
+
+
+def _attention_snapshot(client: redis.Redis, top_n: int):
+    """取全局注意力榜单 top-N（60 秒进程级缓存，避免逐候选重复拉取）。"""
+    now = time.time()
+    if (_ATTN_SNAPSHOT["raw"] is not None
+            and (now - float(_ATTN_SNAPSHOT["ts"] or 0.0)) < _ATTN_SNAPSHOT_TTL
+            and int(_ATTN_SNAPSHOT["top_n"] or 0) >= int(top_n)):
+        return _ATTN_SNAPSHOT["raw"][:top_n]
+    fetch_n = max(int(top_n), 50)
+    raw = client.zrevrange(ATTENTION_SET, 0, fetch_n - 1, withscores=True)
+    _ATTN_SNAPSHOT.update({"raw": raw, "top_n": fetch_n, "ts": now})
+    return raw[:top_n]
 
 
 def record_attention(
@@ -116,7 +137,7 @@ def match_attention_boost(
         return 1.0
 
     try:
-        raw = client.zrevrange(ATTENTION_SET, 0, top_n - 1, withscores=True)
+        raw = _attention_snapshot(client, top_n)
         if not raw:
             return 1.0
 
