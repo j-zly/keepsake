@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -287,6 +288,42 @@ def invalidate_channel_cache(path: Optional[str] = None) -> None:
         _channel_cache = {}
     else:
         _channel_cache.pop(path, None)
+
+
+# ---------------------------------------------------------------------------
+# 具体细节保真（2026-09-15）
+# 背景：合并会把具体 token（路径 / IP / 编号 / 日期）蒸发掉——实测库级蒸发率 5.8%，
+# 且被吞掉的原料条目（fragment_type=consumed）不再进入检索结果 ⇒ 细节型查询直接丢候选。
+# 对策：合并产出后比对「原料里有、摘要里没有」的具体 token，附一行「关键细节」，
+# 保证这些信息仍留在可被 BM25 检索到的正文里（不依赖原料条目存活）。
+# ---------------------------------------------------------------------------
+
+_CONCRETE_TOKEN_RE = re.compile(
+    r"(/home/[A-Za-z0-9_./-]+"
+    r"|/opt/[A-Za-z0-9_./-]+"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|\b[A-Z]{2,}-\d+\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b)"
+)
+
+
+def _missing_concrete_tokens(sources: List[str], summary: str, limit: int = 20) -> List[str]:
+    """返回「原料里有、摘要里没有」的具体 token（去重、保序、限量）。"""
+    if not summary:
+        return []
+    found: List[str] = []
+    seen = set()
+    for src in sources:
+        if not src:
+            continue
+        for t in _CONCRETE_TOKEN_RE.findall(src):
+            if t in seen or t in summary:
+                continue
+            seen.add(t)
+            found.append(t)
+            if len(found) >= limit:
+                return found
+    return found
 
 
 def _call_llm(messages: List[Dict[str, str]], model: str = "",
@@ -601,6 +638,17 @@ class Consolidator:
 
         if not result:
             return False
+
+        # 细节保真（2026-09-15）：把摘要里丢掉的具体 token（路径/IP/编号/日期）附回正文，
+        # 否则它们随原料被标 consumed 而彻底不可检索（实测库级蒸发率 5.8%）。
+        try:
+            missing = _missing_concrete_tokens(
+                [f.get("content", "") for f in group], result)
+            if missing:
+                result = result.rstrip() + "\n\n关键细节（合并自原条目）：" + "；".join(missing)
+                logger.info("consolidator: 附回 %d 个具体细节 token（防合并蒸发）", len(missing))
+        except Exception as e:
+            logger.debug("consolidator: 细节保真检查失败: %s", e)
 
         # 分析情绪
         from .splitter import analyze_sentiment

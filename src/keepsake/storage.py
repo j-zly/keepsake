@@ -12,6 +12,7 @@ import hashlib
 import json as _json
 import logging
 import os
+import re as _re
 import struct
 import threading
 import time
@@ -109,6 +110,11 @@ SYNONYM_HASH_KEY = "keepsake:synonyms"
 
 # 一次性告警状态（避免无 embedder 时每次写入都刷日志）
 _WARN_STATE: Dict[str, bool] = {"no_embedder": False}
+
+# 「新版继承旧版名次」按 key 载入的 fragment 缓存（进程级 60s TTL）
+# 这些条目是稳定内容、量小，缓存避免重复往返。
+_FRAG_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
+_FRAG_CACHE_TTL = 60.0
 
 DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.json")
 
@@ -233,25 +239,34 @@ def _sanitize_terms(terms: List[str], limit: int = 40) -> List[str]:
     返回空列表（异常还被 logger.debug 吞掉）。症状=整类查询召回为 0 而看不出原因。
 
     规则：按空白拆开（短语拆成词）→ 丢纯符号 → 丢小写英文短碎渣 → 去重 → 限数。
+    另外（2026-09-15）：含路径/连接符的词（`/home/claude_user/x`、`agent-worker`）也要按
+    `/-_.` 再拆成子词——索引里的内容是按这些符号切开的，整串当一个 token 查必然 0 命中
+    （实测 `'/home/claude_user/trade-platform/'` 查询返回 0 条，而 `claude_user` 能命中）。
     """
     out: List[str] = []
     seen = set()
     for t in terms or []:
         for piece in str(t).split():
             piece = piece.strip()
-            if not piece or piece in seen:
+            if not piece:
                 continue
-            # 至少含一个字母/数字/汉字，否则是纯符号（--、&&、###）
-            if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in piece):
-                continue
-            # 小写英文且 <=2 字符 = jieba 切英文的碎渣（ge/br/an/rm/io…），
-            # 大写短词（IP/PVE）和纯数字（88）保留
-            if len(piece) <= 2 and piece.isascii() and piece.islower():
-                continue
-            seen.add(piece)
-            out.append(piece)
-            if len(out) >= limit:
-                return out
+            # 含路径/连接符：拆成子词（原串不可能与索引 token 对齐）
+            candidates = [p for p in _re.split(r"[/\-_.]+", piece) if p] \
+                if _re.search(r"[/\-_.]", piece) else [piece]
+            for piece in candidates:
+                if not piece or piece in seen:
+                    continue
+                # 至少含一个字母/数字/汉字，否则是纯符号（--、&&、###）
+                if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in piece):
+                    continue
+                # 小写英文且 <=2 字符 = jieba 切英文的碎渣（ge/br/an/rm/io…），
+                # 大写短词（IP/PVE）和纯数字（88）保留
+                if len(piece) <= 2 and piece.isascii() and piece.islower():
+                    continue
+                seen.add(piece)
+                out.append(piece)
+                if len(out) >= limit:
+                    return out
     return out
 
 
@@ -1523,6 +1538,54 @@ class RedisStorage:
 
         return self._apply_v2_filters(bm25_results)
 
+    def _load_fragments_by_keys(self, client, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """按 Redis key 一次性载入多条 fragment（字段与 search_bm25 产出一致）。
+
+        2026-09-15 新增：供「新版继承旧版名次」注入候选外的新版使用。
+        ⚠️ 必须 pipeline 批量取——逐条 hgetall 就是 N+1 往返（实测 0.17s/次，
+        一次查询能白加 1 秒延迟）。
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        if not keys:
+            return out
+        now = time.time()
+        if now - _FRAG_CACHE["ts"] > _FRAG_CACHE_TTL:
+            _FRAG_CACHE["data"].clear()
+            _FRAG_CACHE["ts"] = now
+        miss = [k for k in keys if k not in _FRAG_CACHE["data"]]
+        if not miss:
+            return {k: _FRAG_CACHE["data"][k] for k in keys if k in _FRAG_CACHE["data"]}
+        try:
+            pipe = client.pipeline()
+            for k in miss:
+                pipe.hgetall(k)
+            raws = pipe.execute()
+        except Exception as e:
+            logger.debug("storage: batch load fragments failed: %s", e)
+            return {k: _FRAG_CACHE["data"][k] for k in keys if k in _FRAG_CACHE["data"]}
+        for k, h in zip(miss, raws):
+            if not h:
+                continue
+            frag: Dict[str, Any] = {}
+            for field in ("content", "tags", "category", "source", "created",
+                          "sentiment_score", "sentiment_label", "feedback_score",
+                          "invalid_at", "valid_until", "entities", "fragment_type"):
+                val = h.get(field)
+                if val is None:
+                    val = h.get(field.encode())
+                if val is None or val == "" or val == b"":
+                    continue
+                frag[field] = val.decode("utf-8", "replace") if isinstance(val, bytes) else val
+            if not frag.get("content"):
+                continue
+            frag["_key"] = k
+            out[k] = frag
+            _FRAG_CACHE["data"][k] = frag
+        for k in keys:
+            if k not in out and k in _FRAG_CACHE["data"]:
+                out[k] = _FRAG_CACHE["data"][k]
+        return out
+
     def _apply_v2_filters(
         self,
         fragments: List[Dict[str, Any]],
@@ -1543,6 +1606,8 @@ class RedisStorage:
         if not fragments:
             return fragments
 
+        client = self._get_client()
+
         # 第一道：fragment_type（已有）+ 长度（保持兼容）
         after_type: List[Dict[str, Any]] = []
         for f in fragments:
@@ -1555,7 +1620,6 @@ class RedisStorage:
         superseded_map: Dict[str, str] = {}
         if keys:
             try:
-                client = self._get_client()
                 if client:
                     pipe = client.pipeline()
                     for k in keys:
@@ -1569,6 +1633,54 @@ class RedisStorage:
                             superseded_map[k] = val
             except Exception as e:
                 logger.debug("storage: v2 superseded_by batch read failed: %s", e)
+
+        # 第三道（2026-09-15 新增）：新版继承旧版名次
+        # 背景：旧版被 superseded 剔除时，其"同一知识的新摘要"（superseded_by 指向的条目）
+        # 往往检索名次更靠后甚至没被召回 ⇒ 相关内容凭空消失。
+        # 做法：把旧版的名次分转移给新版；新版不在候选里就按 key 载入后注入同等分数。
+        if superseded_map and client:
+            by_key = {f.get("_key"): f for f in after_type if f.get("_key")}
+            # 只在「旧版本来就在前列（前 5）」时才补新版：低位的旧版被取代不值得再花一次往返
+            _scored = sorted((float(f.get("_combined_score", 0.0) or 0.0)
+                              for f in after_type), reverse=True)
+            _cut = _scored[min(4, len(_scored) - 1)] if _scored else 0.0
+            # 一遍：收集可继承的名次（不触发任何 Redis 调用）
+            pending = []
+            for old_key, new_key in superseded_map.items():
+                if not new_key or new_key == "__void__":   # DELETE 路径：无后继
+                    continue
+                old_frag = by_key.get(old_key)
+                if not old_frag:
+                    continue
+                sc = float(old_frag.get("_combined_score", 0.0) or 0.0)
+                if sc <= 0 or sc < _cut:
+                    continue
+                pending.append((old_key, new_key, sc, old_frag.get("_sim")))
+            # 两遍：候选里没有的新版一次性批量载入（pipeline，避免 N+1）
+            to_load = [n for _, n, _, _ in pending if n not in by_key]
+            if to_load and len(set(to_load)) != len(to_load):
+                to_load = list(dict.fromkeys(to_load))
+            loaded = self._load_fragments_by_keys(client, to_load) if to_load else {}
+            inherited = 0
+            for old_key, new_key, sc, old_sim in pending:
+                tgt = by_key.get(new_key)
+                if tgt is None:
+                    tgt = loaded.get(new_key)
+                    if tgt is None:
+                        continue
+                    tgt["_combined_score"] = sc
+                    if old_sim is not None:
+                        tgt["_sim"] = old_sim   # 同一知识：沿用旧版语义分，别被地板误杀
+                    after_type.append(tgt)
+                    by_key[new_key] = tgt
+                else:
+                    tgt["_combined_score"] = float(tgt.get("_combined_score", 0.0) or 0.0) + sc
+                tgt["_inherited_from"] = old_key
+                inherited += 1
+            if inherited:
+                logger.info("storage: %d 个被取代的旧版把名次转移给新版", inherited)
+                if all("_combined_score" in f for f in after_type):
+                    after_type.sort(key=lambda f: -float(f.get("_combined_score", 0.0) or 0.0))
 
         after_super: List[Dict[str, Any]] = []
         for f in after_type:
