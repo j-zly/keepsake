@@ -342,7 +342,11 @@ def decide(
         cfg.update(gate_cfg)
 
     if not cfg.get("enabled", True):
-        return IngestDecision("store", "")
+        # ⚠️ 语义区分（借鉴 hermes-jev-skills/jevkit/rerank.py 的「假干净」教训）：
+        #   闸门禁用时必须给出**可辨识的 reason**。否则 "store" + 空 reason 与
+        #   R7 全部检查通过完全同形，从决策记录上分不出「没检查」和「检查过且干净」。
+        #   约定：reason == "" 只代表「已完整走完 R1-R7 且全部通过」。
+        return IngestDecision("store", "gate_disabled")
 
     # R1: compaction 摘要 / 网关系统注入（lstrip 后前缀匹配，case-sensitive）
     #   - [CONTEXT COMPACTION : 压缩摘要（9/8 事故源头）

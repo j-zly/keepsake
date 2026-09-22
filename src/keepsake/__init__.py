@@ -708,8 +708,10 @@ class KeepsakeProvider(MemoryProvider):
             client = self._storage._get_client()
             if client and client.exists(frag_key):
                 existing_meta = {"key": frag_key}
-        except Exception:
-            pass
+        except Exception as e:
+            # ⚠️ 不再静默：Redis 异常会让 R6 去重失效（同一内容会被当新碎片再存一次）。
+            #   降级本身可接受（fail-open），但必须留痕，否则读日志看不出「去重没跑」。
+            logger.warning("keepsake: 既有碎片探测失败，R6 去重本次跳过 (%s)", e)
         return decide(text, category, existing_meta, getattr(self, "_gate_cfg", None)), existing_meta
 
     def _v1_store_after_decide(self, text, decision, existing_meta, category, source, extra_tags) -> None:
