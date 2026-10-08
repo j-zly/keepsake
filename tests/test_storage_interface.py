@@ -121,27 +121,65 @@ def test_signature_drift_probe_is_not_vacuous():
     assert _signature_mismatches(DriftedPg) == ["store"], "签名漂移必须被检出"
 
 
-def test_pg_search_methods_raise_not_implemented():
-    """PG 侧检索三方法必须显式抛错（batch 2），绝不静默返回空列表。
+class _FakeEmbedder:
+    """最小 embedder 桩：有它 search_knn 才会真去连库（无 embedder 返回 [] 是
+    与 Redis 侧一致的合法行为，不是故障）。"""
 
-    DSN 是故意写错的：证明「抛错」发生在建连之前，不依赖数据库可达。
+    _registered = True
+    _model = "fake-4d"
+    dimension = 4
+
+    def get_embedding(self, text: str):
+        return [float(len(text) % 7), 0.5, 0.25, 1.0]
+
+
+_BAD_DSN = "postgresql://nobody:nopass@127.0.0.1:1/nonexistent_db"
+
+
+def test_pg_search_methods_are_implemented():
+    """2026-10 ks_pg_b2：PG 侧检索三方法**已实现**，不再抛 NotImplementedError。
+
+    DSN 是故意写错的：证明「不再抛 NotImplementedError」发生在建连之前，
+    且真去连库时抛的是连接类异常 —— 既不是静默空列表，也不是「以为实现了」。
     """
-    pg = PgStorage(dsn="postgresql://nobody:nopass@127.0.0.1:1/nonexistent_db")
+    pg = PgStorage(dsn=_BAD_DSN, embedder=_FakeEmbedder())
     for name in ("search", "search_bm25", "search_knn"):
-        with pytest.raises(NotImplementedError) as exc:
+        with pytest.raises(Exception) as exc:
             getattr(pg, name)("测试查询")
+        assert not isinstance(exc.value, NotImplementedError), \
+            f"{name} 仍抛 NotImplementedError —— 批 2 已交付检索"
+
+
+def test_pg_corpus_maintenance_still_raises_not_implemented():
+    """语料维护两法仍显式抛错（批 2 不在范围内），绝不静默返回零统计。"""
+    pg = PgStorage(dsn=_BAD_DSN)
+    for name in ("discover_synonyms", "generate_jieba_dict"):
+        with pytest.raises(NotImplementedError) as exc:
+            getattr(pg, name)()
         assert "batch 2" in str(exc.value), f"{name} 的报错必须写明 batch 2"
 
 
-def test_pg_search_methods_do_not_return_empty_list():
-    """反向断言：PG 检索绝不能返回 []（静默空 = 记忆搜不到的静默故障）。"""
-    pg = PgStorage(dsn="postgresql://nobody:nopass@127.0.0.1:1/nonexistent_db")
-    for name in ("search", "search_bm25", "search_knn"):
+def test_pg_search_methods_never_silently_return_empty_on_backend_failure():
+    """反向断言：PG 检索绝不能因为「连不上」而返回 []。
+
+    静默空 = 记忆搜不到的静默故障（切了 backend=postgres 却什么都不报）。
+    """
+    pg = PgStorage(dsn=_BAD_DSN, embedder=_FakeEmbedder())
+    for name in ("search_bm25", "search_knn"):
         try:
             got = getattr(pg, name)("测试查询")
         except NotImplementedError:
-            continue
-        pytest.fail(f"{name}() 返回了 {got!r}，必须抛 NotImplementedError")
+            pytest.fail(f"{name}() 仍抛 NotImplementedError —— 批 2 已交付检索")
+        except Exception:
+            continue        # 连接类异常 = 正确行为（明确报错）
+        pytest.fail(f"{name}() 在后端不可达时返回了 {got!r}，必须抛错而不是静默空")
+
+
+def test_pg_search_knn_without_embedder_returns_empty_like_redis():
+    """无 embedder 时 search_knn 返回 [] —— 这是与 Redis 侧一致的合法契约
+    （向量路不可用），且会打 WARNING，不是静默。"""
+    pg = PgStorage(dsn=_BAD_DSN)
+    assert pg.search_knn("测试查询") == []
 
 
 def test_psycopg_is_not_a_module_level_import():

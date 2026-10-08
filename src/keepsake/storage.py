@@ -25,9 +25,25 @@ from redis.commands.search.query import Query
 
 from .embedder import Embedder, create_embedder
 from .storage_base import StorageBase
+# 2026-10 ks_pg_b2：检索后处理与排序权重抽到 storage_shared —— Redis / PG 共用同一份。
+# 下面这几个名字从 storage_shared 转出，是给既有调用方（cleanup_hot_topics 等）的转出口。
+from .storage_shared import (          # noqa: F401 — 常量与函数均为有意 re-export
+    DECAY_HALF_DAYS,
+    FEEDBACK_NEGATIVE_PENALTY,
+    FEEDBACK_POSITIVE_BOOST,
+    FRAGMENT_FIELDS,
+    HOT_TOPIC_BOOST,
+    HOT_TOPIC_DECAY_HALF_DAYS,
+    apply_v2_filters,
+    attention_boost_from_topics,
+    hot_topic_weighted_hits,
+    load_fragments_by_keys,
+    rrf_fuse,
+    rerank_with_decay,
+)
 from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
-from .attention import record_attention, match_attention_boost
+from .attention import ATTENTION_SET, record_attention
 from .query_expansion import (
     DEFAULT_QEXP_MIN_RESULTS,
     DEFAULT_QEXP_MAX_TERMS,
@@ -49,9 +65,6 @@ DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
 # KNN 参数（embedding 模式用）
 DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
 
-# 时间衰减半衰期（天）
-DECAY_HALF_DAYS = 60
-
 # 实体时间线索引（v1.5: 按实体组织的记忆时间线）
 ENTITY_TIMELINE_KEY = "keepsake:entity_timeline"
 
@@ -63,17 +76,14 @@ SENTIMENT_BOOST_POSITIVE = 1.5   # 正面碎片 ×1.5
 SENTIMENT_BOOST_NEGATIVE = 1.3   # 负面碎片 ×1.3（用户明确表达不喜欢的也重要）
 SENTIMENT_BOOST_NEUTRAL = 1.0    # 中性不变
 
-# 反馈权重
-FEEDBACK_POSITIVE_BOOST = 1.3    # 正反馈 ×1.3
-FEEDBACK_NEGATIVE_PENALTY = 0.5  # 负反馈 ×0.5（标记没用的大幅降权）
+# 🔴 反馈权重 / 热门话题加权 / 时间衰减半衰期 → 已搬进 storage_shared（与 PG 共用），
+#    由顶部 import 转出，名字与取值逐字未变，既有调用方无需改动。
 
-# 热门话题加权
+# 热门话题 Redis key（PG 侧语义对齐用，见 storage_pg.py）
 HOT_TOPIC_SET = "keepsake:hot_topics"
-HOT_TOPIC_BOOST = 1.2           # 命中热门话题的碎片 ×1.2
 HOT_TOPIC_DAILY = "keepsake:hot_topics:daily"  # 日榜
 HOT_TOPIC_WEEKLY = "keepsake:hot_topics:weekly"  # 周榜
 HOT_TOPIC_LAST_SEEN = "keepsake:hot_topics:last_seen"  # 最后提及时间
-HOT_TOPIC_DECAY_HALF_DAYS = 30  # 热门话题时间衰减半衰期（天）
 
 # ---- 2026-09-14 延迟修复：热门话题榜单进程级 TTL 缓存 ----
 # 背景：rerank 对**每条候选**都调 match_hot_topics，而它取的是「全局榜单」
@@ -107,15 +117,36 @@ def _hot_topic_snapshot(client, limit: int):
         _HOT_SNAPSHOT.update({"raw": raw, "last_seen": last_seen, "limit": fetch_n, "ts": now})
     return raw[:limit], last_seen
 
+# ---- 注意力榜单进程级 TTL 缓存（与 _hot_topic_snapshot 同款，防逐候选重复往返）----
+# rerank 对**每条候选**都调 match_attention，而它取的是「全局榜单」
+# （与候选内容无关）⇒ 不缓存就是单次检索几十次往返。
+# 榜单是滚动聚合，秒级陈旧无影响，故缓存 60 s。
+_ATTN_SNAPSHOT_TTL = 60.0
+_ATTN_SNAPSHOT: Dict[str, Any] = {"raw": None, "top_n": 0, "ts": 0.0}
+_ATTN_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _attention_snapshot(client, top_n: int):
+    """取全局注意力榜单 top-N（60 秒进程级缓存）。"""
+    now = time.time()
+    snap = _ATTN_SNAPSHOT
+    if (snap["raw"] is not None
+            and (now - float(snap["ts"] or 0.0)) < _ATTN_SNAPSHOT_TTL
+            and int(snap["top_n"] or 0) >= int(top_n)):
+        return snap["raw"][:top_n]
+    fetch_n = max(int(top_n), 50)
+    raw = client.zrevrange(ATTENTION_SET, 0, fetch_n - 1, withscores=True)
+    with _ATTN_SNAPSHOT_LOCK:
+        _ATTN_SNAPSHOT.update({"raw": raw, "top_n": fetch_n, "ts": now})
+    return raw[:top_n]
+
+
 SYNONYM_HASH_KEY = "keepsake:synonyms"
 
 # 一次性告警状态（避免无 embedder 时每次写入都刷日志）
 _WARN_STATE: Dict[str, bool] = {"no_embedder": False}
 
-# 「新版继承旧版名次」按 key 载入的 fragment 缓存（进程级 60s TTL）
-# 这些条目是稳定内容、量小，缓存避免重复往返。
-_FRAG_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
-_FRAG_CACHE_TTL = 60.0
+# 🔴 「新版继承旧版名次」的 fragment 缓存（进程级 60s TTL）→ 已搬进 storage_shared。
 
 DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.json")
 
@@ -125,6 +156,28 @@ BACKEND_REDIS = "redis"
 BACKEND_POSTGRES = "postgres"
 DEFAULT_BACKEND = BACKEND_REDIS      # 🔴 缺行/空/非法一律回 redis
 _VALID_BACKENDS = (BACKEND_REDIS, BACKEND_POSTGRES)
+
+
+def _build_embedder(cfg: Dict[str, Any], path: Any) -> Optional[Embedder]:
+    """按配置 `embedder` 段造 embedder；没有/构造失败 → None（只影响向量路）。
+
+    抽出来是为了让 Redis 与 PG 两个分支**同源**：2026-10 ks_pg_b2 之前 PG 分支
+    压根不造 embedder，导致 PG 侧永远没有向量、KNN 静默搜不到。
+    """
+    emb_cfg = dict(cfg.get("embedder") or {})
+    if not emb_cfg.get("model"):
+        logger.warning("storage: %s 无可用 embedder 段 → 写入的记忆不会有向量", path)
+        return None
+    try:
+        return create_embedder(
+            provider=emb_cfg.get("provider", "openai"),
+            api_key=emb_cfg.get("api_key", ""),
+            base_url=emb_cfg.get("base_url", ""),
+            model=emb_cfg.get("model", ""),
+        )
+    except Exception as e:
+        logger.warning("storage: embedder 构造失败（本次写入将无向量）: %s", e)
+        return None
 
 
 def resolve_backend(config: Optional[Dict[str, Any]] = None) -> str:
@@ -194,33 +247,25 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             password=str(pg_cfg.get("password", "")),
             sslmode=str(pg_cfg.get("sslmode", "")),
             agent_id=str(kwargs.get("agent_id", cfg.get("agent_id", "")) or ""),
+            # 2026-10 ks_pg_b2：检索参数与 embedder 与 Redis 分支同源构造 ——
+            # PG 侧 KNN 靠 embedder，维度必须和 Redis 侧对齐（否则两库向量不可比）
+            embedder=_build_embedder(cfg, path),
+            embed_dim=int(cfg.get("embed_dim", 1536)),
+            is_primary=bool(cfg.get("is_primary", False)),
+            final_limit=int(cfg.get("top_k", 15)),
+            bm25_limit=int(cfg.get("bm25_limit", 20)),
+            candidate_count=int(cfg.get("candidate_k", 20)),
         )
 
     if kwargs:
         return (redis_cls or RedisStorage)(**kwargs)
 
-    embedder: Optional[Embedder] = None
-    emb_cfg = dict(cfg.get("embedder") or {})
-    if emb_cfg.get("model"):
-        try:
-            embedder = create_embedder(
-                provider=emb_cfg.get("provider", "openai"),
-                api_key=emb_cfg.get("api_key", ""),
-                base_url=emb_cfg.get("base_url", ""),
-                model=emb_cfg.get("model", ""),
-            )
-        except Exception as e:
-            logger.warning("storage: embedder 构造失败（本次写入将无向量）: %s", e)
-            embedder = None
-    if embedder is None:
-        logger.warning("storage: %s 无可用 embedder 段 → 写入的记忆不会有向量", path)
-
     return RedisStorage(
         host=cfg.get("redis_host", "127.0.0.1"),
         port=int(cfg.get("redis_port", 6379)),
         password=cfg.get("redis_password") or None,
-        embedder=embedder,
-        embed_dim=embedder.dimension if embedder is not None else 1536,
+        embedder=_build_embedder(cfg, path),
+        embed_dim=1536,     # embedder 在场时 RedisStorage 会用自己的真实维度覆盖
         agent_id=cfg.get("agent_id", ""),
         is_primary=bool(cfg.get("is_primary", False)),
         final_limit=int(cfg.get("top_k", 15)),
@@ -378,7 +423,18 @@ class RedisStorage(StorageBase):
 
     2026-10 ks_pg_b1：实现 `storage_base.StorageBase` 接口（只做签名对齐，
     既有方法体逐字未动）。另一后端见 `storage_pg.PgStorage`；
-    选哪个由 `storage.backend` 决定（缺省 redis ⇒ 行为不变）。"""
+    选哪个由 `storage.backend` 决定（缺省 redis ⇒ 行为不变）。
+
+    2026-10 ks_pg_b2：检索后处理（RRF / v2 过滤 / 重排 / 批量载入）不再私有，
+    改为绑定 storage_shared 里的共用实现 —— 与 PgStorage 是**同一个函数对象**。
+    Redis 侧只留下两个真·Redis 专属的取数钩子（`_fetch_superseded_by` /
+    `_fetch_fragments`），其余逻辑零改动。"""
+    # ---- 共用实现绑定（不是 def ⇒ 全仓只有一处实现，PG 侧绑定的是同一对象）----
+    _rrf_fuse = rrf_fuse
+    _apply_v2_filters = apply_v2_filters
+    _rerank_with_decay = rerank_with_decay
+    _load_fragments_by_keys = load_fragments_by_keys
+
     def __init__(
         self,
         embedder: Optional[Embedder] = None,
@@ -1086,13 +1142,27 @@ class RedisStorage(StorageBase):
             logger.debug("storage: _record_entity_cooccurrence error: %s", e)
 
     def match_attention(self, content: str, top_n: int = 10) -> float:
-        """检查碎片内容命中多少高注意力话题，返回加权值（1.0~max_boost）。"""
+        """检查碎片内容命中多少高注意力话题，返回加权值（1.0~max_boost）。
+
+        2026-10 ks_pg_b2：加权公式搬到 `storage_shared`，与 `PgStorage.match_attention`
+        共用同一份。这里只负责「从 Redis 把注意力榜单取出来」。
+        （`attention.match_attention_boost` 是上游另有一份的老helper，本单不改它 ——
+          它不在本单的声明改动路径内；待后续单独收敛。）
+        """
         client = self._get_client()
         if not client or not content:
             return 1.0
         try:
+            raw = _attention_snapshot(client, top_n)
+            if not raw:
+                return 1.0
+            rows = [
+                (t.decode("utf-8") if isinstance(t, bytes) else t,
+                 float(v.decode("utf-8") if isinstance(v, bytes) else v))
+                for t, v in raw
+            ]
             boost_max = getattr(self, '_attention_boost_max', 1.5)
-            return match_attention_boost(client, content, top_n=top_n, boost_max=boost_max)
+            return attention_boost_from_topics(rows, content, boost_max)
         except Exception:
             return 1.0
 
@@ -1113,25 +1183,16 @@ class RedisStorage(StorageBase):
                 return 0.0
 
             now = datetime.now(timezone.utc).timestamp()
-            decay_half = float(getattr(self, '_hot_topic_decay_half_days', HOT_TOPIC_DECAY_HALF_DAYS))
-
-            text_lower = text.lower()
-            weighted_hits = 0.0
-            for topic_b, score_raw in raw:
-                topic = topic_b.decode("utf-8") if isinstance(topic_b, bytes) else topic_b
-                if isinstance(score_raw, bytes):
-                    score_raw = score_raw.decode("utf-8")
-                if len(topic) >= 2 and topic in text_lower:
-                    # 时间衰减：最近提及的权重高，久远的低
-                    seen_ts = last_seen.get(topic)
-                    if seen_ts and seen_ts > 0:
-                        days_ago = max(0, (now - seen_ts) / 86400.0)
-                        decay = 2.0 ** (-days_ago / decay_half)
-                    else:
-                        decay = 0.5  # 无时间戳的折半
-                    weighted_hits += decay
-
-            return weighted_hits
+            topics = [
+                t.decode("utf-8") if isinstance(t, bytes) else t
+                for t, _s in raw
+            ]
+            # 时间衰减加权是后端无关的纯计算 → 与 PgStorage 共用 storage_shared 同一份
+            return hot_topic_weighted_hits(
+                topics, last_seen, text, now,
+                decay_half_days=getattr(self, '_hot_topic_decay_half_days',
+                                        HOT_TOPIC_DECAY_HALF_DAYS),
+            )
         except Exception as e:
             logger.debug("storage: match_hot_topics error: %s", e)
             return 0.0
@@ -1416,7 +1477,7 @@ class RedisStorage(StorageBase):
                     frag["_bm25_score"] = float(getattr(doc, "score", 0.0))
                     fragments.append(frag)
 
-            fragments = self._rerank_with_decay(fragments, score_key="_bm25_score", storage=self)
+            fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
             final_fragments = fragments[: self._final_limit]
 
             # 2026-09 ks_retr: 召回分数分布记录（为 min_score 调参攒数据）
@@ -1544,7 +1605,7 @@ class RedisStorage(StorageBase):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))
                     fragments.append(frag)
 
-            fragments = self._rerank_with_decay(fragments, score_key="_knn_score", is_knn=True, storage=self)
+            fragments = self._rerank_with_decay(fragments, score_key="_knn_score", is_knn=True)
             return fragments[: self._final_limit]
 
         except Exception as e:
@@ -1623,325 +1684,55 @@ class RedisStorage(StorageBase):
 
         return self._apply_v2_filters(bm25_results)
 
-    def _load_fragments_by_keys(self, client, keys: List[str]) -> Dict[str, Dict[str, Any]]:
-        """按 Redis key 一次性载入多条 fragment（字段与 search_bm25 产出一致）。
+    # ------------------------------------------------------------------
+    # Redis 专属取数钩子（storage_shared 的两个后端接口，各只有几行）
+    # ------------------------------------------------------------------
 
-        2026-09-15 新增：供「新版继承旧版名次」注入候选外的新版使用。
-        ⚠️ 必须 pipeline 批量取——逐条 hgetall 就是 N+1 往返（实测 0.17s/次，
-        一次查询能白加 1 秒延迟）。
+    def _fetch_superseded_by(self, keys: List[str]) -> Dict[str, str]:
+        """批量读 superseded_by（pipeline 封边写入，不进 RediSearch 索引）。
+
+        2026-09-15：必须 pipeline 批量取 —— 逐条 hget 就是 N+1 往返。
+        Redis 不可达时返回 {}（调用方 `apply_v2_filters` 照常走，无封边可剔）。
         """
+        client = self._get_client()
+        if not client or not keys:
+            return {}
+        pipe = client.pipeline()
+        for k in keys:
+            pipe.hget(k, "superseded_by")
+        out: Dict[str, str] = {}
+        for k, v in zip(keys, pipe.execute()):
+            if v is None:
+                continue
+            val = v.decode("utf-8") if isinstance(v, bytes) else v
+            if val:
+                out[k] = val
+        return out
+
+    def _fetch_fragments(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量 HGETALL → {key: 碎片 dict}（字段裁到检索形状，见 storage_shared.FRAGMENT_FIELDS）。"""
         out: Dict[str, Dict[str, Any]] = {}
         if not keys:
             return out
-        now = time.time()
-        if now - _FRAG_CACHE["ts"] > _FRAG_CACHE_TTL:
-            _FRAG_CACHE["data"].clear()
-            _FRAG_CACHE["ts"] = now
-        miss = [k for k in keys if k not in _FRAG_CACHE["data"]]
-        if not miss:
-            return {k: _FRAG_CACHE["data"][k] for k in keys if k in _FRAG_CACHE["data"]}
-        try:
-            pipe = client.pipeline()
-            for k in miss:
-                pipe.hgetall(k)
-            raws = pipe.execute()
-        except Exception as e:
-            logger.debug("storage: batch load fragments failed: %s", e)
-            return {k: _FRAG_CACHE["data"][k] for k in keys if k in _FRAG_CACHE["data"]}
-        for k, h in zip(miss, raws):
+        client = self._get_client()
+        if not client:
+            return out
+        pipe = client.pipeline()
+        for k in keys:
+            pipe.hgetall(k)
+        for k, h in zip(keys, pipe.execute()):
             if not h:
                 continue
             frag: Dict[str, Any] = {}
-            for field in ("content", "tags", "category", "source", "created",
-                          "sentiment_score", "sentiment_label", "feedback_score",
-                          "invalid_at", "valid_until", "entities", "fragment_type"):
+            for field in FRAGMENT_FIELDS:
                 val = h.get(field)
                 if val is None:
                     val = h.get(field.encode())
                 if val is None or val == "" or val == b"":
                     continue
                 frag[field] = val.decode("utf-8", "replace") if isinstance(val, bytes) else val
-            if not frag.get("content"):
-                continue
-            frag["_key"] = k
             out[k] = frag
-            _FRAG_CACHE["data"][k] = frag
-        for k in keys:
-            if k not in out and k in _FRAG_CACHE["data"]:
-                out[k] = _FRAG_CACHE["data"][k]
         return out
-
-    def _apply_v2_filters(
-        self,
-        fragments: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """v2 后置过滤：剔除 consumed + superseded；可选 min_score 地板。
-
-        设计点：
-          1. fragment_type == "consumed" 由 search_bm25 直接 skip；这里再兜一次（防止
-             pipeline 后续路径绕过 search_bm25）
-          2. superseded_by 非空 → 封边的旧事实，剔除（封边 ≠ 物理删）
-          3. min_score 地板：sim 阈值 = self._v2_min_score（默认 0.05）。
-             这是经验值——实测 prefetch 注入路径下，sim≈0 的碎片大多是噪音或历史
-             版本被错误召回的结果；0.05 兜底后仅剔除明显无关项，不影响 top-K 命中。
-
-        只读 fragment_type / _key 这两个 search_bm25 已返回的字段；superseded_by
-        通过 _key 批量 hget（v2 之前 schema 不含此字段，不进 RediSearch 索引）。
-        """
-        if not fragments:
-            return fragments
-
-        client = self._get_client()
-
-        # 第一道：fragment_type（已有）+ 长度（保持兼容）
-        after_type: List[Dict[str, Any]] = []
-        for f in fragments:
-            if f.get("fragment_type") == "consumed":
-                continue
-            after_type.append(f)
-
-        # 第二道：批量查 superseded_by（pipeline 写入但 schema 未建索引）
-        keys = [f.get("_key") for f in after_type if f.get("_key")]
-        superseded_map: Dict[str, str] = {}
-        if keys:
-            try:
-                if client:
-                    pipe = client.pipeline()
-                    for k in keys:
-                        pipe.hget(k, "superseded_by")
-                    raw_vals = pipe.execute()
-                    for k, v in zip(keys, raw_vals):
-                        if v is None:
-                            continue
-                        val = v.decode("utf-8") if isinstance(v, bytes) else v
-                        if val:
-                            superseded_map[k] = val
-            except Exception as e:
-                logger.debug("storage: v2 superseded_by batch read failed: %s", e)
-
-        # 第三道（2026-09-15 新增）：新版继承旧版名次
-        # 背景：旧版被 superseded 剔除时，其"同一知识的新摘要"（superseded_by 指向的条目）
-        # 往往检索名次更靠后甚至没被召回 ⇒ 相关内容凭空消失。
-        # 做法：把旧版的名次分转移给新版；新版不在候选里就按 key 载入后注入同等分数。
-        if superseded_map and client:
-            by_key = {f.get("_key"): f for f in after_type if f.get("_key")}
-            # 只在「旧版本来就在前列（前 5）」时才补新版：低位的旧版被取代不值得再花一次往返
-            _scored = sorted((float(f.get("_combined_score", 0.0) or 0.0)
-                              for f in after_type), reverse=True)
-            _cut = _scored[min(4, len(_scored) - 1)] if _scored else 0.0
-            # 一遍：收集可继承的名次（不触发任何 Redis 调用）
-            pending = []
-            for old_key, new_key in superseded_map.items():
-                if not new_key or new_key == "__void__":   # DELETE 路径：无后继
-                    continue
-                old_frag = by_key.get(old_key)
-                if not old_frag:
-                    continue
-                sc = float(old_frag.get("_combined_score", 0.0) or 0.0)
-                if sc <= 0 or sc < _cut:
-                    continue
-                pending.append((old_key, new_key, sc, old_frag.get("_sim")))
-            # 两遍：候选里没有的新版一次性批量载入（pipeline，避免 N+1）
-            to_load = [n for _, n, _, _ in pending if n not in by_key]
-            if to_load and len(set(to_load)) != len(to_load):
-                to_load = list(dict.fromkeys(to_load))
-            loaded = self._load_fragments_by_keys(client, to_load) if to_load else {}
-            inherited = 0
-            for old_key, new_key, sc, old_sim in pending:
-                tgt = by_key.get(new_key)
-                if tgt is None:
-                    tgt = loaded.get(new_key)
-                    if tgt is None:
-                        continue
-                    tgt["_combined_score"] = sc
-                    if old_sim is not None:
-                        tgt["_sim"] = old_sim   # 同一知识：沿用旧版语义分，别被地板误杀
-                    after_type.append(tgt)
-                    by_key[new_key] = tgt
-                else:
-                    tgt["_combined_score"] = float(tgt.get("_combined_score", 0.0) or 0.0) + sc
-                tgt["_inherited_from"] = old_key
-                inherited += 1
-            if inherited:
-                logger.info("storage: %d 个被取代的旧版把名次转移给新版", inherited)
-                if all("_combined_score" in f for f in after_type):
-                    after_type.sort(key=lambda f: -float(f.get("_combined_score", 0.0) or 0.0))
-
-        after_super: List[Dict[str, Any]] = []
-        for f in after_type:
-            k = f.get("_key")
-            if k and k in superseded_map:
-                continue
-            after_super.append(f)
-
-        # 第三道：min_score 地板
-        floor = getattr(self, "_v2_min_score", 0.05)
-        if floor and floor > 0:
-            kept: List[Dict[str, Any]] = []
-            for f in after_super:
-                sim = float(f.get("_sim", 0.0) or 0.0)
-                if sim < floor:
-                    continue
-                kept.append(f)
-            return kept
-        return after_super
-
-    def _rrf_fuse(
-        self,
-        bm25_results: List[Dict[str, Any]],
-        knn_results: List[Dict[str, Any]],
-        k: int = 60,
-    ) -> List[Dict[str, Any]]:
-        """Reciprocal Rank Fusion：两路检索按排名位置融合，返回 final_limit 条。
-
-        原理：score(content) = 1/(k+BM25排名) + 1/(k+KNN排名)，k 取 60（业界常用）。
-        - 两路都命中 → 分数叠加 → 排最前（交叉验证）
-        - 单路命中 → 得该路排名分
-        - 按 content 去重合并（同一记忆条目只保留一份，字段取先出现者）
-        """
-        scores: dict = {}
-        items: dict = {}
-        for rank, frag in enumerate(bm25_results, 1):
-            c = frag.get("content")
-            if not c:
-                continue
-            scores[c] = scores.get(c, 0.0) + 1.0 / (k + rank)
-            items[c] = frag
-        for rank, frag in enumerate(knn_results, 1):
-            c = frag.get("content")
-            if not c:
-                continue
-            scores[c] = scores.get(c, 0.0) + 1.0 / (k + rank)
-            if c not in items:
-                items[c] = frag
-
-        fused = sorted(items.values(), key=lambda f: -scores[f.get("content")])
-        for frag in fused:
-            frag["_combined_score"] = scores.get(frag.get("content"), 0.0)
-        return fused[: self._final_limit]
-
-    # ------------------------------------------------------------------
-    # 综合得分重排序
-    # ------------------------------------------------------------------
-
-    def _rerank_with_decay(
-        self,
-        fragments: List[Dict[str, Any]],
-        score_key: str = "_bm25_score",
-        is_knn: bool = False,
-        storage: Optional["RedisStorage"] = None,
-    ) -> List[Dict[str, Any]]:
-        """综合得分重排序。
-
-        BM25 模式: combined = BM25归一化得分 × 时间衰减 × 情绪权重 × 反馈权重 × 热门权重 × 注意力权重
-        KNN 模式:   combined = (1 - 余弦距离/2) × 时间衰减 × 情绪权重 × 反馈权重 × 热门权重 × 注意力权重
-
-        权重参数见模块顶部常量。
-        """
-        if not fragments:
-            return fragments
-
-        now = datetime.now(timezone.utc)
-
-        # ---- Step 1: 计算语义相似度 sim ----
-        for frag in fragments:
-            raw = float(frag.get(score_key, 0.0))
-            if is_knn:
-                # KNN: score 是余弦距离（0~2），越小越近
-                frag["_sim"] = 1.0 - max(0.0, min(1.0, raw / 2.0))
-            else:
-                frag["_sim"] = raw  # 暂存原始 BM25 分数，后面归一化
-
-        # ---- Step 2: BM25 模式用 min-max 动态归一化 ----
-        if not is_knn and fragments:
-            scores_raw = [float(f.get(score_key, 0.0)) for f in fragments]
-            max_raw = max(scores_raw) if scores_raw else 1.0
-            if max_raw < 0.001:
-                max_raw = 1.0
-            for frag in fragments:
-                raw_val = float(frag.get(score_key, 0.0))
-                frag["_sim"] = raw_val / max_raw
-
-        # ---- Step 3: 六维权重综合 ----
-        for frag in fragments:
-            sim = float(frag.get("_sim", 0.0))
-
-            # 0: 已纠正碎片直接压到最低，永远不出现在 Top-K
-            tags = frag.get("tags", "")
-            if "corrected" in (tags if isinstance(tags, str) else ""):
-                frag["_combined_score"] = -1.0
-                continue
-
-            # 3a: 时间衰减
-            created_str = frag.get("created", "")
-            if not created_str:
-                decay = 0.01
-            else:
-                try:
-                    created = datetime.fromisoformat(created_str)
-                    age_days = (now - created).total_seconds() / 86400.0
-                    if age_days < 0:
-                        age_days = 0
-                except (ValueError, TypeError):
-                    decay = 0.01
-                    age_days = 0
-                else:
-                    decay = 2.0 ** (-age_days / self._decay_half_days)
-
-            # 3b: 情绪权重（基于烈度，不再分正负）
-            try:
-                intensity = float(frag.get("sentiment_score", 0))
-            except (ValueError, TypeError):
-                intensity = 0.0
-            # intensity 0.0~2.0 → 权重 1.0~1.0+2.0*factor
-            emotion_factor = getattr(self, '_emotion_intensity_factor', 0.4)
-            emotion_w = 1.0 + min(intensity, 2.0) * emotion_factor
-
-            # 3c: 反馈权重
-            try:
-                fb = float(frag.get("feedback_score", 0))
-            except (ValueError, TypeError):
-                fb = 0.0
-            if fb > 0:
-                feedback_w = 1.0 + (self._feedback_positive_boost - 1.0) * min(fb / 3.0, 1.0)
-            elif fb < 0:
-                feedback_w = 1.0 - (1.0 - self._feedback_negative_penalty) * min(abs(fb) / 3.0, 1.0)
-            else:
-                feedback_w = 1.0
-
-            # 3d: 热门话题加权
-            hot_w = 1.0
-            content = frag.get("content", "")
-            if content and storage is not None and hasattr(storage, 'match_hot_topics'):
-                try:
-                    hits = storage.match_hot_topics(content, limit=10)
-                    if hits >= 3:
-                        hot_w = HOT_TOPIC_BOOST
-                    elif hits >= 1:
-                        hot_w = 1.0 + (HOT_TOPIC_BOOST - 1.0) * (hits / 3.0)
-                except Exception:
-                    pass
-
-            # 3e: 注意力加权
-            attn_w = 1.0
-            if content and storage is not None and hasattr(storage, 'match_attention'):
-                try:
-                    attn_w = storage.match_attention(content)
-                except Exception:
-                    pass
-
-            frag["_combined_score"] = sim * decay * emotion_w * feedback_w * hot_w * attn_w
-            frag["_weights"] = {
-                "sim": round(sim, 4),
-                "decay": round(decay, 4),
-                "emotion": round(emotion_w, 4),
-                "feedback": round(feedback_w, 4),
-                "hot_topic": round(hot_w, 4),
-                "attention": round(attn_w, 4),
-            }
-
-        fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
-        return fragments
 
     def generate_jieba_dict(self, output_path: str = None) -> Dict[str, Any]:
         """从碎片库 + 同义词表生成 jieba 自定义词典。
