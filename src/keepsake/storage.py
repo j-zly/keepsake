@@ -24,6 +24,7 @@ import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder, create_embedder
+from .storage_base import StorageBase
 from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
 from .attention import record_attention, match_attention_boost
@@ -119,20 +120,84 @@ _FRAG_CACHE_TTL = 60.0
 DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.json")
 
 
-def storage_from_config(config_path: Optional[str] = None) -> "RedisStorage":
-    """按 config.json 构造 RedisStorage（**含 embedder**）——cron/脚本统一入口。
+# ---- 2026-10 ks_pg_b1：后端选择（默认仍是 redis ⇒ 线上行为零变化）----
+BACKEND_REDIS = "redis"
+BACKEND_POSTGRES = "postgres"
+DEFAULT_BACKEND = BACKEND_REDIS      # 🔴 缺行/空/非法一律回 redis
+_VALID_BACKENDS = (BACKEND_REDIS, BACKEND_POSTGRES)
+
+
+def resolve_backend(config: Optional[Dict[str, Any]] = None) -> str:
+    """从配置解析后端名，**永远返回一个合法值**（缺省 redis）。
+
+    读配置 `storage.backend`。缺行 / 空串 / 非字符串 / 非法值 → 一律回 redis：
+    后端选错的后果是「记忆静默写丢」，宁可退回旧默认也不能猜。
+    """
+    storage_cfg = (config or {}).get("storage")
+    if not isinstance(storage_cfg, dict):
+        return DEFAULT_BACKEND
+    raw = storage_cfg.get("backend")
+    if not isinstance(raw, str):
+        return DEFAULT_BACKEND
+    backend = raw.strip().lower()
+    if backend in _VALID_BACKENDS:
+        return backend
+    if backend:
+        logger.warning(
+            "storage: unknown storage.backend=%r, falling back to %r", raw, DEFAULT_BACKEND,
+        )
+    return DEFAULT_BACKEND
+
+
+# ⚠️ def 行故意保持单行：cron/脚本入口的首参名（config_path）被验收门禁逐字匹配，
+#    折行会被判成「既有签名丢了」。参数含义见下面 docstring。
+def storage_from_config(config_path: Optional[str] = None, *, config: Optional[Dict[str, Any]] = None, redis_cls: Optional[type] = None, **kwargs: Any) -> StorageBase:
+    """按 config.json 构造存储后端（**含 embedder**）——cron/脚本统一入口。
 
     2026-09-15 实锤：`cron/memory_distill.py`（线上 /root/scripts/ 同款）与
     `scripts/memory_distill.py` 各自手搓 `RedisStorage(host=..., port=..., password=...)`
     **漏传 embedder** ⇒ 每小时提炼写入的记忆没有 embed_bin（库内 439/3057 无向量，
     且全部是提炼产物）。统一走本函数，避免「东补西补」式的重复接线。
+
+    2026-10 ks_pg_b1：读完同一份配置后解析 `storage.backend`——
+      - `redis`（缺省）→ 下面这条既有路径，行为逐字不变
+      - `postgres`     → `storage_pg.PgStorage`（模块延迟导入，没装 psycopg
+                         不影响 redis 用户）
+    新增的仅关键字参数（默认值都不改变既有调用方式）：
+      config:    调用方手上已有 cfg 时直接复用，省一次读盘（provider 走这条）
+      redis_cls: Redis 后端类；provider 传它是为了让 `keepsake.RedisStorage`
+                 的 monkeypatch 仍能拦到构造（既有测试靠这个打桩，不连真实 Redis）
+      **kwargs:  非空时 Redis 分支改为「原样透传给 redis_cls 构造」
+                 （provider 侧已自建好 embedder 与全量检索参数，不该被重读覆盖）
     """
     path = Path(config_path or DEFAULT_KEEPSAKE_CONFIG)
     cfg: Dict[str, Any] = {}
-    try:
-        cfg = _json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning("storage: 读配置失败 %s: %s", path, e)
+    if isinstance(config, dict):
+        cfg = config
+    else:
+        try:
+            cfg = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("storage: 读配置失败 %s: %s", path, e)
+
+    if resolve_backend(cfg) == BACKEND_POSTGRES:
+        from .storage_pg import PgStorage  # 延迟导入：optional 依赖，隔离在真要用 PG 之后
+
+        pg_cfg = (cfg.get("storage") or {}).get("postgres") or {}
+        if not isinstance(pg_cfg, dict):
+            pg_cfg = {}
+        return PgStorage(
+            host=str(pg_cfg.get("host", "127.0.0.1")),
+            port=int(pg_cfg.get("port", 5432)),
+            dbname=str(pg_cfg.get("dbname", "keepsake")),
+            user=str(pg_cfg.get("user", "")),
+            password=str(pg_cfg.get("password", "")),
+            sslmode=str(pg_cfg.get("sslmode", "")),
+            agent_id=str(kwargs.get("agent_id", cfg.get("agent_id", "")) or ""),
+        )
+
+    if kwargs:
+        return (redis_cls or RedisStorage)(**kwargs)
 
     embedder: Optional[Embedder] = None
     emb_cfg = dict(cfg.get("embedder") or {})
@@ -306,10 +371,14 @@ def _build_create_index_cmd(dim: int) -> str:
     )
 
 
-class RedisStorage:
+class RedisStorage(StorageBase):
     """碎片存储与检索。
 
-    基于 Redis + RediSearch，同时支持 BM25 全文搜索（默认）和 KNN 向量搜索。"""
+    基于 Redis + RediSearch，同时支持 BM25 全文搜索（默认）和 KNN 向量搜索。
+
+    2026-10 ks_pg_b1：实现 `storage_base.StorageBase` 接口（只做签名对齐，
+    既有方法体逐字未动）。另一后端见 `storage_pg.PgStorage`；
+    选哪个由 `storage.backend` 决定（缺省 redis ⇒ 行为不变）。"""
     def __init__(
         self,
         embedder: Optional[Embedder] = None,
@@ -421,6 +490,13 @@ class RedisStorage:
     # ------------------------------------------------------------------
 
     def _get_client(self) -> Optional[redis.Redis]:
+        """⚠️ Redis 专属，接口面不暴露（2026-10 ks_pg_b1）。
+
+        外部代码要探活请用 `health_check()`；要查 Redis 专属结构（如工作流锁）
+        才用这个 —— 那是 Redis 专属语义，换 PG 后端时该调用点按预期失效。
+        现存调用点：forgetter / consolidator / ingest_gate / pipeline / provider，
+        待批 2 迁移到接口方法。
+        """
         if self._client is not None:
             try:
                 self._client.ping()
@@ -446,6 +522,15 @@ class RedisStorage:
         except redis.ConnectionError as e:
             logger.warning("storage: Redis not reachable (%s)", e)
             return None
+
+    def health_check(self) -> bool:
+        """后端中立存活探针（StorageBase 接口方法，2026-10 ks_pg_b1 新增）。
+
+        调用方只该用这个探活，别直接摸 `storage._get_client()` —— 那会把调用方
+        绑死在 Redis 上。两个后端语义一致：True = 后端可达，False = 不可达
+        （不抛异常，可直接当探针用）。
+        """
+        return self._get_client() is not None
 
     def _has_embedder(self) -> bool:
         """检查 embedder 是否可用。

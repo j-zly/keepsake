@@ -111,7 +111,18 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   "redis_host": "127.0.0.1",
   "redis_port": 6379,
   "redis_password": "",
-  
+
+  // Storage backend (optional, defaults to "redis")
+  // batch 1: the PostgreSQL backend implements read/write only —
+  // search/search_bm25/search_knn raise NotImplementedError on purpose
+  // (so a misconfigured backend fails loudly instead of silently finding nothing).
+  // Install: pip install 'keepsake-memory[postgres]'
+  // "storage": {
+  //   "backend": "postgres",
+  //   "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
+  //                "user": "keepsake", "password": "***", "sslmode": ""}
+  // },
+
   // Search settings
   "top_k": 5,
   "candidate_k": 10,
@@ -183,6 +194,8 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 ```
 
 > Note: Redis password compatibility: leave empty for no authentication, or provide password to automatically send AUTH command.
+>
+> Note: `storage.backend` defaults to `redis`. A missing, empty or unrecognised value always falls back to `redis`, so existing deployments are unaffected. `postgres` is batch-1 read/write only — its search methods raise `NotImplementedError` until batch 2 ships BM25 + KNN.
 
 ### 3. Environment Variables Reference
 

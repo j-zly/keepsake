@@ -38,7 +38,7 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
         return f"[tool_error] {msg}"
 
 from .embedder import create_embedder
-from .storage import RedisStorage
+from .storage import RedisStorage, storage_from_config
 from .forgetter import Forgetter
 # v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
 from .pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
@@ -394,7 +394,12 @@ class KeepsakeProvider(MemoryProvider):
             embed_dim = 1536
             logger.info("keepsake: BM25-only mode (no embedder configured)")
 
-        self._storage = RedisStorage(
+        # 2026-10 ks_pg_b1：后端由 `storage.backend` 决定（缺省 redis = 行为不变）。
+        # 显式传 redis_cls=RedisStorage —— 这样 `keepsake.RedisStorage` 的
+        # monkeypatch 仍能拦到构造（既有测试靠它打桩，不连真实 Redis）。
+        self._storage = storage_from_config(
+            config=cfg,
+            redis_cls=RedisStorage,
             embedder=embedder,
             host=redis_host,
             port=redis_port,
@@ -444,8 +449,11 @@ class KeepsakeProvider(MemoryProvider):
 
         # 自动创建/验证 index
         if not self._storage.ensure_index():
+            # 2026-10 ks_pg_b1：探活改走后端中立的 health_check()，
+            # 不再在消息里假定后端一定是 Redis（后端由 storage.backend 决定）
             logger.warning(
-                "keepsake: Redis / RediSearch not ready at %s:%s",
+                "keepsake: 存储后端 %s 未就绪（health_check=%s, redis %s:%s）",
+                type(self._storage).__name__, self._storage.health_check(),
                 redis_host, redis_port,
             )
             return

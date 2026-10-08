@@ -114,7 +114,17 @@ pip install git+https://github.com/j-zly/keepsake.git
   "redis_host": "127.0.0.1",
   "redis_port": 6379,
   "redis_password": "",
-  
+
+  // 存储后端（可选，缺省即 redis）
+  // 批 1：PostgreSQL 后端只实现读写 —— search/search_bm25/search_knn 会显式抛
+  // NotImplementedError（宁可炸给你看，也绝不静默搜不到）。
+  // 安装：pip install 'keepsake-memory[postgres]'
+  // "storage": {
+  //   "backend": "postgres",
+  //   "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
+  //                "user": "keepsake", "password": "***", "sslmode": ""}
+  // },
+
   // 搜索相关配置
   "top_k": 5,
   "candidate_k": 10,
@@ -178,6 +188,8 @@ pip install git+https://github.com/j-zly/keepsake.git
 ```
 
 > 注意：Redis 密码兼容性：留空表示无认证，提供密码会自动发送 AUTH 命令。
+>
+> 注意：`storage.backend` 缺省为 `redis`；缺行 / 空串 / 非法值一律回退 redis，现有部署行为逐字不变。`postgres` 是批 1 的读写后端，检索三方法在批 2（BM25 + KNN）落地前会抛 `NotImplementedError`。
 
 ### 3. 环境变量对照表
 
