@@ -202,6 +202,34 @@ def resolve_backend(config: Optional[Dict[str, Any]] = None) -> str:
     return DEFAULT_BACKEND
 
 
+# ---- 2026-10 ks_knob_unify：排序权重键的取值口径（两支共用**唯一**一份实现）----
+# 这 10 个键在 cfg 顶层同名。修前 redis 分支只认 kwargs（不带 kwargs = 配了也不生效的
+# 死配置），PG 分支只认 cfg（带 kwargs 时 kwargs 被忽略）—— 同一批键两套口径。
+# 口径写死为：kwargs（provider 口径） > cfg 顶层 > 模块常量。
+# 缺省值逐字等于 RedisStorage/PgStorage 的形参默认值（= 模块常量），所以「不配 = 现状」。
+_KNOB_SPECS: Dict[str, tuple] = {
+    "decay_half_days": (DECAY_HALF_DAYS, int),
+    "attention_boost_max": (1.5, float),
+    "attention_base_increment": (2.0, float),
+    "attention_emotion_factor": (1.5, float),
+    "emotion_intensity_factor": (0.4, float),
+    "feedback_positive_boost": (FEEDBACK_POSITIVE_BOOST, float),
+    "feedback_negative_penalty": (FEEDBACK_NEGATIVE_PENALTY, float),
+    "hot_topic_boost": (HOT_TOPIC_BOOST, float),
+    "hot_topic_decay_half_days": (HOT_TOPIC_DECAY_HALF_DAYS, int),
+    "v2_min_score": (0.05, float),
+}
+
+
+def _resolve_knobs(cfg: Dict[str, Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """合并 10 个排序权重键：kwargs > cfg 顶层 > 模块常量（见 _KNOB_SPECS）。"""
+    return {
+        k: cast(kwargs[k] if k in kwargs and kwargs[k] is not None
+                 else cfg.get(k, default))
+        for k, (default, cast) in _KNOB_SPECS.items()
+    }
+
+
 # ⚠️ def 行故意保持单行：cron/脚本入口的首参名（config_path）被验收门禁逐字匹配，
 #    折行会被判成「既有签名丢了」。参数含义见下面 docstring。
 def storage_from_config(config_path: Optional[str] = None, *, config: Optional[Dict[str, Any]] = None, redis_cls: Optional[type] = None, **kwargs: Any) -> StorageBase:
@@ -220,8 +248,10 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
       config:    调用方手上已有 cfg 时直接复用，省一次读盘（provider 走这条）
       redis_cls: Redis 后端类；provider 传它是为了让 `keepsake.RedisStorage`
                  的 monkeypatch 仍能拦到构造（既有测试靠这个打桩，不连真实 Redis）
-      **kwargs:  非空时 Redis 分支改为「原样透传给 redis_cls 构造」
-                 （provider 侧已自建好 embedder 与全量检索参数，不该被重读覆盖）
+      **kwargs:  非空时 Redis 分支改为「透传给 redis_cls 构造」（provider 侧已自建好
+                 embedder 与全量检索参数，不该被重读覆盖）。10 个排序权重键统一按
+                 kwargs > cfg 顶层 > 模块常量 合并（见 _KNOB_SPECS / _resolve_knobs），
+                 两支共用同一份实现。
     """
     path = Path(config_path or DEFAULT_KEEPSAKE_CONFIG)
     cfg: Dict[str, Any] = {}
@@ -240,28 +270,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         if not isinstance(pg_cfg, dict):
             pg_cfg = {}
 
-        # 2026-10 ks_pg_knobs：排序权重键与 redis 分支**同源转发**。
-        # 修前 PG 分支只收 top_k/bm25_limit/... 这几个检索量，decay_half_days、
-        # hot_topic_boost、v2_min_score 等 10 个权重键全落到 PgStorage 的形参默认值
-        # = config.json 里配了也不生效的死配置（且切后端会静默改变排序结果）。
-        # 取值口径：kwargs（provider 口径，已自建好这批键）→ cfg 顶层 → 模块常量。
-        # PG 侧形参默认值逐字等于常量，所以「不配 = 现状」，行为不变。
-        _knobs = {
-            "decay_half_days": (DECAY_HALF_DAYS, int),
-            "attention_boost_max": (1.5, float),
-            "attention_base_increment": (2.0, float),
-            "attention_emotion_factor": (1.5, float),
-            "emotion_intensity_factor": (0.4, float),
-            "feedback_positive_boost": (FEEDBACK_POSITIVE_BOOST, float),
-            "feedback_negative_penalty": (FEEDBACK_NEGATIVE_PENALTY, float),
-            "hot_topic_boost": (HOT_TOPIC_BOOST, float),
-            "hot_topic_decay_half_days": (HOT_TOPIC_DECAY_HALF_DAYS, int),
-            "v2_min_score": (0.05, float),
-        }
-        knobs = {
-            k: cast(kwargs.get(k, cfg.get(k, default)))
-            for k, (default, cast) in _knobs.items()
-        }
+        # 排序权重键与 redis 分支**同源**：同一份 _resolve_knobs（kwargs > cfg > 常量）。
         return PgStorage(
             host=str(pg_cfg.get("host", "127.0.0.1")),
             port=int(pg_cfg.get("port", 5432)),
@@ -278,11 +287,16 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             final_limit=int(cfg.get("top_k", 15)),
             bm25_limit=int(cfg.get("bm25_limit", 20)),
             candidate_count=int(cfg.get("candidate_k", 20)),
-            **knobs,
+            **_resolve_knobs(cfg, kwargs),
         )
 
+    # ---- redis 分支 ----
+    # 2026-10 ks_knob_unify：两条分支共用 _resolve_knobs。
+    # 带 kwargs（生产 provider 的调用形状）：先把 cfg 解出的键垫底，再用 kwargs 覆盖
+    # ⇒ kwargs 仍逐键胜出，**实例上 10 个键的值与修前逐键相同**（kwargs 里没有的键，
+    #   修前取形参默认值 = 常量，修后取 cfg/常量；cfg 无该键时两者仍是同一个常量）。
     if kwargs:
-        return (redis_cls or RedisStorage)(**kwargs)
+        return (redis_cls or RedisStorage)(**{**_resolve_knobs(cfg, {}), **kwargs})
 
     return RedisStorage(
         host=cfg.get("redis_host", "127.0.0.1"),
@@ -295,6 +309,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         final_limit=int(cfg.get("top_k", 15)),
         bm25_limit=int(cfg.get("bm25_limit", 20)),
         candidate_count=int(cfg.get("candidate_k", 20)),
+        **_resolve_knobs(cfg, {}),
     )
 
 # ---- 2026-09-14 延迟修复：同义词表四级缓存 ----

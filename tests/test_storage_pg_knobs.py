@@ -89,3 +89,30 @@ def test_redis_branch_untouched() -> None:
     real = RedisStorage(**CFG)
     for key, attr, _const in KNOBS:
         assert getattr(real, attr) == CFG[key]
+
+# ---- 2026-10 ks_knob_unify：两支统一「kwargs > cfg > 常量」，redis 无 kwargs 也要吃 cfg ----
+
+def _redis_cfg(extra: Dict[str, Any]) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {"storage": {"backend": "redis"}}
+    cfg.update(extra)
+    return cfg
+
+
+@pytest.mark.parametrize("key,attr,const", KNOBS)
+def test_redis_knob_from_config_effective(key: str, attr: str, const: Any) -> None:
+    """redis 分支**不带 kwargs** 时 cfg 也要生效（修前恒等于 const = 死配置）。"""
+    assert getattr(storage_from_config(config=_redis_cfg(CFG)), attr) == CFG[key]
+
+
+@pytest.mark.parametrize("key,attr,const", KNOBS)
+def test_redis_knob_default_is_module_constant(key: str, attr: str, const: Any) -> None:
+    """redis 分支不配 = 模块常量（与 PG 分支同口径）。"""
+    assert getattr(storage_from_config(config=_redis_cfg({})), attr) == const
+
+
+@pytest.mark.parametrize("wrap", [_redis_cfg, _pg_cfg])
+@pytest.mark.parametrize("key,attr,const", KNOBS)
+def test_kwargs_beat_cfg(wrap: Any, key: str, attr: str, const: Any) -> None:
+    """优先级最高的一档：显式 kwargs 覆盖 cfg（生产 provider 口径不许被重读覆盖）。"""
+    inst = storage_from_config(config=wrap(CFG), **{key: 999})
+    assert getattr(inst, attr) == 999
