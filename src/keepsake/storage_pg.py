@@ -116,6 +116,33 @@ TS_RANK_NORM = 32              # ts_rank_cd 归一化位：rank/(1+rank)（只�
 BM25_K1 = 1.2                  # 词频饱和参数（RediSearch 默认 1.2）
 BM25_B = 0.75                  # 文档长度归一化（RediSearch 默认 0.75）
 
+# ---- 检索热路径的进程级 TTL 快照（PG 侧，2026-10 ks_pg_perf）----
+#
+# 🔴 为什么需要（实测取证见 /tmp/ks_pgperf_rootcause.txt）：
+#   PG 后端一次 search() 里，**每条候选**的重排都会各发 1 次
+#   `match_hot_topics` + 1 次 `match_attention`（storage_shared.rerank_with_decay
+#   是共用代码，两个后端同一份函数对象，不在这里动）；加上 BM25 的语料统计聚合
+#   （N/avgdl/df 全表 unnest）与每次检索重查同义词表 ⇒ 一次检索几十上百条 SQL。
+#   这些查询**每次返回的行完全一样**（只随时间过期），所以缓存「行」而不是结果值。
+#
+# 与 Redis 侧 `_FRAG_CACHE` 的 TTL 快照同源做法；默认 60s，
+# 构造参数 `snapshot_ttl_s` 可调，**设成 0 即彻底关掉快照**（回到每次实查）。
+DEFAULT_SNAPSHOT_TTL_S = 60.0
+
+#: 进程级快照 `{目标库指纹: {(group, key): (单调时刻, 值)}}`。
+#: 按库指纹分桶 —— 同进程里连多个库不会串味。
+#: 单进程单线程检索热路径，**不加锁**（写入都在各自的 GIL 原子步内，
+#: 丢一次快照只是下条语句多查一次库，不会读到半个对象）。
+_SNAPSHOTS: Dict[str, Dict[tuple, tuple]] = {}
+
+#: KNN 走 HNSW 时内层**多取几倍**再过活记忆过滤。
+#: 改写前是「先过滤后排序取 top-N」，过滤掉多少条就少返回多少条；
+#: 改写后（HNSW 只能先给有序候选、过滤在索引扫描之后）必须多取一些，
+#: 否则「最近的 N 条里有一半是已失效碎片」会把结果集打空。
+#: ponytail: 固定倍数、不做自适应回填。失效/超长碎片占比 >25% 时召回会掉，
+#: 升级路径：按外层存活数不足再补一轮索引查询（代价是一次额外往返）。
+KNN_OVERFETCH = 4
+
 # 🔴 本文件**不**复制一份 HOT_TOPIC_* Redis key 名（那是 Redis 侧的物理布局）。
 # PG 的话题榜在 ks_hot_topic 表里，scope 列区分三榜，语义在 _TOPIC_SCOPES 里。
 _ENTITY_COOC_TTL = 2592000  # 30 天，对齐 Redis 侧 ENTITY_COOC_TTL
@@ -603,6 +630,7 @@ class PgStorage(StorageBase):
         feedback_positive_boost: float = FEEDBACK_POSITIVE_BOOST,
         feedback_negative_penalty: float = FEEDBACK_NEGATIVE_PENALTY,
         v2_min_score: float = 0.05,
+        snapshot_ttl_s: float = DEFAULT_SNAPSHOT_TTL_S,
     ):
         self._dsn = dsn
         self._host = host
@@ -641,6 +669,8 @@ class PgStorage(StorageBase):
         self._feedback_negative_penalty = float(feedback_negative_penalty)
         self._hot_topic_boost = float(hot_topic_boost)
         self._v2_min_score = float(v2_min_score)
+        # 检索热路径快照 TTL（0 = 关掉，每次实查；负数同 0）
+        self._snapshot_ttl_s = max(0.0, float(snapshot_ttl_s))
         self._agent_id = agent_id
         self._is_primary = bool(is_primary)
         self._attention_boost_max = float(attention_boost_max)
@@ -943,13 +973,48 @@ class PgStorage(StorageBase):
             tag = tag.replace(ch, "")
         return tag.strip()
 
+    # ---- 进程级 TTL 快照（检索热路径，与 Redis 侧热词榜快照同源）----
+
+    def _snap_get(self, group: str, key: tuple) -> Any:
+        """取快照；未命中 / 过期 / TTL<=0 一律返回 None（后者 = 彻底关掉快照）。"""
+        if self._snapshot_ttl_s <= 0:
+            return None
+        entry = _SNAPSHOTS.get(self._target_key(), {}).get((group, key))
+        if entry is None:
+            return None
+        ts, value = entry
+        return value if (time.monotonic() - ts) <= self._snapshot_ttl_s else None
+
+    def _snap_put(self, group: str, key: tuple, value: Any) -> None:
+        if self._snapshot_ttl_s <= 0:
+            return
+        _SNAPSHOTS.setdefault(self._target_key(), {})[(group, key)] = (time.monotonic(), value)
+
+    def _snap_drop(self, *groups: str) -> None:
+        """让快照立即失效 —— **写路径必须调**，否则新写入要等一个 TTL 才可见。"""
+        snap = _SNAPSHOTS.get(self._target_key())
+        if not snap:
+            return
+        for g in groups:
+            for k in [k for k in snap if k[0] == g]:
+                snap.pop(k, None)
+
+    #: 写 ks_fragment / 加权信号表的**唯一出口**清单 —— 每个写入口都调一次
+    #: `_snap_drop(*_SNAPSHOT_GROUPS)`，漏一个入口 = 新写入最长陈旧一个 TTL。
+    _SNAPSHOT_GROUPS = ("n_avgdl", "dfs", "hot", "attn", "syn")
+
     def _load_synonym_map(self) -> Dict[str, set]:
         """同义词表（对齐 Redis 的 keepsake:synonyms hash）。
 
         批 2 的 BM25 查询式构造复用 Redis 侧的 `_expand_terms`，词表必须同源，
         否则「同义词扩展」这条召回面两边不一致，对照评测直接失真。
+
+        🔴 走快照：这张表几乎不变，但每次检索都要查 = 每次检索多一次往返。
         """
         out: Dict[str, set] = {}
+        cached = self._snap_get("syn", ())
+        if cached is not None:
+            return cached
         try:
             with self._ro() as cur:
                 cur.execute("SELECT term, synonyms FROM ks_synonym")
@@ -967,6 +1032,7 @@ class PgStorage(StorageBase):
                 if sl and sl != key:
                     bucket.add(sl)
                     out.setdefault(sl, set()).add(key)
+        self._snap_put("syn", (), out)
         return out
 
     def _search_filter_sql(
@@ -1095,33 +1161,68 @@ class PgStorage(StorageBase):
         #    doclen = 该文档全部词元数（= 入库 jieba 分词后的词数，与分词口径一致）
         #    tfs    = 仅查询词的 tf（FILTER，词元少时不必把整篇倒回来）
         #    score  = ts_rank_cd，只用来给候选窗口粗排（取 bm25_limit 条）
+        #
+        # 🔴 **LATERAL 必须挂在 LIMIT 之上**（2026-10 ks_pgq 实测修掉的 147ms 主热点）：
+        #   旧写法把 LATERAL 直接挂在 `ks_fragment f` 上，于是它在 **Sort 之下**，
+        #   对**每一条 GIN 召回命中的行**都要 unnest 一遍 content_tsv
+        #   （实测 rows=1013、loops=1013、每篇 15 个词元），
+        #   而真正只要 top-bm25_limit 条。EXPLAIN 实锤：
+        #       Limit  (actual time=147.464..147.469 rows=20)
+        #         Sort  (Sort Key: ts_rank_cd(...))          <- 0ms
+        #           Nested Loop Left Join (rows=1013.00)   <- 146ms  ← 全在这里
+        #             Bitmap Heap Scan (rows=1013.00)       <- 3.3ms
+        #   改法：先用 CTE（`MATERIALIZED`，显式挡住 pullup）选出 top-N 候选，
+        #   再对**这 N 条**算 doclen/tfs。`doclen`/`tfs` 只依赖该行自己的
+        #   content_tsv，无跨行依赖 ⇒ **候选集、排序、返回列序逐字不变**，
+        #   排序公式/权重/过滤语义/候选集大小一律没动。
+        outer_fields = "cand.key, " + ", ".join(f"cand.{c}" for c in SEARCH_FIELDS)
         sql = (
-            f"SELECT {self._SELECT_FIELDS}, "
-            "c.doclen, COALESCE(c.tfs, '{}') AS tfs, "
-            f"ts_rank_cd(f.content_tsv, to_tsquery('simple', %s), {TS_RANK_NORM}) AS score "
-            "FROM ks_fragment f "
+            "WITH cand AS MATERIALIZED ("
+            f"  SELECT {self._SELECT_FIELDS}, f.content_tsv AS tsv, "
+            f"  ts_rank_cd(f.content_tsv, to_tsquery('simple', %s), {TS_RANK_NORM}) AS score "
+            "  FROM ks_fragment f "
+            "  WHERE f.content_tsv @@ to_tsquery('simple', %s) "
+            f"    AND {where_sql} "
+            "  ORDER BY score DESC LIMIT %s"
+            ") "
+            f"SELECT {outer_fields}, "
+            "c.doclen, COALESCE(c.tfs, '{}') AS tfs, cand.score "
+            "FROM cand "
             "LEFT JOIN LATERAL ("
             "  SELECT COALESCE(sum(cardinality(t.positions)), 0)::float AS doclen, "
             "         array_agg(t.lexeme || ':' || cardinality(t.positions)::text) "
             "           FILTER (WHERE t.lexeme = ANY(%s)) AS tfs "
-            "  FROM unnest(f.content_tsv) t"
+            "  FROM unnest(cand.tsv) t"
             ") c ON TRUE "
-            "WHERE f.content_tsv @@ to_tsquery('simple', %s) "
-            f"AND {where_sql} "
-            "ORDER BY score DESC LIMIT %s"
+            "ORDER BY cand.score DESC"
         )
         # 语料统计：**一条** SQL 拿齐 N / 总长 / avgdl / 每个查询词的 df。
         # 🔴 绝不为每篇文档单独查一次 df（那是 N+1 往返）；df 用一条
         # `GROUP BY lexeme` 的聚合一次算完，词数再多也只有一趟。
-        # ponytail: `corpus` 那半边是全表 unnest 扫描（O(语料)），语料到百万级
-        # 会成为主要延迟。升级路径：入库时把 doclen 落到一个普通列并维护计数，
-        # avgdl 就退化成一次 `avg()`；当前规模（几百到几万条）不值得为此加列。
-        stat_sql = (
+        # 🔴 这条 SQL 里 `corpus` 那半边是**全表 unnest 扫描**（O(语料)），
+        #    而 N / avgdl / df 只随「语料变化 + 过滤条件」变，与查询文本无关
+        #    （df 另加词元集合）⇒ 走进程级 TTL 快照，命中就不发这条 SQL。
+        #    写路径（store/upsert/supersede/correct/import）一律 `_snap_drop`，
+        #    新写入立刻可见，不存在「陈旧到影响断言」的窗口。
+        # 语料统计：**一条** SQL 拿齐 N / 总长 / avgdl / 每个查询词的 df。
+        # 🔴 绝不为每篇文档单独查一次 df（那是 N+1 往返）；df 用一条
+        # `GROUP BY lexeme` 的聚合一次算完，词数再多也只有一趟。
+        # 🔴 `corpus` 那半边是**全表 unnest 扫描**（O(语料)），而 N / avgdl 只随
+        #    「语料变化 + 过滤条件」变、与查询文本无关 ⇒ 走进程级 TTL 快照。
+        #
+        # 🔴 快照是**两个独立分组**（n_avgdl / dfs），因为生产流量里
+        #    「不带 tag/agent 过滤的普通查询」每题词集都不同 ⇒ `dfs` 每次必然 miss，
+        #    而 `n_avgdl`（键里没有查询词）几乎次次命中。于是这里按「缺哪半发哪半」
+        #    拼 SQL：命中 n_avgdl 时**不再计算 corpus CTE**，否则等于每题白扫一遍
+        #    全表（实测 corpus CTE 40ms / 合计 51ms，而只要 df 时只要 11ms）。
+        _corpus_cte = (
             "WITH corpus AS ("
             "  SELECT (SELECT COALESCE(sum(cardinality(t.positions)), 0) "
             "          FROM unnest(f.content_tsv) t) AS doclen "
             "  FROM ks_fragment f "
-            "  WHERE f.content_tsv IS NOT NULL AND " + where_sql + "), "
+            "  WHERE f.content_tsv IS NOT NULL AND " + where_sql + ")"
+        )
+        _dfs_cte = (
             "dfs AS ("
             "  SELECT t.lexeme, count(*)::float AS df "
             "  FROM ks_fragment f, unnest(f.content_tsv) t "
@@ -1129,21 +1230,57 @@ class PgStorage(StorageBase):
             "    AND f.content_tsv @@ to_tsquery('simple', %s) "
             "    AND " + where_sql + " "
             "  GROUP BY t.lexeme"
-            ") "
-            "SELECT (SELECT count(*) FROM corpus)::float, "
-            "       (SELECT COALESCE(sum(doclen), 0)::float FROM corpus), "
-            "       COALESCE((SELECT json_object_agg(lexeme, df) FROM dfs), '{}')"
+            ")"
         )
+        _df_json = "COALESCE((SELECT json_object_agg(lexeme, df) FROM dfs), '{}')"
+        _n_json = ("(SELECT count(*) FROM corpus)::float, "
+                   "(SELECT COALESCE(sum(doclen), 0)::float FROM corpus)")
+        stat_sqls = {
+            # 两半都要：一条 SQL 出齐（首次查询 / 刚被写路径失效）
+            "both": (_corpus_cte + ", " + _dfs_cte + " SELECT " + _n_json + ", " + _df_json,
+                     [*params, lexemes, tsquery, *params]),
+            # 只缺 df（生产常态）
+            "df": ("WITH " + _dfs_cte + " SELECT " + _df_json, [lexemes, tsquery, *params]),
+            # 只缺 N/avgdl（不常发生：n_key 不含查询词）
+            "n": (_corpus_cte + " SELECT " + _n_json, [*params]),
+        }
+
+        # 快照键：**逐项**包含影响结果的参数。
+        #   n_avgdl ← 过滤 SQL + 过滤参数（不含查询词：N/avgdl 与查询词无关）
+        #   dfs     ← 过滤 SQL + 过滤参数 + 查询词集合（df 只认 lexeme 集合，
+        #             故按排序后的集合做键，同词集换顺序仍命中同一条快照）
+        n_key = (where_sql, tuple(params))
+        d_key = n_key + (tuple(sorted(lexemes)),)
+        n_avgdl = self._snap_get("n_avgdl", n_key)
+        df_cached = self._snap_get("dfs", d_key)
+
+        need_n = n_avgdl is None
+        need_df = df_cached is None
 
         with self._ro() as cur:
-            cur.execute(sql, [tsquery, lexemes, tsquery, *params, self._bm25_limit])
+            cur.execute(sql, [tsquery, tsquery, *params, self._bm25_limit, lexemes])
             rows = cur.fetchall()
-            cur.execute(stat_sql, [*params, lexemes, tsquery, *params])
-            n_docs, total_len, df_raw = cur.fetchone()
+            if need_n or need_df:
+                which = "both" if (need_n and need_df) else ("df" if need_df else "n")
+                stat_sql, stat_params = stat_sqls[which]
+                cur.execute(stat_sql, stat_params)
+                if need_n and need_df:
+                    n_docs, total_len, df_raw = cur.fetchone()
+                    n_avgdl = (float(n_docs or 0.0), float(total_len or 0.0))
+                elif need_df:
+                    (df_raw,) = cur.fetchone()
+                else:
+                    n_docs, total_len = cur.fetchone()
+                    n_avgdl = (float(n_docs or 0.0), float(total_len or 0.0))
+                if need_df:
+                    df_cached = {str(k).lower(): float(v) for k, v in dict(df_raw or {}).items()}
+                    self._snap_put("dfs", d_key, df_cached)
+                if need_n:
+                    self._snap_put("n_avgdl", n_key, n_avgdl)
 
         # 3. Python 侧 BM25（候选集不变，只把 ts_rank_cd 换成 BM25 分）
-        dfs = {str(k).lower(): float(v) for k, v in dict(df_raw or {}).items()}
-        n_docs = float(n_docs or 0.0)
+        dfs = df_cached
+        n_docs, total_len = n_avgdl
         avgdl = (float(total_len or 0.0) / n_docs) if n_docs > 0 else 0.0
         scored = []
         for row in rows:
@@ -1193,7 +1330,9 @@ class PgStorage(StorageBase):
         `embedding <=> $q` 返回**余弦距离**（0~2，越小越近），
         与 Redis `DISTANCE_METRIC COSINE` 的 doc.score 量纲一致，
         所以 `_rerank_with_decay(is_knn=True)` 可以两边共用同一个实现。
-        ORDER BY 写成 `f.embedding <=> 常量` —— pgvector 正是这个形状才走 HNSW。
+        ORDER BY 写成 `f.embedding <=> 常量` —— pgvector 正是这个形状才走 HNSW；
+        但**过滤条件必须留在索引扫描之外**（见下面 fetch_n 处的注释），否则规划器
+        会因过滤后的行数估偏而放弃索引、改走全表顺序扫。
         """
         if not (query or "").strip():
             logger.warning("storage_pg: search_knn called with an empty query — "
@@ -1212,16 +1351,33 @@ class PgStorage(StorageBase):
 
         where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
         lit = self._vector_literal(vec)
+        # 🔴 **内层子查询不带任何过滤**，「活记忆」过滤放在外层 WHERE：
+        #   带过滤时规划器把过滤后的行数估成 rows=1218/3655，HNSW 索引路径的
+        #   总代价被抬到 ≥ Seq Scan，于是**整条 KNN 退化成全表顺序扫**
+        #   （EXPLAIN 证据：见 /tmp/ks_pgperf_rootcause.txt，
+        #     Seq Scan 56ms/22171 buffers vs Index Scan 5ms/1229 buffers）。
+        #   把过滤挪到外层后，内层只剩 `ORDER BY embedding <=> $q LIMIT n`，
+        #   规划器必然选 HNSW；子查询带 LIMIT ⇒ PG 不做 subquery pullup，
+        #   过滤不会被下推回索引扫描，语义与原写法逐条对齐。
+        #   代价：HNSW 是「先给有序候选、过滤在扫描之后」，所以内层按
+        #   KNN_OVERFETCH 多取几倍再由外层 LIMIT 收口，避免失效碎片把结果打空。
+        fetch_n = max(self._candidate_count, self._candidate_count * KNN_OVERFETCH)
         sql = (
-            f"SELECT {self._SELECT_FIELDS}, (f.embedding <=> %s::vector) AS score "
-            "FROM ks_fragment f "
-            "WHERE f.embedding IS NOT NULL "
-            f"AND {where_sql} "
-            "ORDER BY f.embedding <=> %s::vector "
+            "SELECT " + self._SELECT_FIELDS + ", v.d AS score "
+            "FROM ("
+            "  SELECT f2.key AS key, (f2.embedding <=> %s::vector) AS d "
+            "  FROM ks_fragment f2 "
+            "  WHERE f2.embedding IS NOT NULL "
+            "  ORDER BY f2.embedding <=> %s::vector "
+            "  LIMIT %s"
+            ") v "
+            "JOIN ks_fragment f ON f.key = v.key "
+            f"WHERE {where_sql} "
+            "ORDER BY v.d "
             "LIMIT %s"
         )
         with self._ro() as cur:
-            cur.execute(sql, [lit, *params, lit, self._candidate_count])
+            cur.execute(sql, [lit, lit, fetch_n, *params, self._candidate_count])
             rows = cur.fetchall()
 
         fragments = self._rows_to_fragments(rows, "_knn_score", 1.0)
@@ -1372,6 +1528,10 @@ class PgStorage(StorageBase):
             logger.warning("storage_pg: upsert_fragment 缺 key，跳过")
             return False
 
+        # 写路径让检索快照立即失效：新写的 content_tsv 会改 N/avgdl/df。
+        # （放在入口而不是提交后：upsert 失败也只是白丢一次快照，正确性不依赖它。）
+        self._snap_drop("n_avgdl", "dfs")
+
         # INSERT 的列清单必须以 key 打头（参数也是 key 在最前），
         # 否则列数与参数数对不上，psycopg 直接报「placeholder 数不符」。
         cols: List[str] = ["key"]
@@ -1437,6 +1597,10 @@ class PgStorage(StorageBase):
         sentiment_label: Optional[str] = None,
     ) -> bool:
         """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store 一致。"""
+        # 写路径让检索快照立即失效：本次会改 ks_fragment 的 content_tsv（→ N/avgdl/df）、
+        # 并累加 ks_hot_topic / ks_attention（→ 重排加权信号）。
+        self._snap_drop(*self._SNAPSHOT_GROUPS)
+
         # 情绪分析（除非明确传入）
         if sentiment_score is None or sentiment_label is None:
             intensity, label = analyze_emotion(text)
@@ -1647,6 +1811,17 @@ class PgStorage(StorageBase):
         """
         if not rows:
             return 0
+        # 迁移会**整表覆盖**辅助结构 ⇒ 对应分组的快照全部作废。
+        # 表名不在映射里就**全清**：迁移是低频路径，多清几个分组的代价是一次重查，
+        # 漏清一个分组的代价是「迁移后仍读旧快照」。
+        group_by_table = {
+            "ks_hot_topic": "hot",
+            "ks_hot_topic_seen": "hot",
+            "ks_attention": "attn",
+            "ks_synonym": "syn",
+        }
+        group = group_by_table.get(table)
+        self._snap_drop(*(self._SNAPSHOT_GROUPS if group is None else (group,)))
         with self._tx() as cur:
             self._insert_many(cur, table, columns, rows, on_conflict)
         return len(rows)
@@ -1729,6 +1904,7 @@ class PgStorage(StorageBase):
         """封边：标 superseded_by + superseded_at（不物理删）。"""
         if not old_key:
             return False
+        self._snap_drop("n_avgdl", "dfs")   # 封边不改 content_tsv，但会改「活记忆」口径的 N
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._tx() as cur:
             cur.execute(
@@ -1748,6 +1924,7 @@ class PgStorage(StorageBase):
         """
         if not keys:
             return 0
+        self._snap_drop("n_avgdl", "dfs")   # corrected 会把 valid_until 置空 → 口径变
         now_iso = datetime.now(timezone.utc).isoformat()
         count = 0
         with self._tx() as cur:
@@ -1859,43 +2036,66 @@ class PgStorage(StorageBase):
     # ------------------------------------------------------------------
 
     def match_attention(self, content: str, top_n: int = 10) -> float:
-        """内容命中高注意力话题的加权值（公式与 attention.match_attention_boost 同）。"""
+        """内容命中高注意力话题的加权值（公式与 attention.match_attention_boost 同）。
+
+        🔴 走进程级 TTL 快照：`rerank_with_decay` 对**每条候选**都调一次本方法，
+        而它取回的那张榜（scope + top_n + 未过期）在整轮重排里是**同一批行**。
+        不缓存就是「每条候选一次往返」——实测占了 search() 总耗时的大头
+        （见 /tmp/ks_pgperf_rootcause.txt）。写路径一律 `_snap_drop("attn")`。
+        """
         if not content:
             return 1.0
-        with self._ro() as cur:
-            cur.execute(
-                """
-                SELECT topic, score FROM ks_attention
-                WHERE scope = %s AND expire_ts > extract(epoch from now())
-                ORDER BY score DESC LIMIT %s
-                """,
-                (_TOPIC_SCOPE_ALL, top_n),
-            )
-            raw = cur.fetchall()
+        key = (top_n,)
+        raw = self._snap_get("attn", key)
+        if raw is None:
+            with self._ro() as cur:
+                cur.execute(
+                    """
+                    SELECT topic, score FROM ks_attention
+                    WHERE scope = %s AND expire_ts > extract(epoch from now())
+                    ORDER BY score DESC LIMIT %s
+                    """,
+                    (_TOPIC_SCOPE_ALL, top_n),
+                )
+                raw = cur.fetchall()
+            self._snap_put("attn", key, raw)
         # 加权公式是后端无关的纯计算 → 与 Redis 侧共用 storage_shared 同一份
         return attention_boost_from_topics(raw, content, self._attention_boost_max)
 
     def match_hot_topics(self, text: str, limit: int = 10) -> float:
-        """内容命中热词的衰减加权命中数（公式与 Redis match_hot_topics 同）。"""
+        """内容命中热词的衰减加权命中数（公式与 Redis match_hot_topics 同）。
+
+        🔴 同 `match_attention`：热词榜 + last_seen 走进程级 TTL 快照，
+        写路径 `_snap_drop("hot")` 后立刻失效。**只缓存取回的行**，
+        `hot_topic_weighted_hits` 仍按每条候选的文本实算 ⇒ 加权公式与排序零改动。
+        """
         if not text:
             return 0.0
-        with self._ro() as cur:
-            cur.execute(
-                """
-                SELECT topic FROM ks_hot_topic
-                WHERE scope = %s AND expire_ts > extract(epoch from now())
-                ORDER BY score DESC LIMIT %s
-                """,
-                (_TOPIC_SCOPE_ALL, limit),
-            )
-            topics = [t for (t,) in cur.fetchall()]
-            if not topics:
-                return 0.0
-            cur.execute(
-                "SELECT topic, last_seen FROM ks_hot_topic_seen WHERE topic = ANY(%s)",
-                (topics,),
-            )
-            last_seen = {t: float(ls) for t, ls in cur.fetchall()}
+        key = (limit,)
+        snap = self._snap_get("hot", key)
+        if snap is None:
+            with self._ro() as cur:
+                cur.execute(
+                    """
+                    SELECT topic FROM ks_hot_topic
+                    WHERE scope = %s AND expire_ts > extract(epoch from now())
+                    ORDER BY score DESC LIMIT %s
+                    """,
+                    (_TOPIC_SCOPE_ALL, limit),
+                )
+                topics = [t for (t,) in cur.fetchall()]
+                last_seen: Dict[str, float] = {}
+                if topics:
+                    cur.execute(
+                        "SELECT topic, last_seen FROM ks_hot_topic_seen WHERE topic = ANY(%s)",
+                        (topics,),
+                    )
+                    last_seen = {t: float(ls) for t, ls in cur.fetchall()}
+            snap = (topics, last_seen)
+            self._snap_put("hot", key, snap)
+        topics, last_seen = snap
+        if not topics:
+            return 0.0
 
         # 衰减加权同样是纯计算 → 与 Redis 侧共用 storage_shared 同一份
         return hot_topic_weighted_hits(
