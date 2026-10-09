@@ -71,7 +71,9 @@ import logging
 import math
 import random
 import struct
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -641,11 +643,43 @@ class PgStorage(StorageBase):
         包括「没命中就算命中集为空」「total<=0 时不加权」这些边角）。
         公式本身仍在 storage_shared 那一份里跑，PG 侧只换「命中数从哪来」。
         没有 `pre_weights`（完整候选）时行为与改造前逐字相同。
+
+        🔴 收尾多一步 `_tiebreak`：共用的 `rerank_with_decay` 末尾只按
+        `_combined_score` 降序排，Python 的 `list.sort` 稳定 ⇒ **同分行之间
+        保留输入次序**，而输入次序来自候选 SQL 的 `ORDER BY … , key`/HNSW 返回序，
+        跨次运行不保证一致 → 同分行的相对名次会飘。这里按 key 兜死（见 `_tiebreak`）。
         """
         if not fragments or not pre_weights:
-            return rerank_with_decay(self, fragments, score_key=score_key, is_knn=is_knn)
-        return rerank_with_decay(_PrecomputedWeights(self, pre_weights), fragments,
-                                 score_key=score_key, is_knn=is_knn)
+            out = rerank_with_decay(self, fragments, score_key=score_key, is_knn=is_knn)
+        else:
+            out = rerank_with_decay(_PrecomputedWeights(self, pre_weights), fragments,
+                                    score_key=score_key, is_knn=is_knn)
+        return self._tiebreak(out)
+
+    @staticmethod
+    def _tiebreak(fragments: List[Dict[str, Any]],
+                  score_key: str = "_combined_score") -> List[Dict[str, Any]]:
+        """**并列 tiebreaker**：同分时按 `key` 字典序（升序）定序。
+
+        🔴 为什么需要：共用实现里的排序都只用一个分字段，而 PG 的分是
+        `float` 连乘（sim × decay × emotion × feedback × hot × attention），
+        **同分极其常见**（尤其 BM25 归一化后大量候选挤在同一个值上）。
+        `list.sort` 稳定 ⇒ 同分行沿用输入次序，而输入次序由候选 SQL 的
+        `ORDER BY score DESC, key` 与 HNSW 的返回序决定 —— HNSW 是近似检索，
+        同一查询两次运行返回的候选集/次序可以不同，于是同分行的名次逐次不同，
+        「同一题连查多次结果不一致」的抖动就是这么来的。
+
+        规则：**只改同分项之间的相对次序**，不改任何一行的分数、不改名次分档、
+        不改条数（`final_limit` 仍按原样截断）。Redis 侧零改动 ——
+        本函数只在 PgStorage 内调用。
+
+        无 `_key` 的行排在最后（`or ""` 兜底），不与有 key 的行抢位置。
+        """
+        if len(fragments) < 2:
+            return fragments
+        return sorted(fragments,
+                      key=lambda f: (-float(f.get(score_key, 0.0) or 0.0),
+                                     f.get("_key") or ""))
 
     def __init__(
         self,
@@ -722,6 +756,11 @@ class PgStorage(StorageBase):
         self._attention_emotion_factor = float(attention_emotion_factor)
         self._hot_topic_decay_half_days = int(hot_topic_decay_half_days)
         self._conn: Optional[Any] = None
+        # ---- 并行检索：每线程一条只读连接（psycopg Connection 非线程安全）----
+        self._tls = threading.local()
+        self._conn_lock = threading.Lock()
+        self._worker_conns: List[Any] = []
+        self._pool: Optional[ThreadPoolExecutor] = None
 
     def _has_embedder(self) -> bool:
         """能否写/查向量（判据与 RedisStorage._has_embedder 一致）。"""
@@ -735,34 +774,41 @@ class PgStorage(StorageBase):
     # 连接管理
     # ------------------------------------------------------------------
 
-    def _connect(self) -> Any:
-        """惰性建连。psycopg 在这里才 import —— 没装也不影响 import 本模块。"""
-        if self._conn is not None:
-            return self._conn
+    def _open_conn(self) -> Any:
+        """建一条**新**连接（不碰 `self._conn`）—— 并行检索的工作线程各调一次。"""
         import psycopg  # noqa: PLC0415 — optional 依赖，延迟到真要用 PG 时
 
-        if self._dsn:
-            conninfo = self._dsn
-        else:
-            parts = [
-                f"host={self._host}",
-                f"port={self._port}",
-                f"dbname={self._dbname}",
-            ]
-            if self._user:
-                parts.append(f"user={self._user}")
-            if self._password:
-                parts.append(f"password={self._password}")
-            if self._sslmode:
-                parts.append(f"sslmode={self._sslmode}")
-            conninfo = " ".join(parts)
+        conninfo = self._conninfo()
         try:
-            self._conn = psycopg.connect(conninfo, connect_timeout=self._connect_timeout)
+            conn = psycopg.connect(conninfo, connect_timeout=self._connect_timeout)
         except Exception as e:
             # 只出 host，不出 conninfo（可能含口令）
             logger.error("storage_pg: connect to %s:%s failed: %s", self._host, self._port, e)
             raise
         logger.info("storage_pg: connected to %s:%s/%s", self._host, self._port, self._dbname)
+        return conn
+
+    def _conninfo(self) -> str:
+        if self._dsn:
+            return self._dsn
+        parts = [
+            f"host={self._host}",
+            f"port={self._port}",
+            f"dbname={self._dbname}",
+        ]
+        if self._user:
+            parts.append(f"user={self._user}")
+        if self._password:
+            parts.append(f"password={self._password}")
+        if self._sslmode:
+            parts.append(f"sslmode={self._sslmode}")
+        return " ".join(parts)
+
+    def _connect(self) -> Any:
+        """惰性建连。psycopg 在这里才 import —— 没装也不影响 import 本模块。"""
+        if self._conn is not None:
+            return self._conn
+        self._conn = self._open_conn()
         return self._conn
 
     def _drop_conn(self) -> None:
@@ -772,6 +818,66 @@ class PgStorage(StorageBase):
                 conn.close()
             except Exception:
                 pass
+
+    # ---- 并行检索用的「每线程一条连接」 ----
+    #
+    # 🔴 为什么不能共用 `self._conn`：psycopg 的 Connection **不是线程安全的** ——
+    #    两个线程各开一个 cursor 在同一条连接上交替 execute，结果集会互相踩
+    #    （psycopg 用一把锁把 execute 串起来，但 fetchall 读到的是**对方**的
+    #    结果集）。所以 BM25 与 KNN 并行时必须各持一条连接。
+    #
+    # ponytail: 线程池固定 2 个 worker ⇒ 连接数上界 = 3（主线程 + 2 worker），
+    # 不做通用连接池。升级路径：真要放开并发度再换 psycopg_pool。
+    def _worker_conn(self) -> Any:
+        """取本线程的只读连接（首次调用时建，连到 `self._drop_conn` 之后重建）。"""
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            return conn
+        conn = self._open_conn()
+        self._tls.conn = conn
+        with self._conn_lock:
+            self._worker_conns.append(conn)
+        return conn
+
+    def _drop_worker_conn(self) -> None:
+        """本线程连接出错时丢弃并清空（与 `_drop_conn` 对称）。"""
+        conn, self._tls.conn = getattr(self._tls, "conn", None), None
+        if conn is None:
+            return
+        with self._conn_lock:
+            if conn in self._worker_conns:
+                self._worker_conns.remove(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    @contextmanager
+    def _ro(self) -> Iterator[Any]:
+        """只读游标。读完显式 commit 关掉 psycopg 的隐式事务。
+
+        为什么要关：psycopg 默认非 autocommit，任何 SELECT 都会开一个隐式事务并
+        一直挂着（既留脏状态，也让后续 `_tx()` 只拿到 SAVEPOINT 而不提交）。
+        """
+        # 并行检索的工作线程走**自己那条**连接，绝不与主线程共用 cursor。
+        if getattr(self._tls, "in_worker", False):
+            conn = self._worker_conn()
+            try:
+                with conn.cursor() as cur:
+                    yield cur
+                conn.commit()
+            except Exception:
+                self._drop_worker_conn()
+                raise
+            return
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                yield cur
+            conn.commit()
+        except Exception:
+            self._drop_conn()
+            raise
 
     @contextmanager
     def _tx(self) -> Iterator[Any]:
@@ -788,22 +894,6 @@ class PgStorage(StorageBase):
             with conn.transaction():
                 with conn.cursor() as cur:
                     yield cur
-            conn.commit()
-        except Exception:
-            self._drop_conn()
-            raise
-
-    @contextmanager
-    def _ro(self) -> Iterator[Any]:
-        """只读游标。读完显式 commit 关掉 psycopg 的隐式事务。
-
-        为什么要关：psycopg 默认非 autocommit，任何 SELECT 都会开一个隐式事务并
-        一直挂着（既留脏状态，也让后续 `_tx()` 只拿到 SAVEPOINT 而不提交）。
-        """
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                yield cur
             conn.commit()
         except Exception:
             self._drop_conn()
@@ -996,6 +1086,16 @@ class PgStorage(StorageBase):
 
     def close(self) -> None:
         """关连接，可重复调用。"""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=True)
+        with self._conn_lock:
+            conns, self._worker_conns = self._worker_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
         self._drop_conn()
 
     # ------------------------------------------------------------------
@@ -1412,7 +1512,8 @@ class PgStorage(StorageBase):
                                        pre_weights, attn_total)
         fragments = self._rerank_with_pre(fragments, score_key="_bm25_score",
                                           pre_weights=pre_weights)
-        return fragments[: self._final_limit]
+        # 🔴 tiebreak 在截断之前（理由同 `_knn_thin`）。
+        return self._tiebreak(fragments)[: self._final_limit]
 
     def _text_to_vector(self, text: str) -> Optional[List[float]]:
         """文本 → float 向量（无 embedder 或取不到返回 None）。"""
@@ -1531,7 +1632,9 @@ class PgStorage(StorageBase):
                                        pre_weights, attn_total)
         fragments = self._rerank_with_pre(fragments, score_key="_knn_score", is_knn=True,
                                           pre_weights=pre_weights)
-        return fragments[: self._final_limit]
+        # 🔴 tiebreak 必须发生在**截断之前**：截断点正好落在同分档上时，
+        #    「哪几条被切掉」本身就要确定，否则同题多查的返回条数都会不一样。
+        return self._tiebreak(fragments)[: self._final_limit]
 
     def search(
         self,
@@ -1547,19 +1650,79 @@ class PgStorage(StorageBase):
           3. v2 后置过滤（剔除 consumed / superseded + 相似度地板）
 
         两步的重排/融合/过滤都走 `storage_shared` 的共用实现，不是副本。
+
+        🔴 **两路并行**（2026-10 ks_ppar）：改前是 `bm25_thin()` 跑完再
+        `knn_thin()` 的**串行**，端到端 = 两路耗时相加（180 实测 1.355s ≈
+        0.919 + 0.412）。而 KNN 那 0.9s 里裸 SQL 只有 9ms，绝大部分是
+        **查询向量那次 embedder HTTP 调用** —— 它与 BM25 完全无依赖，
+        串行等于让 BM25 的 SQL 白等一次网络往返。现在两路各投一个 worker：
+        KNN 先投（它要先做 HTTP），BM25 同时跑，墙钟 ≈ max(两路)。
+
+        安全性：两路都是**只读**且各自 `self._ro()`；worker 线程走
+        `_worker_conn()` 的**独立连接**（psycopg Connection 非线程安全，
+        共用一条会让两个 cursor 的结果集互相踩，见 `_worker_conn` 注释）。
+        合并顺序、融合/过滤/重排全部在主线程按**原顺序**执行，排序语义未动。
+
+        查询向量**每次 search 只算一次**：`_knn_thin` 是唯一调
+        `_text_to_vector(query)` 的地方，且这里只投一次 KNN（见 /tmp/ks_ppar_embed.txt）。
         """
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        bm25_results = self._bm25_thin(query, tag_filter, effective_agent_id,
-                                        effective_is_primary)
-        if self._has_embedder():
-            knn_results = self._knn_thin(query, tag_filter, effective_agent_id,
-                                          effective_is_primary)
-            if knn_results:
-                fused = self._rrf_fuse(bm25_results, knn_results)
-                return self._hydrate_thin(self._apply_v2_filters(fused))
+        if not self._has_embedder():
+            bm25_results = self._bm25_thin(query, tag_filter, effective_agent_id,
+                                            effective_is_primary)
+            return self._hydrate_thin(self._apply_v2_filters(bm25_results))
+
+        knn_results, bm25_results = self._search_parallel(
+            query, tag_filter, effective_agent_id, effective_is_primary)
+        if knn_results:
+            fused = self._rrf_fuse(bm25_results, knn_results)
+            return self._hydrate_thin(self._apply_v2_filters(self._tiebreak(fused)))
         return self._hydrate_thin(self._apply_v2_filters(bm25_results))
+
+    def _search_parallel(
+        self,
+        query: str,
+        tag_filter: str,
+        agent_id: str,
+        is_primary: Optional[bool],
+    ) -> tuple:
+        """BM25 与 KNN 两路并行跑，返回 `(knn_results, bm25_results)`。
+
+        🔴 异常语义**与串行版逐条一致**：任一路抛错就把那路的异常原样上抛，
+        不吞、不降级（`future.result()` 会重抛 worker 里的原始异常）。
+        两路都只读，所以「BM25 成功 / KNN 失败」不会留下写副作用。
+
+        线程池**按实例复用**（`_pool` 惰性建、2 个 worker、`close()` 里
+        shutdown）—— 每次 search 新建线程池会让 worker 连接反复重建，
+        而建连到远端库要 2~4s，比省下的那点时间贵得多。
+        """
+        pool = self._pool
+        if pool is None:
+            with self._conn_lock:
+                if self._pool is None:
+                    self._pool = ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="ks-pg-search")
+                pool = self._pool
+
+        def run(fn, *args):
+            # 标记本线程走独立连接（`_ro()` 据此分流到 `_worker_conn`）
+            self._tls.in_worker = True
+            try:
+                return fn(*args)
+            finally:
+                self._tls.in_worker = False
+
+        # KNN 先投：它要先做查询向量的 embedder HTTP 调用（最慢的一段），
+        # 先投进去让 BM25 的 SQL 与它重叠，而不是排在它后面等。
+        f_knn = pool.submit(run, self._knn_thin, query, tag_filter, agent_id, is_primary)
+        f_bm25 = pool.submit(run, self._bm25_thin, query, tag_filter, agent_id, is_primary)
+        # 取 BM25 的结果先（它通常更短），但两路都已 in-flight，取哪个不影响并行度
+        bm25_results = f_bm25.result()
+        knn_results = f_knn.result()
+        # 融合前的输入顺序仍是「BM25 原序 + KNN 原序」，与串行版一致
+        return knn_results, bm25_results
 
     def _hydrate_thin(self, fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """薄候选 → 完整结果：**对最终要返回的 N 条，一次 `key = ANY` 取回正文**。
