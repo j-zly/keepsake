@@ -147,14 +147,22 @@ class _Ctx:
         return False
 
 
-def _row(key, content, doclen, tfs):
-    """一行候选：key + content（其余 SEARCH_FIELDS 留空） + doclen + tfs。
+def _row(key, doclen, tfs):
+    """一行**薄候选**（2026-10 ks_pgr 之后候选阶段不再回正文）。
 
-    列序与 search_bm25 的 SELECT 对上：key + SEARCH_FIELDS（共 11 列，含
-    content；这里只给 content 非空 → `_rows_to_fragments` 只保留 content）
-    + doclen + tfs + ts_rank_cd（最后一列是改造前的粗排分，会被 BM25 顶掉）。
+    列序与 `_bm25_thin` 的 SELECT 对上：
+      key, chash, created, sentiment_score, feedback_score, corrected, consumed,
+      hot_w, attn_w, doclen, tfs, ts_rank_cd（最后一列是粗排分，会被 BM25 顶掉）。
+    正文在 `_hydrate_thin()` 的第二条 SQL 里按 key 取回（`_frag_row`）。
     """
-    return (key, content) + (None,) * (len(SEARCH_FIELDS) - 1) + (doclen, tfs, 1.8)
+    return (key, f"{key}-hash", "2026-01-01T00:00:00+00:00", "0", "0", 0, 0,
+            0.0, 0.0, doclen, tfs, 1.8)
+
+
+def _frag_row(key, content):
+    """一行 `_hydrate_thin` 的取回结果（FRAGMENT_COLUMNS 列序）。"""
+    return (key, content, "shared", "", "", "2026-01-01T00:00:00+00:00",
+            "0", "", "0", "", "fact", "", "", "", "", "", "")
 
 
 def _fake_pg(monkeypatch, queue):
@@ -176,10 +184,11 @@ def test_search_bm25_fetches_corpus_stats_in_one_aggregate_not_per_document(monk
     这条断言直接对着「别为每篇文档单独查一次 df」那条要求 ——
     写成 N+1 的实现在这里必然红（statements 数会随候选数线性涨）。
     """
-    rows = [_row(f"k{i}", f"前端部署到 /opt/web 第{i}版", 20, ["前端:2", "部署:2"])
-            for i in range(30)]
-    # 三趟：同义词（空表）、候选召回、语料统计
-    pg, db = _fake_pg(monkeypatch, [[], rows, [(50.0, 1000.0, {"前端": 5.0, "部署": 5.0})]])
+    rows = [_row(f"k{i}", 20, ["前端:2", "部署:2"]) for i in range(30)]
+    frags = [_frag_row(f"k{i}", f"前端部署到 /opt/web 第{i}版") for i in range(30)]
+    # 六趟：同义词（空表）、热词榜（空）、注意力榜（空）、候选召回、语料统计、取回正文
+    pg, db = _fake_pg(monkeypatch, [[], [], [], rows,
+                                    [(50.0, 1000.0, {"前端": 5.0, "部署": 5.0})], frags])
 
     out = pg.search_bm25("前端部署")
     assert out, "应当返回候选"
@@ -203,11 +212,12 @@ def test_search_bm25_fetches_corpus_stats_in_one_aggregate_not_per_document(monk
 def test_search_bm25_scores_are_bm25_not_rank_cd(monkeypatch):
     """端到端：跑真实 `search_bm25`，检查 `_bm25_score` 等于手算 BM25，
     且**不再是全并列**（候选集相同、只有打分换了）。"""
-    rows = [
-        _row("k1", "前端部署到 /opt/web", 20, ["前端:1", "部署:1"]),
-        _row("k2", "前端部署到 /opt/web 前端部署 前端部署 前端部署", 26, ["前端:4", "部署:4"]),
-    ]
-    pg, _db = _fake_pg(monkeypatch, [[], rows, [(2.0, 46.0, {"前端": 2.0, "部署": 2.0})]])
+    rows = [_row("k1", 20, ["前端:1", "部署:1"]),
+            _row("k2", 26, ["前端:4", "部署:4"])]
+    frags = [_frag_row("k1", "前端部署到 /opt/web"),
+             _frag_row("k2", "前端部署到 /opt/web 前端部署 前端部署 前端部署")]
+    pg, _db = _fake_pg(monkeypatch, [[], [], [], rows,
+                                      [(2.0, 46.0, {"前端": 2.0, "部署": 2.0})], frags])
 
     out = pg.search_bm25("前端部署")
     assert {f["_key"] for f in out} == {"k1", "k2"}

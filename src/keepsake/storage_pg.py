@@ -589,6 +589,34 @@ _NOT_IMPLEMENTED = (
 )
 
 
+class _PrecomputedWeights:
+    """给共用的 `rerank_with_decay` 用的权重代理。
+
+    薄候选的 `content` 是 md5 摘要，不是正文，所以热词/注意力命中数没法在
+    Python 侧重算（那是 `storage_shared` 里的纯计算）—— 改成在候选 SQL 里
+    一次算完，这里只按摘要查表回给共用公式。
+    其余属性（衰减半衰期 / 情绪 / 反馈 / 热门权重配置）全部透传给真实实例，
+    共用公式一行没改。查不到摘要时回落到真实查询（防御性，正常路径不会走到）。
+    """
+
+    __slots__ = ("_base", "_pre")
+
+    def __init__(self, base: Any, pre: Dict[str, tuple]):
+        self._base = base
+        self._pre = pre
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def match_hot_topics(self, text: str, limit: int = 10) -> float:
+        hit = self._pre.get(text)
+        return float(hit[0]) if hit else self._base.match_hot_topics(text, limit=limit)
+
+    def match_attention(self, content: str, top_n: int = 10) -> float:
+        hit = self._pre.get(content)
+        return float(hit[1]) if hit else self._base.match_attention(content, top_n=top_n)
+
+
 class PgStorage(StorageBase):
     """PostgreSQL 存储后端（批 2：读写 + 检索全量）。
 
@@ -602,6 +630,22 @@ class PgStorage(StorageBase):
     _apply_v2_filters = apply_v2_filters
     _rerank_with_decay = rerank_with_decay
     _load_fragments_by_keys = load_fragments_by_keys
+
+    def _rerank_with_pre(self, fragments, score_key="_bm25_score", is_knn=False,
+                         pre_weights=None):
+        """共用的 rerank_with_decay + 薄候选入口。
+
+        `pre_weights` 是候选 SQL 侧算好的 `{md5(content): (hot_w, attn_w)}`
+        —— 正文没取回来，热词/注意力加权就只能在 SQL 里先算完（公式与共用的
+        `hot_topic_weighted_hits` / `attention_boost_from_topics` 逐条对齐，
+        包括「没命中就算命中集为空」「total<=0 时不加权」这些边角）。
+        公式本身仍在 storage_shared 那一份里跑，PG 侧只换「命中数从哪来」。
+        没有 `pre_weights`（完整候选）时行为与改造前逐字相同。
+        """
+        if not fragments or not pre_weights:
+            return rerank_with_decay(self, fragments, score_key=score_key, is_knn=is_knn)
+        return rerank_with_decay(_PrecomputedWeights(self, pre_weights), fragments,
+                                 score_key=score_key, is_knn=is_knn)
 
     def __init__(
         self,
@@ -1083,35 +1127,99 @@ class PgStorage(StorageBase):
         clauses.append(f"content <> '' AND length(content) <= {MAX_CONTENT_LEN}")
         return " AND ".join(clauses), params
 
-    # 🔴 SELECT 列表必须**按 SEARCH_FIELDS 的顺序**排，不能按 FRAGMENT_COLUMNS 排：
-    #    两者的列顺序不同（FRAGMENT_COLUMNS 里 entities/fragment_type 排在
-    #    invalid_at 前面），按错的顺序取会把 entities 的值塞进 invalid_at 键 ——
-    #    结果字典看着正常、语义全错，且上层按 invalid_at 判「不是活记忆」会误判。
-    _SELECT_FIELDS = "f.key, " + ", ".join(f"f.{c}" for c in SEARCH_FIELDS)
+    # 🔴 **候选阶段只回「极轻列 + md5(content)」**（2026-10 ks_pgr 收尾）。
+    #    原来候选 SQL 直接 SELECT 全部 SEARCH_FIELDS（content/tags/entities…），
+    #    于是**候选集大小 × 正文体积**的字节全压在客户端：生产实测一次检索
+    #    取回 1.2MB，而 SQL 只跑了 0.46s —— 端到端 1.2~3.4s 的差距全在这。
+    #    现在融合/过滤/去重/重排都在 key 级别做（正文对最终 top-N **只取一次**），
+    #    所以候选行只需要：
+    #      * key        —— 身份（最终取正文的锚点）
+    #      * md5(content) 前 16 位 —— RRF 按 content 去重的**代理身份**（16 字节）。
+    #        截 16 位够用：这个摘要**只在同一次检索的候选集内**（≤200 行）两两比较，
+    #        64 位碰撞概率 ~1e-15。
+    #        必须按 content 去重而不是按 key：key 是 sha256(content)[:12] 加版本
+    #        尾巴，同一份正文在不同版本下是两个 key，按 key 去重会漏合并。
+    #      * created / sentiment_score / feedback_score —— rerank_with_decay 直接读
+    #      * 两个布尔 —— rerank 只判 `tags` 里有没有 corrected、_apply_v2_filters
+    #        只判 fragment_type == 'consumed'，那就只把「判据」取回来，别取原列
+    #    正文/entities/category/source/invalid_at 全部留到 _hydrate_thin() 取。
+    #: 「这段正文命中了哪些话题词、各值多少权重」在 SQL 侧算完，只回两个 float。
+    #: topics/last_seen 与共用的 match_hot_topics / match_attention 同源同快照
+    #: （都是 ≤10 个词），所以公式、顺序、判据逐条一致，只是把 strpos 挪到 PG 里做。
+    #:
+    #: 写法上必须是 **一次 LEFT JOIN + 聚合**，不能是每行一个相关子查询 ——
+    #: 相关子查询要为每条候选各起一次子计划（改前实测 148 行候选就把这一段
+    #: 拖到 ~0.7s，比整条检索其余部分加起来还多）。一次 JOIN 走的是
+    #: 「候选行 × ≤10 个词」的嵌套循环，代价与候选数线性。
+    _TOPIC_HITS_JOIN = (
+        "LEFT JOIN unnest(%s::text[], %s::float[], %s::int[]) AS w(tw, wt, kind) "
+        "  ON length(w.tw) >= 2 AND strpos({c}, w.tw) > 0"
+    )
+    _THIN_GROUP_BY_BM25 = (
+        "GROUP BY cand.key, cand.chash, cand.created, cand.sentiment_score, "
+        "cand.feedback_score, cand.corrected, cand.consumed, "
+        "c.doclen, c.tfs, cand.score"
+    )
+    _THIN_GROUP_BY_KNN = (
+        "GROUP BY key, chash, created, sentiment_score, feedback_score, "
+        "corrected, consumed, d"
+    )
+    #: 热词(kind=0) 与注意力(kind=1) 的命中权重和，各自成一个 float。
+    _TOPIC_HITS_SELECT = (
+        "COALESCE(sum(w.wt) FILTER (WHERE w.kind = 0), 0)::float, "
+        "COALESCE(sum(w.wt) FILTER (WHERE w.kind = 1), 0)::float"
+    )
 
-    def _rows_to_fragments(self, rows: List[tuple], score_key: str, default_score: float) -> List[Dict[str, Any]]:
-        """DB 行 → 检索结果 dict（形状与 Redis 侧**逐字同形**）。
+    def _rows_to_thin(
+        self,
+        rows: List[tuple],
+        score_key: str,
+        default_score: float,
+        pre_weights: Dict[str, tuple],
+        attn_total: float,
+    ) -> List[Dict[str, Any]]:
+        """候选行 → 轻量 dict（**不含正文**）。
 
-        键集合 = SEARCH_FIELDS（空值不进 dict，同 Redis hash 稀疏语义）
-                 + `_key` + `_bm25_score`/`_knn_score`；
-        随后的 `_sim` / `_combined_score` / `_weights` 由共用的 rerank_with_decay 补。
+        `content` 字段放的是 md5 摘要，不是正文：它只被两处用到 ——
+        RRF 的去重键、以及热词/注意力加权的查表键（`_PrecomputedWeights`）。
+        真正的正文在 `_hydrate_thin()` 里按 key 一次性取回后替换。
         """
         out: List[Dict[str, Any]] = []
         for row in rows:
-            key = row[0]
-            frag: Dict[str, Any] = {}
-            for name, value in zip(SEARCH_FIELDS, row[1:1 + len(SEARCH_FIELDS)]):
-                if value is None or value == "":
-                    continue
-                frag[name] = value if isinstance(value, str) else str(value)
-            if not frag.get("content"):
-                continue
+            key, chash, created, sent, fb, corrected, consumed, hot_w, attn_w = row[:9]
+            frag: Dict[str, Any] = {"content": chash}
+            if created:
+                frag["created"] = created
+            if sent:
+                frag["sentiment_score"] = sent if isinstance(sent, str) else str(sent)
+            if fb:
+                frag["feedback_score"] = fb if isinstance(fb, str) else str(fb)
+            if corrected:
+                frag["tags"] = "corrected"
+            if consumed:
+                frag["fragment_type"] = "consumed"
             frag["_key"] = key
             frag[score_key] = float(row[-1]) if row[-1] is not None else default_score
+            frag["_chash"] = chash
+            # attn_w 按共用的 attention_boost_from_topics 口径换算：
+            # ratio = min(命中分数和 / 全部分数和, 1.0)，全部为 0 时不加权。
+            ratio = min(float(attn_w) / attn_total, 1.0) if attn_total > 0 else 0.0
+            pre_weights[chash] = (float(hot_w),
+                                  1.0 + (self._attention_boost_max - 1.0) * ratio)
             out.append(frag)
         return out
 
     def search_bm25(
+        self,
+        query: str,
+        tag_filter: str = "",
+        agent_id: str = "",
+        is_primary: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """BM25 全文搜索（对外入口：内部薄候选 + 一次取回正文，形状逐字不变）。"""
+        return self._hydrate_thin(self._bm25_thin(query, tag_filter, agent_id, is_primary))
+
+    def _bm25_thin(
         self,
         query: str,
         tag_filter: str = "",
@@ -1175,18 +1283,25 @@ class PgStorage(StorageBase):
         #   再对**这 N 条**算 doclen/tfs。`doclen`/`tfs` 只依赖该行自己的
         #   content_tsv，无跨行依赖 ⇒ **候选集、排序、返回列序逐字不变**，
         #   排序公式/权重/过滤语义/候选集大小一律没动。
-        outer_fields = "cand.key, " + ", ".join(f"cand.{c}" for c in SEARCH_FIELDS)
+        outer_fields = ("cand.key, cand.chash, cand.created, cand.sentiment_score, "
+                        "cand.feedback_score, cand.corrected, cand.consumed, ")
+        topic_t, topic_w, topic_k, attn_total = self._topic_weight_args()
+        # 候选 CTE 里顺手把 lower(content) 算好：话题命中在 PG 里做，正文不外传
         sql = (
             "WITH cand AS MATERIALIZED ("
-            f"  SELECT {self._SELECT_FIELDS}, f.content_tsv AS tsv, "
+            "  SELECT f.key, left(md5(f.content), 16) AS chash, f.created, f.sentiment_score, "
+            "         f.feedback_score, CASE WHEN strpos(f.tags, 'corrected') > 0 THEN 1 ELSE 0 END AS corrected, "
+            "         CASE WHEN f.fragment_type = 'consumed' THEN 1 ELSE 0 END AS consumed, "
+            "         lower(f.content) AS clower, f.content_tsv AS tsv, "
             f"  ts_rank_cd(f.content_tsv, to_tsquery('simple', %s), {TS_RANK_NORM}) AS score "
             "  FROM ks_fragment f "
             "  WHERE f.content_tsv @@ to_tsquery('simple', %s) "
             f"    AND {where_sql} "
-            "  ORDER BY score DESC LIMIT %s"
+            "  ORDER BY score DESC, f.key LIMIT %s"
             ") "
-            f"SELECT {outer_fields}, "
-            "c.doclen, COALESCE(c.tfs, '{}') AS tfs, cand.score "
+            f"SELECT {outer_fields}"
+            + self._TOPIC_HITS_SELECT + ", "
+            + "c.doclen, COALESCE(c.tfs, '{}') AS tfs, cand.score "
             "FROM cand "
             "LEFT JOIN LATERAL ("
             "  SELECT COALESCE(sum(cardinality(t.positions)), 0)::float AS doclen, "
@@ -1194,7 +1309,9 @@ class PgStorage(StorageBase):
             "           FILTER (WHERE t.lexeme = ANY(%s)) AS tfs "
             "  FROM unnest(cand.tsv) t"
             ") c ON TRUE "
-            "ORDER BY cand.score DESC"
+            + self._TOPIC_HITS_JOIN.format(c="cand.clower") + " "
+            + self._THIN_GROUP_BY_BM25 + " "
+            "ORDER BY cand.score DESC, cand.key"
         )
         # 语料统计：**一条** SQL 拿齐 N / 总长 / avgdl / 每个查询词的 df。
         # 🔴 绝不为每篇文档单独查一次 df（那是 N+1 往返）；df 用一条
@@ -1258,7 +1375,8 @@ class PgStorage(StorageBase):
         need_df = df_cached is None
 
         with self._ro() as cur:
-            cur.execute(sql, [tsquery, tsquery, *params, self._bm25_limit, lexemes])
+            cur.execute(sql, [tsquery, tsquery, *params, self._bm25_limit, lexemes,
+                              topic_t, topic_w, topic_k])
             rows = cur.fetchall()
             if need_n or need_df:
                 which = "both" if (need_n and need_df) else ("df" if need_df else "n")
@@ -1289,8 +1407,11 @@ class PgStorage(StorageBase):
                                n_docs, avgdl, dfs)
             scored.append(tuple(row[:-1]) + (score,))
 
-        fragments = self._rows_to_fragments(scored, "_bm25_score", 0.0)
-        fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
+        pre_weights: Dict[str, tuple] = {}
+        fragments = self._rows_to_thin(scored, "_bm25_score", 0.0,
+                                       pre_weights, attn_total)
+        fragments = self._rerank_with_pre(fragments, score_key="_bm25_score",
+                                          pre_weights=pre_weights)
         return fragments[: self._final_limit]
 
     def _text_to_vector(self, text: str) -> Optional[List[float]]:
@@ -1319,6 +1440,16 @@ class PgStorage(StorageBase):
         return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
     def search_knn(
+        self,
+        query: str,
+        tag_filter: str = "",
+        agent_id: str = "",
+        is_primary: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """KNN 向量搜索（对外入口：内部薄候选 + 一次取回正文）。"""
+        return self._hydrate_thin(self._knn_thin(query, tag_filter, agent_id, is_primary))
+
+    def _knn_thin(
         self,
         query: str,
         tag_filter: str = "",
@@ -1362,26 +1493,44 @@ class PgStorage(StorageBase):
         #   代价：HNSW 是「先给有序候选、过滤在扫描之后」，所以内层按
         #   KNN_OVERFETCH 多取几倍再由外层 LIMIT 收口，避免失效碎片把结果打空。
         fetch_n = max(self._candidate_count, self._candidate_count * KNN_OVERFETCH)
+        topic_t, topic_w, topic_k, attn_total = self._topic_weight_args()
+        # 同 BM25 侧：先把过完滤的候选（含 lower(content)）物化成 CTE，
+        # 话题命中才在它上面算 —— 否则每个候选要 lower 正文 10 次。
         sql = (
-            "SELECT " + self._SELECT_FIELDS + ", v.d AS score "
-            "FROM ("
-            "  SELECT f2.key AS key, (f2.embedding <=> %s::vector) AS d "
-            "  FROM ks_fragment f2 "
-            "  WHERE f2.embedding IS NOT NULL "
-            "  ORDER BY f2.embedding <=> %s::vector "
+            "WITH cand AS MATERIALIZED ("
+            "  SELECT f.key, v.d, left(md5(f.content), 16) AS chash, lower(f.content) AS clower, "
+            "         f.created, f.sentiment_score, f.feedback_score, "
+            "         CASE WHEN strpos(f.tags, 'corrected') > 0 THEN 1 ELSE 0 END AS corrected, "
+            "         CASE WHEN f.fragment_type = 'consumed' THEN 1 ELSE 0 END AS consumed "
+            "  FROM ("
+            "    SELECT f2.key AS key, (f2.embedding <=> %s::vector) AS d "
+            "    FROM ks_fragment f2 "
+            "    WHERE f2.embedding IS NOT NULL "
+            "    ORDER BY f2.embedding <=> %s::vector "
+            "    LIMIT %s"
+            "  ) v "
+            "  JOIN ks_fragment f ON f.key = v.key "
+            f"  WHERE {where_sql} "
+            "  ORDER BY v.d, f.key "
             "  LIMIT %s"
-            ") v "
-            "JOIN ks_fragment f ON f.key = v.key "
-            f"WHERE {where_sql} "
-            "ORDER BY v.d "
-            "LIMIT %s"
+            ") "
+            "SELECT key, chash, created, sentiment_score, feedback_score, "
+            "corrected, consumed, "
+            + self._TOPIC_HITS_SELECT + ", d AS score "
+            "FROM cand "
+            + self._TOPIC_HITS_JOIN.format(c="clower") + " "
+            + self._THIN_GROUP_BY_KNN + " ORDER BY d, key"
         )
         with self._ro() as cur:
-            cur.execute(sql, [lit, lit, fetch_n, *params, self._candidate_count])
+            cur.execute(sql, [lit, lit, fetch_n, *params, self._candidate_count,
+                              topic_t, topic_w, topic_k])
             rows = cur.fetchall()
 
-        fragments = self._rows_to_fragments(rows, "_knn_score", 1.0)
-        fragments = self._rerank_with_decay(fragments, score_key="_knn_score", is_knn=True)
+        pre_weights: Dict[str, tuple] = {}
+        fragments = self._rows_to_thin(rows, "_knn_score", 1.0,
+                                       pre_weights, attn_total)
+        fragments = self._rerank_with_pre(fragments, score_key="_knn_score", is_knn=True,
+                                          pre_weights=pre_weights)
         return fragments[: self._final_limit]
 
     def search(
@@ -1402,15 +1551,58 @@ class PgStorage(StorageBase):
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        bm25_results = self.search_bm25(query, tag_filter, effective_agent_id,
+        bm25_results = self._bm25_thin(query, tag_filter, effective_agent_id,
                                         effective_is_primary)
         if self._has_embedder():
-            knn_results = self.search_knn(query, tag_filter, effective_agent_id,
+            knn_results = self._knn_thin(query, tag_filter, effective_agent_id,
                                           effective_is_primary)
             if knn_results:
                 fused = self._rrf_fuse(bm25_results, knn_results)
-                return self._apply_v2_filters(fused)
-        return self._apply_v2_filters(bm25_results)
+                return self._hydrate_thin(self._apply_v2_filters(fused))
+        return self._hydrate_thin(self._apply_v2_filters(bm25_results))
+
+    def _hydrate_thin(self, fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """薄候选 → 完整结果：**对最终要返回的 N 条，一次 `key = ANY` 取回正文**。
+
+        融合/过滤/去重/重排全在 key 级别做完，正文只需要取一次（≤1 条 SQL）。
+        取回后按 SEARCH_FIELDS 的顺序重建成与改造前**逐字同形**的 dict
+        （空值不进 dict + 非 str 转 str，与 Redis hash 稀疏语义一致），
+        排序分（`_sim`/`_combined_score`/`_weights`/`_key`）原样保留。
+        """
+        need = [f for f in fragments if f.get("_chash")]
+        if not need:
+            return fragments
+        with self._ro() as cur:
+            cur.execute(
+                f"SELECT {', '.join(FRAGMENT_COLUMNS)} FROM ks_fragment WHERE key = ANY(%s)",
+                ([f["_key"] for f in need],),
+            )
+            rows = {row[0]: self._row_to_fragment(row) for row in cur.fetchall()}
+        out: List[Dict[str, Any]] = []
+        gone = 0
+        for frag in fragments:      # 按原顺序走一遍，别把两段来源重排了
+            if not frag.get("_chash"):
+                out.append(frag)
+                continue
+            row = rows.get(frag.get("_key"))
+            if row is None:
+                # 候选与取正文之间被删/改写：正文已不存在，宁可不返回也不返回
+                # 半条（md5 当正文会污染上层）
+                gone += 1
+                continue
+            rest = {k: v for k, v in frag.items()
+                    if k not in SEARCH_FIELDS and k != "_chash"}
+            frag.clear()
+            for name in SEARCH_FIELDS:
+                value = row.get(name)
+                if value is None or value == "":
+                    continue
+                frag[name] = value
+            frag.update(rest)
+            out.append(frag)
+        if gone:
+            logger.debug("storage_pg: %d 条候选在取正文前已消失（并发写），已剔除", gone)
+        return out
 
     # ------------------------------------------------------------------
     # 后端专属取数钩子（storage_shared 的两个后端接口）
@@ -2035,16 +2227,8 @@ class PgStorage(StorageBase):
     # 加权信号
     # ------------------------------------------------------------------
 
-    def match_attention(self, content: str, top_n: int = 10) -> float:
-        """内容命中高注意力话题的加权值（公式与 attention.match_attention_boost 同）。
-
-        🔴 走进程级 TTL 快照：`rerank_with_decay` 对**每条候选**都调一次本方法，
-        而它取回的那张榜（scope + top_n + 未过期）在整轮重排里是**同一批行**。
-        不缓存就是「每条候选一次往返」——实测占了 search() 总耗时的大头
-        （见 /tmp/ks_pgperf_rootcause.txt）。写路径一律 `_snap_drop("attn")`。
-        """
-        if not content:
-            return 1.0
+    def _attn_snapshot(self, top_n: int) -> list:
+        """注意力榜（进程级 TTL 快照）—— `match_attention` 与薄候选 SQL 共用同一批行。"""
         key = (top_n,)
         raw = self._snap_get("attn", key)
         if raw is None:
@@ -2059,18 +2243,10 @@ class PgStorage(StorageBase):
                 )
                 raw = cur.fetchall()
             self._snap_put("attn", key, raw)
-        # 加权公式是后端无关的纯计算 → 与 Redis 侧共用 storage_shared 同一份
-        return attention_boost_from_topics(raw, content, self._attention_boost_max)
+        return raw
 
-    def match_hot_topics(self, text: str, limit: int = 10) -> float:
-        """内容命中热词的衰减加权命中数（公式与 Redis match_hot_topics 同）。
-
-        🔴 同 `match_attention`：热词榜 + last_seen 走进程级 TTL 快照，
-        写路径 `_snap_drop("hot")` 后立刻失效。**只缓存取回的行**，
-        `hot_topic_weighted_hits` 仍按每条候选的文本实算 ⇒ 加权公式与排序零改动。
-        """
-        if not text:
-            return 0.0
+    def _hot_snapshot(self, limit: int) -> tuple:
+        """热词榜 + last_seen（进程级 TTL 快照）—— 同上，两处共用。"""
         key = (limit,)
         snap = self._snap_get("hot", key)
         if snap is None:
@@ -2093,7 +2269,66 @@ class PgStorage(StorageBase):
                     last_seen = {t: float(ls) for t, ls in cur.fetchall()}
             snap = (topics, last_seen)
             self._snap_put("hot", key, snap)
-        topics, last_seen = snap
+        return snap
+
+    def _topic_weight_args(self, limit: int = 10) -> tuple:
+        """薄候选 SQL 用的话题参数：`(词表, 权重表, 类别表, 注意力总分)`。
+
+        热词（kind=0）与注意力话题（kind=1）合成**一根平行数组**，
+        候选 SQL 里一次 `LEFT JOIN unnest(...)` 就把两边的命中权重都算出来。
+
+        每个词的权重与共用的 `hot_topic_weighted_hits` / `attention_boost_from_topics`
+        逐条对齐（长度 <2 的词不进命中集；无 last_seen 按 0.5 折半；有则 2^(-天数/半衰期)；
+        注意力分母含长度 <2 的词），唯一差别是「某段正文命中了哪些词」这一步从
+        Python 挪进 PG（见 `_TOPIC_HITS_JOIN`）。命中之后 hot_w / attn_w 的换算仍在
+        共用公式里跑，这里只交出词与权重。
+        """
+        topics, last_seen = self._hot_snapshot(limit)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        half = self._hot_topic_decay_half_days
+        terms: List[str] = []
+        weights: List[float] = []
+        kinds: List[int] = []
+        for topic in topics:
+            if len(topic) < 2:
+                continue
+            seen = last_seen.get(topic)
+            terms.append(topic)
+            kinds.append(0)
+            weights.append(0.5 if not (seen and seen > 0)
+                           else 2.0 ** (-max(0.0, (now_ts - seen) / 86400.0) / half))
+        total = 0.0
+        for topic, score in self._attn_snapshot(limit):
+            terms.append(topic)
+            kinds.append(1)
+            weights.append(float(score))
+            total += float(score)      # 长度 <2 的词也计入分母（与共用公式一致）
+        return terms, weights, kinds, total
+
+    def match_attention(self, content: str, top_n: int = 10) -> float:
+        """内容命中高注意力话题的加权值（公式与 attention.match_attention_boost 同）。
+
+        🔴 走进程级 TTL 快照：`rerank_with_decay` 对**每条候选**都调一次本方法，
+        而它取回的那张榜（scope + top_n + 未过期）在整轮重排里是**同一批行**。
+        不缓存就是「每条候选一次往返」——实测占了 search() 总耗时的大头
+        （见 /tmp/ks_pgperf_rootcause.txt）。写路径一律 `_snap_drop("attn")`。
+        """
+        if not content:
+            return 1.0
+        # 加权公式是后端无关的纯计算 → 与 Redis 侧共用 storage_shared 同一份
+        return attention_boost_from_topics(self._attn_snapshot(top_n), content,
+                                            self._attention_boost_max)
+
+    def match_hot_topics(self, text: str, limit: int = 10) -> float:
+        """内容命中热词的衰减加权命中数（公式与 Redis match_hot_topics 同）。
+
+        🔴 同 `match_attention`：热词榜 + last_seen 走进程级 TTL 快照，
+        写路径 `_snap_drop("hot")` 后立刻失效。**只缓存取回的行**，
+        `hot_topic_weighted_hits` 仍按每条候选的文本实算 ⇒ 加权公式与排序零改动。
+        """
+        if not text:
+            return 0.0
+        topics, last_seen = self._hot_snapshot(limit)
         if not topics:
             return 0.0
 
