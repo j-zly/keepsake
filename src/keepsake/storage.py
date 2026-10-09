@@ -1045,6 +1045,45 @@ class RedisStorage(StorageBase):
     # v2 两相管线辅助 — 单碎片读写 + 封边
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 细粒度能力探针（StorageBase，2026-10 ks_pcli）
+    # 这里是 Redis 专属命令的唯一收口处；语义与改动前的
+    # `client.exists / client.pipeline().hincrby / client.hset` 逐字一致。
+    # ------------------------------------------------------------------
+
+    def fragment_exists(self, key: str) -> Optional[bool]:
+        """EXISTS。Redis 不可达返回 **None**（不可达 ≠ 不存在，见 StorageBase 三态约定）。"""
+        if not key:
+            return False
+        client = self._get_client()
+        if not client:
+            return None
+        return bool(client.exists(key))
+
+    def touch_fragment(self, key: str) -> bool:
+        """R6：pipeline 里 touch_count+1 与 updated_at 一起刷，绝不碰 content。"""
+        if not key:
+            return False
+        client = self._get_client()
+        if not client:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        pipe = client.pipeline()
+        pipe.hincrby(key, "touch_count", 1)
+        pipe.hset(key, "updated_at", now)
+        pipe.execute()
+        return True
+
+    def set_supersedes(self, new_key: str, old_key: str) -> bool:
+        """单向留痕：新碎片 supersedes=<old_key>。"""
+        if not new_key or not old_key:
+            return False
+        client = self._get_client()
+        if not client:
+            return False
+        client.hset(new_key, "supersedes", old_key)
+        return True
+
     def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
         """读一个碎片的完整 hash（v2 pipeline UPDATE 阶段需要看旧事实全文）。
 

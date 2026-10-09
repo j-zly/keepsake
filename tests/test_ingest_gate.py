@@ -18,6 +18,7 @@ from keepsake.ingest_gate import (
     decide,
     update_state_only,
 )
+from keepsake.storage import RedisStorage
 
 
 # ===========================================================================
@@ -383,11 +384,20 @@ class _FakeClient:
 
 
 class _FakeStorage:
+    """2026-10 ks_pcli：update_state_only 改走 StorageBase 的 `touch_fragment`。
+
+    这里把**真实的** `RedisStorage.touch_fragment` 绑过来、只把 `_get_client`
+    换成 fake client —— 这样下面那条断言验的仍是 Redis 侧真实发出的
+    hincrby/hset 两行（而不是 fake 自己实现的同名方法，验了等于没验）。
+    """
+
     def __init__(self):
         self.client = _FakeClient()
 
     def _get_client(self):
         return self.client
+
+    touch_fragment = RedisStorage.touch_fragment
 
 
 class TestUpdateStateOnlyHelper:

@@ -394,29 +394,25 @@ def update_state_only(storage: Any, existing_meta: Dict[str, Any]) -> bool:
     """R6 命中后调用：仅刷新 updated_at/count，不覆盖 content。
 
     参数:
-        storage: RedisStorage 实例（必须实现 _get_client()）。
+        storage: StorageBase 实例（实现 touch_fragment()）。
         existing_meta: 至少含 "key" 字段（形如 "memory:frag:<hash>"）。
 
     返回:
-        True = 刷新成功；False = 参数缺失或 storage 不可用或 Redis 异常。
-    """
-    from datetime import datetime, timezone
+        True = 刷新成功；False = 参数缺失、storage 不可用、或后端不支持。
 
+    2026-10 ks_pcli：改走 StorageBase 接口 `touch_fragment()`，不再摸
+    `_get_client()`（PgStorage 没有它 ⇒ AttributeError 会冒泡进 R6 决策）。
+    Redis 侧行为逐字不变（同一 pipeline：hincrby touch_count + hset updated_at）；
+    PG 侧 `touch_fragment` 返回 False 并自记原因日志（ks_fragment 无这两列）。
+    R6 的核心语义「绝不覆盖 content」由调用方 store() 短路保证，与后端无关。
+    """
     if storage is None or not existing_meta:
         return False
     key = existing_meta.get("key")
     if not key:
         return False
-    client = storage._get_client()  # noqa: SLF001 — 与 storage.store() 同级用法
-    if not client:
-        return False
-    now = datetime.now(timezone.utc).isoformat()
     try:
-        pipe = client.pipeline()
-        pipe.hincrby(key, "touch_count", 1)
-        pipe.hset(key, "updated_at", now)
-        pipe.execute()
-        return True
+        return bool(storage.touch_fragment(key))
     except Exception:
         return False
 

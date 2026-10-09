@@ -626,15 +626,14 @@ class KeepsakeProvider(MemoryProvider):
 
         import time as _time
 
-        # 检查工作流锁（复用 Redis client）
-        lock_client = None
+        # 检查工作流锁（后端无关探测：Redis 读 keepsake:workflow_lock key；
+        # PG 后端没有这张「全局开关表」⇒ 恒 False = 锁不存在，放行检索）
         try:
-            lock_client = self._storage._get_client()
-            if lock_client and lock_client.exists("keepsake:workflow_lock"):
+            if self._storage.fragment_exists("keepsake:workflow_lock"):
                 logger.debug("keepsake: workflow lock active, skipping search")
                 return ""
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("keepsake: workflow lock probe failed, proceeding: %s", e)
 
         start = _time.time()
         fragments = self._storage.search(
@@ -713,11 +712,10 @@ class KeepsakeProvider(MemoryProvider):
         frag_key = f"memory:frag:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
         existing_meta = None
         try:
-            client = self._storage._get_client()
-            if client and client.exists(frag_key):
+            if self._storage.fragment_exists(frag_key):
                 existing_meta = {"key": frag_key}
         except Exception as e:
-            # ⚠️ 不再静默：Redis 异常会让 R6 去重失效（同一内容会被当新碎片再存一次）。
+            # ⚠️ 不再静默：探测异常会让 R6 去重失效（同一内容会被当新碎片再存一次）。
             #   降级本身可接受（fail-open），但必须留痕，否则读日志看不出「去重没跑」。
             logger.warning("keepsake: 既有碎片探测失败，R6 去重本次跳过 (%s)", e)
         return decide(text, category, existing_meta, getattr(self, "_gate_cfg", None)), existing_meta

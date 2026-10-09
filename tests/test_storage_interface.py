@@ -32,6 +32,10 @@ REQUIRED_METHODS = (
     "record_feedback",
     "get_fragment",
     "get_fragments_batch",
+    # 2026-10 ks_pcli：`_get_client()` 依赖链后端无关化的三个落点
+    "fragment_exists",
+    "touch_fragment",
+    "set_supersedes",
     "search",
     "search_bm25",
     "search_knn",

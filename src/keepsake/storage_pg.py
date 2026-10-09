@@ -2361,6 +2361,59 @@ class PgStorage(StorageBase):
                 out[row[0]] = self._row_to_fragment(row)
         return out
 
+        # ------------------------------------------------------------------
+    # 细粒度能力探针（StorageBase，2026-10 ks_pcli）
+    # Redis 侧这三个方法走 EXISTS / pipeline HINCRBY / HSET；PG 侧逐个对照：
+    #   fragment_exists  → ks_fragment.key 是主键，**完全等价**，真查库
+    #   touch_fragment   → 无 touch_count/updated_at 列（R6 的核心语义「不覆盖
+    #                      content」由调用方 store() 短路保证，与后端无关）
+    #   set_supersedes   → 无 supersedes 列（该字段至今无任何读取方）
+    # 后两个返回 False 并留可辨识日志，**禁止静默跳过**。
+    # ------------------------------------------------------------------
+
+    def fragment_exists(self, key: str) -> Optional[bool]:
+        """EXISTS 的等价实现：主键点查。真查库，不会返回 None（不可达时向上抛）。"""
+        if not key:
+            return False
+        with self._ro() as cur:
+            cur.execute("SELECT 1 FROM ks_fragment WHERE key = %s", (key,))
+            return cur.fetchone() is not None
+
+    def touch_fragment(self, key: str) -> bool:
+        """unsupported：ks_fragment 无 touch_count / updated_at 列。
+
+        为什么不为它建列：这两个字段**全仓无任何读取方**（唯一读点在
+        `__init__.py:600` 的临时 dict 上，不碰碎片库）—— 建列即造无人读的数据。
+        R6 真正要保的语义「命中后绝不覆盖原 content」由调用方 store() 短路保证，
+        PG 后端照样成立。
+        ponytail: 若将来要做「最近命中时间」排序/衰减，把这两列加进
+        `_DDL_TABLES.ks_fragment` + FRAGMENT_COLUMNS，本方法改成一条 UPDATE 即可。
+        """
+        if not key:
+            return False
+        logger.info(
+            "storage_pg: touch_fragment(%s) unsupported — ks_fragment 无 "
+            "touch_count/updated_at 列（R6 的『不覆盖 content』语义不受影响，"
+            "仅这两个遥测字段不持久化）",
+            key,
+        )
+        return False
+
+    def set_supersedes(self, new_key: str, old_key: str) -> bool:
+        """unsupported：ks_fragment 无 supersedes 列。
+
+        `supersedes` 是**单向**留痕字段（全仓 grep 无任何读取方）；反向封边走
+        `supersede_fragment(old_key, new_key)` —— 那个两后端都已实现，不受影响。
+        """
+        if not new_key or not old_key:
+            return False
+        logger.info(
+            "storage_pg: set_supersedes(%s <- %s) unsupported — ks_fragment 无 "
+            "supersedes 列（该字段无读取方；反向封边请用 supersede_fragment）",
+            new_key, old_key,
+        )
+        return False
+
     def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
         """按时间倒序返回某实体的记忆时间线。"""
         if not entity or not entity.strip():

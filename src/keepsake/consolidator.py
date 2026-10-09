@@ -32,6 +32,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .storage_shared import maintenance_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -441,9 +443,13 @@ class Consolidator:
 
     def consolidate(self) -> Dict[str, Any]:
         """执行一轮碎片合并。返回操作统计。"""
-        client = self._storage._get_client()
+        client = maintenance_client(self._storage)
         if not client:
-            return {"status": "error", "reason": "Redis not available"}
+            return {
+                "status": "unsupported",
+                "reason": "consolidate 需要 Redis SCAN/HMGET/HSET/DEL 全套语义"
+                          "（PG 后端既无扫描接口也无删除接口，且无 consumed_by 列）",
+            }
 
         stats = {"scanned": 0, "groups_found": 0, "merged": 0, "skipped": 0, "errors": 0}
 

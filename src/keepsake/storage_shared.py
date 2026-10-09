@@ -450,3 +450,27 @@ def rerank_with_decay(
 
     fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
     return fragments
+
+
+def maintenance_client(storage: Any) -> Any:
+    """取「全库扫描/批量维护」用的 Redis 连接；**非 Redis 后端恒返回 None**。
+
+    2026-10 ks_pcli：consolidator / forgetter 需要的是 SCAN 游标分页 + pipeline
+    批量 HMGET/HSET/DEL —— 这是一整套 Redis 专属语义，不适合塞进 StorageBase 接口
+    （PG 侧既没有扫描接口也没有删除接口，硬抽象只会造出一个两边都半残的方法）。
+    所以这里**不碰 StorageBase**，只在这两个仍属 Redis 专属的模块入口处显式取一次：
+
+      * 有 `_get_client()` 的后端（RedisStorage）→ 逐字走原路径，行为不变
+      * 没有的后端（PgStorage）→ 返回 None，由调用方给出**具名**的
+        `status="unsupported" + reason`，不再 AttributeError、绝不静默跳过
+
+    为什么不用 getattr 静默兜底：那样 PG 上 forget() 会「什么都不删、返回成功」，
+    是最危险的形态 —— 必须让上层看见 unsupported。
+    """
+    getter = getattr(storage, "_get_client", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None

@@ -23,6 +23,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .storage_shared import maintenance_client
+
 logger = logging.getLogger(__name__)
 
 # 默认参数
@@ -63,9 +65,14 @@ class Forgetter:
         返回:
             操作统计
         """
-        client = self._storage._get_client()
+        client = maintenance_client(self._storage)
         if not client:
-            return {"status": "error", "reason": "Redis not available"}
+            return {
+                "status": "unsupported",
+                "reason": "forget 需要 Redis SCAN/HMGET/HGET/DEL 全套语义"
+                          "（PG 后端既无扫描接口也无删除接口，且 memory:full:* "
+                          "在 ks_fragment 无对应数据模型）",
+            }
 
         stats = {
             "scanned": 0,

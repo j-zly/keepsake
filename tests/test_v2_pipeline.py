@@ -21,6 +21,7 @@ from collections import deque
 
 import pytest
 
+from keepsake.storage import RedisStorage
 from keepsake.pipeline import (
     Pipeline,
     Turn,
@@ -157,6 +158,13 @@ class FakeStorage:
     def _get_client(self):
         """返回含 exists()/hset() 的 fake redis client，供 _key_exists + hset 校验用。"""
         return self._client
+
+    # 2026-10 ks_pcli：pipeline 不再摸 `_get_client()`，改调 StorageBase 的
+    # `fragment_exists` / `set_supersedes`。这里把**真实的** RedisStorage 实现
+    # 绑过来、只把 `_get_client` 换成上面那个 fake client —— 于是下面「幻觉 key
+    # 必须被拒」的断言验的仍是 Redis 侧真实行为，而不是 fake 自己写的同名方法。
+    fragment_exists = RedisStorage.fragment_exists
+    set_supersedes = RedisStorage.set_supersedes
 
 
 # ===========================================================================

@@ -205,7 +205,8 @@ class Pipeline:
     ):
         """
         参数:
-            storage: RedisStorage 实例（必须实现 search_bm25/store/get_fragment/supersede_fragment/_get_client）
+            storage: StorageBase 实例（必须实现 search_bm25/store/get_fragment/supersede_fragment/
+            fragment_exists/set_supersedes）
             llm_fn: LLM 调用函数，签名 (messages, model) -> Optional[str]；None 则全部走 v1 兜底
             model: LLM 模型名
             window_pairs: 队列攒够多少对触发 drain
@@ -635,10 +636,8 @@ class Pipeline:
         new_key = self._key_for_content(content)
         if new_key:
             try:
-                # 新碎片加 supersedes 字段（store 不支持 → 直接 hset）
-                client = self._storage._get_client()  # noqa: SLF001
-                if client:
-                    client.hset(new_key, "supersedes", old_key)
+                # 新碎片加 supersedes 字段（单向留痕，走后端中立接口）
+                self._storage.set_supersedes(new_key, old_key)
             except Exception as e:
                 logger.debug("pipeline: set supersedes field failed: %s", e)
             try:
@@ -708,18 +707,14 @@ class Pipeline:
     def _key_exists(self, key: str) -> bool:
         """检查碎片是否存在（双保险）。
 
-        client 不可用 / Redis 不可达 → 容错放行 True（白名单已守一道）。
+        后端不可达（None）/ 查询失败 → 容错放行 True（白名单已守一道）。
+        与改动前 `client is None → True` 逐字等价。
         """
         try:
-            client = self._storage._get_client()  # noqa: SLF001
+            exists = self._storage.fragment_exists(key)
         except Exception:
             return True
-        if client is None:
-            return True
-        try:
-            return bool(client.exists(key))
-        except Exception:
-            return True
+        return True if exists is None else bool(exists)
 
     @staticmethod
     def _key_for_content(text: str) -> str:

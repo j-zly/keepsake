@@ -93,6 +93,39 @@ class StorageBase(ABC):
         """批量读碎片，返回 {key: fragment}；缺失的 key 不出现。"""
 
     # ------------------------------------------------------------------
+    # 细粒度能力探针（2026-10 ks_pcli）
+    #
+    # 这三个方法是 `_get_client()` 依赖链后端无关化的落点：调用方（ingest_gate /
+    # pipeline / provider）只认这三个语义，不再摸 Redis 专有连接对象。
+    # 语义约定：**返回 False 必须留有可辨识的原因**（日志），不许静默跳过。
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def fragment_exists(self, key: str) -> Optional[bool]:
+        """按 key 判断碎片是否存在（替代 `client.exists(key)`）。
+
+        **三态**（调用方靠它区分「不存在」与「查不到」，不能塌成 bool）：
+          * True / False = 确实存在 / 确实不存在
+          * None = 后端不可达，本次判断无效（调用方须按各自语义 fail-open 或告警）
+        """
+
+    @abstractmethod
+    def touch_fragment(self, key: str) -> bool:
+        """R6 命中后刷新「最近命中」状态；**绝不覆盖 content**。
+
+        Redis 侧逐字保留原实现（pipeline 里 hincrby touch_count + hset updated_at）。
+        PG 侧 ks_fragment 无这两列 ⇒ 返回 False 并打日志说明（见 storage_pg 实现）。
+        """
+
+    @abstractmethod
+    def set_supersedes(self, new_key: str, old_key: str) -> bool:
+        """给新碎片打单向 `supersedes=<old_key>` 留痕（替代 `client.hset`）。
+
+        注意与 `supersede_fragment(old, new)` 方向相反：后者是反向封边，两后端都有；
+        本方法只是单向元数据，Redis 侧至今无任何读取方。
+        """
+
+    # ------------------------------------------------------------------
     # 检索（PG 后端批 1 未实现 → 抛 NotImplementedError）
     # ------------------------------------------------------------------
 
