@@ -18,7 +18,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import pytest
 
@@ -64,19 +64,35 @@ def pg():
 
 @pytest.fixture(autouse=True)
 def _cleanup(pg):
-    """每个测试后清掉本次写入的行（按 key / 按本轮关键词）。"""
+    """每个测试后清掉本次写入的行（按 key / 按本轮关键词）。
+
+    🔴 2026-10 ks_pg_bm25 修的**测试卫生泄漏**：`store()` 会把
+    `extract_keywords(text)` 永久写进 `ks_hot_topic` / `ks_hot_topic_seen`
+    （见 storage_pg.store 结尾的 `_update_hot_topics`），而本 fixture 原来
+    只删 `_TOPICS` 里的**标记词**、不删正文关键词。于是「与话题完全无关」那条
+    语料里的 `无关` 会**永久留在热词榜**里，下一轮跑
+    `test_hot_topics_and_match` 的 `match_hot_topics("完全无关的句子 xyzzy") == 0.0`
+    必然红 —— 而且与被测代码无关，是上一轮遗留的数据把这一轮判死的。
+    所以这里在删碎片**之前**先按 key 取回正文，把它们的关键词一并清掉。
+    """
     yield
     with pg._tx() as cur:      # noqa: SLF001 — 测试内清理自有数据
+        leaked: List[str] = []
         if _WROTE_KEYS:
+            cur.execute("SELECT content FROM ks_fragment WHERE key = ANY(%s)",
+                        (list(_WROTE_KEYS),))
+            for (content,) in cur.fetchall():
+                leaked.extend(extract_keywords(content or "", max_keywords=5))
             cur.execute("DELETE FROM ks_fragment WHERE key = ANY(%s)", (list(_WROTE_KEYS),))
             cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = ANY(%s)",
                         (list(_WROTE_KEYS),))
             _WROTE_KEYS.clear()
-        if _TOPICS:
-            cur.execute("DELETE FROM ks_hot_topic WHERE topic = ANY(%s)", (list(_TOPICS),))
-            cur.execute("DELETE FROM ks_attention WHERE topic = ANY(%s)", (list(_TOPICS),))
-            cur.execute("DELETE FROM ks_hot_topic_seen WHERE topic = ANY(%s)", (list(_TOPICS),))
-            _TOPICS.clear()
+        topics = _TOPICS + [kw for kw in leaked if kw not in _TOPICS]
+        if topics:
+            cur.execute("DELETE FROM ks_hot_topic WHERE topic = ANY(%s)", (list(topics),))
+            cur.execute("DELETE FROM ks_attention WHERE topic = ANY(%s)", (list(topics),))
+            cur.execute("DELETE FROM ks_hot_topic_seen WHERE topic = ANY(%s)", (list(topics),))
+        _TOPICS.clear()
 
 
 def _text(tag: str) -> str:
@@ -284,6 +300,64 @@ def test_wrong_dsn_raises_instead_of_silently_succeeding():
         f"预期 psycopg 连接类异常，实际 {type(exc.value).__name__}"
     assert "nopass" not in str(exc.value), "异常信息不得回显凭据"
     assert bad.health_check() is False
+
+# =============================================================================
+# 批 3：多行写的绑定参数上限（2026-10 真数据迁移崩在这条线上）
+#
+# 🔴 为什么这组不连库：线上崩的是「一条语句带了 149727 个绑定参数」，
+# psycopg 在**发出之前**就拒（PG 扩展协议里参数个数是 Int16，上限 65535）——
+# 与库无关，纯客户端的协议边界。用记录型游标就能验，且不必往测试库灌 5 万行。
+# 真量级连库验证见 /tmp/keepsake_pg_aux_chunk_realscale.py（≥5 万行 entity_timeline）。
+# =============================================================================
+
+_TL_COLS = ("entity", "frag_key", "ts")
+_TL_ON_CONFLICT = "ON CONFLICT (entity, frag_key) DO UPDATE SET ts = EXCLUDED.ts"
+
+
+class _RecordingCursor:
+    """只记 execute() 的语句与参数（不连库）。"""
+
+    def __init__(self):
+        self.stmts: list = []
+
+    def execute(self, sql, params=None):
+        self.stmts.append((sql, list(params or [])))
+
+
+def _timeline_rows(n_rows: int) -> list:
+    per, extra = divmod(n_rows, 4964)
+    rows = []
+    for e in range(4964):
+        cnt = per + (1 if e < extra else 0)
+        rows.extend((f"ent_{e:05d}", f"frag_{e:05d}_{i}", float(i)) for i in range(cnt))
+    return rows
+
+
+def test_insert_many_chunks_at_param_cap_and_keeps_order():
+    """🔴 5 万行必须切成多条语句，且跨块仍全局有序（死锁防线不被分块破坏）。"""
+    rows = _timeline_rows(50000)
+    assert len(rows) == 50000
+    cur = _RecordingCursor()
+    PgStorage._insert_many(cur, "ks_entity_timeline", _TL_COLS,   # noqa: SLF001
+                           list(reversed(rows)), _TL_ON_CONFLICT)
+
+    assert len(cur.stmts) > 1, "5 万行 × 3 列不该挤进一条语句"
+    for sql, params in cur.stmts:
+        assert len(params) <= 65535, f"单条语句带了 {len(params)} 个绑定参数，超 PG 协议上限"
+
+    emitted = [tuple(params[i:i + 3]) for _sql, params in cur.stmts
+               for i in range(0, len(params), 3)]
+    assert emitted == sorted(rows), "分块后的发出顺序必须等于排序后的全局行序"
+
+
+def test_insert_many_row_width_mismatch_is_rejected():
+    """列数与行宽不一致要当场报错 —— 否则块大小算错，报错点离病因十万八千里。"""
+    cur = _RecordingCursor()
+    with pytest.raises(ValueError):
+        PgStorage._insert_many(cur, "ks_entity_timeline", _TL_COLS,   # noqa: SLF001
+                               [("ent", "frag")], _TL_ON_CONFLICT)
+    assert not cur.stmts, "参数对不上时不应发出任何语句"
+
 
 # =============================================================================
 # 批 2：PG 检索（合成数据 → 真库断言）

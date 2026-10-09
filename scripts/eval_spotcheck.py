@@ -21,8 +21,21 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/opt/fragmented-memory/src")
+# 🔴 源码树优先：把本仓库的 src 插到**最前**。
+#
+# 旧写法是 `sys.path.insert(0, "/opt/fragmented-memory/src")` —— 硬编码线上安装版路径，
+# 且插在第 0 位 ⇒ 任何「从源码树跑评测」的进程实际 import 的是**线上安装版**（旧代码），
+# 而且不报错、不告警，症状是下游莫名其妙：
+#     AttributeError: 'RedisStorage' object has no attribute 'health_check'
+# （安装版没有这个方法，源码树有 —— 说明跑的根本不是源码树）。
+#
+# 改成按脚本自身位置推 src，与 scripts/eval_compare_backends.py 的做法一致：
+#   * 在源码树里跑 ⇒ 用的就是源码树（正在改的代码立刻生效）
+#   * 在安装位置跑 ⇒ ROOT 就是安装目录，行为不变
+# 不硬编码任何绝对路径 ⇒ 换机器、换安装位置都不用改这里。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 CFG = json.load(open(os.path.expanduser("~/.config/keepsake/config.json")))
 DEFAULT_OUT_DIR = os.path.expanduser("~/ks_eval_runs")

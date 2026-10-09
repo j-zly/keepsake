@@ -414,15 +414,19 @@ def rerank_with_decay(
             feedback_w = 1.0
 
         # 3d: 热门话题加权
+        # 🔴 读**实例**上的配置（与情绪/反馈/注意力同一口径），模块常量仅作兜底。
+        # 这里原本直接读 HOT_TOPIC_BOOST ⇒ `hot_topic_boost` 配置项从头到尾是死的：
+        # 传什么都不影响重排。现 getattr 兜底，老对象/桩对象行为不变（默认仍是 1.2）。
+        hot_boost = getattr(storage, "_hot_topic_boost", HOT_TOPIC_BOOST)
         hot_w = 1.0
         content = frag.get("content", "")
         if content and hasattr(storage, "match_hot_topics"):
             try:
                 hits = storage.match_hot_topics(content, limit=10)
                 if hits >= 3:
-                    hot_w = HOT_TOPIC_BOOST
+                    hot_w = hot_boost
                 elif hits >= 1:
-                    hot_w = 1.0 + (HOT_TOPIC_BOOST - 1.0) * (hits / 3.0)
+                    hot_w = 1.0 + (hot_boost - 1.0) * (hits / 3.0)
             except Exception:
                 pass
 

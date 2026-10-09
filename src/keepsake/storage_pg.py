@@ -21,8 +21,10 @@ Python 侧用仓库既有的 jieba 做（`splitter.segment_query` → 同义词�
          存进 `ks_fragment.content_tsv`，建 GIN 索引
          （A=content 对齐 RediSearch `content TEXT WEIGHT 1`；B=entities+tags
            对齐 RediSearch 侧 `@entities`/`@tags` 的 OR 召回面）
-  查询：`to_tsquery('simple', 'a' | 'b' | ...)`，排序 `ts_rank_cd(..., 32)`
-         （32 = rank/(1+rank) 归一化，值域 0~1，正好给共用重排的 min-max 用）
+  查询：`to_tsquery('simple', 'a' | 'b' | ...)`，**召回**走 GIN 索引，
+         **打分**在 Python 侧算真 BM25（k1=1.2 / b=0.75，对齐 RediSearch 默认）
+         —— 候选集与改造前逐字相同（ts_rank_cd 只当召回窗口的粗排），
+         见 `search_bm25` 的 docstring
   KNN ：`ks_fragment.embedding vector(N)` + HNSW(cosine) 索引，
          `embedding <=> $q` 返回**余弦距离**（0~2，越小越近），
          与 Redis `DISTANCE_METRIC COSINE` 的 doc.score 量纲一致 ⇒ 共用重排函数
@@ -66,7 +68,9 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
+import math
 import random
+import struct
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -102,7 +106,15 @@ DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
 DEFAULT_BM25_LIMIT = 20        # BM25 候选数
 DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
 MAX_CONTENT_LEN = 600          # 超长条目视为噪音跳过（对齐 Redis search_bm25）
-TS_RANK_NORM = 32              # ts_rank_cd 归一化位：rank/(1+rank)
+TS_RANK_NORM = 32              # ts_rank_cd 归一化位：rank/(1+rank)（只用于召回窗口粗排）
+
+# ---- BM25 参数（与 RediSearch 默认逐字一致）----
+# 🔴 为什么不用 ts_rank_cd 当最终相关性分：ts_rank_cd 是**覆盖密度**，
+#    输出离散且**大量并列** —— 归一化后 `_sim` 这一维失去分辨率，
+#    几百条候选挤在同一分上，名次就被时间衰减/情绪/热词/注意力这些
+#    非相关性维度决定了。实测同一查询下 top-50 候选里最大同分簇 50/50（全并列）。
+BM25_K1 = 1.2                  # 词频饱和参数（RediSearch 默认 1.2）
+BM25_B = 0.75                  # 文档长度归一化（RediSearch 默认 0.75）
 
 # 🔴 本文件**不**复制一份 HOT_TOPIC_* Redis key 名（那是 Redis 侧的物理布局）。
 # PG 的话题榜在 ks_hot_topic 表里，scope 列区分三榜，语义在 _TOPIC_SCOPES 里。
@@ -269,6 +281,75 @@ def _search_index_ddl() -> tuple:
 
 
 # =============================================================================
+# BM25 打分（纯计算，零新扩展）
+# =============================================================================
+
+def _parse_tfs(raw: Any) -> Dict[str, float]:
+    """把 SQL `array_agg(lexeme || ':' || tf)` 解成 `{lexeme: tf}`。
+
+    lexeme 里理论上不会出现 `:`（`to_tsvector('simple', ...)` 的词元不含冒号），
+    所以用 `rpartition` 从**右边**切，词元本身含分隔符也不会切错。
+    驱动/适配器把 text[] 退回字符串时（`{a:1,b:2}`）也照样能解。
+    """
+    out: Dict[str, float] = {}
+    if not raw:
+        return out
+    if isinstance(raw, str):
+        items: List[str] = [s for s in raw.strip("{}").split(",") if s]
+    else:
+        items = [str(s) for s in raw]
+    for item in items:
+        lexeme, sep, tf = item.rpartition(":")
+        if not sep or not lexeme:
+            continue
+        try:
+            out[lexeme] = float(tf)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def bm25_score(
+    tfs: Dict[str, float],
+    doclen: float,
+    n_docs: float,
+    avgdl: float,
+    dfs: Dict[str, float],
+    k1: float = BM25_K1,
+    b: float = BM25_B,
+) -> float:
+    """单篇文档的 BM25 分 —— RediSearch 的公式，零新扩展。
+
+        idf(t) = ln(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
+        score  = Σ_t idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl/avgdl))
+
+    参数:
+        tfs:    {查询词: 该文档内的词频}（来自 content_tsv 的 positions 数组长度）
+        doclen: 该文档的词元总数（**同一口径**：content_tsv 里 positions 的总长度，
+                就是入库时 jieba 分词后的词数，不另算、不重切）
+        n_docs: 语料文档数 N；avgdl: 平均长度
+        dfs:    {查询词: 语料里的文档频率}
+
+    `idf` 用 RediSearch 的 `ln(1 + ...)` 变体（不是 Lucene 的 `ln((N-df+0.5)/(df+0.5))`）：
+    短查询里常见的高 df 词在 Lucene 变体下 idf 会变成负数、把**长文档**顶上来。
+    """
+    if not tfs or n_docs <= 0 or avgdl <= 0:
+        return 0.0
+    denom_base = k1 * (1.0 - b + b * (float(doclen) / avgdl))
+    total = 0.0
+    for term, tf in tfs.items():
+        tf = float(tf)
+        if tf <= 0:
+            continue
+        df = float(dfs.get(term, 0.0))
+        if df <= 0:
+            continue
+        idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+        total += idf * (tf * (k1 + 1.0)) / (tf + denom_base)
+    return total
+
+
+# =============================================================================
 # 迁移段（ensure_index）的并发安全参数
 # =============================================================================
 
@@ -331,6 +412,17 @@ DEADLOCK_RETRY_BACKOFF_S = 0.2
 #: SQLSTATE：40P01 = deadlock_detected，40001 = serialization_failure
 #: （后者是同一族「事务被并发冲突打断」，同样只能整体重跑）
 _CONFLICT_SQLSTATES = frozenset({"40P01", "40001"})
+
+#: 🔴 单条语句**允许携带的绑定参数数上限**（`_insert_many` 的分块依据）。
+#:
+#: PG 扩展查询协议里参数个数是 Int16，协议上限 65535；psycopg3 在**发出之前**
+#: 校验，超了就抛 `number of parameters must be between 0 and 65535` ——
+#: 客户端就炸，一个字都没进库。
+#:
+#: 取 64000 而不是贴着 65535：留一点余量，免得某个驱动/封装层在参数之外再加占位。
+#: 这个数只影响「一条语句带多少行」，不影响正确性 —— 分块后行序仍然全局有序，
+#: 幂等语义也由 ON CONFLICT 保证（见 `_insert_many` 的 docstring）。
+SAFE_PARAM_CAP = 64000
 
 
 def _is_retryable_conflict(exc: BaseException) -> bool:
@@ -403,6 +495,62 @@ def _as_text(v: Any) -> str:
     if v is None:
         return ""
     return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+
+
+class _BytesFieldError(TypeError):
+    """文本字段还是 bytes 就被当正文用 —— 早失败，且说清怎么改。
+
+    🔴 为什么值得单独一个类型：这类错误的真实触发路径是「调用方用
+    `decode_responses=False` 连 Redis，把 hash 值原样喂进来」。症状原本是
+    `json.dumps` 抛 `Object of type bytes is not JSON serializable` —— 那条栈
+    指向 embedder，离病因（没解码）十万八千里，排查成本极高。这里在**入口**
+    就拦住，并直接告诉调用方字段名与解码办法。
+    继承 TypeError：与它取代的那个 json 报错同类，调用方原有的
+    `except TypeError` 仍能兜住。
+    """
+
+
+def _text_field(v: Any, field: str) -> str:
+    """文本字段取值 —— 仍是 bytes 就抛**可操作**的错，而不是留到 json.dumps 炸。
+
+    解码责任在**调用方**（迁移脚本的字段分类表，见
+    `scripts/migrate_redis_to_pg.py::TEXT_FIELDS`）：本函数不做兜底解码，
+    因为「静默按 UTF-8 replace 解码」会把真·二进制字段（向量 blob）毁成乱码，
+    那比报错更糟。
+    """
+    if isinstance(v, (bytes, bytearray)):
+        raise _BytesFieldError(
+            f"storage_pg: 字段 {field!r} 是 {type(v).__name__}（未解码），不能当正文用。"
+            f"请在进 upsert_fragment() 之前按 UTF-8 解码，例如 "
+            f"_text_field/v.decode('utf-8')；只有向量 blob 字段（embed_bin）"
+            f"应保持 bytes 原样传递。"
+        )
+    return _as_text(v)
+
+
+def _blob_to_vector(blob: bytes, field: str = "embed_bin") -> List[float]:
+    """Redis 的 float32 向量 blob（`struct.pack(f'{n}f', *vec)`）→ float 列表。
+
+    🔴 为什么是「搬运」而不是重算：对照评测要求 Redis 侧与 PG 侧**同源向量**。
+    重算会引入与后端无关的差异（模型版本漂移、批量归一化差异），让评测结论
+    失真。所以 Redis 里已有的向量一律原样搬，只有确实没有向量时才调 embedder。
+
+    小端 float32：与 `storage.RedisStorage._text_to_blob` 写入时的
+    `struct.pack(f'{n}f', ...)` 在 x86/ARM 上同为小端，且与 RediSearch
+    `TYPE FLOAT32` 的线格式一致。
+    """
+    if not isinstance(blob, (bytes, bytearray)):
+        raise TypeError(
+            f"storage_pg: {field!r} 应为 float32 二进制 blob，实际是 "
+            f"{type(blob).__name__}。无法搬运 —— 请检查上游写库是否用了 struct.pack。"
+        )
+    n = len(blob) // 4
+    if len(blob) % 4:
+        raise _SchemaDimMismatch(
+            f"storage_pg: {field!r} 长度 {len(blob)} 不是 4 的倍数，不是合法的 "
+            f"float32 向量 blob。拒绝搬运（重算会掩盖数据损坏）。"
+        )
+    return list(struct.unpack(f"<{n}f", bytes(blob)))
 
 
 # 仍未实现的方法（语料维护类，与检索正交）→ 统一文案
@@ -904,13 +1052,23 @@ class PgStorage(StorageBase):
         agent_id: str = "",
         is_primary: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
-        """BM25 全文搜索（jieba 分词 → tsquery → ts_rank_cd）。
+        """BM25 全文搜索（jieba 分词 → tsquery 召回 → **Python 侧真 BM25 打分**）。
 
         流程与 Redis 侧 search_bm25 同构：
           1. 分词（segment_query）→ 同义词扩展 → `_sanitize_terms`（含路径/连字符拆子词）
-          2. tsquery OR 检索，ts_rank_cd 排序
+          2. tsquery OR 召回（GIN）；**打分**在 Python 侧算 BM25
           3. 共用的 rerank_with_decay 重排 → 取 final_limit
         空查询 → 空列表并记 WARNING（明确、不静默）。
+
+        🔴 **只换打分，不换召回**：召回条件与候选窗口（`content_tsv @@ tsquery`
+        + `ORDER BY ts_rank_cd LIMIT bm25_limit`）与改造前逐字相同 ——
+        ts_rank_cd 退化成「召回窗口的粗排」，不再当相关性分输出。
+        原来拿它当最终分的问题是**离散 + 大量并列**（覆盖密度不区分词频与长度），
+        归一化后 `_sim` 失去分辨率 ⇒ 名次被非相关性维度决定。
+
+        🔴 **不装任何新扩展**：BM25 要的语料统计全部用现有 tsvector 自带的
+        `unnest` + `cardinality(positions)` 在一条聚合 SQL 里取齐
+        （tf / doclen / df / N / avgdl），零新依赖、零新 DDL。
         """
         if not (query or "").strip():
             logger.warning("storage_pg: search_bm25 called with an empty query — "
@@ -928,26 +1086,86 @@ class PgStorage(StorageBase):
         # tsquery：每个词加单引号做 lexeme 引用（词内含 : ' 也不会破语法），
         # 单引号在 tsquery 里靠写两遍转义。
         tsquery = " | ".join("'" + t.replace("'", "''") + "'" for t in terms)
+        # `to_tsvector('simple', ...)` 会把词元**小写化**，所以 tf / df 两处
+        # 都拿小写词元比对（不清就查不到 tf，BM25 会整批算成 0）。
+        lexemes = [t.lower() for t in terms]
         where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
 
+        # 2. 召回 + 取打分素材。一条 SQL 同时拿：
+        #    doclen = 该文档全部词元数（= 入库 jieba 分词后的词数，与分词口径一致）
+        #    tfs    = 仅查询词的 tf（FILTER，词元少时不必把整篇倒回来）
+        #    score  = ts_rank_cd，只用来给候选窗口粗排（取 bm25_limit 条）
         sql = (
             f"SELECT {self._SELECT_FIELDS}, "
+            "c.doclen, COALESCE(c.tfs, '{}') AS tfs, "
             f"ts_rank_cd(f.content_tsv, to_tsquery('simple', %s), {TS_RANK_NORM}) AS score "
             "FROM ks_fragment f "
+            "LEFT JOIN LATERAL ("
+            "  SELECT COALESCE(sum(cardinality(t.positions)), 0)::float AS doclen, "
+            "         array_agg(t.lexeme || ':' || cardinality(t.positions)::text) "
+            "           FILTER (WHERE t.lexeme = ANY(%s)) AS tfs "
+            "  FROM unnest(f.content_tsv) t"
+            ") c ON TRUE "
             "WHERE f.content_tsv @@ to_tsquery('simple', %s) "
             f"AND {where_sql} "
             "ORDER BY score DESC LIMIT %s"
         )
-        with self._ro() as cur:
-            cur.execute(sql, [tsquery, tsquery, *params, self._bm25_limit])
-            rows = cur.fetchall()
+        # 语料统计：**一条** SQL 拿齐 N / 总长 / avgdl / 每个查询词的 df。
+        # 🔴 绝不为每篇文档单独查一次 df（那是 N+1 往返）；df 用一条
+        # `GROUP BY lexeme` 的聚合一次算完，词数再多也只有一趟。
+        # ponytail: `corpus` 那半边是全表 unnest 扫描（O(语料)），语料到百万级
+        # 会成为主要延迟。升级路径：入库时把 doclen 落到一个普通列并维护计数，
+        # avgdl 就退化成一次 `avg()`；当前规模（几百到几万条）不值得为此加列。
+        stat_sql = (
+            "WITH corpus AS ("
+            "  SELECT (SELECT COALESCE(sum(cardinality(t.positions)), 0) "
+            "          FROM unnest(f.content_tsv) t) AS doclen "
+            "  FROM ks_fragment f "
+            "  WHERE f.content_tsv IS NOT NULL AND " + where_sql + "), "
+            "dfs AS ("
+            "  SELECT t.lexeme, count(*)::float AS df "
+            "  FROM ks_fragment f, unnest(f.content_tsv) t "
+            "  WHERE t.lexeme = ANY(%s) "
+            "    AND f.content_tsv @@ to_tsquery('simple', %s) "
+            "    AND " + where_sql + " "
+            "  GROUP BY t.lexeme"
+            ") "
+            "SELECT (SELECT count(*) FROM corpus)::float, "
+            "       (SELECT COALESCE(sum(doclen), 0)::float FROM corpus), "
+            "       COALESCE((SELECT json_object_agg(lexeme, df) FROM dfs), '{}')"
+        )
 
-        fragments = self._rows_to_fragments(rows, "_bm25_score", 0.0)
+        with self._ro() as cur:
+            cur.execute(sql, [tsquery, lexemes, tsquery, *params, self._bm25_limit])
+            rows = cur.fetchall()
+            cur.execute(stat_sql, [*params, lexemes, tsquery, *params])
+            n_docs, total_len, df_raw = cur.fetchone()
+
+        # 3. Python 侧 BM25（候选集不变，只把 ts_rank_cd 换成 BM25 分）
+        dfs = {str(k).lower(): float(v) for k, v in dict(df_raw or {}).items()}
+        n_docs = float(n_docs or 0.0)
+        avgdl = (float(total_len or 0.0) / n_docs) if n_docs > 0 else 0.0
+        scored = []
+        for row in rows:
+            # 列序：… SELECT_FIELDS, doclen, tfs, ts_rank_cd（row[-1] 只是粗排分）
+            score = bm25_score(_parse_tfs(row[-2]), float(row[-3] or 0.0),
+                               n_docs, avgdl, dfs)
+            scored.append(tuple(row[:-1]) + (score,))
+
+        fragments = self._rows_to_fragments(scored, "_bm25_score", 0.0)
         fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
         return fragments[: self._final_limit]
 
     def _text_to_vector(self, text: str) -> Optional[List[float]]:
         """文本 → float 向量（无 embedder 或取不到返回 None）。"""
+        # 🔴 bytes 早失败：`get_embedding()` 会把它塞进 `json.dumps` 的 payload，
+        # 报出来的错指向 embedder 而非真正的病因（上游漏了解码），排查成本极高。
+        if isinstance(text, (bytes, bytearray)):
+            raise _BytesFieldError(
+                "storage_pg: _text_to_vector() 收到 bytes 类型的文本 "
+                f"（{len(text)} 字节）。请先按 UTF-8 解码成 str 再传入，"
+                "例如 value.decode('utf-8')。"
+            )
         if not self._has_embedder():
             return None
         vec = self._embedder.get_embedding(text)
@@ -1137,11 +1355,19 @@ class PgStorage(StorageBase):
           * 本方法**用调用方给的 key**，`ON CONFLICT (key) DO UPDATE` 覆盖
             ⇒ 重复跑不产生重复行，且 Redis 里是什么样 PG 里就什么样
 
-        tsvector / embedding 照常现场算（迁移脚本不该也不需要自己分词）。
+        tsvector 照常现场算（迁移脚本不该也不需要自己分词）。
         未提供的列保持原值不被清空（`DO UPDATE` 只覆盖传入的列）。
+
+        🔴 **文本字段必须是 str**：`fields` 若是 `decode_responses=False` 的
+        Redis HGETALL 原样产物，值全是 bytes —— 那是上游漏了解码，不是本方法
+        该兜底的（兜底会把向量 blob 之类真二进制字段静默毁成乱码）。故在此
+        **入口显式抛 `_BytesFieldError`**，并点名是哪个字段。
+
+        🔴 **向量优先搬运**：`fields["embed_bin"]`（float32 blob）若存在就
+        原样搬到 `embedding` 列，**不重算** —— 对照评测要两边同源向量。
+        只有确实没有向量时才调 embedder 现算。
         """
         key = fields.get("key")
-        content = fields.get("content") or ""
         if not key:
             logger.warning("storage_pg: upsert_fragment 缺 key，跳过")
             return False
@@ -1153,16 +1379,30 @@ class PgStorage(StorageBase):
         for hash_field, column in self._HASH_TO_COLUMN.items():
             if hash_field == "key" or hash_field not in fields:
                 continue
-            value = fields[hash_field]
             cols.append(column)
-            params.append(_as_text(value))
+            params.append(_text_field(fields[hash_field], hash_field))
+        content = _text_field(fields.get("content"), "content")
         if "content" not in cols:
             cols.append("content")
             params.append(content)
 
-        entities = _as_text(fields.get("entities"))
-        tags = _as_text(fields.get("tags"))
-        vec = self._text_to_vector(content)
+        entities = _text_field(fields.get("entities"), "entities")
+        tags = _text_field(fields.get("tags"), "tags")
+
+        # 向量：Redis 已有就搬，没有才算。搬运后必须校验维度 —— 维度不符是
+        # 配置/数据错误，重试与重算都没意义，显式抛错（同 _SchemaDimMismatch 语义）。
+        blob = fields.get("embed_bin")
+        if blob:
+            vec = _blob_to_vector(blob)
+            if len(vec) != self._embed_dim:
+                raise _SchemaDimMismatch(
+                    f"storage_pg: embed_bin 维度 {len(vec)} != embed_dim={self._embed_dim} "
+                    f"(key={key})。Refusing to mix vector dimensions — 向量必须原样搬运，"
+                    f"请核对 embedder 模型与 embed_dim 配置；不要靠重算掩盖。"
+                )
+        else:
+            vec = self._text_to_vector(content)
+
         tsv_sql = ("setweight(to_tsvector('simple', %s), 'A') "
                    "|| setweight(to_tsvector('simple', %s), 'B')")
         params.extend([" ".join(self._tsv_tokens(content)),
@@ -1325,18 +1565,91 @@ class PgStorage(StorageBase):
         所以**按整行 `sorted()`** 与「按唯一键排序」完全等价：唯一键互不相同时，
         决定顺序的只有前几列，后面的 score/ts 永远轮不到比较。
         不给每张表单开一份键列表 = 少一处会漂移的配置。
+
+        ## 🔴 为什么还要**按绑定参数数切块**（真数据上炸出来的）
+
+        psycopg3 走的是 PG 的扩展查询协议：一条语句的参数个数是 Int16，上限 65535。
+        实体时间线在真数据上是「4964 个 zset、成员合计 49909 行」，单条 INSERT
+        带 3 列就是 149727 个参数 ⇒ psycopg 在**发出之前**就抛：
+
+            psycopg.OperationalError: sending query and params failed:
+            number of parameters must be between 0 and 65535
+
+        崩在客户端、库一个字都没写 ⇒ 迁移静默停在 0 行。上一单的夹具只有 2~3 行，
+        量级根本够不到这条线（这正是本单要补的那道门）。
+        所以切块放在**这里**（多行写的唯一出口），而不是在每个调用点各切一遍 ——
+        调用点五六个 + 迁移路径一个，漏一处就退回原样，且漏的那个不报错、只是
+        「这批表永远是 0 行」。
+
+        **先排序、后切块**（不是反过来）：排序是按整行做的，切块只是把已排好序的
+        列表切成连续段 ⇒ 跨块仍然单调。反过来（先切块再各块排序）会让「全局行序」
+        随块边界错位，块与块之间又可能相反 ⇒ 死锁防线被悄悄破坏，而这类退化
+        只在并发下偶发，测不出来。
         """
         if not rows:
             return
+        ncol = len(columns)
+        # 参数个数与列数必须一致，否则下面算出的块大小和实际发出的参数数会错位
+        # （多退少补都算不出来，只能等 psycopg 抛一个和病因无关的错）
+        for r in rows:
+            if len(r) != ncol:
+                raise ValueError(
+                    f"storage_pg._insert_many: {table} 的行有 {len(r)} 个值，"
+                    f"但 columns 有 {ncol} 列 —— 列与行必须一一对应"
+                )
         rows = sorted(rows)          # ← 第一道防线的**单点**，见上文「为什么行序=加锁顺序」
-        values_sql = ",".join(["(" + ",".join(["%s"] * len(columns)) + ")"] * len(rows))
-        params: List[Any] = []
-        for row in rows:
-            params.extend(row)
-        cur.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES {values_sql} {on_conflict}",
-            params,
-        )
+        tuple_sql = "(" + ",".join(["%s"] * ncol) + ")"
+        head = f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
+        chunk = max(1, SAFE_PARAM_CAP // ncol)
+        n_blocks = -(-len(rows) // chunk)          # 向上取整；至少 1（rows 非空）
+        for i, start in enumerate(range(0, len(rows), chunk), 1):
+            block = rows[start:start + chunk]
+            params: List[Any] = []
+            for row in block:
+                params.extend(row)
+            try:
+                cur.execute(
+                    head + ",".join([tuple_sql] * len(block)) + " " + on_conflict,
+                    params,
+                )
+            except Exception as e:              # noqa: BLE001 — 只为补上下文，原样重抛
+                # 块内失败要能定位：只报「50000 行里第几块、哪张表、这块多少行」，
+                # 否则重跑只能从头再猜一遍。异常本身不吞、不改写。
+                logger.error(
+                    "storage_pg: %s 写入失败于第 %d/%d 块（该块 %d 行，共 %d 行）: %s: %s",
+                    table, i, n_blocks, len(block), len(rows), type(e).__name__, e,
+                )
+                raise
+
+    @with_deadlock_retry
+    def import_aux_rows(
+        self,
+        table: str,
+        columns: tuple,
+        rows: List[tuple],
+        on_conflict: str,
+    ) -> int:
+        """🔴 **迁移专用**：按主键**覆盖**导入辅助结构的多行（热词/注意力/时间线/共现/同义词）。
+
+        ## 为什么不能走 `_record_topics()` / `_record_attention()` / `_record_entity_cooc()`
+
+        那三个是**在线累加**语义（`score = ks_x.score + EXCLUDED.score`）：
+        每次 store() 都往同一个 (scope, topic) 上加一点。迁移要的是**镜像** ——
+        「Redis 里是多少，PG 里就是多少」。用累加路径搬一遍，跑第二次分数就翻倍，
+        对照评测的两侧加权数据从此不可比。所以这里换 `SET = EXCLUDED`：覆盖而非累加，
+        **重复跑同一份 Redis 快照 ⇒ 行数与分数都不变**（幂等）。
+
+        仍然复用 `_insert_many()` —— 它的「按整行排序再发」是死锁防线（见该方法
+        docstring），迁移与在线写入走同一个出口 ⇒ 不会因为「这是迁移路径」就绕过它。
+
+        `table`/`columns`/`on_conflict` 由调用方给（同 `_insert_many` 的约定）：
+        表名只来自本模块的辅助表清单，**不接受外部输入**。
+        """
+        if not rows:
+            return 0
+        with self._tx() as cur:
+            self._insert_many(cur, table, columns, rows, on_conflict)
+        return len(rows)
 
     def _record_attention(
         self,

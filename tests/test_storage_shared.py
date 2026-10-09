@@ -273,9 +273,23 @@ def migrate():
 
 
 def test_migrate_script_has_no_redis_writes(migrate):
-    """🔴 迁移脚本对 Redis **只读**：源码里不得对连接调用任何写命令。"""
+    """🔴 迁移脚本对 Redis **只读**：源码里只准出现下面这些**读**命令。
+
+    白名单（而不是只靠脚本自己的黑名单）：脚本里的 `FORBIDDEN_REDIS_COMMANDS`
+    是「碰了就拒跑」的黑名单，这里是「**只准**有这些」的正面清单 —— 脚本将来
+    引入一个既不在黑名单、也不在白名单里的调用（比如某个新的客户端方法），
+    这条测试会当场红，而不是等它真的写进去。
+
+    2026-10-10 ks_pg_aux_migrate 扩充：迁辅助结构新增 4 个**只读**命令
+        exists  —— 判断某结构在 Redis 侧到底存不存在（区分「结构缺失」与「结构为空」）
+        zrange  —— 读三榜 ZSET / entity_timeline / entity_cooc 的全部成员与分值
+        type   —— 时间线前缀下按 type 筛掉非 zset 的键
+        ttl    —— Redis「整集 TTL」换算成 PG 逐行 expire_ts
+    四个都是纯读，不改任何状态；`scan` 本来就在白名单里。
+    """
     called = migrate.assert_no_redis_writes(MIGRATE_SCRIPT)
-    assert set(called) <= {"scan", "hgetall", "ping", "pipeline", "execute"}, called
+    assert set(called) <= {"scan", "hgetall", "ping", "pipeline", "execute",
+                           "exists", "zrange", "type", "ttl"}, called
 
 
 @pytest.mark.parametrize("injected", [

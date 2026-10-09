@@ -108,6 +108,31 @@ def make_scorers(mod: Any):
 
 # ---------------------------------------------------------------- 后端构造
 
+# 🔴 重排权重旋钮全量透传。背景：这两个 build 函数原先只传连接与 embedder，
+# 权重键一个没传 ⇒ 两端一律跑**构造默认值**。于是「把加权改成中性做对照」这种
+# A/B 会得到两份**逐字相同**的输出，很容易被误读成「加权对该后端无影响」——
+# 其实是被测变量压根没进被测系统。键名与 `__init__.py` 构造 storage 时读的 cfg 键同名。
+RERANK_KNOBS: Tuple[Tuple[str, Any], ...] = (
+    ("decay_half_days", int),              # → _decay_half_days
+    ("hot_topic_boost", float),            # → _hot_topic_boost
+    ("hot_topic_decay_half_days", int),    # → _hot_topic_decay_half_days
+    ("attention_boost_max", float),        # → _attention_boost_max
+    ("emotion_intensity_factor", float),   # → _emotion_intensity_factor
+    ("feedback_positive_boost", float),    # → _feedback_positive_boost
+    ("feedback_negative_penalty", float),  # → _feedback_negative_penalty
+)
+
+
+def rank_knobs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """从配置里抽出重排权重旋钮；**键不存在才用默认**，存在则原样透传。
+
+    键不存在时返回的默认值与两个后端 `__init__` 的默认值逐字相同 ⇒ 不改默认行为。
+    """
+    out: Dict[str, Any] = {}
+    for key, cast in RERANK_KNOBS:
+        out[key] = cast(cfg[key]) if key in cfg else None
+    return {k: v for k, v in out.items() if v is not None}
+
 
 def build_redis(cfg: Dict[str, Any], is_primary: bool = True):
     from keepsake.embedder import create_embedder
@@ -126,6 +151,7 @@ def build_redis(cfg: Dict[str, Any], is_primary: bool = True):
         password=cfg.get("redis_password") or None,
         embedder=embedder,
         is_primary=is_primary,
+        **rank_knobs(cfg),
     )
 
 
@@ -153,6 +179,7 @@ def build_pg(cfg: Dict[str, Any], is_primary: bool = True):
         agent_id=str(cfg.get("agent_id", "")),
         embedder=embedder,
         is_primary=is_primary,
+        **rank_knobs(cfg),
     )
 
 
