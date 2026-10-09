@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import redis
 from redis.commands.search.query import Query
@@ -1137,6 +1137,79 @@ class RedisStorage(StorageBase):
         except Exception as e:
             logger.debug("storage: get_fragments_batch error: %s", e)
         return out
+
+    # ------------------------------------------------------------------
+    # 维护原语（合并 / 遗忘）—— StorageBase 接口，Redis 侧直译 SCAN/pipeline
+    # 语义。合并/遗忘两个模块据此工作，**Redis 侧行为与改动前逐字一致**。
+    # ------------------------------------------------------------------
+
+    def scan_fragment_keys(
+        self,
+        cursor: str = "",
+        limit: int = 200,
+        prefix: str = "memory:frag:",
+    ) -> Tuple[str, List[str]]:
+        """SCAN 游标分页（`MATCH prefix*`）。游标 0 表示扫完，对外统一成 `""`。"""
+        client = self._get_client()
+        if not client:
+            return "", []
+        try:
+            cur = int(cursor or 0)
+            next_cursor, keys = client.scan(cursor=cur, match=f"{prefix}*", count=limit)
+        except Exception as e:
+            logger.warning("storage: scan_fragment_keys failed (cursor=%s): %s", cursor, e)
+            return "", []
+        out = [k.decode("utf-8") if isinstance(k, bytes) else k for k in (keys or [])]
+        return ("" if int(next_cursor) == 0 else str(int(next_cursor))), out
+
+    def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """批量 HSET（pipeline 一把梭）。返回写入条数。"""
+        if not rows:
+            return 0
+        client = self._get_client()
+        if not client:
+            return 0
+        pipe = client.pipeline()
+        n = 0
+        for row in rows:
+            key = row.get("key")
+            if not key:
+                continue
+            mapping = {k: ("" if v is None else str(v))
+                       for k, v in row.items() if k != "key"}
+            pipe.hset(key, mapping=mapping)
+            n += 1
+        if n:
+            pipe.execute()
+        return n
+
+    def update_fragment_fields(self, key: str, fields: Dict[str, Any]) -> bool:
+        """局部更新若干 hash 字段（HSET 单 key，不动其余字段）。"""
+        if not key or not fields:
+            return False
+        client = self._get_client()
+        if not client:
+            return False
+        try:
+            client.hset(key, mapping={k: ("" if v is None else str(v))
+                                      for k, v in fields.items()})
+            return True
+        except Exception as e:
+            logger.debug("storage: update_fragment_fields(%s) failed: %s", key, e)
+            return False
+
+    def delete_fragments_batch(self, keys: List[str]) -> int:
+        """批量 DEL。返回实际删除条数。"""
+        if not keys:
+            return 0
+        client = self._get_client()
+        if not client:
+            return 0
+        try:
+            return int(client.delete(*keys) or 0)
+        except Exception as e:
+            logger.debug("storage: delete_fragments_batch failed: %s", e)
+            return 0
 
     def supersede_fragment(self, old_key: str, new_key: str) -> bool:
         """封边：把 old_key 标 superseded_by=new_key + superseded_at=now。

@@ -39,6 +39,11 @@ REQUIRED_METHODS = (
     "search",
     "search_bm25",
     "search_knn",
+    # 2026-10 ks_pmn：合并/遗忘的维护原语（分页扫描 / 批量写 / 局部更新 / 批量删）
+    "scan_fragment_keys",
+    "write_fragments_batch",
+    "update_fragment_fields",
+    "delete_fragments_batch",
     "match_attention",
     "match_hot_topics",
     "get_hot_topics",

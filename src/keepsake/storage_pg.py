@@ -76,7 +76,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .emotion import analyze_emotion
 from .splitter import extract_entities, extract_keywords, segment_query
@@ -205,7 +205,16 @@ _DDL_TABLES = (
         superseded_at   text NOT NULL DEFAULT '',
         corrected_at    text NOT NULL DEFAULT '',
         invalid_at      text NOT NULL DEFAULT '',
-        embed_bin       bytea
+        embed_bin       bytea,
+        -- 202-10 ks_pmn：合并（consolidator）维护的字段。
+        --   level       多级提炼层级（原始=1，首次合并=2…）；只有 consolidator 写
+        --   consumed_by 被哪条 consolidated 碎片吞掉（`memory:frag:<hash>`）
+        --   consumed_at 合并发生时刻（ISO8601）
+        -- 三列都由 ALTER 路径补（见 _MAINTENANCE_COLUMN_DDL），
+        -- DEFAULT '' 兼容存量行：consolidator 的 int(f.get("level","1")) 本就容错。
+        level           text NOT NULL DEFAULT '',
+        consumed_by     text NOT NULL DEFAULT '',
+        consumed_at     text NOT NULL DEFAULT ''
     )
     """),
     # 对齐 keepsake:entity_timeline:<实体> ZSET（member=碎片 key，score=时间戳）
@@ -271,6 +280,34 @@ _DDL_INDEXES = (
 #   embedding 的维度是运行期才知道的（`vector(dim)`），写死就是「换个 embedder
 #   模型维度就建错表」。所以走 ensure_index() 里的「检查→ALTER→建索引」。
 SEARCH_COLUMNS = ("content_tsv", "embedding")
+
+# 202-10 ks_pmn：合并（consolidator）需要的 3 列。**不进 FRAGMENT_COLUMNS** ——
+# FRAGMENT_COLUMNS 是检索结果的字段形状，Redis 侧 `_fetch_fragments` 按
+# FRAGMENT_FIELDS 裁剪、不含这三列；加进去会让 PG 侧检索结果多出字段 ⇒ 形状漂移。
+# 维护路径（合并/遗忘）单独按 MAINTENANCE_COLUMNS 读。
+MAINTENANCE_COLUMNS = ("level", "consumed_by", "consumed_at")
+
+
+def _maintenance_column_ddl() -> tuple:
+    """合并所需的 3 列的 ALTER —— (列名, 语句)。
+
+    与 `_search_column_ddl` 同理走「先查后补」：列已在就不发 ALTER
+    （无条件发 ADD COLUMN 会拿 ACCESS EXCLUSIVE 挡写，见 ensure_index docstring）。
+
+    🔴 **为什么这三条必须带 `IF NOT EXISTS`，而 content_tsv/embedding 那两条不带**：
+    这 3 列**同时**写进了 `_DDL_TABLES` 的 `CREATE TABLE ks_fragment`（新库一次建全），
+    所以**全新库**上 `_plan_schema_ddl` 会排出「CREATE TABLE（含 level…）」+
+    「ADD COLUMN level」（先查后补查不到）两条同事务语句 ⇒ 后者
+    `DuplicateColumn: column "level" already exists` ⇒ 整个迁移段回滚、
+    ensure_index 重试 3 次后**返回 False**、provider 初始化中止。
+    实测（隔离 schema、embed_dim=4）复现：`FRESH ensure_index -> False`。
+    `IF NOT EXISTS` 让第二条退化成 no-op，两条路径（CREATE / ALTER）都幂等。
+    content_tsv/embedding 不在 CREATE TABLE 里（维度运行期才知道），无此撞车，不加。
+    """
+    return tuple(
+        (c, f"ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS {c} text NOT NULL DEFAULT ''")
+        for c in MAINTENANCE_COLUMNS
+    )
 
 
 def _search_column_ddl(dim: int) -> tuple:
@@ -1056,6 +1093,9 @@ class PgStorage(StorageBase):
             if name not in have_indexes:
                 plan.append(sql)
         for name, sql in _search_column_ddl(self._embed_dim):
+            if name not in have_columns:
+                plan.append(sql)
+        for name, sql in _maintenance_column_ddl():
             if name not in have_columns:
                 plan.append(sql)
         for name, sql in _search_index_ddl():
@@ -1854,7 +1894,9 @@ class PgStorage(StorageBase):
     # ------------------------------------------------------------------
 
     # Redis hash 字段 → PG 列的映射（迁移脚本按 Redis 侧字段名喂进来）
-    _HASH_TO_COLUMN = {c: c for c in FRAGMENT_COLUMNS}
+    # 含 MAINTENANCE_COLUMNS（level/consumed_by/consumed_at）—— 合并要写它们，
+    # 迁移脚本搬 Redis hash 时也顺带搬（Redis 侧这三个字段同样存在）。
+    _HASH_TO_COLUMN = {c: c for c in FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS}
 
     @with_deadlock_retry
     def upsert_fragment(self, fields: Dict[str, Any]) -> bool:
@@ -2348,18 +2390,116 @@ class PgStorage(StorageBase):
         return self._row_to_fragment(row) if row else None
 
     def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量读；缺失的 key 不出现在结果里。"""
+        """批量读；缺失的 key 不出现在结果里。
+
+        对齐 Redis 侧 `get_fragments_batch` 的 **HGETALL** 语义 ⇒ 这里也读**全列**，
+        含 MAINTENANCE_COLUMNS（level/consumed_by/consumed_at，合并要读 level）。
+        检索路径另有 `_fetch_fragments` 按 FRAGMENT_COLUMNS 裁剪，形状不受影响。
+        """
         out: Dict[str, Dict[str, Any]] = {}
         if not keys:
             return out
+        cols = FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS
         with self._ro() as cur:
             cur.execute(
-                f"SELECT {', '.join(FRAGMENT_COLUMNS)} FROM ks_fragment WHERE key = ANY(%s)",
+                f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key = ANY(%s)",
                 (list(keys),),
             )
             for row in cur.fetchall():
-                out[row[0]] = self._row_to_fragment(row)
+                doc: Dict[str, Any] = {}
+                for name, value in zip(cols, row):
+                    if name == "key":
+                        continue
+                    if value is None or value == "":
+                        continue
+                    doc[name] = value if isinstance(value, str) else str(value)
+                out[row[0]] = doc
         return out
+
+    # ------------------------------------------------------------------
+    # 维护原语（合并 / 遗忘）—— StorageBase 接口，PG 侧实现
+    #
+    # 🔴 扫描用 **keyset 分页**（`key > cursor ORDER BY key LIMIT n`），
+    # 不用 OFFSET：ks_fragment 是全量表，`OFFSET n` 要先扫掉 n 行才吐数据，
+    # 页数越多越慢。keyset 走主键索引，每页都是 O(limit)。
+    # ------------------------------------------------------------------
+
+    def scan_fragment_keys(
+        self,
+        cursor: str = "",
+        limit: int = 200,
+        prefix: str = "memory:frag:",
+    ) -> Tuple[str, List[str]]:
+        """keyset 分页扫描 key。对齐 Redis `SCAN MATCH prefix* COUNT limit`。
+
+        游标 = 上一页最后一个 key（`""` = 从头）。返回 `next_cursor=""` 表示扫完
+        （页不满即到底；页恰好满则下一轮返回空页 + `""`，多一次空查询，正确性不受影响）。
+        """
+        limit = max(1, int(limit))
+        with self._ro() as cur:
+            cur.execute(
+                "SELECT key FROM ks_fragment "
+                "WHERE key > %s AND key LIKE %s ORDER BY key LIMIT %s",
+                (cursor or "", f"{prefix}%", limit),
+            )
+            keys = [r[0] for r in cur.fetchall()]
+        if not keys:
+            return "", []
+        if len(keys) < limit:
+            return "", keys
+        return keys[-1], keys
+
+    def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """批量 upsert。复用 `upsert_fragment`（它已负责重算 content_tsv/embedding）。
+
+        合并每组只写 1 条 consolidated 碎片 ⇒ 这里逐条调用即可，
+        **不引入第二条写路径**（一条新 SQL = 一份要单独测的语义）。
+        """
+        n = 0
+        for row in rows:
+            if not row.get("key"):
+                continue
+            if self.upsert_fragment(row):
+                n += 1
+        return n
+
+    def update_fragment_fields(self, key: str, fields: Dict[str, Any]) -> bool:
+        """局部 UPDATE，**不碰 content / content_tsv / embedding**。
+
+        只更新 FRAGMENT_COLUMNS ∪ MAINTENANCE_COLUMNS 里出现的字段；
+        其它 key 一律忽略（不猜列 —— 拼 SQL 前必须白名单校验）。
+        """
+        if not key or not fields:
+            return False
+        allowed = (set(FRAGMENT_COLUMNS) | set(MAINTENANCE_COLUMNS)) - {"key"}
+        cols = [c for c in fields if c in allowed]
+        if not cols:
+            return False
+        set_sql = ", ".join(f"{c} = %s" for c in cols)
+        params = [_as_text(fields[c]) for c in cols] + [key]
+        with self._tx() as cur:
+            cur.execute(
+                f"UPDATE ks_fragment SET {set_sql} WHERE key = %s",
+                params,
+            )
+            return cur.rowcount > 0
+
+    def delete_fragments_batch(self, keys: List[str]) -> int:
+        """批量硬删。一条 DELETE + 一条时间线清理（碎片没了，时间线成员就是死引用）。
+
+        hot_topic / attention / hot_topic_seen 是**聚合信号**（话题级、非碎片级），
+        Redis 侧 forget 也不动它们 ⇒ 这里同样不动，保持后端语义等价。
+        """
+        keys = [k for k in keys if k]
+        if not keys:
+            return 0
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM ks_fragment WHERE key = ANY(%s)", (list(keys),))
+            deleted = cur.rowcount
+            cur.execute(
+                "DELETE FROM ks_entity_timeline WHERE frag_key = ANY(%s)", (list(keys),))
+            return deleted
 
         # ------------------------------------------------------------------
     # 细粒度能力探针（StorageBase，2026-10 ks_pcli）

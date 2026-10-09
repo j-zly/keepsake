@@ -145,26 +145,41 @@ def test_unsupported_capabilities_leave_identifiable_log(pg, caplog):
     assert "set_supersedes" in caplog.text and "unsupported" in caplog.text
 
 
-def test_consolidate_returns_named_unsupported(pg):
-    """合并：PG 下必须是具名 unsupported，而不是 AttributeError。"""
-    res = Consolidator(storage=pg).consolidate()
-    assert res["status"] == "unsupported", res
-    assert "SCAN" in res["reason"], res
+def test_consolidate_runs_on_pg_not_unsupported(pg):
+    """合并：PG 下**真跑**（2026-10 ks_pmn 起不再是 unsupported）。
+
+    LLM 通道未配置 ⇒ `_call_llm` 返回 None ⇒ 每组都合并失败，
+    但**流程必须真跑完**：有 scanned/groups_found 统计，且一个字节都不写。
+    """
+    with pg._ro() as cur:      # noqa: SLF001
+        cur.execute("SELECT count(*) FROM ks_fragment")
+        before = cur.fetchone()[0]
+
+    res = Consolidator(storage=pg).consolidate(dry_run=True)
+    assert res.get("status") != "unsupported", res
+    assert res["dry_run"] is True, res
+    assert res["scanned"] >= 0 and "groups_found" in res, res
+
+    with pg._ro() as cur:      # noqa: SLF001
+        cur.execute("SELECT count(*) FROM ks_fragment")
+        assert cur.fetchone()[0] == before, "dry-run 动了数据"
 
 
-def test_forget_dry_run_returns_named_unsupported(pg):
-    """遗忘（dry-run）：PG 下必须是具名 unsupported，且**没有删任何数据**。"""
+def test_forget_runs_on_pg_not_unsupported(pg):
+    """遗忘（dry-run）：PG 下真跑，且**没有删任何数据**。"""
     with pg._ro() as cur:      # noqa: SLF001
         cur.execute("SELECT count(*) FROM ks_fragment WHERE key LIKE %s", (f"%{_TOKEN}%",))
         before = cur.fetchone()[0]
 
     res = Forgetter(storage=pg, dry_run=True).forget()
-    assert res["status"] == "unsupported", res
-    assert "SCAN" in res["reason"], res
+    assert res.get("status") != "unsupported", res
+    assert res["dry_run"] is True, res
+    assert res["deleted"] == 0, res
+    assert res["scanned"] >= 0 and "candidates" in res, res
 
     with pg._ro() as cur:      # noqa: SLF001
         cur.execute("SELECT count(*) FROM ks_fragment WHERE key LIKE %s", (f"%{_TOKEN}%",))
-        assert cur.fetchone()[0] == before, "unsupported 路径动了数据"
+        assert cur.fetchone()[0] == before, "dry-run 动了数据"
 
 
 # --------------------------------------------------------------------------

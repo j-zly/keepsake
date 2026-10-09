@@ -393,6 +393,7 @@ class TestV2PipelineStillUsesConsolidatorHelpers:
         assert "class Consolidator:" in src, (
             "Consolidator 类源码应整文件保留（任务书：日后想复活再议）"
         )
-        assert "def consolidate(self)" in src, (
+        assert "def consolidate(self" in src, (
             "Consolidator.consolidate 方法应保留"
+            "（2026-10 ks_pmn 加了 dry_run 形参，名字前缀不变）"
         )

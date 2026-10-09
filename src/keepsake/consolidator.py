@@ -32,8 +32,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .storage_shared import maintenance_client
-
 logger = logging.getLogger(__name__)
 
 
@@ -441,20 +439,23 @@ class Consolidator:
         # channel：可选 resolve_llm_channel 输出；None → _call_llm 内部兜底
         self._channel = channel
 
-    def consolidate(self) -> Dict[str, Any]:
-        """执行一轮碎片合并。返回操作统计。"""
-        client = maintenance_client(self._storage)
-        if not client:
-            return {
-                "status": "unsupported",
-                "reason": "consolidate 需要 Redis SCAN/HMGET/HSET/DEL 全套语义"
-                          "（PG 后端既无扫描接口也无删除接口，且无 consumed_by 列）",
-            }
+    def consolidate(self, dry_run: bool = False) -> Dict[str, Any]:
+        """执行一轮碎片合并。返回操作统计。
 
-        stats = {"scanned": 0, "groups_found": 0, "merged": 0, "skipped": 0, "errors": 0}
+        `dry_run=True`：**只扫描 + 聚类 + 报组数，一个字都不写**（不建 consolidated
+        碎片、不标 consumed）。用于「先看看能合多少组」的安全预演。
+
+        2026-10 ks_pmn：改为**只通过 StorageBase 的维护原语**访问存储
+        （`scan_fragment_keys` / `get_fragments_batch` / `write_fragments_batch` /
+        `update_fragment_fields`），Redis 与 PG 两个后端语义等价，不再有 unsupported。
+        """
+        stats = {
+            "scanned": 0, "groups_found": 0, "merged": 0, "skipped": 0,
+            "errors": 0, "dry_run": bool(dry_run),
+        }
 
         # 1. 扫描未合并的碎片
-        fragments = self._scan_unconsolidated(client)
+        fragments = self._scan_unconsolidated()
         stats["scanned"] = len(fragments)
         if not fragments:
             return stats
@@ -463,13 +464,21 @@ class Consolidator:
         groups = self._cluster_by_topic(fragments)
         stats["groups_found"] = len(groups)
 
+        if dry_run:
+            # 只报「发现 N 组可合并」（含达标的组数），不调 LLM、不写库。
+            stats["would_merge"] = sum(
+                len(g) for g in groups if len(g) >= self._min_group_size)
+            logger.info("consolidator: [DRY RUN] 发现 %d 组可合并（共 %d 碎片），未写入",
+                        stats["would_merge"], len(fragments))
+            return stats
+
         # 3. 对每个符合条件的组执行合并
         for group in groups:
             if len(group) < self._min_group_size:
                 stats["skipped"] += len(group)
                 continue
 
-            result = self._merge_group(client, group)
+            result = self._merge_group(group)
             if result:
                 stats["merged"] += len(group)
             else:
@@ -477,48 +486,35 @@ class Consolidator:
 
         return stats
 
-    def _scan_unconsolidated(self, client) -> List[Dict[str, Any]]:
+    def _scan_unconsolidated(self) -> List[Dict[str, Any]]:
         """扫描符合合并条件的碎片。
 
         条件:
           - fragment_type != "consumed"（未被更高层合并吞掉的）
           - 创建时间 > max_age_hours（给新碎片时间积累）
           - 已合并的（consolidated）也参与扫描，实现多级提炼
+
+        分页由后端负责：Redis 是 SCAN 游标，PG 是 keyset 分页（`key > :last`）。
         """
         try:
             cutoff = (datetime.now(timezone.utc).timestamp() - self._max_age_hours * 3600)
-            cursor = 0
+            cursor = ""
             fragments = []
 
             while True:
-                cursor, keys = client.scan(
+                cursor, keys = self._storage.scan_fragment_keys(
                     cursor=cursor,
-                    match="memory:frag:*",
-                    count=self._batch_size,
+                    limit=self._batch_size,
+                    prefix="memory:frag:",
                 )
 
-                if not keys:
-                    if cursor == 0:
-                        break
-                    continue
+                # 批量读一页（Redis=pipeline HMGETALL，PG=`key = ANY` 一条 SQL）
+                docs = self._storage.get_fragments_batch(keys) if keys else {}
 
-                # 用 pipeline 批量 HMGETALL，减少网络往返
-                pipe = client.pipeline()
-                for key_b in keys:
-                    pipe.hgetall(key_b)
-                pipe_results = pipe.execute()
-
-                for key_b, data in zip(keys, pipe_results):
-                    key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
-                    if not data:
+                for key in keys:
+                    doc = docs.get(key)
+                    if not doc:
                         continue
-
-                    # 解码
-                    doc = {}
-                    for k_b, v_b in data.items():
-                        k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
-                        v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
-                        doc[k] = v
 
                     # 跳过已被更高层合并吞掉的
                     if doc.get("fragment_type", "") == "consumed":
@@ -537,7 +533,7 @@ class Consolidator:
                     doc["_key"] = key
                     fragments.append(doc)
 
-                if cursor == 0:
+                if not cursor:
                     break
 
             return fragments
@@ -591,7 +587,7 @@ class Consolidator:
 
         return groups
 
-    def _merge_group(self, client, group: List[Dict]) -> bool:
+    def _merge_group(self, group: List[Dict]) -> bool:
         """用 LLM 合并一组碎片。"""
         # 计算新层级：取组内最高 level + 1
         max_level = 1
@@ -680,11 +676,12 @@ class Consolidator:
         consolidated_key = f"memory:frag:{content_hash}"
 
         # 如果没有相同 key（去重检查），就存
-        existing = client.exists(consolidated_key)
+        existing = self._storage.fragment_exists(consolidated_key)
         if existing:
             logger.debug("consolidator: duplicate consolidated result, skipping")
         else:
-            client.hset(consolidated_key, mapping=mapping)
+            self._storage.write_fragments_batch(
+                [dict(mapping, key=consolidated_key)])
 
         # 软删除原始碎片（标记为已消费，不硬删）
         from datetime import datetime as _dt
@@ -694,9 +691,11 @@ class Consolidator:
             key = f.get("_key")
             if key:
                 try:
-                    client.hset(key, "consumed_by", consolidated_key)
-                    client.hset(key, "consumed_at", now_iso)
-                    client.hset(key, "fragment_type", "consumed")
+                    self._storage.update_fragment_fields(key, {
+                        "consumed_by": consolidated_key,
+                        "consumed_at": now_iso,
+                        "fragment_type": "consumed",
+                    })
                     consumed_count += 1
                 except Exception:
                     pass

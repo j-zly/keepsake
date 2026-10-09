@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class StorageBase(ABC):
@@ -182,6 +182,58 @@ class StorageBase(ABC):
     @abstractmethod
     def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
         """按时间倒序返回某实体的记忆时间线。"""
+
+    # ------------------------------------------------------------------
+    # 维护原语（合并 / 遗忘用）—— 202-10 ks_pmn
+    #
+    # 合并与遗忘要做的是「全库分页扫描 + 批量读写删」，原先它们直接摸 Redis
+    # 的 SCAN 游标 + pipeline，于是 PG 后端整体 unsupported。这里给出**后端无关
+    # 的四个原语**，两个后端各实现一份：
+    #
+    #   * `scan_fragment_keys`  分页扫描（Redis=SCAN 游标；PG=keyset 分页
+    #     `WHERE key > :cursor ORDER BY key LIMIT n`，**禁止大 OFFSET**）
+    #   * `get_fragments_batch` 批量读（已在上面声明，Redis=HMGETALL、PG=ANY）
+    #   * `write_fragments_batch` 批量写（新碎片；PG 侧要重算 content_tsv/embedding）
+    #   * `update_fragment_fields` 局部更新（标记 consumed 用，不动 content）
+    #   * `delete_fragments_batch` 批量删
+    #
+    # 游标约定：`cursor` 是**不透明字符串**，`""` = 从头开始；
+    # 返回的 `next_cursor` 为 `""` 表示**已扫完**（Redis 的游标 0 = PG 的空串）。
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def scan_fragment_keys(
+        self,
+        cursor: str = "",
+        limit: int = 200,
+        prefix: str = "memory:frag:",
+    ) -> Tuple[str, List[str]]:
+        """分页扫描碎片 key。返回 `(next_cursor, keys)`。
+
+        `prefix` 是**前缀**（不带 `*`），Redis 侧转成 `SCAN MATCH prefix*`，
+        PG 侧转成 `key LIKE prefix%`。两个后端对同一 prefix 必须给出等价 key 集
+        —— 调用方（合并/遗忘）按 `prefix="memory:full:"` 扫描时，
+        Redis 若无该 keyspace 就返回空，PG 侧 ks_fragment 里没有这些 key 也返回空。
+        """
+        ...
+
+    @abstractmethod
+    def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """批量写碎片（upsert）。`rows` 每项必须含 `key` 与 `content`，返回写入条数。
+
+        PG 侧必须重算 `content_tsv` / `embedding`（否则新碎片进不了 BM25/KNN）。
+        """
+        ...
+
+    @abstractmethod
+    def update_fragment_fields(self, key: str, fields: Dict[str, Any]) -> bool:
+        """局部更新一条碎片的若干字段（**不动 content / content_tsv / embedding**）。"""
+        ...
+
+    @abstractmethod
+    def delete_fragments_batch(self, keys: List[str]) -> int:
+        """批量删除碎片，返回实际删除条数。"""
+        ...
 
     # ------------------------------------------------------------------
     # 语料维护（批 2 与检索一起做）

@@ -23,8 +23,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .storage_shared import maintenance_client
-
 logger = logging.getLogger(__name__)
 
 # 默认参数
@@ -64,16 +62,11 @@ class Forgetter:
 
         返回:
             操作统计
-        """
-        client = maintenance_client(self._storage)
-        if not client:
-            return {
-                "status": "unsupported",
-                "reason": "forget 需要 Redis SCAN/HMGET/HGET/DEL 全套语义"
-                          "（PG 后端既无扫描接口也无删除接口，且 memory:full:* "
-                          "在 ks_fragment 无对应数据模型）",
-            }
 
+        2026-10 ks_pmn：改为**只通过 StorageBase 的维护原语**访问存储
+        （`scan_fragment_keys` / `get_fragments_batch` / `delete_fragments_batch`），
+        Redis 与 PG 两个后端语义等价，不再有 unsupported。
+        """
         stats = {
             "scanned": 0,
             "candidates": 0,
@@ -82,10 +75,10 @@ class Forgetter:
             "dry_run": self._dry_run and not force,
         }
 
-        forgettable = self._find_forgettable(client, stats)
+        forgettable = self._find_forgettable(stats)
 
         # 扫描完整记忆（memory:full:*），只按年龄判断
-        forgettable_full = self._find_forgettable_full(client, stats)
+        forgettable_full = self._find_forgettable_full(stats)
         forgettable.extend(forgettable_full)
 
         stats["candidates"] = len(forgettable)
@@ -103,24 +96,15 @@ class Forgetter:
             return stats
 
         # 实际删除
-        deleted = 0
-        for key in forgettable:
-            try:
-                client.delete(key)
-                deleted += 1
-            except Exception as e:
-                logger.debug("forgetter: delete %s failed: %s", key, e)
-
-        stats["deleted"] = deleted
+        stats["deleted"] = self._storage.delete_fragments_batch(forgettable)
         logger.info(
             "forgetter: deleted %d/%d forgettable fragments",
-            deleted, len(forgettable),
+            stats["deleted"], len(forgettable),
         )
         return stats
 
     def _find_forgettable(
         self,
-        client,
         stats: Dict[str, Any],
     ) -> List[str]:
         """扫描并筛选可遗忘的碎片。"""
@@ -128,95 +112,80 @@ class Forgetter:
         cutoff_ts = now.timestamp() - self._max_age_days * 86400
         forgettable_keys: List[str] = []
 
-        cursor = 0
+        cursor = ""
         protected = 0
 
         while True:
-            cursor, keys = client.scan(
+            cursor, keys = self._storage.scan_fragment_keys(
                 cursor=cursor,
-                match="memory:frag:*",
-                count=self._batch_size,
+                limit=self._batch_size,
+                prefix="memory:frag:",
             )
 
-            if not keys:
-                if cursor == 0:
-                    break
-                continue
+            if keys:
+                # 批量读一页（Redis=pipeline HGETALL，PG=`key = ANY` 一条 SQL）
+                docs = self._storage.get_fragments_batch(keys)
 
-            # 用 pipeline 批量 HMGET，减少网络往返
-            pipe = client.pipeline()
-            hmget_fields = ["created", "feedback_score", "sentiment_score",
-                            "fragment_type", "source", "category", "content"]
-            for key_b in keys:
-                pipe.hmget(key_b, hmget_fields)
-            pipe_results = pipe.execute()
+                for key in keys:
+                    stats["scanned"] += 1
 
-            for key_b, fields in zip(keys, pipe_results):
-                key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
-                stats["scanned"] += 1
+                    doc = docs.get(key)
+                    if not doc:
+                        continue  # key 不存在或空
 
-                if not fields or not any(fields):
-                    continue  # key 不存在或空
+                    created_str = doc.get("created", "")
+                    fb_str = doc.get("feedback_score", "")
+                    sent_str = doc.get("sentiment_score", "")
+                    frag_type = doc.get("fragment_type", "")
+                    source = doc.get("source", "")
+                    content = doc.get("content", "")
 
-                def _d(v):
-                    if v is None:
-                        return ""
-                    return v.decode("utf-8") if isinstance(v, bytes) else str(v)
-
-                created_str = _d(fields[0])
-                fb_str = _d(fields[1])
-                sent_str = _d(fields[2])
-                frag_type = _d(fields[3])
-                source = _d(fields[4])
-                category = _d(fields[5])
-                content = _d(fields[6])
-
-                # ---- 保护规则 ----
-                # 1. 不删 consolidated 碎片
-                if frag_type == "consolidated":
-                    protected += 1
-                    continue
-
-                # 2. 不删用户手动存的 memory
-                if source == "hermes_agent":
-                    fb = self._parse_float(fb_str, 0)
-                    if fb >= 0:
+                    # ---- 保护规则 ----
+                    # 1. 不删 consolidated 碎片
+                    if frag_type == "consolidated":
                         protected += 1
                         continue
 
-                # 3. 不删正反馈碎片
-                fb = self._parse_float(fb_str, 0)
-                if fb > self._min_feedback_score:
-                    protected += 1
-                    continue
+                    # 2. 不删用户手动存的 memory
+                    if source == "hermes_agent":
+                        fb = self._parse_float(fb_str, 0)
+                        if fb >= 0:
+                            protected += 1
+                            continue
 
-                # ---- 年龄检查 ----
-                if created_str:
-                    try:
-                        created_ts = datetime.fromisoformat(created_str).timestamp()
-                        if created_ts > cutoff_ts:
-                            continue  # 还不够老
-                    except (ValueError, TypeError):
-                        pass
+                    # 3. 不删正反馈碎片
+                    fb = self._parse_float(fb_str, 0)
+                    if fb > self._min_feedback_score:
+                        protected += 1
+                        continue
 
-                # ---- 情绪烈度检查 ----
-                intensity = self._parse_float(sent_str, 0)
-                if intensity >= self._min_intensity:
-                    continue
+                    # ---- 年龄检查 ----
+                    if created_str:
+                        try:
+                            created_ts = datetime.fromisoformat(created_str).timestamp()
+                            if created_ts > cutoff_ts:
+                                continue  # 还不够老
+                        except (ValueError, TypeError):
+                            pass
 
-                # ---- 注意力检查 ----
-                if content:
-                    try:
-                        attn_w = self._storage.match_attention(content)
-                        if attn_w and attn_w > 1.1:
-                            continue  # 高关注度话题，保留
-                    except Exception:
-                        pass
+                    # ---- 情绪烈度检查 ----
+                    intensity = self._parse_float(sent_str, 0)
+                    if intensity >= self._min_intensity:
+                        continue
 
-                # 所有条件都满足 → 可遗忘
-                forgettable_keys.append(key)
+                    # ---- 注意力检查 ----
+                    if content:
+                        try:
+                            attn_w = self._storage.match_attention(content)
+                            if attn_w and attn_w > 1.1:
+                                continue  # 高关注度话题，保留
+                        except Exception:
+                            pass
 
-            if cursor == 0:
+                    # 所有条件都满足 → 可遗忘
+                    forgettable_keys.append(key)
+
+            if not cursor:
                 break
 
         stats["skipped_protected"] = protected
@@ -234,36 +203,48 @@ class Forgetter:
 
     def _find_forgettable_full(
         self,
-        client,
         stats: Dict[str, Any],
     ) -> List[str]:
-        """扫描完整记忆（memory:full:*），只按年龄判断是否可遗忘。"""
+        """扫描完整记忆（memory:full:*），只按年龄判断是否可遗忘。
+
+        🔴 2026-10 ks_pmn 取证结论：`memory:full:*` 是 2026-06-27（commit fab4c82
+        "store full entries only"）就已删除写方的**遗留旁路** —— 现在
+        `grep -rn memory:full src/` 只剩本函数。也就是说 Redis 侧这个 keyspace
+        **恒为空**，本循环是个空转。
+
+        PG 侧 `ks_fragment.content` 存的就是**未截断正文**（store() 直接写传入全文），
+        与该旁路语义等价但无独立数据模型 ⇒ `scan_fragment_keys(prefix="memory:full:")`
+        天然返回空，与 Redis 空 keyspace **行为等价**，不需要建表/加列。
+        """
         now = datetime.now(timezone.utc)
         cutoff_ts = now.timestamp() - self._full_max_age_days * 86400
         forgettable_keys: List[str] = []
 
-        cursor = 0
+        cursor = ""
         while True:
-            cursor, keys = client.scan(
+            cursor, keys = self._storage.scan_fragment_keys(
                 cursor=cursor,
-                match="memory:full:*",
-                count=self._batch_size,
+                limit=self._batch_size,
+                prefix="memory:full:",
             )
-            for key_b in keys:
-                key = key_b.decode("utf-8") if isinstance(key_b, bytes) else key_b
-                stats["scanned"] += 1
-                try:
-                    created_data = client.hget(key, "last_accessed") or client.hget(key, "created")
-                    if not created_data:
+            if keys:
+                docs = self._storage.get_fragments_batch(keys)
+                for key in keys:
+                    stats["scanned"] += 1
+                    doc = docs.get(key) or {}
+                    raw = doc.get("last_accessed") or doc.get("created") or ""
+                    if not raw:
                         continue
-                    created_ts = float(created_data)
+                    try:
+                        created_ts = float(raw)
+                    except (ValueError, TypeError):
+                        logger.debug("forgetter: skip full memory key %s: bad ts %r",
+                                     key, raw)
+                        continue
                     if created_ts > cutoff_ts:
                         continue  # 最近被访问过或创建不久，保留
                     forgettable_keys.append(key)
-                except Exception as e:
-                    logger.debug("forgetter: skip full memory key %s: %s", key, e)
-                    continue
-            if cursor == 0:
+            if not cursor:
                 break
 
         return forgettable_keys
