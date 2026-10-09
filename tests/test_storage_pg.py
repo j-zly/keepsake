@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List
 
+import jieba
 import pytest
 
 from keepsake.splitter import extract_entities, extract_keywords
@@ -64,7 +65,7 @@ def pg():
 
 @pytest.fixture(autouse=True)
 def _cleanup(pg):
-    """每个测试后清掉本次写入的行（按 key / 按本轮关键词）。
+    """每个测试后清掉本次写入的行（按 key / 按本轮关键词），并**复查残留=0**。
 
     🔴 2026-10 ks_pg_bm25 修的**测试卫生泄漏**：`store()` 会把
     `extract_keywords(text)` 永久写进 `ks_hot_topic` / `ks_hot_topic_seen`
@@ -74,25 +75,72 @@ def _cleanup(pg):
     `test_hot_topics_and_match` 的 `match_hot_topics("完全无关的句子 xyzzy") == 0.0`
     必然红 —— 而且与被测代码无关，是上一轮遗留的数据把这一轮判死的。
     所以这里在删碎片**之前**先按 key 取回正文，把它们的关键词一并清掉。
+
+    🔴 2026-10 ks_testiso 补的四处漏网（取证见 /tmp/ks_testiso_rootcause.txt）：
+      1. `ks_entity_cooc` —— **从来没被任何 fixture 删过**，只增不减（实测涨到 3052 行）。
+         `store()` 的 `_record_entity_cooc` 会把正文抽出的实体两两配对永久写进去。
+      2. `ks_entity_timeline` 孤儿 —— 只删 `frag_key = ANY(_WROTE_KEYS)`，
+         但 store() 写的 timeline 行在版本化场景下会对不上，实测攒下 **515 行孤儿**
+         （frag_key 指向早已删除的碎片，100% 孤儿率）。
+      3. **大小写**：`_record_attention` 存的是 `kw.lower().strip()`，而这里按
+         **原样 kw** 删 ⇒ 含大写字母的英文关键词（`PostgreSQL` → `postgresql`）删不掉。
+      4. `_TOPICS` / `_WROTE_KEYS` 是模块级 list：某个用例中途失败时不会被清，
+         下一轮继续累积。
     """
     yield
     with pg._tx() as cur:      # noqa: SLF001 — 测试内清理自有数据
         leaked: List[str] = []
-        if _WROTE_KEYS:
-            cur.execute("SELECT content FROM ks_fragment WHERE key = ANY(%s)",
-                        (list(_WROTE_KEYS),))
+        entities: List[str] = []
+        keys = list(_WROTE_KEYS)
+        if keys:
+            # 先取回正文：要靠它反推关键词与实体（删完就取不到了）
+            cur.execute("SELECT content FROM ks_fragment WHERE key = ANY(%s)", (keys,))
             for (content,) in cur.fetchall():
                 leaked.extend(extract_keywords(content or "", max_keywords=5))
-            cur.execute("DELETE FROM ks_fragment WHERE key = ANY(%s)", (list(_WROTE_KEYS),))
-            cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = ANY(%s)",
-                        (list(_WROTE_KEYS),))
+                entities.extend(extract_entities(content or ""))
+            cur.execute("DELETE FROM ks_fragment WHERE key = ANY(%s)", (keys,))
+            # timeline：既删本轮 key，也删它派生出的版本化 key（`key:<epoch>` 后缀）
+            cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = ANY(%s)", (keys,))
+            for k in keys:
+                cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key LIKE %s",
+                            (f"{k}:%",))
             _WROTE_KEYS.clear()
-        topics = _TOPICS + [kw for kw in leaked if kw not in _TOPICS]
-        if topics:
-            cur.execute("DELETE FROM ks_hot_topic WHERE topic = ANY(%s)", (list(topics),))
-            cur.execute("DELETE FROM ks_attention WHERE topic = ANY(%s)", (list(topics),))
-            cur.execute("DELETE FROM ks_hot_topic_seen WHERE topic = ANY(%s)", (list(topics),))
+
+        # attention 存的是小写词 ⇒ 删除集合必须同时含原样与小写两种形态
+        topics = list({*_TOPICS, *leaked})
+        lowered = {t.lower().strip() for t in topics if len(t.strip()) >= 2}
+        all_topics = sorted({*topics, *lowered})
+        if all_topics:
+            cur.execute("DELETE FROM ks_hot_topic WHERE topic = ANY(%s)", (all_topics,))
+            cur.execute("DELETE FROM ks_attention WHERE topic = ANY(%s)", (all_topics,))
+            cur.execute("DELETE FROM ks_hot_topic_seen WHERE topic = ANY(%s)", (all_topics,))
+
+        # cooc：与 `_record_entity_cooc` 同一套配对规则（实体小写排序后两两组合）
+        ents = sorted({e.lower().strip() for e in entities if e.strip()})
+        pairs = [f"{ents[i]}||{ents[j]}"
+                 for i in range(len(ents)) for j in range(i + 1, len(ents))]
+        if pairs:
+            cur.execute("DELETE FROM ks_entity_cooc WHERE pair = ANY(%s)", (pairs,))
         _TOPICS.clear()
+
+        # ---- 复查：本用例圈定范围内残留必须为 0（否则下一轮会被脏数据判死）----
+        if keys:
+            cur.execute("""
+                SELECT (SELECT count(*) FROM ks_fragment WHERE key = ANY(%s))
+                     + (SELECT count(*) FROM ks_entity_timeline
+                        WHERE frag_key = ANY(%s) OR frag_key LIKE ANY(%s)),
+                       (SELECT count(*) FROM ks_hot_topic WHERE topic = ANY(%s))
+                     + (SELECT count(*) FROM ks_attention WHERE topic = ANY(%s))
+                     + (SELECT count(*) FROM ks_hot_topic_seen WHERE topic = ANY(%s))
+            """, (keys, keys, [f"{k}:%" for k in keys],
+                  all_topics or [""], all_topics or [""], all_topics or [""]))
+            frag_res, topic_res = cur.fetchone()
+            assert frag_res == 0, f"碎片/时间线残留 {frag_res} 行，teardown 没清干净"
+            assert topic_res == 0, f"榜单残留 {topic_res} 行，teardown 没清干净"
+        if pairs:
+            cur.execute("SELECT count(*) FROM ks_entity_cooc WHERE pair = ANY(%s)", (pairs,))
+            cooc_res = cur.fetchone()[0]
+            assert cooc_res == 0, f"共现残留 {cooc_res} 行，teardown 没清干净"
 
 
 def _text(tag: str) -> str:
@@ -367,21 +415,42 @@ _EMBED_DIM = 1536
 
 
 class _FakeEmbedder:
-    """确定性假 embedder（不调任何 LLM/网络）。
+    """确定性假 embedder（不调任何 LLM/网络），但**必须真的有语义**。
 
     维度必须等于 `PgStorage` 构造时的 embed_dim（1536）——PG 的 `vector(N)` 列
     维度由 ensure_index 首次建表时定死，ensure_index 会拒绝维度漂移。
-    向量由文本的 sha256 派生 ⇒ 同文本恒得同向量，且文本越像共享前缀越多、距离越小。
+
+    🔴 2026-10 ks_testiso 修的**夹具缺陷**：这里原来用
+    `sha256(text).digest()` 当向量。sha256 是雪崩哈希，**文本越像、向量越不像**，
+    实测 cos(query, 目标正文)=0.70 而 cos(query, 无关正文)=0.75 ——
+    KNN 路返回的是**纯噪声序**，与相关性零相关。
+    而 `rrf_fuse` 的名次分 `1/(k+bm) + 1/(k+knn)`（k=60）是对称的：
+        1/61 + 1/64 = 0.032018（目标：BM25 第 1、KNN 第 4）
+        1/63 + 1/61 = 0.032266（无关：BM25 第 3、KNN 第 1）  ← 反而更大
+    名次差 1~4 位在 k=60 下只值 0.8%，远小于 BM25 分差能提供的区分度
+    ⇒ **KNN 噪声直接决定 fused 名次**，本轮刚 seed 的「无关闲聊」稳定把目标顶到第 2。
+    对照实验：把库清到 0 残留后连跑 20 轮仍 14/20 失败 ⇒ 与累积状态无关，是夹具问题。
+
+    改法：词袋哈希（jieba 词 + 相邻单字 bigram → blake2b 哈希到 1536 维 → L2 归一）。
+    共享的词/bigram 越多 ⇒ 桶重合越多 ⇒ 余弦越近 ⇒ **KNN 序恢复成相关性序**，
+    且仍然完全确定性、零依赖、零网络。
+    ponytail: 哈希到固定 1536 维会有轻微桶碰撞；当前语料（4~5 条、几十个词）
+    实测 0 假阴性，是刻意接受的简化。升级路径：改用真实 embedding 服务。
     """
 
     _registered = True
-    _model = "test-hash-1536"
+    _model = "test-bag-1536"
     dimension = _EMBED_DIM
 
     def get_embedding(self, text: str):
-        raw = hashlib.sha256((text or "").encode("utf-8")).digest()
-        vals = [(b + 1) / 256.0 for b in raw] * (_EMBED_DIM // 32 + 1)
-        vec = vals[:_EMBED_DIM]
+        t = (text or "").lower().strip()
+        grams = [w for w in jieba.lcut(t) if w.strip()]
+        grams += [t[i:i + 2] for i in range(len(t) - 1)]
+        vec = [0.0] * _EMBED_DIM
+        for g in grams:
+            h = int.from_bytes(hashlib.blake2b(g.encode("utf-8"),
+                                                digest_size=8).digest(), "big")
+            vec[h % _EMBED_DIM] += 1.0
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 
@@ -416,6 +485,22 @@ def _seed_corpus(pg, marker: str) -> Dict[str, str]:
     return keys
 
 
+def _bm25_top_of(rows, keys) -> str:
+    """在「本用例 seed 的那几条」里，BM25 排第一的是哪个主题。"""
+    mine = [r for r in rows if r["_key"] in set(keys.values())]
+    return _topic_of(max(mine, key=lambda r: r["_bm25_score"]), keys)
+
+
+def _knn_top_of(rows, keys) -> str:
+    """同上，按余弦距离（越小越近）判。"""
+    mine = [r for r in rows if r["_key"] in set(keys.values())]
+    return _topic_of(min(mine, key=lambda r: r["_knn_score"]), keys)
+
+
+def _topic_of(row, keys) -> str:
+    return next(t for t, k in keys.items() if k == row["_key"])
+
+
 def test_bm25_hits_the_relevant_fragment(pg_search):
     """BM25：查「数据库迁移」必须命中对应那条，且给出正分与降序。"""
     marker = uuid.uuid4().hex[:8]
@@ -424,7 +509,9 @@ def test_bm25_hits_the_relevant_fragment(pg_search):
 
     res = pg_search.search_bm25(f"数据库迁移 {marker}")
     assert res, f"BM25 应当命中本轮写入的碎片（marker={marker}）"
-    assert res[0]["_key"] == keys["数据库迁移方案"]
+    # 🔴 只在**自己 seed 的那批**里判第一（排名依赖全库是设计如此，
+    #    库里别人的行排前面不代表 BM25 有错 —— 同 ks_testiso hybrid 用例）
+    assert _bm25_top_of(res, keys) == "数据库迁移方案"
     assert res[0]["_bm25_score"] > 0
     assert res[0]["_sim"] > 0
     scores = [r["_combined_score"] for r in res]
@@ -466,7 +553,8 @@ def test_knn_returns_closest_and_reports_cosine_distance(pg_search):
     query = f"用户偏好使用 PostgreSQL 方案处理数据库迁移，快照键键值标记甲 {marker}"
     res = pg_search.search_knn(query)
     assert res, "KNN 应当返回候选（本轮每条都写了向量）"
-    assert res[0]["_key"] == keys["数据库迁移方案"]
+    # 🔴 同样只在本批 seed 里判最近（同 ks_testiso hybrid 用例：排名依赖全候选集）
+    assert _knn_top_of(res, keys) == "数据库迁移方案"
     dists = [r["_knn_score"] for r in res]
     assert all(0.0 <= d <= 2.0 for d in dists), f"余弦距离应落在 [0,2]，实际 {dists}"
     # 目标那条的余弦距离是最小值。
@@ -479,21 +567,57 @@ def test_knn_returns_closest_and_reports_cosine_distance(pg_search):
 
 
 def test_hybrid_search_fuses_both_paths(pg_search):
-    """混合检索 = BM25 + KNN 两路都跑，RRF 融合后仍返回共同命中的那条。"""
+    """混合检索 = BM25 + KNN 两路都跑，RRF 融合后目标条**排在同批语料之首**。
+
+    🔴 2026-10 ks_testiso：断言从「fused 的全局 top-1」改成「同批 seed 内的第一」。
+    理由：**排名依赖全候选集是设计如此**（RRF 名次分对全库/全候选计算），
+    测试库里的历史语料、或别的用例残留的行，出现在 fused 更前面并不代表融合有错。
+    原写法 `fused[0] == target` 因此是个**依赖库当前恰好干净**的断言 ——
+    它测的是「库里没脏数据」，不是「融合优先于单路」。
+
+    改后仍钉住原意的两件事，一件都没放松：
+      1. 「两路都命中」—— 目标必须同时出现在 BM25 与 KNN 的结果里，
+         且在**各自那一路里都排第一**（单路就已经把目标顶到最前，不是靠融合救回来的）；
+      2. 「融合优先于单路」—— 在本批 seed 的 4 条语料里，融合后目标仍排第一。
+    另加：BM25 分差要有实质优势（不是并列第一那种「碰巧赢」）。
+    """
     marker = uuid.uuid4().hex[:8]
     keys = _seed_corpus(pg_search, marker)
     _TOPICS.append(marker)
 
     query = f"数据库迁移 {marker}"
-    bm = {r["_key"] for r in pg_search.search_bm25(query)}
-    knn = {r["_key"] for r in pg_search.search_knn(query)}
+    bm_rows = pg_search.search_bm25(query)
+    knn_rows = pg_search.search_knn(query)
+    bm = {r["_key"] for r in bm_rows}
+    knn = {r["_key"] for r in knn_rows}
     assert keys["数据库迁移方案"] in bm, "BM25 路应命中"
     assert keys["数据库迁移方案"] in knn, "KNN 路应命中"
 
     fused = pg_search.search(query)
     assert fused, "混合检索应返回结果"
-    assert fused[0]["_key"] == keys["数据库迁移方案"]
     assert "_combined_score" in fused[0] and "_weights" in fused[0]
+
+    # 只在**自己 seed 的那 4 条**里比名次（库里别人的行不参与这个判断）
+    seeded = set(keys.values())
+    mine = [r for r in fused if r["_key"] in seeded]
+    target = keys["数据库迁移方案"]
+    assert target in {r["_key"] for r in mine}, "目标必须出现在融合结果里"
+
+    # 「融合优先于单路」：目标是本批语料里**两路都把它排在最前**的那条 ——
+    # 单看任一路都不足以定胜负（两路的候选集都是全部 4 条），是融合后才分出的高低。
+    assert _bm25_top_of(bm_rows, keys) == "数据库迁移方案"
+    assert _knn_top_of(knn_rows, keys) == "数据库迁移方案"
+    # BM25 分差要有实质优势（不是并列第一那种「碰巧赢」）
+    mine_bm = [r for r in bm_rows if r["_key"] in seeded]
+    top_bm = max(r["_bm25_score"] for r in mine_bm)
+    runner_bm = sorted((r["_bm25_score"] for r in mine_bm), reverse=True)[1]
+    assert top_bm > runner_bm, f"目标在 BM25 上必须明显领先，实际 {top_bm} vs {runner_bm}"
+
+    mine_rank = [r["_key"] for r in mine].index(target)
+    assert mine_rank == 0, (
+        f"目标在自己 seed 的语料里应排第一，实际第 {mine_rank + 1}："
+        f"{[(r['_key'], r.get('_combined_score')) for r in mine]}"
+    )
 
 
 def test_search_respects_v2_filters(pg_search):
