@@ -239,6 +239,29 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         pg_cfg = (cfg.get("storage") or {}).get("postgres") or {}
         if not isinstance(pg_cfg, dict):
             pg_cfg = {}
+
+        # 2026-10 ks_pg_knobs：排序权重键与 redis 分支**同源转发**。
+        # 修前 PG 分支只收 top_k/bm25_limit/... 这几个检索量，decay_half_days、
+        # hot_topic_boost、v2_min_score 等 10 个权重键全落到 PgStorage 的形参默认值
+        # = config.json 里配了也不生效的死配置（且切后端会静默改变排序结果）。
+        # 取值口径：kwargs（provider 口径，已自建好这批键）→ cfg 顶层 → 模块常量。
+        # PG 侧形参默认值逐字等于常量，所以「不配 = 现状」，行为不变。
+        _knobs = {
+            "decay_half_days": (DECAY_HALF_DAYS, int),
+            "attention_boost_max": (1.5, float),
+            "attention_base_increment": (2.0, float),
+            "attention_emotion_factor": (1.5, float),
+            "emotion_intensity_factor": (0.4, float),
+            "feedback_positive_boost": (FEEDBACK_POSITIVE_BOOST, float),
+            "feedback_negative_penalty": (FEEDBACK_NEGATIVE_PENALTY, float),
+            "hot_topic_boost": (HOT_TOPIC_BOOST, float),
+            "hot_topic_decay_half_days": (HOT_TOPIC_DECAY_HALF_DAYS, int),
+            "v2_min_score": (0.05, float),
+        }
+        knobs = {
+            k: cast(kwargs.get(k, cfg.get(k, default)))
+            for k, (default, cast) in _knobs.items()
+        }
         return PgStorage(
             host=str(pg_cfg.get("host", "127.0.0.1")),
             port=int(pg_cfg.get("port", 5432)),
@@ -255,6 +278,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             final_limit=int(cfg.get("top_k", 15)),
             bm25_limit=int(cfg.get("bm25_limit", 20)),
             candidate_count=int(cfg.get("candidate_k", 20)),
+            **knobs,
         )
 
     if kwargs:
