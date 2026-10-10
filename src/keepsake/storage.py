@@ -311,8 +311,13 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             embedder=_build_embedder(cfg, path),
             embed_dim=int(cfg.get("embed_dim", 1536)),
             is_primary=bool(cfg.get("is_primary", False)),
-            **{k: v for k, v in _resolve_knobs(cfg, kwargs).items()
-               if k in ("attention_base_increment", "attention_emotion_factor")},
+            # 2026-10 ks_sqlite_p2_1：**条数上限与排序权重全部读配置**，与 PG 分支
+            # 同一份取值来源（PG 分支就是从这里拿的）。修前这三个键一个都不传
+            # ⇒ sqlite 恒用模块默认 5/20/20 ⇒ 同一 query 与 PG 差一个数量级。
+            final_limit=int(cfg.get("top_k", 15)),
+            bm25_limit=int(cfg.get("bm25_limit", 20)),
+            candidate_count=int(cfg.get("candidate_k", 20)),
+            **_resolve_knobs(cfg, kwargs),
         )
 
     if backend == BACKEND_POSTGRES:

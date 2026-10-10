@@ -904,6 +904,28 @@ def test_search_bm25_returns_pg_shaped_fields(search_store):
     assert f["content"] and f["created"]
 
 
+def test_search_bm25_tag_filter_single_and_multi(search_store):
+    """🔴 `tag_filter` 拼 SQL：单标签 / 多标签都**不许抛异常**（p2.1 修掉的必崩 bug）。
+
+    修前拼法是「`X OR ` + ` OR `.join([X] * (n-1)) + `)`」⇒ n=1 时拼出
+    `(instr(...) > 0 OR )` —— **任何单标签过滤必抛** `near ")": syntax error`
+    （p2.1 做 PG 对照时实测踩到，整个检索直接不可用）。
+
+    ⚠️ 这里**只断言「不崩 + 无过滤时照常有结果」**：`instr('|tags|','|tag|')`
+    这个边界匹配对**逗号分隔**的 tags 一条都匹配不上（只有整串首尾各补一个 `|`，
+    中间的 tag 两侧是逗号不是竖线）—— 这是 **PG 与 SQLite 共有的既存缺陷**
+    （PG 的 `strpos('|'||tags||'|', …)` 逐字同款，实测两侧都恒返 0 条）。
+    修它要动两个后端 + 定分隔符语义，属跨后端改动，不在本任务范围（见 verdict）。
+    """
+    search_store.store("网关重启后 Redis 连接池要重建", tags="ops,shared")
+    search_store.store("备份策略每天全量加每周归档", tags="backup,shared")
+    assert search_store.search_bm25("网关"), "无过滤时本就该有结果（对照基线）"
+    for tf in ("ops", "ops,backup", "  ", "不存在的标签"):
+        out = search_store.search_bm25("网关", tag_filter=tf)   # 不抛 = 通过
+        assert isinstance(out, list), f"tag_filter={tf!r} 返回的不是列表"
+    assert search_store.search_bm25("", tag_filter="ops") == [], "空查询契约不变"
+
+
 def test_search_bm25_empty_query_returns_empty_with_warning(search_store, caplog):
     """空查询 → 空列表 + **warning**（明确、不静默）。"""
     with caplog.at_level(logging.WARNING):
@@ -1006,13 +1028,21 @@ def test_entity_timeline_matches_pg_shape(search_store):
 
 
 def test_corpus300_top10_keys_are_stable(search_store):
-    """**同数据自证**：300 条基准语料跑 10 条固定查询。
+    """300 条基准语料 × 10 条固定查询 —— 断言**不变量**，不断言字面 key 顺序。
 
-    断言的是**真正的判据**：语料里逐字含该词的查询必须有召回；
-    语料里根本没有的词（Termux / 证书续签 —— 实测 300 条里 0 条逐字命中）
-    返回空是**正确**行为，断言它非空才是错的。
+    🔴 为什么不能写死 top-10 key：jieba 的切词结果**依赖机器上的用户词典**
+    （`~/.config/keepsake/jieba_dict.txt`）。有词典的机器与没有的机器切出不同的词
+    ⇒ 名次不同 ⇒ 写死的期望在「主脑」红、在 CI 机绿 —— 这是本项目的老坑
+    （对分词器输出做字面期望）。因此这里只断言**与词典无关的不变量**：
 
-    具体 top-10 key 顺序写进 /tmp/ks_sq_search_verify.txt 供与 PG 侧机械比对。
+      1. 语料里有逐字命中 ⇒ 必须有召回（分词/索引没坏）；
+      2. 无重复 key；
+      3. `_combined_score` 单调不增；
+      4. 更深 N 的结果是更浅 N 的**同序前缀**；
+      5. 同一 query 连跑两次结果完全一致（同分 tiebreak 稳定）。
+
+    具体 top-10 key 顺序由 /tmp/ks_sq_align_verify.txt 出证（供与 PG 侧机械比对），
+    不进断言。
     """
     rows = [json.loads(line) for line in
             CORPUS300.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -1025,6 +1055,187 @@ def test_corpus300_top10_keys_are_stable(search_store):
         in_corpus = q.lower() in blob
         if in_corpus:
             assert hits, f"查询 {q!r} 在语料里有逐字命中却 0 召回 —— 分词/索引坏了"
-        else:
-            # 语料里没有这个词：允许空，也允许靠 jieba 切出的子词召回
-            assert isinstance(hits, list)
+        # 2. 无重复 key
+        keys = [h["_key"] for h in hits]
+        assert len(keys) == len(set(keys)), f"{q!r} 返回了重复 key: {keys}"
+        # 3. _combined_score 单调不增
+        scores = [float(h.get("_combined_score", 0.0)) for h in hits]
+        assert scores == sorted(scores, reverse=True), f"{q!r} 未按综合分降序: {scores}"
+        # 4. 更深 N 是更浅 N 的同序前缀（临时放宽 final_limit 再比）
+        shallow_limit, search_store._final_limit = search_store._final_limit, 50
+        try:
+            deeper = search_store.search_bm25(q)
+        finally:
+            search_store._final_limit = shallow_limit
+        assert len(deeper) >= len(hits)
+        # 只比 key 序：`_combined_score` 带**运行时衰减**（time.time()），逐次会抖
+        # 末位浮点；名次才是契约。
+        assert [h["_key"] for h in deeper[:len(hits)]] == keys, \
+            f"{q!r} 加深 N 后前 {len(hits)} 条不是原结果的同序前缀"
+        # 5. 同 query 连跑一致
+        assert [h["_key"] for h in search_store.search_bm25(q)] == keys, \
+            f"{q!r} 两次连跑名次不一致（tiebreak 抖动）"
+
+
+def test_topn_count_is_min_hits_and_final_limit(tmp_path):
+    """条数契约：返回条数 == min(命中数, top_k)（不是写死的 5）。"""
+    rows = [{"key": f"memory:frag:{i:012x}",
+             "content": f"部署流程 第{i}版 流水线 说明",
+             "tags": "ops", "created": "2026-10-01T00:00:00+00:00"}
+            for i in range(12)]
+    s = SqliteStorage(path=str(tmp_path / "lim.db"), is_primary=True, final_limit=10)
+    try:
+        assert s.ensure_index() is True
+        assert s.write_fragments_batch(rows) == 12
+        assert len(s.search_bm25("部署流程")) == 10, "final_limit 没生效"
+    finally:
+        s.close()
+    s2 = SqliteStorage(path=str(tmp_path / "lim2.db"), is_primary=True, final_limit=99)
+    try:
+        assert s2.ensure_index() is True
+        assert s2.write_fragments_batch(rows) == 12
+        assert len(s2.search_bm25("部署流程")) == 12, "命中 12 条时不该被砍到 top_k 以下"
+    finally:
+        s2.close()
+
+
+def test_sqlite_search_limits_come_from_config(tmp_path):
+    """🔴 条数上限必须**读配置**，与 PG 分支同源（`top_k` / `bm25_limit` / `candidate_k`）。
+
+    修前 sqlite 分支一个都不传 ⇒ 恒用模块默认 5/20/20 ⇒ 与 PG 同查询差一个数量级。
+    """
+    from keepsake.storage import storage_from_config
+
+    cfg = {"storage": {"backend": "sqlite",
+                       "sqlite": {"path": str(tmp_path / "cfg.db")}},
+           "top_k": 7, "bm25_limit": 9, "candidate_k": 11}
+    s = storage_from_config(config=cfg)
+    try:
+        assert isinstance(s, SqliteStorage)
+        assert s._final_limit == 7, f"final_limit 没读 top_k：{s._final_limit}"
+        assert s._bm25_limit == 9, f"bm25_limit 没读配置：{s._bm25_limit}"
+        assert s._candidate_count == 11, f"candidate_count 没读配置：{s._candidate_count}"
+    finally:
+        s.close()
+
+
+def test_search_returns_entities_like_pg(search_store):
+    """返回字段集合必须含 `entities`，且值与库内一致（PG 侧同一字段集实测有该列）。"""
+    key = "memory:frag:0123456789ab"
+    content = "飞书机器人 webhook 部署在 91 网关，凭证走环境变量"
+    assert search_store.write_fragments_batch([{ "key": key, "content": content,
+                                                 "tags": "ops,shared"}]) == 1
+    hits = search_store.search_bm25("飞书")
+    assert hits, "飞书 0 召回"
+    frag = hits[0]
+    assert "entities" in frag, f"返回字段缺 entities: {sorted(frag)}"
+    assert frag["entities"], "entities 为空（写路径没有落实体）"
+    assert frag["entities"] == search_store.get_fragment(frag["_key"])["entities"]
+
+
+# --- 排序契约：SQLite 的分数与名次必须由 PG 那套 BM25 公式决定（p2.1）-------
+
+def _tsv_lexemes(store: SqliteStorage) -> dict:
+    """库内 `content_tsv` → {key: [词元]}（**不碰分词器**：读库里的真相）。
+
+    测试刻意只依赖已落库的 token 串 ⇒ 与机器上的 jieba 用户词典无关。
+    """
+    with store._lock:
+        rows = store._db().execute("SELECT key, content_tsv FROM ks_fragment").fetchall()
+    return {k: (tsv or "").split() for k, tsv in rows}
+
+
+def _expected_order(store: SqliteStorage, query: str, depth: int) -> list:
+    """按 **PG 的公式与 tiebreak** 独立算出的期望 key 序（测试内重算一遍）。"""
+    from keepsake.splitter import segment_query
+    from keepsake.storage import _expand_terms, _sanitize_terms
+    from keepsake.storage_pg import bm25_score
+
+    terms = [t.lower() for t in _sanitize_terms(_expand_terms(segment_query(query), {}))]
+    lex = _tsv_lexemes(store)
+    assert all(all(w.isalnum() or "_" in w for w in ws) for ws in lex.values()), \
+        "content_tsv 里出现了非词元字符（分词口径与 FTS5/PG 不一致）"
+    n_docs = float(len(lex))
+    avgdl = sum(len(v) for v in lex.values()) / n_docs if lex else 0.0
+    dfs = {t: float(sum(1 for v in lex.values() if t in v)) for t in set(terms)}
+    scored = []
+    for key, words in lex.items():
+        wl = [w.lower() for w in words]
+        tfs = {t: float(wl.count(t)) for t in set(terms)}
+        score = bm25_score({t: c for t, c in tfs.items() if c}, float(len(words)),
+                           n_docs, avgdl, dfs)
+        if score > 0:
+            scored.append((score, key))
+    # 与 PG `_tiebreak` 同规则：分数降序，同分按 key 字典序升序
+    scored.sort(key=lambda sk: (-sk[0], sk[1]))
+    return [k for _, k in scored[:depth]]
+
+
+def test_bm25_score_and_order_follow_pg_formula(tmp_path):
+    """🔴 SQLite 的 `_bm25_score` 与名次必须由 **PG 的同一个 BM25 公式**决定。
+
+    修前用 FTS5 内建 `bm25()`：idf 变体、长度归一化与 PG 的 RediSearch 公式都不同
+    ⇒ 同一份语料两后端的名次不一致（同序前缀对不上）。
+    本测试**独立重算**一遍 PG 公式（只读库里的 content_tsv，不依赖分词器），
+    逐条比对分数与顺序。
+    """
+    rows = [{"key": f"memory:frag:{i:012x}", "tags": "ops,shared",
+             "content": c, "created": "2026-10-01T00:00:00+00:00"}
+            for i, c in enumerate([
+                "部署流程 分四批 读写原语 schema 自愈",
+                "网关重启 后 Redis 连接池 要重建",
+                "备份策略 每天全量 每周归档",
+                "证书续签 用 acme 每周一次",
+                "部署流程 网关 重启 的 演练 记录",
+                "飞书机器人 webhook 凭证 走环境变量",
+                "网关 网关 网关 重启 重启 日志",
+                "Termux 在手机上跑 Python 脚本",
+            ])]
+    s = SqliteStorage(path=str(tmp_path / "bm.db"), is_primary=True,
+                      final_limit=3, bm25_limit=100)
+    try:
+        assert s.ensure_index() is True
+        assert s.write_fragments_batch(rows) == len(rows)
+        for q in ("部署流程", "网关", "备份策略", "证书续签"):
+            hits = s.search_bm25(q)
+            exp = _expected_order(s, q, 3)
+            assert [h["_key"] for h in hits] == exp, (
+                f"{q!r} 名次与 PG 公式重算结果不一致：\n"
+                f"  实际 {[h['_key'] for h in hits]}\n  期望 {exp}\n"
+                f"  分数 {[round(h['_bm25_score'], 6) for h in hits]}")
+    finally:
+        s.close()
+
+
+def test_bm25_score_equals_pg_formula_value(tmp_path):
+    """分数**数值**本身也要等于 PG 公式（不只是顺序巧合）。"""
+    from keepsake.splitter import segment_query
+    from keepsake.storage import _expand_terms, _sanitize_terms
+    from keepsake.storage_pg import bm25_score
+
+    rows = [{"key": f"memory:frag:{i:012x}", "tags": "ops,shared",
+             "content": "记忆检索 用 FTS5 加 jieba 全文 召回",
+             "created": "2026-10-01T00:00:00+00:00"} for i in range(4)]
+    rows.append({"key": "memory:frag:ffffffffff", "tags": "ops,shared",
+                 "content": "网关 重启 之后 要 重建 连接池", "created":
+                 "2026-10-01T00:00:00+00:00"})
+    s = SqliteStorage(path=str(tmp_path / "bm2.db"), is_primary=True,
+                      final_limit=10, bm25_limit=100)
+    try:
+        assert s.ensure_index() is True
+        assert s.write_fragments_batch(rows) == len(rows)
+        terms = [t.lower() for t in _sanitize_terms(_expand_terms(segment_query("记忆检索"), {}))]
+        lex = _tsv_lexemes(s)
+        n_docs = float(len(lex))
+        avgdl = sum(len(v) for v in lex.values()) / n_docs
+        dfs = {t: float(sum(1 for v in lex.values() if t in v)) for t in set(terms)}
+        hits = s.search_bm25("记忆检索")
+        assert hits
+        for h in hits:
+            wl = [w.lower() for w in lex[h["_key"]]]
+            want = bm25_score({t: float(wl.count(t)) for t in set(terms) if wl.count(t)},
+                              float(len(wl)), n_docs, avgdl, dfs)
+            assert abs(h["_bm25_score"] - want) < 1e-9, (
+                f"{h['_key']}: 实际 {h['_bm25_score']!r} != PG 公式 {want!r}")
+    finally:
+        s.close()

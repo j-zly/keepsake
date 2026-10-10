@@ -60,11 +60,11 @@ SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + 
     查库时 FTS5 只在**空格分隔的 token 串**上匹配。
     🔴 为什么不用 trigram 分词器：它有 3 字下限，「证书续签」里的「证书」这种
     2 字词查恒 0 —— 中文检索里 2 字词占大头，必须靠 jieba 预切 + 默认分词器。
-  * **打分用 FTS5 内建 `bm25()`**（零新依赖，SQLite 自带 FTS5 扩展）：
-    🔴 方向是本批最大的坑 —— FTS5 的 `bm25()` **返回值越小越相关（负数）**，
-    与 PG/Redis 的「分数越大越相关」相反。这里统一取 `-bm25()` 翻正，
-    契约与另两个后端一致（`_bm25_score` 越大越好），才敢共用
-    `storage_shared.rerank_with_decay`（它内部按 min-max 归一化，越大越好）。
+  * **打分复用 PG 的同一个 `storage_pg.bm25_score`**（p2.1 起）：FTS5 只负责**召回**
+    与候选窗口粗排（对应 PG 侧候选 CTE 里的 `ts_rank_cd`），最终相关性分在 Python 侧
+    按 PG 的 RediSearch 公式算 —— 公式复制一份必然漂移，而漂移的后果就是两后端同一
+    份语料的名次对不上（实测：`记忆检索` 这类同分密集的查询只有 2/5 重合）。
+    FTS5 内建 `bm25()` 只在「取负翻正后」用来给候选窗口排序，不再当最终分。
   * **排序/融合/过滤一律复用 `storage_shared`**（`rerank_with_decay` /
     `apply_v2_filters` / `rrf_fuse` / `attention_boost_from_topics` /
     `hot_topic_weighted_hits`）—— 三后端一份实现是用户明确要求，本文件不重写。
@@ -84,10 +84,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+import re
 import sqlite3
 import struct
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -127,6 +129,9 @@ from .storage_pg import (
     _TOPIC_TTL,
     FRAGMENT_COLUMNS,
     MAINTENANCE_COLUMNS,
+    # BM25 公式本身也**复用 PG 的同一个函数对象**（p2.1 B3）：打分公式复制一份
+    # 必然漂移，而漂移的后果就是同序前缀对不上（实测：FTS5 内建 bm25 与它不一致）。
+    bm25_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -333,6 +338,23 @@ def _sha12(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
+#: unicode61 的词元口径 = `\w+`（含下划线，ASCII 大小写由 unicode61 折叠）。
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tsv_lexemes(text: str) -> List[str]:
+    """文本 → **词元**列表（按 unicode61 的口径切开；纯标点/空白自然消失）。
+
+    🔴 为什么要多切一刀：jieba 会吐出带连字符/点号的整块（如 `needs-attention`）。
+    FTS5 的 `unicode61` 会把它索引成**两个** token（needs / attention），PG 的
+    `to_tsvector('simple', …)` 同样 ⇒ 但 `content_tsv` 里仍是一个空格分隔的「词」，
+    于是「按空格数长度」与「按词元数长度」算出来的 doclen / avgdl 会漂。
+    这里统一成 unicode61 词元（等价于 PG 的 lexeme），FTS5 索引内容**逐字不变**
+    （unicode61 本来就是这么切的），但 Python 侧与 SQL 侧的计数口径对齐了。
+    """
+    return _WORD_RE.findall(text or "")
+
+
 def _tok_string(text: str) -> str:
     """文本 → FTS5 可索引的**空格分隔 token 串**（jieba 切词，与 PG 同路）。
 
@@ -345,13 +367,7 @@ def _tok_string(text: str) -> str:
     """
     import jieba  # noqa: PLC0415 — 与 splitter / storage_pg 同款延迟 import（首调建词典）
 
-    out: List[str] = []
-    for w in jieba.lcut(text or ""):
-        w = w.strip()
-        if not w or not any(ch.isalnum() for ch in w):
-            continue    # 纯标点/空白 → 只会造出噪音 token
-        out.append(w)
-    return " ".join(out)
+    return " ".join(_tsv_lexemes(" ".join(w.strip() for w in jieba.lcut(text or ""))))
 
 
 def _fts_match_expr(terms: List[str]) -> str:
@@ -751,6 +767,15 @@ class SqliteStorage(StorageBase):
                 continue
             row[col] = (_blob_value(fields[col]) if col in _BLOB_COLUMNS
                         else _text_value(fields[col], col))
+        # 🔴 迁移/批量写（`write_fragments_batch` → 本方法）拿来的行往往**没有
+        # entities 字段**（Redis hash / 导出 json 都可能缺），而 `store()` 是用
+        # `extract_entities(content)` 落实体的 —— 两条写路径口径不一致 ⇒ 同一份
+        # 语料经 PG 侧 store() 入库有 entities、经这里入库没有 ⇒ 检索返回的字段
+        # 集合少一项（p2.1 B2）。这里补齐：**调用方给了就以调用方为准，没给才推导**。
+        if not row.get("entities") and row.get("content"):
+            ents = extract_entities(row["content"])
+            if ents:
+                row["entities"] = ",".join(ents)
         params: List[Any] = [str(key)]
         for col in ALL_COLUMNS:
             if col == "key":
@@ -1338,9 +1363,11 @@ class SqliteStorage(StorageBase):
                        for t in (x.strip() for x in tag_filter.split(","))
                        if self._clean_tag(t)]
             if needles:
-                clauses.append("(instr('|'||tags||'|', ?) > 0 OR "
-                               + " OR ".join(["instr('|'||tags||'|', ?) > 0"]
-                                             * (len(needles) - 1)) + ")")
+                # 🔴 拼法用「重复 N 次再 OR 连起来」：**单标签时不能写成
+                #    `(instr(...) > 0 OR )`** —— 那是语法错，整条检索抛
+                #    `near ")": syntax error`（p2.1 实测：单 tag_filter 必崩）。
+                clauses.append("(" + " OR ".join(["instr('|'||tags||'|', ?) > 0"]
+                                                 * len(needles)) + ")")
                 params.extend(needles)
 
         clauses.append("invalid_at = ''")
@@ -1457,14 +1484,60 @@ class SqliteStorage(StorageBase):
             return self._apply_v2_filters(fused)
         return self._apply_v2_filters(bm25_results)
 
+    def _bm25_stats(self, where_sql: str, params: List[Any],
+                    terms: List[str]) -> Tuple[float, float, Dict[str, float]]:
+        """语料统计 (N, avgdl, dfs) —— 与 PG `_bm25_thin` 的统计**同一口径**。
+
+        * N / avgdl：过滤后的活记忆行数与平均长度（`content_tsv` 空格分隔 ⇒
+          「空格数 + 1」就是词元数，与 PG 的 `sum(cardinality(positions))` 等价）。
+        * df(t)：**含词元 t 的文档数**。PG 侧的口径是「lexeme = t 且命中 tsquery」
+          ⇒ 等价于「该词元的文档频率」。本实现用 FTS5 `MATCH` 数（走索引，不扫表）。
+          只有一个 unicode61 词元形态的查询词才可能有 df；含 `-`/空格等的多词查询词
+          在 tsvector 里压根不存在这个 lexeme ⇒ df=0（与 PG 同，不特殊照顾）。
+
+        ponytail: 每次查询两趟 SQL（N/avgdl 一趟、df 一趟 UNION ALL），无缓存。
+        嵌入式单文件库上代价可忽略；语料量级上到十万行再给 df/avgdl 加 TTL 快照
+        （PG 侧 `_snap_get` 那套，同款）。
+        """
+        # 只有「单词元」的查询词才可能有 df —— 与 PG 的 lexeme 口径逐字对齐
+        singles = sorted({t.lower() for t in terms if _WORD_RE.fullmatch(t)})
+        df_sql = " UNION ALL ".join(
+            # 🔴 FTS5 的 MATCH 必须写**表名**（不能给虚表起别名），否则 no such column
+            f"SELECT ? AS term, COUNT(*) AS df FROM ks_fragment f "
+            f"JOIN {FTS_TABLE} ON {FTS_TABLE}.frag_key = f.key "
+            f"WHERE {FTS_TABLE} MATCH ? AND {where_sql}" for _ in singles)
+        df_params: List[Any] = []
+        for t in singles:
+            df_params.extend([t, _fts_match_expr([t]), *params])
+        with self._lock:
+            cur = self._db().cursor()
+            cur.execute(
+                f"SELECT COUNT(*), COALESCE(SUM("
+                f"CASE WHEN content_tsv = '' THEN 0"
+                f" ELSE length(content_tsv) - length(replace(content_tsv, ' ', '')) + 1 END"
+                f"), 0) FROM ks_fragment WHERE {where_sql}", params)
+            n_docs, total_len = cur.fetchone()
+            dfs: Dict[str, float] = {}
+            if singles:
+                cur.execute(df_sql, df_params)
+                for term, df in cur.fetchall():
+                    dfs[str(term)] = float(df)
+        n_docs_f = float(n_docs or 0.0)
+        avgdl = (float(total_len or 0.0) / n_docs_f) if n_docs_f > 0 else 0.0
+        return n_docs_f, avgdl, dfs
+
     def search_bm25(self, query: str, tag_filter: str = "", agent_id: str = "",
                     is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """BM25 全文搜索（jieba 切词 → FTS5 MATCH 召回 → FTS5 内建 `bm25()` 打分
-        → 共用 `rerank_with_decay` 重排 → 取 `final_limit` 条）。
+        """BM25 全文搜索（jieba 切词 → FTS5 MATCH 召回 → **PG 的同一个 BM25 公式**
+        在 Python 侧打分 → 共用 `rerank_with_decay` 重排 → 取 `final_limit` 条）。
 
-        🔴 **打分方向（本批最大的坑）**：FTS5 的 `bm25()` 返回**负数、越小越相关**，
-        与 PG/Redis 的「越大越相关」相反。这里统一取 `-bm25()` 翻正，
-        `_bm25_score` 契约才与另两个后端一致，共用重排的 min-max 归一化才成立。
+        🔴 **p2.1 B3：打分换回 PG 公式**。原来用 FTS5 内建 `bm25()`：它的 idf 变体
+        （BM25 默认 vs RediSearch 的 `ln(1+…)`）与长度归一化口径都和 PG 不同，
+        同一份语料两后端的名次对不上（同序前缀差一大截）。现在**召回**仍走 FTS5
+        （索引在 SQLite 侧），但**打分**用 `storage_pg.bm25_score`（同一个函数
+        对象）+ 同一份语料统计 ⇒ 分数与名次与 PG 逐条一致。
+        FTS5 的 `bm25()` 只用来给**候选窗口**粗排（`ORDER BY … LIMIT bm25_limit`），
+        对应 PG 侧候选 CTE 里的 `ts_rank_cd` —— 两边都是「窗口粗排、非最终分」。
 
         返回字段与 PG `search_bm25` 逐字段对齐（`SEARCH_FIELDS` + `_key` /
         `_bm25_score` / `_sim` / `_combined_score` / `_weights`）。
@@ -1488,11 +1561,13 @@ class SqliteStorage(StorageBase):
         try:
             with self._lock:
                 cur = self._db().cursor()
+                # 候选窗口：`content_tsv` 一并取回（Python 侧算 tf/doclen 用）
                 cur.execute(
                     f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
                     f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
-                    f"f.entities, f.fragment_type, f.invalid_at, "
-                    # 🔴 取负翻正（越大越相关），排序键同向 ⇒ ORDER BY 用 DESC
+                    f"f.entities, f.fragment_type, f.invalid_at, f.content_tsv, "
+                    # 🔴 FTS5 的 bm25() 只用来给**窗口粗排**（对应 PG 侧的 ts_rank_cd），
+                    #    最终分在 Python 侧按 PG 公式重算 —— 见方法 docstring。
                     f"-bm25({FTS_TABLE}) AS bm25_pos "
                     f"FROM {FTS_TABLE} JOIN ks_fragment f ON f.key = {FTS_TABLE}.frag_key "
                     f"WHERE {FTS_TABLE} MATCH ? AND {where_sql} "
@@ -1500,6 +1575,9 @@ class SqliteStorage(StorageBase):
                     [expr, *params, self._bm25_limit],
                 )
                 rows = cur.fetchall()
+            if not rows:
+                return []      # 0 候选就不必算语料统计（N/avgdl 是全表聚合）
+            n_docs, avgdl, dfs = self._bm25_stats(where_sql, params, terms)
         except sqlite3.OperationalError as e:
             # FTS5 查询式语法错/表缺失 → **显式告警**（PG/Redis 都犯过「语法错被
             # debug 吞掉 ⇒ 整类查询静默 0 召回」的错，这里提到 warning 并向上抛）。
@@ -1510,10 +1588,17 @@ class SqliteStorage(StorageBase):
             return []
 
         fragments: List[Dict[str, Any]] = []
+        lower_terms = {t.lower() for t in terms}
         for row in rows:
             key, content, tags, category, source, created, sent, label, fb, \
-                entities, ftype, invalid_at, score = row
-            frag: Dict[str, Any] = {"_key": key, "_bm25_score": float(score or 0.0)}
+                entities, ftype, invalid_at, tsv, _window_score = row
+            # tf / doclen：词元口径与 PG 的 tsvector positions 逐字对齐
+            # （content_tsv 落库时已按 unicode61 词元切分，见 `_tok_string`）
+            words = [w.lower() for w in (tsv or "").split()]
+            counts = Counter(words)
+            tfs = {t: float(c) for t, c in counts.items() if c and t in lower_terms}
+            score = bm25_score(tfs, float(len(words)), n_docs, avgdl, dfs)
+            frag: Dict[str, Any] = {"_key": key, "_bm25_score": score}
             for name, value in (
                 ("content", content), ("tags", tags), ("category", category),
                 ("source", source), ("created", created), ("sentiment_score", sent),
