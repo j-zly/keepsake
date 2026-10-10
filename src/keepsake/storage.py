@@ -317,6 +317,16 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             final_limit=int(cfg.get("top_k", 15)),
             bm25_limit=int(cfg.get("bm25_limit", 20)),
             candidate_count=int(cfg.get("candidate_k", 20)),
+            # 2026-10 ks_sqlite_p3_1：同义词三阈值**同源接线**（与 redis/provider 侧
+            # 同一份 cfg 顶层键、同一组默认值；provider 把它们当 kwargs 传进来时
+            # kwargs 胜出，口径与 _resolve_knobs 一致）。修前 sqlite 分支一个都不传
+            # ⇒ 经配置装配时恒取模块默认，改配置不生效。
+            synonym_min_word_freq=int(kwargs.get(
+                "synonym_min_word_freq", cfg.get("synonym_min_word_freq", 10))),
+            synonym_jaccard_threshold=float(kwargs.get(
+                "synonym_jaccard_threshold", cfg.get("synonym_jaccard_threshold", 0.5))),
+            synonym_min_co_occurrence=int(kwargs.get(
+                "synonym_min_co_occurrence", cfg.get("synonym_min_co_occurrence", 3))),
             **_resolve_knobs(cfg, kwargs),
         )
 

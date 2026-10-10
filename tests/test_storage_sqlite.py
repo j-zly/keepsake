@@ -286,9 +286,9 @@ def test_store_writes_float32_blob_with_embedder(tmp_path):
 
 @pytest.mark.parametrize("name,args", [
     # 批 2 起 search / search_bm25 / match_* / get_hot_topics / entity_timeline 已实现，
-    # 不再是留桩（见下方批 2 段）。仍在留桩的必须**显式可辨识**。
+    # 批 3 起 discover_synonyms / generate_jieba_dict 也已实现（见下方批 3 段），
+    # 不再是留桩。仍在留桩的必须**显式可辨识**。
     ("search_knn", ("q",)),
-    ("discover_synonyms", ()), ("generate_jieba_dict", ()),
 ])
 def test_stub_methods_raise_not_implemented(store, name, args):
     """留桩必须**显式可辨识** —— 返回空值/None 假装成功是最危险的失败形态。"""
@@ -528,6 +528,41 @@ def test_storage_from_config_sqlite_backend(tmp_path):
     # 默认后端逐字不变（缺行 / 非法值仍回 redis）
     assert resolve_backend(None) == "redis"
     assert resolve_backend({"storage": {"backend": "瞎写的"}}) == "redis"
+
+
+def test_storage_from_config_sqlite_reads_synonym_thresholds(tmp_path):
+    """同义词三阈值经 `storage_from_config` 装配必须**真的读配置**（p3.1 B）。
+
+    修前 sqlite 分支只透传 `_resolve_knobs` 的 10 个排序权重键 ⇒ 这三个键恒取
+    模块默认（10 / 0.5 / 3），改配置不生效。口径同 `_resolve_knobs`：kwargs > cfg > 默认。
+    """
+    from keepsake.storage import storage_from_config
+
+    cfg = {"storage": {"backend": "sqlite",
+                       "sqlite": {"path": str(tmp_path / "syn.db")}},
+           "synonym_min_word_freq": 7, "synonym_jaccard_threshold": 0.75,
+           "synonym_min_co_occurrence": 5}
+    s = storage_from_config(config=cfg)
+    try:
+        assert (s._synonym_min_word_freq, s._synonym_jaccard_threshold,
+                s._synonym_min_co_occurrence) == (7, 0.75, 5)
+    finally:
+        s.close()
+
+    d = storage_from_config(config={"storage": {"backend": "sqlite",
+                                                "sqlite": {"path": str(tmp_path / "d.db")}}})
+    try:
+        assert (d._synonym_min_word_freq, d._synonym_jaccard_threshold,
+                d._synonym_min_co_occurrence) == (10, 0.5, 3)   # 缺省 ⇒ 保持原默认
+    finally:
+        d.close()
+
+    k = storage_from_config(config=cfg, synonym_min_word_freq=99)
+    try:
+        assert k._synonym_min_word_freq == 99                     # kwargs 胜出
+        assert k._synonym_min_co_occurrence == 5                 # 其余键仍取 cfg
+    finally:
+        k.close()
 
 
 def test_sqlite_backend_satisfies_storage_base_contract():
@@ -1239,3 +1274,483 @@ def test_bm25_score_equals_pg_formula_value(tmp_path):
                 f"{h['_key']}: 实际 {h['_bm25_score']!r} != PG 公式 {want!r}")
     finally:
         s.close()
+
+
+# ===========================================================================
+# 批 3：维护能力（合并 consolidator / 遗忘 forgetter / 同义词与词典）
+#
+# 铁律（任务书）：
+#   1. 维护逻辑只经抽象层访问存储 —— 本段全部用 `Consolidator` / `Forgetter`
+#      （后端无关模块）驱动，**不**给 SQLite 另写一份合并/遗忘实现。
+#   2. 阈值从配置读（非法值回落默认 + 留 reason），不写死魔数。
+#   3. 维护列判「未设置」用 `= ''`（列是 TEXT NOT NULL DEFAULT ''），**不得 IS NULL**。
+#   4. 降级/跳过必须留痕（`degraded` / WARNING）；未就绪仍抛 StorageNotReadyError。
+# ===========================================================================
+
+from keepsake.consolidator import Consolidator, resolve_consolidate_config  # noqa: E402
+from keepsake.forgetter import Forgetter  # noqa: E402
+
+
+@pytest.fixture()
+def maint_store(tmp_path) -> SqliteStorage:
+    """维护用后端：主脑=True（与检索段同一口径）。"""
+    s = SqliteStorage(path=str(tmp_path / "maint.db"), is_primary=True,
+                      synonym_min_word_freq=2, synonym_jaccard_threshold=0.3,
+                      synonym_min_co_occurrence=2,
+                      synonym_scan_batch=2)   # 小页 ⇒ 分页路径被真的走到
+    assert s.ensure_index() is True
+    yield s
+    s.close()
+
+
+# ---------------------------------------------------------------------------
+# 批 3 B1：合并（consolidator）
+# ---------------------------------------------------------------------------
+
+def test_consolidator_scans_unconsolidated_on_sqlite(maint_store):
+    """`_scan_unconsolidated` 在 SQLite 上要真扫得出待合并碎片（不是恒 0）。"""
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": f"部署流程 第{i}步 网关 重启 连接池 重建 检查 证书 续签",
+             "created": "2020-01-01T00:00:00+00:00"} for i in range(6)]
+    rows.append({"key": "memory:frag:fresh",
+                 "content": "新碎片 网关 重启 连接池 重建 检查 证书 续签",
+                 "created": "2999-01-01T00:00:00+00:00"})   # 太新 ⇒ 不该被扫进来
+    assert maint_store.write_fragments_batch(rows) == len(rows)
+
+    c = Consolidator(maint_store, min_group_size=3, max_age_hours=72)
+    frags = c._scan_unconsolidated()
+    keys = {f["_key"] for f in frags}
+    assert len(keys) == 6, f"应扫出 6 条老碎片，实际 {len(keys)}: {sorted(keys)}"
+    assert "memory:frag:fresh" not in keys, "太新的碎片不该进合并候选"
+    # 已 consumed 的不参与（多级提炼时原料才不会被反复合并）
+    assert all(f.get("fragment_type") != "consumed" for f in frags)
+
+
+def test_consolidator_dry_run_reports_three_numbers_and_writes_nothing(maint_store):
+    """dry-run：报 scanned/groups_found/would_merge，且**一个字都不写**。"""
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": f"备份 策略 轮换 保留 天数 校验 和 恢复 演练",
+             "created": "2020-01-01T00:00:00+00:00"} for i in range(4)]
+    assert maint_store.write_fragments_batch(rows) == 4
+    before = _rows(maint_store)
+
+    stats = Consolidator(maint_store, min_group_size=3,
+                         max_age_hours=0).consolidate(dry_run=True)
+    assert stats["dry_run"] is True
+    assert stats["scanned"] == 4
+    assert stats["groups_found"] >= 1
+    assert stats["would_merge"] >= 3, stats
+    assert stats["merged"] == 0
+    assert _rows(maint_store) == before, "dry-run 竟然改了库"
+
+
+def test_consolidator_merges_and_marks_consumed_via_primitives(maint_store, monkeypatch):
+    """真合并：新碎片写入（level=2/category=consolidated）+ 旧碎片标 consumed_by/consumed_at。
+
+    🔴 走的是 `consolidator.py` 里**后端无关**的那份逻辑（`_merge_group` →
+    `write_fragments_batch` / `update_fragment_fields`）—— 本测试同时是
+    「SQLite 没有被另写一份合并实现」的证据。
+    """
+    import keepsake.consolidator as C
+
+    monkeypatch.setattr(
+        C, "_call_llm",
+        lambda msgs, model="", **kw: "备份策略统一为：每日轮换、保留 30 天、每月恢复演练")
+
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": f"备份 策略 轮换 保留 天数 校验 和 恢复 演练 记录 {i}",
+             "created": "2020-01-01T00:00:00+00:00"} for i in range(3)]
+    assert maint_store.write_fragments_batch(rows) == 3
+
+    stats = Consolidator(maint_store, min_group_size=3, max_age_hours=0).consolidate()
+    assert stats["merged"] == 3, stats
+
+    with maint_store._lock:
+        cur = maint_store._db().cursor()
+        new = cur.execute(
+            "SELECT key, level, category, source FROM ks_fragment "
+            "WHERE fragment_type='consolidated'").fetchall()
+        old = cur.execute(
+            "SELECT key, consumed_by, consumed_at, fragment_type FROM ks_fragment "
+            "WHERE consumed_by <> ''").fetchall()
+    assert len(new) == 1, new
+    new_key, level, category, source = new[0]
+    assert (level, category, source) == ("2", "consolidated", "consolidator")
+    assert len(old) == 3, old
+    for key, consumed_by, consumed_at, ftype in old:
+        assert consumed_by == new_key
+        assert consumed_at, "consumed_at 必须落库"
+        assert ftype == "consumed"
+
+
+def test_maintenance_columns_judged_with_eq_empty_not_is_null(maint_store):
+    """🔴 铁律 3：维护列是 `TEXT NOT NULL DEFAULT ''` ⇒ 判「未设置」必须 `= ''`。
+
+    断言的是**判定语句本身**：库里所有维护列都必须是非 NULL 的文本，
+    任何 `IS NULL` 判据在这套 schema 上永远不成立 ⇒ 静默判错。
+    """
+    maint_store.write_fragments_batch(
+        [{"key": "memory:frag:a", "content": "一条普通碎片 网关 重启"}])
+    with maint_store._lock:
+        cur = maint_store._db().cursor()
+        for col in ("level", "consumed_by", "consumed_at"):
+            nulls = cur.execute(
+                f"SELECT COUNT(*) FROM ks_fragment WHERE {col} IS NULL").fetchone()[0]
+            empties = cur.execute(
+                f"SELECT COUNT(*) FROM ks_fragment WHERE {col} = ''").fetchone()[0]
+            assert nulls == 0, f"{col} 出现 NULL ⇒ schema 契约被破坏，`IS NULL` 判据会失效"
+            assert empties == 1, f"{col} 未设置时应为 ''，实际空串行数 {empties}"
+        # 「未设置」的判据（= ''）必须真能选中行
+        assert cur.execute(
+            "SELECT COUNT(*) FROM ks_fragment WHERE consumed_by = '' "
+            "AND level = '' AND consumed_at = ''").fetchone()[0] == 1
+
+
+def test_consolidate_threshold_comes_from_config_with_fallback_trace(maint_store):
+    """阈值从配置读；非法值回落默认**并留 reason**（不静默）。"""
+    assert resolve_consolidate_config({"consolidate_min_overlap": 5})["min_overlap"] == 5
+    bad = resolve_consolidate_config({"consolidate_min_overlap": "三", "consolidate_min_group": 0})
+    assert bad["min_overlap"] == 3 and bad["min_group_size"] == 3, bad
+    assert len(bad["reasons"]) == 2 and all("回落默认" in r for r in bad["reasons"])
+
+    c = Consolidator(maint_store, config={"consolidate_min_overlap": "x"})
+    assert c._min_overlap == 3, "非法值必须回落默认 3"
+    assert Consolidator(maint_store, config={"consolidate_min_overlap": 5})._min_overlap == 5
+    # 阈值随统计回传（运维 dry-run 能看到本轮用的是几）
+    stats = c.consolidate(dry_run=True)
+    assert stats["min_overlap"] == 3 and stats["min_group_size"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 批 3 B2：遗忘（forgetter）
+# ---------------------------------------------------------------------------
+
+def _frags(store: SqliteStorage, sql: str) -> List:
+    with store._lock:
+        return store._db().execute(sql).fetchall()
+
+
+def test_forgetter_dry_run_reports_four_numbers_and_deletes_nothing(maint_store):
+    """dry-run：报 scanned/candidates/deleted/skipped_protected，且不删。"""
+    rows = [{"key": f"memory:frag:{i:04d}", "content": f"琐碎 内容 {i}",
+             "created": "2020-01-01T00:00:00+00:00",
+             "sentiment_score": "0.0", "feedback_score": "0"}
+            for i in range(5)]
+    rows.append({"key": "memory:frag:keep", "content": "正反馈碎片",
+                 "created": "2020-01-01T00:00:00+00:00", "feedback_score": "3"})
+    rows.append({"key": "memory:frag:cons", "content": "已合并的高层条目",
+                 "created": "2020-01-01T00:00:00+00:00", "fragment_type": "consolidated"})
+    assert maint_store.write_fragments_batch(rows) == len(rows)
+    before = _rows(maint_store)
+
+    stats = Forgetter(maint_store, max_age_days=1, dry_run=True).forget()
+    assert stats["dry_run"] is True
+    assert stats["scanned"] == len(rows)
+    assert stats["candidates"] == 5, stats           # 5 条琐碎
+    assert stats["deleted"] == 0
+    assert stats["skipped_protected"] == 2, stats    # 正反馈 + consolidated
+    assert _rows(maint_store) == before, "dry-run 竟然删了行"
+
+
+def test_forgetter_protection_rules_match_backend_neutral_code(maint_store):
+    """保护规则：consolidated / 正反馈 / hermes_agent 无负反馈 —— 都不许删。"""
+    rows = [
+        {"key": "memory:frag:cons", "content": "高层条目", "created": "2020-01-01T00:00:00+00:00",
+         "fragment_type": "consolidated"},
+        {"key": "memory:frag:pos", "content": "有用的条目", "created": "2020-01-01T00:00:00+00:00",
+         "feedback_score": "1"},
+        {"key": "memory:frag:man", "content": "手动存的", "created": "2020-01-01T00:00:00+00:00",
+         "source": "hermes_agent", "feedback_score": "0"},
+        {"key": "memory:frag:dodge", "content": "琐碎条目", "created": "2020-01-01T00:00:00+00:00"},
+    ]
+    assert maint_store.write_fragments_batch(rows) == 4
+    stats = Forgetter(maint_store, max_age_days=1, dry_run=True).forget()
+    assert stats["skipped_protected"] == 3, stats
+    assert stats["candidates"] == 1, stats
+
+
+def test_forgetter_feedback_weight_participates(maint_store):
+    """反馈权重参与判定：`min_feedback_score` 抬高 ⇒ 原本可遗忘的碎片转入受保护。"""
+    maint_store.write_fragments_batch(
+        [{"key": "memory:frag:zero", "content": "零反馈碎片",
+          "created": "2020-01-01T00:00:00+00:00", "feedback_score": "0"}])
+    loose = Forgetter(maint_store, max_age_days=1, min_feedback_score=0, dry_run=True).forget()
+    assert loose["candidates"] == 1, loose
+    strict = Forgetter(maint_store, max_age_days=1, min_feedback_score=-1, dry_run=True).forget()
+    assert strict["candidates"] == 0 and strict["skipped_protected"] == 1, strict
+
+
+def test_forgetter_real_delete_goes_through_delete_primitives(maint_store):
+    """真删路径（dry_run=False）：走 `delete_fragments_batch`，FTS 同步清。"""
+    keys = [f"memory:frag:d{i}" for i in range(4)]
+    assert maint_store.write_fragments_batch(
+        [{"key": k, "content": f"待遗忘的琐碎条目 {i}", "created": "2020-01-01T00:00:00+00:00"}
+         for i, k in enumerate(keys)]) == 4
+    maint_store.write_fragments_batch(
+        [{"key": "memory:frag:keep", "content": "留着的条目", "created": "2020-01-01T00:00:00+00:00",
+          "feedback_score": "5"}])
+    before = _rows(maint_store)
+
+    stats = Forgetter(maint_store, max_age_days=1, dry_run=False).forget()
+    assert stats["deleted"] == 4, stats
+    assert _rows(maint_store) == before - 4
+    assert len(_frags(maint_store,
+                      "SELECT key FROM ks_fragment WHERE key LIKE 'memory:frag:d%'")) == 0
+    # 🔴 FTS 僵尸行：主表删了索引没删 ⇒ 检索仍能召回一条取不回正文的碎片
+    assert len(_frags(maint_store,
+                      "SELECT frag_key FROM ks_fragment_fts WHERE frag_key LIKE 'memory:frag:d%'")) == 0
+    assert len(_frags(maint_store,
+                      "SELECT frag_key FROM ks_fragment_fts WHERE frag_key = 'memory:frag:keep'")) == 1
+
+
+def test_forgetter_force_overrides_dry_run_and_report_stays_truthful(maint_store):
+    """C：`Forgetter(storage, dry_run=True).forget(force=True)` 的 `"dry_run": false`
+    是**设计如此且报告自洽**，不是「报告字段不实」。
+
+    机制（forgetter.py:57-104）：`stats["dry_run"] = self._dry_run and not force`
+    与删除分支判定 `if self._dry_run and not force:` 用的是**同一个表达式** ⇒
+    字段与行为恒等：字段为 true ⇒ 一行都不删；字段为 false ⇒ 真删且 deleted 是
+    实删条数。`force` 的 docstring 已写明「True 时忽略 dry_run 设置，实际删除」。
+    本测试锁住这个恒等式在 SQLite 后端上同样成立。
+    """
+    rows = [{"key": f"memory:frag:f{i}", "content": f"待遗忘的琐碎条目 {i}",
+             "created": "2020-01-01T00:00:00+00:00"} for i in range(4)]
+    assert maint_store.write_fragments_batch(rows) == 4
+    before = _rows(maint_store)
+
+    stats = Forgetter(maint_store, max_age_days=1, dry_run=True).forget(force=True)
+    assert stats["dry_run"] is False, stats            # force 覆盖了 dry_run
+    assert stats["candidates"] == 4, stats
+    assert stats["deleted"] == 4, stats                # 真删了，字段没骗人
+    assert _rows(maint_store) == before - 4
+
+    # 同一形态的另一半：dry_run=True 且不 force ⇒ 字段 true 且 deleted 恒为 0
+    assert maint_store.write_fragments_batch(rows) == 4
+    kept = _rows(maint_store)
+    stats2 = Forgetter(maint_store, max_age_days=1, dry_run=True).forget()
+    assert stats2["dry_run"] is True and stats2["candidates"] == 4, stats2
+    assert stats2["deleted"] == 0 and _rows(maint_store) == kept
+
+
+def test_maintenance_primitives_raise_when_schema_not_ready(tmp_path):
+    """🔴 铁律 4：schema 未就绪时维护原语**仍抛 StorageNotReadyError**（不是静默扫 0 条）。"""
+    from keepsake.storage_sqlite import StorageNotReadyError
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("占位")
+    s = SqliteStorage(path=str(blocker / "ks.db"))
+    try:
+        assert s.ensure_index() is False
+        for call in (lambda: s.scan_fragment_keys(),
+                     lambda: s.get_fragments_batch(["memory:frag:x"]),
+                     lambda: s.write_fragments_batch([{"key": "k", "content": "c"}]),
+                     lambda: s.update_fragment_fields("k", {"level": "2"}),
+                     lambda: s.delete_fragments_batch(["k"]),
+                     lambda: s.discover_synonyms(),
+                     lambda: s.generate_jieba_dict(str(tmp_path / "d.txt"))):
+            with pytest.raises(StorageNotReadyError):
+                call()
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------------
+# 批 3 B3：同义词与词典
+# ---------------------------------------------------------------------------
+
+def test_discover_synonyms_writes_ks_synonym(maint_store):
+    """同义词自动发现：真写 `ks_synonym`，返回统计与 `degraded`。"""
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": "备份 策略 轮换 保留 天数 校验 和 恢复 演练"}
+            for i in range(4)]
+    assert maint_store.write_fragments_batch(rows) == 4
+
+    stats = maint_store.discover_synonyms(rebuild=True)
+    assert stats["rebuild"] is True
+    assert stats["scanned_fragments"] == 4
+    assert stats["discovered_groups"] > 0, stats
+    assert stats["degraded"] == [], f"健康路径不该有降级: {stats['degraded']}"
+    terms = {t for (t,) in _frags(maint_store, "SELECT term FROM ks_synonym")}
+    assert "备份" in terms and "策略" in terms, sorted(terms)[:20]
+
+
+def test_synonym_map_is_loaded_as_json_not_character_soup(maint_store):
+    """🔴 批 3 修的真 bug：`ks_synonym.synonyms` 是 TEXT（JSON 串）。
+
+    修前 `for s in (syns or [])` 在**逐字符**迭代 JSON ⇒ 词表全是单字碎片，
+    查询式扩展被垃圾 token 撑大且**不报错**。这里断言反例：不得出现 `[`/`"` 等字符。
+    """
+    with maint_store._lock:
+        maint_store._db().execute(
+            "INSERT INTO ks_synonym (term, synonyms) VALUES (?, ?)",
+            ("防火墙", json.dumps(["网络屏障", "gateway"], ensure_ascii=False)),
+        )
+    m = maint_store._load_synonym_map()
+    assert "防火墙" in m
+    assert m["防火墙"] == {"网络屏障", "gateway"}, m["防火墙"]
+    assert "gateway" in m, "反向映射也必须在（同 PG/Redis 口径）"
+    for junk in ("[", "]", '"', "\\"):
+        assert junk not in m, f"JSON 串被当成字符序列迭代了：出现了 {junk!r}"
+
+
+def test_synonym_broken_row_is_skipped_loudly(maint_store, caplog):
+    """坏行必须**留痕跳过**，不许静默当空（也不许整表崩）。"""
+    with maint_store._lock:
+        cur = maint_store._db().cursor()
+        cur.execute("INSERT INTO ks_synonym (term, synonyms) VALUES ('好的', ?)",
+                    (json.dumps(["正常词"]),))
+        cur.execute("INSERT INTO ks_synonym (term, synonyms) VALUES ('坏的', 'not-json')")
+    with caplog.at_level(logging.WARNING, logger="keepsake.storage_sqlite"):
+        m = maint_store._load_synonym_map()
+    assert m.get("好的") == {"正常词"}
+    assert any("格式非法" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+    assert "坏的" in m, "坏行应保留 term 占位（只是没同义词），不得整行消失"
+
+
+def test_discover_synonyms_rebuild_clears_and_incremental_keeps_manual(maint_store):
+    """rebuild=True 清表重建；默认增量保留手动已有项（不被自动发现覆盖）。"""
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": "备份 策略 轮换 保留 天数 校验 和 恢复 演练"}
+            for i in range(4)]
+    maint_store.write_fragments_batch(rows)
+
+    with maint_store._lock:
+        maint_store._db().execute(
+            "INSERT INTO ks_synonym (term, synonyms) VALUES (?, ?)",
+            ("手动词", json.dumps(["手工伙伴"], ensure_ascii=False)))
+
+    incremental = maint_store.discover_synonyms(rebuild=False)
+    assert incremental["rebuild"] is False
+    assert _frags(maint_store,
+                  "SELECT synonyms FROM ks_synonym WHERE term='手动词'")[0][0], \
+        "增量模式必须保留手动添加项"
+
+    maint_store.discover_synonyms(rebuild=True)
+    assert not _frags(maint_store, "SELECT term FROM ks_synonym WHERE term='手动词'"), \
+        "rebuild=True 必须洗掉历史项"
+
+
+def test_discover_synonyms_denoises_short_ascii_and_stopwords(maint_store):
+    """降噪口径与 Redis 侧同源：**对分词器字面输出零假设**。
+
+    🔴 本仓库的老坑：断言 `assert "embedding" in terms` 依赖 jieba 把 `embedding`
+    切成一个整词。有用户词典（`~/.config/keepsake/jieba_dict.txt`）的机器上它会被
+    切成 `em be dd in g` ⇒ 断言必红，而无词典的机器绿 —— 同一份代码两台机两种结论。
+    （现场证据 /tmp/ks_sq_p31_red.txt。）
+
+    这里改成断言与词典无关的不变量：用**同一条降噪判据 + 同一个分词入口**先算出
+    「实际 token 集合」，再断言「该滤的滤掉了、该进的都进了」，两边口径同源。
+    """
+    import jieba
+    from keepsake.splitter import _STOP_WORDS
+    from keepsake.storage_sqlite import _DENOISE_STOPWORDS, _is_pure_ascii_short
+
+    def keep(w):                      # 与 discover_synonyms 里那条判据逐条同源
+        return (len(w) >= 2 and w not in _STOP_WORDS and w not in _DENOISE_STOPWORDS
+                and not w.isdigit() and not _is_pure_ascii_short(w))
+
+    content = "no no to in of embedding model 备份 策略 embedding model 备份 策略"
+    rows = [{"key": f"memory:frag:{i:04d}", "content": content} for i in range(4)]
+    assert maint_store.write_fragments_batch(rows) == 4
+    stats = maint_store.discover_synonyms(rebuild=True)
+
+    raw = set(jieba.lcut(content))                 # 本机词典下的**实际**切词结果
+    survivors = {w for w in raw if keep(w)}       # 过了降噪判据的（即实现里的候选前集）
+    noise = raw - survivors
+    assert len(survivors) >= 2, f"样例语料至少留下 2 个候选词，实测 {sorted(raw)}"
+    assert noise, f"样例语料应当能造出碎渣词，实测 {sorted(raw)}"
+
+    terms = {t for (t,) in _frags(maint_store, "SELECT term FROM ks_synonym")}
+    # 该滤的：被降噪判据滤掉的 token（含纯 ASCII 短词/内置虚词）一个都不许进表
+    assert not (noise & terms), f"碎渣词混进了同义词表: {sorted(noise & terms)}"
+    assert terms <= survivors, f"表里有没走降噪判据的词: {sorted(terms - survivors)}"
+    # 该进的：每条碎片都出现的候选词两两共现 >= min_co_occurrence ⇒ 必成对进表
+    assert survivors <= terms, f"该进的候选词没进表: {sorted(survivors - terms)}"
+    # stats 自洽：表里几行就报几个词条
+    assert stats["degraded"] == [], stats["degraded"]
+    assert stats["total_terms"] == len(terms), stats
+    assert stats["discovered_groups"] >= 1, stats
+
+
+def test_generate_jieba_dict_writes_loadable_format(maint_store, tmp_path):
+    """词典输出格式 = jieba 用户词典样式 `词 词频 nz`，且同语料重跑逐字节相同。"""
+    rows = [{"key": f"memory:frag:{i:04d}",
+             "content": "备份 策略 轮换 网关 重启 连接池 重建 证书 续签"}
+            for i in range(4)]
+    maint_store.write_fragments_batch(rows)
+
+    out = tmp_path / "dicts" / "jieba_dict.txt"
+    stats = maint_store.generate_jieba_dict(str(out))
+    assert stats["degraded"] == [], stats["degraded"]
+    assert stats["written_terms"] > 0
+    text = out.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    for line in text.splitlines():
+        parts = line.split()
+        assert len(parts) == 3 and parts[2] == "nz" and parts[1].isdigit(), repr(line)
+    words = {l.split()[0] for l in text.splitlines()}
+    assert {"备份", "策略", "网关"} <= words, sorted(words)
+
+    again = tmp_path / "again.txt"
+    maint_store.generate_jieba_dict(str(again))
+    assert again.read_text(encoding="utf-8") == text, "同语料重跑结果必须逐字节相同"
+
+
+def test_generate_jieba_dict_includes_synonym_terms(maint_store, tmp_path):
+    """同义词表里的 term 至少算 3 次（手工词不该被词频筛掉）。"""
+    maint_store.write_fragments_batch(
+        [{"key": "memory:frag:a", "content": "一条 只有 一次 的 罕见词"}])
+    with maint_store._lock:
+        maint_store._db().execute(
+            "INSERT INTO ks_synonym (term, synonyms) VALUES (?, ?)",
+            ("手工罕见词", json.dumps(["伙伴"], ensure_ascii=False)))
+    out = tmp_path / "d.txt"
+    maint_store.generate_jieba_dict(str(out))
+    body = out.read_text(encoding="utf-8")
+    assert "手工罕见词 3 nz" in body, body
+
+
+def test_maintenance_scan_leaves_degraded_trace_on_partial_read(maint_store, monkeypatch, caplog):
+    """🔴 铁律 4：分页原语 fail-open 时，覆盖度自检必须把「扫到一半」变成可辨识返回值。"""
+    maint_store.write_fragments_batch(
+        [{"key": f"memory:frag:{i:04d}", "content": f"备份 策略 轮换 校验 恢复 演练 {i}"}
+         for i in range(6)])
+
+    real_batch = maint_store.get_fragments_batch
+    calls = {"n": 0}
+
+    def lossy_batch(keys):
+        calls["n"] += 1
+        if calls["n"] == 2:      # 第二页整页读失败（fail-open：只 warning、返回残缺）
+            return {}
+        return real_batch(keys)
+
+    monkeypatch.setattr(maint_store, "get_fragments_batch", lossy_batch)
+    with caplog.at_level(logging.WARNING, logger="keepsake.storage_sqlite"):
+        stats = maint_store.discover_synonyms(rebuild=True)
+    assert stats["degraded"], "整页读失败却没有降级留痕 ⇒ 静默少做一半活"
+    assert any("覆盖不全" in d for d in stats["degraded"]), stats["degraded"]
+    assert any("降级" in r.getMessage() for r in caplog.records)
+
+
+def test_maintenance_modules_are_backend_neutral_ast():
+    """合并/遗忘**不许**出现第二份 SQLite 实现（铁律 1）。
+
+    机械判据：`consolidator.py` / `forgetter.py` 全文不 import 任何具体后端模块
+    —— 它们只经 StorageBase 的维护原语访问存储，PG 与 SQLite 走**逐字同一份代码**。
+    """
+    import ast
+
+    for mod in ("consolidator", "forgetter"):
+        path = Path(__file__).resolve().parents[1] / "src" / "keepsake" / f"{mod}.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+        backends = {"storage", "storage_pg", "storage_sqlite", "redis"} & {
+            m.split(".")[-1] for m in imported}
+        assert not backends, f"{mod}.py 直接 import 了具体后端 {backends} ⇒ 存在后端分叉"
