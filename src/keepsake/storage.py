@@ -182,8 +182,10 @@ DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.jso
 # ---- 2026-10 ks_pg_b1：后端选择（默认仍是 redis ⇒ 线上行为零变化）----
 BACKEND_REDIS = "redis"
 BACKEND_POSTGRES = "postgres"
+# 2026-10 ks_sqlite_p1：第三后端（嵌入式单文件，定位单机/单代理）。默认仍是 redis。
+BACKEND_SQLITE = "sqlite"
 DEFAULT_BACKEND = BACKEND_REDIS      # 🔴 缺行/空/非法一律回 redis
-_VALID_BACKENDS = (BACKEND_REDIS, BACKEND_POSTGRES)
+_VALID_BACKENDS = (BACKEND_REDIS, BACKEND_POSTGRES, BACKEND_SQLITE)
 
 
 def _build_embedder(cfg: Dict[str, Any], path: Any) -> Optional[Embedder]:
@@ -272,6 +274,8 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
       - `redis`（缺省）→ 下面这条既有路径，行为逐字不变
       - `postgres`     → `storage_pg.PgStorage`（模块延迟导入，没装 psycopg
                          不影响 redis 用户）
+      - `sqlite`       → `storage_sqlite.SqliteStorage`（批 1 仅读写原语；
+                         检索留桩显式抛 NotImplementedError，模块延迟导入）
     新增的仅关键字参数（默认值都不改变既有调用方式）：
       config:    调用方手上已有 cfg 时直接复用，省一次读盘（provider 走这条）
       redis_cls: Redis 后端类；provider 传它是为了让 `keepsake.RedisStorage`
@@ -291,7 +295,27 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         except Exception as e:
             logger.warning("storage: 读配置失败 %s: %s", path, e)
 
-    if resolve_backend(cfg) == BACKEND_POSTGRES:
+    backend = resolve_backend(cfg)
+    if backend == BACKEND_SQLITE:
+        # 2026-10 ks_sqlite_p1：第三后端（嵌入式单文件、零第三方依赖）。
+        # 只用标准库 sqlite3；`sqlite-vec` 留到第 3 批做**可选懒加载**。
+        from .storage_sqlite import DEFAULT_SQLITE_PATH, SqliteStorage  # 延迟导入，同 PG 分支
+
+        sq_cfg = (cfg.get("storage") or {}).get("sqlite") or {}
+        if not isinstance(sq_cfg, dict):
+            sq_cfg = {}
+        return SqliteStorage(
+            path=str(sq_cfg.get("path", "") or DEFAULT_SQLITE_PATH),
+            busy_timeout_ms=int(sq_cfg.get("busy_timeout_ms", 5000)),
+            agent_id=str(kwargs.get("agent_id", cfg.get("agent_id", "")) or ""),
+            embedder=_build_embedder(cfg, path),
+            embed_dim=int(cfg.get("embed_dim", 1536)),
+            is_primary=bool(cfg.get("is_primary", False)),
+            **{k: v for k, v in _resolve_knobs(cfg, kwargs).items()
+               if k in ("attention_base_increment", "attention_emotion_factor")},
+        )
+
+    if backend == BACKEND_POSTGRES:
         from .storage_pg import PgStorage  # 延迟导入：optional 依赖，隔离在真要用 PG 之后
 
         pg_cfg = (cfg.get("storage") or {}).get("postgres") or {}

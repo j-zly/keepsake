@@ -20,6 +20,7 @@ import pytest
 from keepsake.storage import RedisStorage
 from keepsake.storage_base import StorageBase
 from keepsake.storage_pg import PgStorage
+from keepsake.storage_sqlite import SqliteStorage
 
 # 接口要求的方法全集（= 任务书列出的「实际被调用点」+ health_check）
 REQUIRED_METHODS = (
@@ -52,7 +53,8 @@ REQUIRED_METHODS = (
     "generate_jieba_dict",
 )
 
-BACKENDS = {"RedisStorage": RedisStorage, "PgStorage": PgStorage}
+BACKENDS = {"RedisStorage": RedisStorage, "PgStorage": PgStorage,
+            "SqliteStorage": SqliteStorage}   # 2026-10 ks_sqlite_p1：第三后端纳入同一套接口检查
 
 
 def _missing_methods(cls) -> list:
