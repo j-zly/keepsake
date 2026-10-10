@@ -170,7 +170,8 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
 
   // Auto maintenance
-  "consolidate_min_group": 2,
+  "consolidate_min_group": 3,
+  "consolidate_min_overlap": 3,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
   "forget_dry_run": false,
@@ -333,7 +334,8 @@ Then reference it in config.json:
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API key |
 | `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API endpoint |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
-| `consolidate_min_group` | — | `2` | Minimum entries to trigger consolidation |
+| `consolidate_min_group` | — | `3` | Minimum entries to trigger consolidation |
+| `consolidate_min_overlap` | — | `3` | Minimum shared keywords for two entries to count as the same topic |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation |
 | `forget_max_age_days` | — | `30` | Max age (days) before deletion |
 | `forget_dry_run` | — | `true` | Safe mode: `true` = count only, `false` = delete |

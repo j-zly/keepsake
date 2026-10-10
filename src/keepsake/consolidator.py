@@ -8,9 +8,17 @@
   5. 删除原始碎片（或标记已合并）
 
 配置参数:
-  - min_group_size: 最少多少条碎片才触发合并（默认 3）
+  - min_group_size: 最少多少条碎片才触发合并（默认 3，config 键 consolidate_min_group）
+  - min_overlap: 两条碎片至少共用几个关键词才判为同主题（默认 3，config 键 consolidate_min_overlap）
   - max_age_hours: 只合并超过此年龄的碎片（给新碎片时间积累，默认 72h）
   - llm_model: LLM 模型名（2026-09 起不再硬编码默认值——须由 config.json 的 llm 节提供）
+
+2026-10 变更（任务 ks_consolidate_threshold）：
+  * 重叠阈值由裸字面量 2 提成参数 `min_overlap`，默认 **3**（默认值 2→3）——
+    实测同批 2819 条碎片，真并占比 53.1%（阈值 2）→ 13.2%（阈值 3）→ 2.1%（阈值 4）
+  * `consolidate_min_group` / `consolidate_min_overlap` 两个顶层键接进
+    resolve_consolidate_config()（与 forget_* 顶层键同一读法）；非法值回落默认 + 告警
+  * 阈值挂在 Consolidator 实例上 ⇒ Redis 与 PG 两后端同一判据（无后端特异分支）
 
 2026-09 重大变更（任务 ks_noqwen）：
   * 移除硬编码 base_url / 默认 model 兜底 —— 无 llm 节 = 无 LLM 通道
@@ -56,7 +64,10 @@ def _resolve_request_extra(llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # 默认参数
-DEFAULT_MIN_GROUP_SIZE = 2  # 有重复内容就合
+DEFAULT_MIN_GROUP_SIZE = 3  # 组内至少这么多条才真合并（2026-10 ks_cth：2→3，与生产对齐）
+# 关键词重叠门槛（2026-10 ks_cth）：两条碎片共用关键词 < 本值 ⇒ 不判同主题。
+# 2 → 3 是本次唯一的行为变化（见模块 docstring 的实测表）。
+DEFAULT_MIN_OVERLAP = 3
 DEFAULT_MAX_AGE_HOURS = 72
 DEFAULT_BATCH_SIZE = 200  # 每次 consolidate 扫描的碎片数
 
@@ -88,6 +99,59 @@ def _get_api_key() -> str:
       * key_file 路径由 resolve_llm_channel 直接读取，不由本函数介入
     """
     return os.environ.get("OPENAI_API_KEY", "")
+
+
+# ---------------------------------------------------------------------------
+# 合并阈值配置（2026-10 ks_consolidate_threshold）
+# ---------------------------------------------------------------------------
+# 两个键 consolidate_min_group / consolidate_min_overlap 都是**顶层平铺键**
+# （与 forget_max_age_days / skip_min_length 同族），不新造 consolidator 节。
+# 非法值一律回落默认 + 告警，绝不崩、绝不静默。
+
+
+def _coerce_threshold(cfg: Dict[str, Any], key: str, default: int) -> Tuple[int, str]:
+    """从 cfg 顶层取正整数阈值。返回 (值, reason)。
+
+    reason 非空 ⇒ 该值被回落成 default（非法 / <1 / 类型错）。
+    """
+    raw = cfg.get(key) if isinstance(cfg, dict) else None
+    if raw is None:
+        return default, ""
+    # bool 是 int 的子类，明确拒绝（True/False 当阈值是配错）
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        reason = f"{key}={raw!r} 非整数 → 回落默认 {default}"
+    elif raw < 1:
+        reason = f"{key}={raw} < 1 → 回落默认 {default}"
+    else:
+        return raw, ""
+    logger.warning("consolidator: %s", reason)
+    return default, reason
+
+
+def resolve_consolidate_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """解析合并阈值配置（2026-10 ks_consolidate_threshold）。
+
+    读法与 forget_* 顶层键同族：`cfg.get(键, 默认)` + 显式校验。
+
+    返回:
+      {"min_group_size": int, "min_overlap": int, "reasons": [str, ...]}
+      reasons 非空表示有键被回落默认值（调用方可据此上报/告警）。
+
+    生效方式：cfg 由调用方在**每轮构造 Consolidator 时**传入 —— Consolidator 不常驻
+    （2026-09-09 已退役运行期接线），运维脚本/cron 每次现构造 ⇒ 改 config.json 后
+    下一轮即生效，无需重启。若将来接线回 initialize()，则退化为重启生效
+    （_load_json_config 只在 initialize 读一次）。
+    """
+    out: Dict[str, Any] = {}
+    for key, default, field in (
+        ("consolidate_min_group", DEFAULT_MIN_GROUP_SIZE, "min_group_size"),
+        ("consolidate_min_overlap", DEFAULT_MIN_OVERLAP, "min_overlap"),
+    ):
+        val, reason = _coerce_threshold(cfg or {}, key, default)
+        out[field] = val
+        if reason:
+            out.setdefault("reasons", []).append(reason)
+    return out
 
 
 def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -425,14 +489,25 @@ class Consolidator:
     def __init__(
         self,
         storage: Any,  # RedisStorage instance (avoid circular import)
-        min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
+        min_group_size: Optional[int] = None,
         max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
         llm_model: str = "",  # 2026-09 移除硬编码模型兜底；须由 channel 解析提供
         batch_size: int = DEFAULT_BATCH_SIZE,
         channel: Optional[Dict[str, Any]] = None,
+        min_overlap: Optional[int] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
+        """两个阈值的三级优先级（高→低）：显式构造参数 > config 顶层键 > 模块默认值。
+
+        `config` 传 None 或键缺失 → 走默认；传了非法值 → 回落默认 + logger.warning
+        （见 resolve_consolidate_config）。两个阈值都在实例上 ⇒ Redis/PG 两后端同一判据。
+        """
+        cfg_res = resolve_consolidate_config(config)
         self._storage = storage
-        self._min_group_size = min_group_size
+        self._min_group_size = (min_group_size if min_group_size is not None
+                                else cfg_res["min_group_size"])
+        self._min_overlap = (min_overlap if min_overlap is not None
+                             else cfg_res["min_overlap"])
         self._max_age_hours = max_age_hours
         self._llm_model = llm_model
         self._batch_size = batch_size
@@ -452,6 +527,9 @@ class Consolidator:
         stats = {
             "scanned": 0, "groups_found": 0, "merged": 0, "skipped": 0,
             "errors": 0, "dry_run": bool(dry_run),
+            # 阈值随统计回传 —— 运维 dry-run 时能直接看到本轮用的是几
+            "min_overlap": self._min_overlap,
+            "min_group_size": self._min_group_size,
         }
 
         # 1. 扫描未合并的碎片
@@ -547,7 +625,7 @@ class Consolidator:
 
         策略:
           - 对每个碎片提取关键词（用 jieba）
-          - 关键词重叠 >= 2 的归为一组
+          - 关键词重叠 >= `self._min_overlap` 的归为一组（2026-10 由硬编码 2 提为参数，默认 3）
           - 贪心算法，不追求最优聚类
         """
         from .splitter import extract_keywords
@@ -577,9 +655,9 @@ class Consolidator:
             for j, other in enumerate(frag_data):
                 if j in assigned:
                     continue
-                # 重叠 >= 2 个关键词
+                # 重叠 >= min_overlap 个关键词（默认 3；2026-10 由裸字面量 2 提出）
                 overlap = len(data["keywords"] & other["keywords"])
-                if overlap >= 2:
+                if overlap >= self._min_overlap:
                     group.append(other["frag"])
                     assigned.add(j)
 

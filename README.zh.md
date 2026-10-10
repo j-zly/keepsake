@@ -168,7 +168,8 @@ pip install git+https://github.com/j-zly/keepsake.git
   "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
   
   // 自动维护配置
-  "consolidate_min_group": 2,
+  "consolidate_min_group": 3,
+  "consolidate_min_overlap": 3,
   "consolidate_max_age_hours": 72,
   "forget_max_age_days": 30,
   "forget_dry_run": true,
@@ -327,7 +328,8 @@ yeah
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
 | `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
-| `consolidate_min_group` | — | `2` | 合并触发最少条目数 |
+| `consolidate_min_group` | — | `3` | 合并触发最少条目数 |
+| `consolidate_min_overlap` | — | `3` | 判为同一主题所需的最少公共关键词数 |
 | `consolidate_max_age_hours` | — | `72` | 条目最少年龄（小时）后才参与合并 |
 | `forget_max_age_days` | — | `30` | 条目保留天数后可能被遗忘 |
 | `forget_dry_run` | — | `true` | 遗忘安全模式：仅统计不删除 |
