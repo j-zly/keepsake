@@ -375,3 +375,67 @@ def test_redis_match_attention_does_not_call_the_legacy_formula():
     assert "match_attention_boost" not in called, (
         "match_attention 仍在调上游那份独立公式 —— 共用没真正生效"
     )
+
+
+# ------------------------------------------------ 语料维护判定链（批 3）唯一实现
+#
+# 2026-10 ks_pg_syn：PG 补齐 discover_synonyms / generate_jieba_dict 之后，
+# 「三后端靠配置切换」这个用户口径要求两侧判定链**不能各写一份**。
+# 下面两条把它钉死：定义只允许在 storage_shared，PG/SQLite 都必须引用。
+
+#: 语料维护的纯计算：PG / SQLite 两个后端共用的判定链
+CORPUS_MAINTENANCE_FUNCS = (
+    "synonym_words", "jieba_dict_words",
+    "accumulate_word_freq", "accumulate_co_occurrence",
+    "discover_synonym_pairs", "merge_synonym_maps", "synonym_rows",
+    "jieba_dict_entries",
+)
+#: 两个后端各自的语料维护入口（方法名，用于查「引用了共用函数」）
+CORPUS_MAINTENANCE_ENTRYPOINTS = {
+    "storage_pg.py": ("discover_synonyms", "generate_jieba_dict"),
+    "storage_sqlite.py": ("discover_synonyms", "generate_jieba_dict"),
+}
+
+
+@pytest.mark.parametrize("func_name", CORPUS_MAINTENANCE_FUNCS)
+def test_corpus_maintenance_chain_has_one_definition(func_name):
+    """全仓 `src/keepsake` 里 `def <func_name>` 只允许有一处，且在 storage_shared。
+
+    判据用 AST 而非 grep：grep 分不清「定义」与「引用」，测不出后端里另抄了一份。
+    """
+    seen = []
+    for path in sorted(SRC.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(isinstance(n, ast.FunctionDef) and n.name == func_name
+               for n in ast.walk(tree)):
+            seen.append(path.name)
+    assert seen == ["storage_shared.py"], (
+        f"{func_name} 必须只在 storage_shared.py 里定义一次，实测定义于 {seen}"
+    )
+
+
+@pytest.mark.parametrize("mod, methods", sorted(CORPUS_MAINTENANCE_ENTRYPOINTS.items()))
+def test_backends_reference_shared_corpus_maintenance_chain(mod, methods):
+    """每个后端的语料维护入口都真的调到了共用判定链（不能只 import 不调用）。"""
+    src = (SRC / mod).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef)
+               and n.name in ("PgStorage", "SqliteStorage"))
+    for method in methods:
+        fn = next(n for n in cls.body
+                  if isinstance(n, ast.FunctionDef) and n.name == method)
+        called = set()
+        for c in ast.walk(fn):
+            if not isinstance(c, ast.Call):
+                continue
+            if isinstance(c.func, ast.Attribute):
+                called.add(c.func.attr)
+            elif isinstance(c.func, ast.Name):
+                called.add(c.func.id)
+        used = {"synonym_words", "jieba_dict_words", "discover_synonym_pairs",
+                "merge_synonym_maps", "jieba_dict_entries"}
+        assert used & called, (
+            f"{mod}.{method} 一个共用判定链函数都没调，实际调了 {sorted(called)} —— "
+            f"它自己抄了一份？"
+        )

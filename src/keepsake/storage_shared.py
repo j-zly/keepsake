@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +450,206 @@ def rerank_with_decay(
 
     fragments.sort(key=lambda x: x.get("_combined_score", 0), reverse=True)
     return fragments
+
+
+# ---------------------------------------------------------------------------
+# 语料维护的纯计算：同义词发现 + jieba 用户词典（SQLite / PostgreSQL 共用）
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么这一段也共用**（与上面的检索后处理同一个理由）：`discover_synonyms`
+#    的判定链（降噪筛 → 词频门槛 → Jaccard/共现 → 每词条截断 → 与手工项合并）
+#    逐条都在两个后端的 `discover_synonyms` 里各写一遍的话，两边迟早漂移 ——
+#    而同义词表是**检索查询式扩展**的输入（`_expand_terms`），漂移的表现是
+#    「同一条查询在两个后端召回到不同结果」且**不报错**，对照评测直接失真。
+#
+# 后端相关的只剩「怎么把正文取出来」与「怎么把结果写回去」两件，各 ~10 行，
+# 留在各自的存储类里；这里的函数**不碰任何后端、不碰 self**。
+#
+# Redis 侧**没有**并进来：它的截断排序（只按 Jaccard 分、不定字典序 tiebreak）
+# 与合并循环（一趟 + `if word in merged: continue`，结果依赖 set 迭代序 ⇒
+# 同一语料两次运行结果不同）是**已知的历史行为**，改成与另两侧一致属于
+# 改 Redis 既有行为，任务书明确禁止（见本次 verdict）。
+
+#: 同义词发现的降噪黑名单（与 `RedisStorage.discover_synonyms` 的局部常量逐条同源：
+#: 2 字母高频虚词 + jieba 切英文常见碎块）。
+DENOISE_STOPWORDS = frozenset({
+    "eg", "us", "ok", "no", "of", "to", "in", "an", "be", "by",
+    "it", "is", "as", "at", "or", "so", "if", "do", "on", "up",
+    "he", "we", "me", "my", "am", "go",
+    "em", "be", "dd", "ce", "ng", "st", "th", "nt", "ab", "cd",
+    "ef", "gh", "ij", "kl", "mn", "op", "qr", "uv", "wx", "yz",
+})
+
+#: 每词条同义表上限（防 hub 式泛连）—— 同 Redis 侧 `_MAX_SYNS_PER_WORD`
+MAX_SYNONYMS_PER_WORD = 8
+
+
+def is_pure_ascii_short(w: str) -> bool:
+    """纯 ASCII 词长度 < 3 → 视为 jieba 切碎渣（同 Redis `discover_synonyms` 口径）。"""
+    try:
+        return w.isascii() and len(w) < 3
+    except Exception:  # noqa: BLE001 — 判据本身不该让维护入口崩
+        return False
+
+
+def has_chinese(w: str) -> bool:
+    """是否含 CJK 基本区汉字（中文对长度门槛用）。"""
+    return any(0x4E00 <= ord(c) <= 0x9FFF for c in w)
+
+
+def synonym_words(content: str) -> List[str]:
+    """正文 → 同义词发现的候选词（jieba 切词 + 降噪筛）。
+
+    判据与 Redis 侧逐条同源：`len>=2`、不在 `splitter._STOP_WORDS`、
+    不在 `DENOISE_STOPWORDS`、非纯数字、非纯 ASCII 短词（<3 字）。
+    """
+    import jieba                                        # noqa: PLC0415 — 首调建词典
+    from .splitter import _STOP_WORDS                   # noqa: PLC0415
+
+    return [w for w in jieba.lcut(content)
+            if len(w) >= 2
+            and w not in _STOP_WORDS
+            and w not in DENOISE_STOPWORDS
+            and not w.isdigit()
+            and not is_pure_ascii_short(w)]
+
+
+def jieba_dict_words(content: str) -> List[str]:
+    """正文 → jieba 用户词典的候选词（比 `synonym_words` 宽一档）。
+
+    🔴 两条口径**故意不同**（与 Redis/SQLite 侧逐条一致）：用户词典要把
+    「短英文碎片」也收进去（用户自己可能就拿它当词条），所以这里**不**套
+    `DENOISE_STOPWORDS` 与 ASCII 短词判据，只保留长度/停用词/纯数字三条。
+    改成一致 = 两个后端的词典文件对不齐，不是收敛是回归。
+    """
+    import jieba                                        # noqa: PLC0415
+    from .splitter import _STOP_WORDS                   # noqa: PLC0415
+
+    return [w for w in jieba.lcut(content)
+            if len(w) >= 2 and w not in _STOP_WORDS and not w.isdigit()]
+
+
+def accumulate_word_freq(words: List[str], word_freq: Dict[str, int]) -> None:
+    """一条正文的词频累计（原地写回）。`set` 去重 ⇒ 同一碎片内不重复计数。"""
+    for w in set(words):
+        word_freq[w] = word_freq.get(w, 0) + 1
+
+
+def accumulate_co_occurrence(words: List[str], co_occur: Dict[Tuple[str, str], int]) -> None:
+    """一条正文的共现累计（原地写回）。
+
+    `sorted(set(words))` 去重 ⇒ 同一碎片内重复出现的词只算一次（不去重会让共现
+    数被词频放大、Jaccard 虚高）；排序是为了让 `(a, b)` 这个 pair 键与词序无关 ——
+    否则同一对词会以两种次序入表，Jaccard 查不到。
+    """
+    uniq = sorted(set(words))
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            pair = (uniq[i], uniq[j])
+            co_occur[pair] = co_occur.get(pair, 0) + 1
+
+
+def discover_synonym_pairs(
+    word_freq: Dict[str, int],
+    co_occur: Dict[Tuple[str, str], int],
+    min_word_freq: int,
+    jaccard_threshold: float,
+    min_co_occurrence: int,
+) -> Tuple[Dict[str, set], int]:
+    """候选词两两配对 → `{词: {同义词}}`（每词条截断到 8）+ 配对数。
+
+    成对判据（与 Redis/SQLite 侧逐条相同）：Jaccard >= `jaccard_threshold`
+    **或** 共现次数 >= `min_co_occurrence`；中文对额外要求至少一方是 ≥2 字汉字。
+    """
+    # ponytail: O(候选数²)。候选由词频门槛压住（默认 10 次），
+    # 语料再大一个数量级时该换 MinHash/SIMHash，改动点只在这一个循环里。
+    candidates = {w for w, f in word_freq.items() if f >= min_word_freq}
+    new_map: Dict[str, set] = {}
+    pair_score: Dict[Tuple[str, str], float] = {}
+    discovered_groups = 0
+    for word_a in sorted(candidates):
+        for word_b in sorted(candidates):
+            if word_a >= word_b:
+                continue
+            if (has_chinese(word_a) or has_chinese(word_b)) and not any(
+                    has_chinese(w) and len(w) >= 2 for w in (word_a, word_b)):
+                continue                        # 中文单字对：靠 _STOP_WORDS 之外再兜一层
+            c = co_occur.get((word_a, word_b), 0)
+            union = word_freq[word_a] + word_freq[word_b] - c
+            jaccard = (c / union) if union > 0 else 0.0
+            if jaccard >= jaccard_threshold or c >= min_co_occurrence:
+                new_map.setdefault(word_a, set()).add(word_b)
+                new_map.setdefault(word_b, set()).add(word_a)
+                discovered_groups += 1
+                pair_score[(word_a, word_b)] = max(
+                    pair_score.get((word_a, word_b), 0.0), jaccard)
+
+    # 每词条上限 8：按 Jaccard 降序截断（hub 式泛连被剪掉）。
+    # 🔴 平手时**再按词字典序**定序：只按分数排的话，同分项的先后取决于
+    #    `set` 的迭代序（PYTHONHASHSEED 随机化）⇒ 同一份语料重跑得到不同的表，
+    #    「机械对照」根本无法成立。
+    capped: Dict[str, set] = {}
+    for word, syns in new_map.items():
+        if len(syns) <= MAX_SYNONYMS_PER_WORD:
+            capped[word] = syns
+            continue
+        capped[word] = set(sorted(
+            syns,
+            key=lambda s: (-pair_score.get((word, s) if word < s else (s, word), 0.0), s),
+        )[:MAX_SYNONYMS_PER_WORD])
+    return capped, discovered_groups
+
+
+def merge_synonym_maps(existing: Dict[str, set], discovered: Dict[str, set]) -> Dict[str, set]:
+    """已有（手工/历史）项 + 自动发现项 → 最终 `{词: {同义词}}`。
+
+    已有项优先、**不被自动发现覆盖**（手工添加的词条不该被一次 rebuild 洗掉）。
+    🔴 **两趟 + 排序遍历**：若一趟遍历且 `if word in merged: continue`，某词若先
+    作为别人的反向映射被建出来，它自己的同义表就被这一句跳过 ⇒ 结果取决于
+    「谁先被遍历」，而遍历序来自 `set` 迭代序（PYTHONHASHSEED 随机化）⇒
+    同一份语料两次运行结果不同，逐 term 对照无从谈起。先按 term 排序、先铺已有
+    项、再统一补反向 ⇒ 结果与遍历序完全无关。
+    """
+    merged: Dict[str, set] = {t: set(s) for t, s in existing.items()}
+    for word in sorted(discovered):
+        if word in existing:
+            continue
+        merged.setdefault(word, set()).update(discovered[word])
+    for word in sorted(discovered):
+        if word in existing:
+            continue
+        for syn in discovered[word]:
+            merged.setdefault(syn, set()).add(word)
+    return merged
+
+
+def synonym_rows(merged: Dict[str, set]) -> List[Tuple[str, str]]:
+    """`{词: {同义词}}` → `[(term, JSON 串)]`（**不带引号**，参数化写入用）。
+
+    同义词表逐行小（几十~几百），一个事务写完；JSON 串排序输出 ⇒ 同语料重跑
+    得到**逐字节相同**的表（Redis 侧从 set 直出、顺序不定，两边对不齐的正是这里）。
+    """
+    import json                                           # noqa: PLC0415
+
+    return [(w, json.dumps(sorted(s), ensure_ascii=False)) for w, s in merged.items()]
+
+
+def jieba_dict_entries(
+    word_freq: Dict[str, int],
+    synonym_terms: List[str],
+    min_freq: int = 2,
+) -> List[Tuple[str, int]]:
+    """词典词条 `[(词, 词频)]`，按 `(-词频, 词)` 排序（确定性 ⇒ 重跑逐字节相同）。
+
+    同义词表里的 term 至少算 3 次：手工加的词不该因为语料里没出现过就被筛掉。
+    排序键固定成字典序（Redis 侧只按 `-词频` + dict 插入序，同频词的行序跨后端
+    对不齐）—— 见 `generate_jieba_dict` 的 docstring。
+    """
+    freq = dict(word_freq)
+    for term in synonym_terms:
+        freq[term] = max(freq.get(term, 0), 3)
+    return sorted(((w, f) for w, f in freq.items() if f >= min_freq),
+                  key=lambda x: (-x[1], x[0]))
 
 
 def maintenance_client(storage: Any) -> Any:

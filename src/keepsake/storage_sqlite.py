@@ -12,7 +12,8 @@ SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + 
   **未实现且显式抛 NotImplementedError**：search_knn（需要 `sqlite-vec` 扩展，
     第 3 批可选懒加载）
   —— 批 3 —— discover_synonyms / generate_jieba_dict（同语义基线是 Redis 侧；
-    PG 侧这两个至今是 NotImplementedError ⇒ 本实现**严格强于 PG**，不是「与 PG 齐平」）
+    判定链在 `storage_shared` 与 PG 侧共用**同一批函数对象**，两侧只有「怎么取正文 /
+    怎么写回表」不同 ⇒ 本后端与 PG 侧是等价实现，不是「谁强于谁」）
   —— **绝不返回空值假装成功**：静默空 = 记忆搜不到且无告警，是本项目最危险的
   失败形态。向量路径不可用时 `search_knn` **抛明确 NotImplementedError** 并说明
   需要该扩展，`search` 则记 WARNING 后降级为 BM25 单路（降级可辨识、不静默）。
@@ -105,17 +106,28 @@ from .storage_base import StorageBase
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
 from .storage_shared import (
     DECAY_HALF_DAYS,
+    DENOISE_STOPWORDS,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
     HOT_TOPIC_BOOST,
     HOT_TOPIC_DECAY_HALF_DAYS,
+    MAX_SYNONYMS_PER_WORD,
     SEARCH_FIELDS,
+    accumulate_co_occurrence,
+    accumulate_word_freq,
     apply_v2_filters,
     attention_boost_from_topics,
+    discover_synonym_pairs,
     hot_topic_weighted_hits,
+    is_pure_ascii_short,
+    jieba_dict_entries,
+    jieba_dict_words,
     load_fragments_by_keys,
+    merge_synonym_maps,
     rrf_fuse,
     rerank_with_decay,
+    synonym_rows,
+    synonym_words,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
 from .storage import _expand_terms, _sanitize_terms
@@ -159,22 +171,15 @@ WRITE_RETRY_BACKOFF_S = 0.05
 # 留一半余量。批量读/删按此分块。
 SQL_PARAM_CHUNK = 400
 
-# 同义词发现的降噪黑名单（2026-09 ks_retr 口径，与 `RedisStorage.discover_synonyms`
-# 逐条同源）。**为什么要有第二份**：那边是 discover_synonyms 的**函数内局部变量**，
-# 拿不到、也没法 import；本模块允许改动的范围只有 storage_sqlite.py（任务书硬约束），
-# 抽到 storage_shared.py 就必须同时动 storage.py ⇒ 越界。故此处复刻一份并在
-# verdict 里逐条登记（两处若要改必须一起改）。
-_DENOISE_STOPWORDS = frozenset({
-    # 2 字母高频虚词（discover_synonyms 抽查实锤：eg->[max,ssh,ter] / us->... / Too->[Two,Observ]）
-    "eg", "us", "ok", "no", "of", "to", "in", "an", "be", "by",
-    "it", "is", "as", "at", "or", "so", "if", "do", "on", "up",
-    "he", "we", "me", "my", "am", "go",
-    # jieba 切英文常见碎块（em/be/dd/ce/...）
-    "em", "be", "dd", "ce", "ng", "st", "th", "nt", "ab", "cd",
-    "ef", "gh", "ij", "kl", "mn", "op", "qr", "uv", "wx", "yz",
-})
+# 同义词发现的降噪黑名单 / 每词条上限 / 中文判据 / ASCII 短词判据：
+# 2026-10 起**定义搬到了 `storage_shared`**，与 PG 侧共用同一份对象（不是副本）。
+# 这里的三个名字是**别名**（不是复刻）：storage_shared 是唯一 `def`/`frozenset` 定义处，
+# 外部代码与既有测试仍可 `from keepsake.storage_sqlite import _DENOISE_STOPWORDS …`。
+# 判定逻辑本体见 storage_shared.discover_synonym_pairs / synonym_words。
+# Redis 侧那份是 discover_synonyms 的**函数内局部变量**（历史形态，未并入共用层）。
+_DENOISE_STOPWORDS = DENOISE_STOPWORDS
 #: 每词条同义表上限（防 hub 式泛连）—— 同 Redis 侧 `_MAX_SYNS_PER_WORD`
-MAX_SYNONYMS_PER_WORD = 8
+MAX_SYNONYMS_PER_WORD = MAX_SYNONYMS_PER_WORD
 
 # BLOB 列：只有它们允许 bytes；其余列收到 bytes 一律显式报错（同 PG _text_field）
 _BLOB_COLUMNS = ("embed_bin", "embedding")
@@ -351,17 +356,9 @@ def _chunks(seq: List[Any], size: int = SQL_PARAM_CHUNK) -> Iterator[List[Any]]:
         yield seq[i:i + size]
 
 
-def _is_pure_ascii_short(w: str) -> bool:
-    """纯 ASCII 词长度 < 3 → 视为 jieba 切碎渣（同 Redis `discover_synonyms` 口径）。"""
-    try:
-        return w.isascii() and len(w) < 3
-    except Exception:  # noqa: BLE001 — 判据本身不该让维护入口崩
-        return False
-
-
-def _has_chinese(w: str) -> bool:
-    """是否含 CJK 基本区汉字（中文对长度门槛用）。"""
-    return any(0x4E00 <= ord(c) <= 0x9FFF for c in w)
+#: 纯 ASCII 短词判据 —— **别名**，真身在 storage_shared（与 PG 共用一份）。
+#: 保留私有名是为了不打乱既有 import（tests/test_storage_sqlite.py 直接 import 它）。
+_is_pure_ascii_short = is_pure_ascii_short
 
 
 def _sha12(text: str) -> str:
@@ -1430,8 +1427,9 @@ class SqliteStorage(StorageBase):
         `{"[", "网", ...}` 这种单字碎片 ⇒ 查询式扩展注入一堆单字符 token，
         召回面被垃圾词撑大且**不报错**（本项目最典型的静默错形态）。
         现在按 JSON 解；解不开的行**打 WARNING 并跳过**，绝不静默当空。
-        （PG 侧同一段代码有同样的问题，但 `storage_pg.py` 不在本批可改范围，
-          已登记在 verdict。）
+        （PG 侧**没有**这个 bug：`ks_synonym.synonyms` 是 `jsonb`，psycopg 默认
+          把它解成 Python list，实测确认（2026-10 ks_pg_syn）。本侧是 `TEXT` 存串，
+          必须自己解 —— 两边写法不同是列类型不同导致的，不是同一处逻辑抄歪。）
         """
         out: Dict[str, set] = {}
         try:
@@ -1785,22 +1783,15 @@ class SqliteStorage(StorageBase):
     def discover_synonyms(self, rebuild: bool = False) -> Dict[str, Any]:
         """自动发现同义词组并写入 `ks_synonym`（批 3）。
 
-        语义基线 = `RedisStorage.discover_synonyms`（**PG 侧这个方法至今是
-        NotImplementedError**，所以本实现严格强于 PG，不存在「与 PG 齐平」的问题）：
-          * 候选词：jieba 切词后 `len>=2`、不在 `splitter._STOP_WORDS`、
-            不在 `_DENOISE_STOPWORDS`、非纯数字、非纯 ASCII 短词（<3 字）
-          * 候选集：词频 >= `synonym_min_word_freq`
-          * 成对：Jaccard >= `synonym_jaccard_threshold` **或**
-            共现次数 >= `synonym_min_co_occurrence`（中文对至少一方 >=2 字）
-          * 每词条同义表截断到 `MAX_SYNONYMS_PER_WORD`（按 Jaccard 降序，防 hub 泛连）
-          * `rebuild=True` → 先清空 `ks_synonym` 再重建（洗历史碎渣）；
-            默认**增量**（手动已有项优先，不覆盖）
+        语义基线 = `RedisStorage.discover_synonyms`；判定链（降噪筛 → 词频门槛 →
+        Jaccard/共现成对 → 每词条截断 → 与已有项合并）**不再在本文件**，在
+        `storage_shared` 里与 PG 侧共用同一批函数对象（见 storage_shared 的说明）。
+        本方法只剩「怎么取正文 / 怎么写回表」两件后端相关的事。
+        本文件是 PG 侧该方法的**基准实现**（PG 侧不再抛 NotImplementedError）。
+
         返回值多带 `degraded`（降级/跳过原因，非空即有 WARNING 日志）——
         铁律「不许静默跳过」：扫描覆盖不全、分词失败的条数都进这里。
         """
-        import jieba                                        # noqa: PLC0415 — 同 splitter 延迟 import
-        from .splitter import _STOP_WORDS                  # noqa: PLC0415
-
         self._require_ready("discover_synonyms")
         degraded: List[str] = []
 
@@ -1821,12 +1812,7 @@ class SqliteStorage(StorageBase):
         scanned = 0
         for content in self._iter_fragment_contents(self._synonym_scan_batch):
             try:
-                words = [w for w in jieba.lcut(content)
-                         if len(w) >= 2
-                         and w not in _STOP_WORDS
-                         and w not in _DENOISE_STOPWORDS
-                         and not w.isdigit()
-                         and not _is_pure_ascii_short(w)]
+                words = synonym_words(content)
             except Exception as e:      # noqa: BLE001
                 degraded.append(f"分词失败跳过 1 条: {e}")
                 logger.warning("storage_sqlite: discover_synonyms 分词失败，跳过一条正文: %s", e)
@@ -1834,74 +1820,20 @@ class SqliteStorage(StorageBase):
             if not words:
                 continue
             scanned += 1
-            uniq = sorted(set(words))          # set 去重 ⇒ 同一碎片内不重复计数
-            for w in uniq:
-                word_freq[w] = word_freq.get(w, 0) + 1
-            for i in range(len(uniq)):
-                for j in range(i + 1, len(uniq)):
-                    pair = (uniq[i], uniq[j])
-                    co_occur[pair] = co_occur.get(pair, 0) + 1
+            accumulate_word_freq(words, word_freq)
+            accumulate_co_occurrence(words, co_occur)
 
         note = self._scan_coverage_note("memory:frag:", scanned)
         if note:
             degraded.append(note)
 
-        # 候选词对（ponytain: O(候选数²)。与 Redis 侧同一量级与同一上限；
-        # 语料再大一个数量级时该换 MinHash/SIMHash，改动点只在这一个循环里。）
-        candidates = {w for w, f in word_freq.items() if f >= self._synonym_min_word_freq}
-        new_map: Dict[str, set] = {}
-        pair_score: Dict[Tuple[str, str], float] = {}
-        discovered_groups = 0
-        for word_a in sorted(candidates):
-            for word_b in sorted(candidates):
-                if word_a >= word_b:
-                    continue
-                if (_has_chinese(word_a) or _has_chinese(word_b)) and not any(
-                        _has_chinese(w) and len(w) >= 2 for w in (word_a, word_b)):
-                    continue                        # 中文单字对：靠 _STOP_WORDS 之外再兜一层
-                c = co_occur.get((word_a, word_b), 0)
-                union = word_freq[word_a] + word_freq[word_b] - c
-                jaccard = (c / union) if union > 0 else 0.0
-                if (jaccard >= self._synonym_jaccard_threshold
-                        or c >= self._synonym_min_co_occurrence):
-                    new_map.setdefault(word_a, set()).add(word_b)
-                    new_map.setdefault(word_b, set()).add(word_a)
-                    discovered_groups += 1
-                    pair_score[(word_a, word_b)] = max(
-                        pair_score.get((word_a, word_b), 0.0), jaccard)
-
-        # 每词条上限 8：按 Jaccard 降序截断（hub 式泛连被剪掉）。
-        # 🔴 平手时**再按词字典序**定序：只按分数排的话，同分项的先后取决于
-        #    `set` 的迭代序（PYTHONHASHSEED 随机化）⇒ 同一份语料重跑得到不同的表，
-        #    「机械对照」根本无法成立。Redis 侧没有这一层（本侧更严格，不是分歧）。
-        capped: Dict[str, set] = {}
-        for word, syns in new_map.items():
-            if len(syns) <= MAX_SYNONYMS_PER_WORD:
-                capped[word] = syns
-                continue
-            capped[word] = set(sorted(
-                syns,
-                key=lambda s: (-pair_score.get((word, s) if word < s else (s, word), 0.0), s),
-            )[:MAX_SYNONYMS_PER_WORD])
-
-        # 合并：已有（手动）项优先，不被自动发现覆盖；新发现项补全双向映射。
-        # 🔴 **两趟 + 排序遍历**：Redis 侧是一趟 `for word, synonyms in new_map.items()`
-        #    且 `if word in merged: continue` —— 某个词若先作为别人的反向映射被建出来，
-        #    它自己的同义表就被这一句跳过，于是「谁先被遍历」决定结果；而遍历序来自
-        #    `set` 的迭代序（PYTHONHASHSEED 随机化）⇒ **同一份语料两次运行结果不同**，
-        #    逐 term 对照无从谈起。这里改成：先按 term 排序、先铺已有项、再统一补反向，
-        #    结果与遍历序完全无关。算法与阈值仍与 Redis 侧逐条相同。
-        existing = self._load_synonym_map()
-        merged: Dict[str, set] = {t: set(s) for t, s in existing.items()}
-        for word in sorted(capped):
-            if word in existing:
-                continue                      # 手动添加的项优先，不被自动发现覆盖
-            merged.setdefault(word, set()).update(capped[word])
-        for word in sorted(capped):
-            if word in existing:
-                continue
-            for syn in capped[word]:
-                merged.setdefault(syn, set()).add(word)
+        capped, discovered_groups = discover_synonym_pairs(
+            word_freq, co_occur,
+            self._synonym_min_word_freq,
+            self._synonym_jaccard_threshold,
+            self._synonym_min_co_occurrence,
+        )
+        merged = merge_synonym_maps(self._load_synonym_map(), capped)
 
         if merged:
             try:
@@ -1912,8 +1844,7 @@ class SqliteStorage(StorageBase):
                     cur.executemany(
                         "INSERT INTO ks_synonym (term, synonyms) VALUES (?, ?) "
                         "ON CONFLICT(term) DO UPDATE SET synonyms = excluded.synonyms",
-                        [(w, json.dumps(sorted(s), ensure_ascii=False))
-                         for w, s in merged.items()],
+                        synonym_rows(merged),
                     )
             except StorageNotReadyError:
                 raise
@@ -1936,14 +1867,12 @@ class SqliteStorage(StorageBase):
 
         与 `RedisStorage.generate_jieba_dict` **同一格式**：`"<词> <词频> nz\\n"`，
         即 `jieba.load_userdict()` 可直接加载的格式；默认路径同为
-        `~/.config/keepsake/jieba_dict.txt`。
+        `~/.config/keepsake/jieba_dict.txt`。切词与选条**共用** `storage_shared`
+        （与 PG 侧同一批函数对象）；本方法只负责取正文与写文件。
         与 Redis 侧的唯一差别（更严格、不是不一致）：排序键是 `(-词频, 词)`，
         Redis 是 `(-词频)` + dict 插入序 ⇒ 同频词的行序取决于写入顺序、跨后端对不齐。
         这里固定成字典序 ⇒ 同语料重跑逐字节相同，便于机械对照。
         """
-        import jieba                                        # noqa: PLC0415 — 同上
-        from .splitter import _STOP_WORDS                  # noqa: PLC0415
-
         self._require_ready("generate_jieba_dict")
         if output_path is None:
             output_path = str(Path.home() / ".config" / "keepsake" / "jieba_dict.txt")
@@ -1953,26 +1882,20 @@ class SqliteStorage(StorageBase):
         scanned = 0
         for content in self._iter_fragment_contents(self._synonym_scan_batch):
             try:
-                words = [w for w in jieba.lcut(content)
-                         if len(w) >= 2 and w not in _STOP_WORDS and not w.isdigit()]
+                words = jieba_dict_words(content)
             except Exception as e:      # noqa: BLE001
                 degraded.append(f"分词失败跳过 1 条: {e}")
                 logger.warning("storage_sqlite: generate_jieba_dict 分词失败，跳过一条正文: %s", e)
                 continue
             scanned += 1
-            for w in set(words):
-                word_freq[w] = word_freq.get(w, 0) + 1
+            accumulate_word_freq(words, word_freq)
 
         note = self._scan_coverage_note("memory:frag:", scanned)
         if note:
             degraded.append(note)
 
         # 同义词表补全：term 至少算 3 次（与 Redis 侧同口径，手工词不该被词频筛掉）
-        for term in self._load_synonym_map():
-            word_freq[term] = max(word_freq.get(term, 0), 3)
-
-        selected = sorted(((w, f) for w, f in word_freq.items() if f >= 2),
-                          key=lambda x: (-x[1], x[0]))
+        selected = jieba_dict_entries(word_freq, list(self._load_synonym_map()))
         out = Path(output_path)
         try:
             out.parent.mkdir(parents=True, exist_ok=True)

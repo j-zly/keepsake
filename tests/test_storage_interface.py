@@ -161,13 +161,21 @@ def test_pg_search_methods_are_implemented():
             f"{name} 仍抛 NotImplementedError —— 批 2 已交付检索"
 
 
-def test_pg_corpus_maintenance_still_raises_not_implemented():
-    """语料维护两法仍显式抛错（批 2 不在范围内），绝不静默返回零统计。"""
+def test_pg_corpus_maintenance_is_implemented_and_never_silently_zero():
+    """2026-10 ks_pg_syn：语料维护两法**已实现**，不再抛 NotImplementedError。
+
+    与检索三方法同一条契约：DSN 故意写错 ⇒ 抛的是**连接类异常**，
+    既不是 `NotImplementedError`（= 没实现），也不是静默返回零统计
+    （= 「什么都没扫到」被读成「扫过了，没有同义词」—— 三后端对照直接失真）。
+    """
     pg = PgStorage(dsn=_BAD_DSN)
-    for name in ("discover_synonyms", "generate_jieba_dict"):
-        with pytest.raises(NotImplementedError) as exc:
-            getattr(pg, name)()
-        assert "batch 2" in str(exc.value), f"{name} 的报错必须写明 batch 2"
+    for name, args in (("discover_synonyms", (True,)),
+                       ("discover_synonyms", ()),
+                       ("generate_jieba_dict", ("/tmp/ks_pg_syn_unittest_dict.txt",))):
+        with pytest.raises(Exception) as exc:
+            getattr(pg, name)(*args)
+        assert not isinstance(exc.value, NotImplementedError), \
+            f"{name}{args} 仍抛 NotImplementedError —— 批 3 已交付语料维护"
 
 
 def test_pg_search_methods_never_silently_return_empty_on_backend_failure():

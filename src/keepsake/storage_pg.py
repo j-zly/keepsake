@@ -6,8 +6,9 @@ PostgreSQL 存储后端 — keepsake 第二个存储实现（批 2：读写 + �
     correct_fragments / supersede_fragment / record_feedback / get_hot_topics /
     match_hot_topics / match_attention / entity_timeline / close / health_check /
     **search / search_bm25 / search_knn**
-  **未实现且显式抛错**：discover_synonyms / generate_jieba_dict（语料维护类，
-    与检索正交；仍显式抛错而不是静默返回空统计）。
+    —— 批 3 —— **discover_synonyms / generate_jieba_dict**（语料维护，与
+    SQLite 侧逐条等价；判定链在 `storage_shared` 共用，不在本文件）
+  **未实现且显式抛错**：无（PG 侧不再有 NotImplementedError 的方法）。
 
 ## 检索怎么做的（零 PG 中文扩展）
 
@@ -76,6 +77,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .emotion import analyze_emotion
@@ -95,6 +97,15 @@ from .storage_shared import (          # 与 Redis 共用的检索后处理（�
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
+    # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
+    accumulate_co_occurrence,
+    accumulate_word_freq,
+    discover_synonym_pairs,
+    jieba_dict_entries,
+    jieba_dict_words,
+    merge_synonym_maps,
+    synonym_rows,
+    synonym_words,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 路径/连字符拆子词的 sanitize）。
 # 复用而不是重抄：上游 58bf19c/d00b7eb 修过这套的坑，两边各写一份必漂移。
@@ -619,13 +630,11 @@ def _blob_to_vector(blob: bytes, field: str = "embed_bin") -> List[float]:
     return list(struct.unpack(f"<{n}f", bytes(blob)))
 
 
-# 仍未实现的方法（语料维护类，与检索正交）→ 统一文案
-_NOT_IMPLEMENTED = (
-    "PgStorage.{name}() is not implemented yet — corpus maintenance is out of "
-    "scope for batch 2 (which delivered read/write/search). "
-    "Raising on purpose: returning a zero-statistics dict here would silently "
-    "make every memory unsearchable when backend=postgres is selected."
-)
+# 🔴 **PG 侧已无 NotImplementedError 方法**（2026-10 ks_pg_syn 交付
+#    discover_synonyms / generate_jieba_dict）。本模块不再保留兜底文案常量：
+#    留着 = 「以后新增的方法忘了实现」时看起来像还能用，实际已无引用方。
+#    真要新增未实现的方法，请直接写清「缺什么、为什么、怎么绕过」，不要复用旧文案。
+
 
 
 class _PrecomputedWeights:
@@ -746,6 +755,11 @@ class PgStorage(StorageBase):
         feedback_negative_penalty: float = FEEDBACK_NEGATIVE_PENALTY,
         v2_min_score: float = 0.05,
         snapshot_ttl_s: float = DEFAULT_SNAPSHOT_TTL_S,
+        # ---- 同义词发现阈值（键名/默认值与 RedisStorage / SqliteStorage 逐字同源）----
+        synonym_min_word_freq: int = 10,
+        synonym_jaccard_threshold: float = 0.5,
+        synonym_min_co_occurrence: int = 3,
+        synonym_scan_batch: int = 500,
     ):
         self._dsn = dsn
         self._host = host
@@ -786,6 +800,11 @@ class PgStorage(StorageBase):
         self._v2_min_score = float(v2_min_score)
         # 检索热路径快照 TTL（0 = 关掉，每次实查；负数同 0）
         self._snapshot_ttl_s = max(0.0, float(snapshot_ttl_s))
+        # ---- 同义词发现阈值（不写死魔数；与 Redis/SQLite 侧同源读配置）----
+        self._synonym_min_word_freq = int(synonym_min_word_freq)
+        self._synonym_jaccard_threshold = float(synonym_jaccard_threshold)
+        self._synonym_min_co_occurrence = int(synonym_min_co_occurrence)
+        self._synonym_scan_batch = max(1, int(synonym_scan_batch))
         self._agent_id = agent_id
         self._is_primary = bool(is_primary)
         self._attention_boost_max = float(attention_boost_max)
@@ -1837,14 +1856,196 @@ class PgStorage(StorageBase):
         return out
 
     # ------------------------------------------------------------------
-    # 语料维护类仍未实现（显式抛错，绝不静默返回零统计）
+    # 语料维护（批 3）：同义词自动发现 + jieba 用户词典
+    #
+    # 🔴 **本节与 `SqliteStorage` 逐条等价**，判定链（降噪筛 / 词频门槛 /
+    #    Jaccard+共现成对 / 每词条截断 / 与手工项合并 / 词典选条）全在
+    #    `storage_shared`，两侧调的是**同一批函数对象**，不是各写一份。
+    #    这里只留后端相关的两件事：怎么把正文分页取出来、怎么把结果写回
+    #    `ks_synonym`。字段、阈值口径、返回值形状、确定性保证与 SQLite 侧同形。
     # ------------------------------------------------------------------
 
     def discover_synonyms(self, rebuild: bool = False) -> Dict[str, Any]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="discover_synonyms"))
+        """自动发现同义词组并写入 `ks_synonym`（`ks_synonym` 对齐 `keepsake:synonyms`）。
+
+        语义基线 = `SqliteStorage.discover_synonyms`（该侧是最近一版、已验收）：
+          * 候选词：jieba 切词后 `len>=2`、不在 `splitter._STOP_WORDS`、
+            不在 `DENOISE_STOPWORDS`、非纯数字、非纯 ASCII 短词（<3 字）
+          * 候选集：词频 >= `synonym_min_word_freq`
+          * 成对：Jaccard >= `synonym_jaccard_threshold` **或**
+            共现次数 >= `synonym_min_co_occurrence`（中文对至少一方 >=2 字）
+          * 每词条同义表截断到 8（按 Jaccard 降序 + 字典序 tiebreak，防 hub 泛连）
+          * `rebuild=True` → 先清空 `ks_synonym` 再重建（洗历史碎渣）；
+            默认**增量**（手动已有项优先，不覆盖）
+        返回值多带 `degraded`（降级/跳过原因，非空即有 WARNING 日志）——
+        铁律「不许静默跳过」：扫描覆盖不全、分词失败的条数都进这里。
+        """
+        degraded: List[str] = []
+
+        if rebuild:
+            try:
+                with self._tx() as cur:
+                    cur.execute("DELETE FROM ks_synonym")
+            except Exception as e:      # noqa: BLE001
+                # 清表失败**不吞**：按增量继续（保留手动项），但留痕。
+                degraded.append(f"rebuild 清空 ks_synonym 失败，本轮按增量继续: {e}")
+                logger.warning("storage_pg: discover_synonyms(rebuild=True) 清表失败，"
+                               "本轮按增量继续: %s", e)
+            # 表动过了 ⇒ 检索侧的同义词快照必须作废，否则下一轮增量读到的是删表前的词表
+            self._snap_drop("syn")
+
+        word_freq: Dict[str, int] = {}
+        co_occur: Dict[Tuple[str, str], int] = {}
+        scanned = 0
+        for content in self._iter_fragment_contents(self._synonym_scan_batch):
+            try:
+                words = synonym_words(content)
+            except Exception as e:      # noqa: BLE001
+                degraded.append(f"分词失败跳过 1 条: {e}")
+                logger.warning("storage_pg: discover_synonyms 分词失败，跳过一条正文: %s", e)
+                continue
+            if not words:
+                continue
+            scanned += 1
+            accumulate_word_freq(words, word_freq)
+            accumulate_co_occurrence(words, co_occur)
+
+        note = self._scan_coverage_note("memory:frag:", scanned)
+        if note:
+            degraded.append(note)
+
+        capped, discovered_groups = discover_synonym_pairs(
+            word_freq, co_occur,
+            self._synonym_min_word_freq,
+            self._synonym_jaccard_threshold,
+            self._synonym_min_co_occurrence,
+        )
+        merged = merge_synonym_maps(self._load_synonym_map(), capped)
+
+        if merged:
+            try:
+                with self._tx() as cur:
+                    # 同义词表逐行小（几十~几百），一次事务写完；JSON 串排序输出
+                    # ⇒ 同语料重跑得到**逐字节相同**的表。
+                    # `%s::jsonb` 是必要的：synonyms 列是 jsonb，不带这个 cast
+                    # psycopg 会按 text 推断，整列被隐式转换依赖服务端默认值。
+                    cur.executemany(
+                        "INSERT INTO ks_synonym (term, synonyms) VALUES (%s, %s::jsonb) "
+                        "ON CONFLICT (term) DO UPDATE SET synonyms = excluded.synonyms",
+                        synonym_rows(merged),
+                    )
+            except Exception as e:      # noqa: BLE001
+                degraded.append(f"写 ks_synonym 失败: {e}")
+                logger.warning("storage_pg: discover_synonyms 写同义词表失败: %s", e)
+            # 写成功/失败都作废快照：写失败时表可能已被部分改写，
+            # 缓存里的旧词表比半张新表更容易误导下游（且不会报错）。
+            self._snap_drop("syn")
+
+        for reason in degraded:
+            logger.warning("storage_pg: discover_synonyms 降级: %s", reason)
+        return {
+            "discovered_groups": discovered_groups,
+            "total_terms": len(merged),
+            "scanned_fragments": scanned,
+            "rebuild": bool(rebuild),
+            "degraded": degraded,
+        }
 
     def generate_jieba_dict(self, output_path: str = None) -> Dict[str, Any]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="generate_jieba_dict"))
+        """从碎片库 + 同义词表生成 jieba 用户词典（与 SQLite/Redis 侧同格式）。
+
+        输出 `词 词频 nz`（`jieba.load_userdict()` 可直接加载）；默认路径同为
+        `~/.config/keepsake/jieba_dict.txt`。排序键固定 `(-词频, 词)` ⇒
+        **同语料重跑逐字节相同**（Redis 侧只按 `-词频` + dict 插入序，同频词的
+        行序跨后端对不齐；这是更严格的一侧，不是分歧）。
+        """
+        if output_path is None:
+            output_path = str(Path.home() / ".config" / "keepsake" / "jieba_dict.txt")
+        degraded: List[str] = []
+
+        word_freq: Dict[str, int] = {}
+        scanned = 0
+        for content in self._iter_fragment_contents(self._synonym_scan_batch):
+            try:
+                words = jieba_dict_words(content)
+            except Exception as e:      # noqa: BLE001
+                degraded.append(f"分词失败跳过 1 条: {e}")
+                logger.warning("storage_pg: generate_jieba_dict 分词失败，跳过一条正文: %s", e)
+                continue
+            scanned += 1
+            accumulate_word_freq(words, word_freq)
+
+        note = self._scan_coverage_note("memory:frag:", scanned)
+        if note:
+            degraded.append(note)
+
+        # 同义词表补全：term 至少算 3 次（与另两侧同口径，手工词不该被词频筛掉）
+        selected = jieba_dict_entries(word_freq, list(self._load_synonym_map()))
+        out = Path(output_path)
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("".join(f"{w} {f} nz\n" for w, f in selected), encoding="utf-8")
+        except OSError as e:
+            # 写不出词典 = 消费方（jieba）拿不到自定义词表，属**降级**必须留痕
+            degraded.append(f"写词典文件失败 {out}: {e}")
+            logger.error("storage_pg: generate_jieba_dict 写文件失败 %s: %s", out, e)
+
+        for reason in degraded:
+            logger.warning("storage_pg: generate_jieba_dict 降级: %s", reason)
+        return {
+            "written_terms": len(selected),
+            "total_candidates": len(word_freq),
+            "output_path": str(out),
+            "degraded": degraded,
+        }
+
+    # ------------------------------------------------------------------
+    # 语料维护内部件：全库正文遍历 + 覆盖度自检
+    # ------------------------------------------------------------------
+
+    def _iter_fragment_contents(self, batch: int) -> Iterator[str]:
+        """分页遍历全库正文（`memory:frag:` 前缀）。
+
+        🔴 走**维护原语**（`scan_fragment_keys` + `get_fragments_batch`）而不是
+        本文件另开一条 SELECT —— 同义词/词典与合并/遗忘共用同一条读路径，后端
+        语义天然等价；逐条 `get_fragment` 则是 N+1 往返。
+        空正文跳过（返回的条数 = 有正文的碎片数，与 `_scan_coverage_note` 的口径对齐）。
+        """
+        cursor = ""
+        while True:
+            cursor, keys = self.scan_fragment_keys(
+                cursor=cursor, limit=max(1, int(batch)), prefix="memory:frag:",
+            )
+            if keys:
+                docs = self.get_fragments_batch(keys)
+                for key in keys:
+                    content = (docs.get(key) or {}).get("content") or ""
+                    if content:
+                        yield content
+            if not cursor:
+                return
+
+    def _scan_coverage_note(self, prefix: str, seen: int) -> str:
+        """扫描覆盖度自检：扫到的条数与库内该前缀的「有正文」行数对不上 ⇒ 降级留痕。
+
+        为什么需要：分页原语在异常时是 **fail-open**（`scan_fragment_keys` /
+        `get_fragments_batch` 都只打 WARNING 返回空/残缺）—— 对维护类入口来说，
+        「扫到 200/300 条却报告成功」就是**静默少做一半活**。一条 COUNT 聚合即可
+        把这种形态变成可辨识的返回值。与 SQLite 侧同名方法同口径、只换 SQL。
+        ponytail: 一条 COUNT，无缓存；只在低频的维护入口跑，代价可忽略。
+        """
+        try:
+            with self._ro() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM ks_fragment WHERE key LIKE %s AND content <> ''",
+                    (f"{prefix}%",),
+                )
+                total = cur.fetchone()[0]
+        except Exception as e:      # noqa: BLE001
+            return f"覆盖度自检失败（{type(e).__name__}: {e}）"
+        if int(total) != int(seen):
+            return f"扫描覆盖不全：扫到 {seen} 条，库内 {prefix}* 有正文者共 {total} 条"
+        return ""
 
     # ------------------------------------------------------------------
     # 行 <-> 碎片 dict
