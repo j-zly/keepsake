@@ -32,7 +32,8 @@ User: "How did we set up that React project structure last time?"
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **Memory Intake** — explicit `memory(action='add')` entries plus per-turn text screened by the v1 ingest gate (R1–R8); junk/system-injected content is rejected before storage, and the v2 pipeline distills turns into facts
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
-- **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation retired 2026-09 — see below.
+- **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation is no longer wired into the provider (2026-09) but stays available as an ops-invoked engine — see [Storage Backends](#storage-backends-redis--postgresql) and [Consolidation Retirement](#consolidation-retirement-2026-09-09).
+- **Two Storage Backends** — `storage.backend` picks `redis` (default) or `postgres`; both are functionally equivalent for write / BM25+KNN search / consolidation / forgetting. See [Storage Backends](#storage-backends-redis--postgresql).
 - **RRF Fusion Ranking (v1.3)** — Reciprocal Rank Fusion combines BM25 full-text and semantic KNN results into a single ranked list for better recall
 - **Local Semantic Search** — optional self-hosted Ollama embedder (e.g. `bge-m3`, 1024-dim) runs fully on-premise via the OpenAI-compatible `/v1/embeddings` endpoint — no external embedding API needed
 - **LLM Query Expansion (2026-09)** — when BM25 recalls fewer than `min_results` hits, a free-tier chat LLM quietly generates synonymous short phrases (2–8 chars) into a Redis cache (24h TTL). Runs on a background thread: **zero added latency on the hot path**; disabled automatically when no `llm` channel is configured
@@ -58,7 +59,7 @@ Keepsake stores **full, self-contained entries** — not split conversation snip
 | Entity Association | Entity co-occurrence tracking — entries mentioning "BTC" also recall "halving" without being synonyms |
 | Entity Tagging | Like the brain tagging memories with people/places/things — auto-extracted entities searched alongside content |
 | Memory Intake | Explicit `memory(action='add')` writes, plus per-turn text screened by the ingest gate and distilled by the v2 pipeline |
-| Sleep Consolidation | Background maintenance every 2h: selective forgetting (multi-dimension low-value detection). Consolidator retired 2026-09. |
+| Sleep Consolidation | Background maintenance every 2h: selective forgetting (multi-dimension low-value detection). Consolidation is ops-invoked, not wired into the provider. |
 | Context Isolation | agent_id tagging — different identities, separate memories |
 | Fuzzy but Enough | BM25 full-text search — doesn't need an exact match to recall |
 
@@ -112,11 +113,12 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   "redis_port": 6379,
   "redis_password": "",
 
-  // Storage backend (optional, defaults to "redis")
-  // batch 1: the PostgreSQL backend implements read/write only —
-  // search/search_bm25/search_knn raise NotImplementedError on purpose
-  // (so a misconfigured backend fails loudly instead of silently finding nothing).
-  // Install: pip install 'keepsake-memory[postgres]'
+  // Storage backend (optional, defaults to "redis") — this ONE line switches backends.
+  // "postgres" is functionally equivalent to "redis": write, BM25+KNN search,
+  // consolidation and forgetting all work. See "Storage Backends" below.
+  // Install: pip install 'keepsake-memory[postgres]'  (needs pgvector in the database)
+  // ⚠️ Without an embedder you MUST set top-level "embed_dim" (e.g. 1024) — see
+  //    "Storage Backends" → "embed_dim".
   // "storage": {
   //   "backend": "postgres",
   //   "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
@@ -196,30 +198,27 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 
 > Note: Redis password compatibility: leave empty for no authentication, or provide password to automatically send AUTH command.
 >
-> Note: `storage.backend` defaults to `redis`. A missing, empty or unrecognised value always falls back to `redis`, so existing deployments are unaffected. `postgres` is batch-1 read/write only — its search methods raise `NotImplementedError` until batch 2 ships BM25 + KNN.
+> Note: `storage.backend` defaults to `redis`. A missing, empty or unrecognised value always falls back to `redis`, so existing deployments are unaffected. `postgres` is functionally equivalent to `redis` — write, BM25+KNN search, consolidation and forgetting all work; only the implementation differs. See [Storage Backends](#storage-backends-redis--postgresql).
 
 ### 3. Environment Variables Reference
 
 | Environment Variable | Corresponding Config Item | Description |
 |----------------------|----------------------------|-------------|
+| `KEEPSAKE_CONFIG` | — | Path to `config.json` (default `~/.config/keepsake/config.json`) |
 | `KEEPSAKE_REDIS_HOST` | `redis_host` | Redis server host |
 | `KEEPSAKE_REDIS_PORT` | `redis_port` | Redis server port |
 | `KEEPSAKE_REDIS_PASSWORD` | `redis_password` | Redis password for authentication |
 | `KEEPSAKE_TOP_K` | `top_k` | Number of final entries returned |
 | `KEEPSAKE_CANDIDATE_K` | `candidate_k` | Candidate entries count (for KNN) |
-| `KEEPSAKE_BM25_LIMIT` | `bm25_limit` | BM25 search candidate count |
 | `KEEPSAKE_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
-| `KEEPSAKE_DECAY_HALF_DAYS` | `decay_half_days` | Time decay half-life (days) |
-| `KEEPSAKE_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | Hot topic time decay half-life (days) |
-| `KEEPSAKE_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding cache TTL (seconds) |
+| `KEEPSAKE_AGENT_ID` | `agent_id` | Agent identity tag for isolation |
+| `KEEPSAKE_IS_PRIMARY` | `is_primary` | `true` = sees all entries; `false` = only tagged ones |
 | `KEEPSAKE_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
-| `KEEPSAKE_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | Minimum entries to trigger consolidation |
-| `KEEPSAKE_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | Minimum age (hours) before entries can be consolidated |
-| `KEEPSAKE_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | Number of days before entries might be forgotten |
-| `KEEPSAKE_FORGET_DRY_RUN` | `forget_dry_run` | Safe mode: `true` = count only, `false` = actually delete |
-| `KEEPSAKE_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | Emotion intensity → weight coefficient (0=disabled, 1=max) |
+| `OPENAI_API_KEY` | `embedder.api_key` | Embedding API key |
+
+> **Every other config item is `config.json`-only — there is no environment variable for it.** In particular `bm25_limit`, `decay_half_days`, `hot_topic_decay_half_days`, `embed_cache_ttl`, `storage.backend`, `embed_dim`, `consolidate_min_group`, `consolidate_min_overlap`, `consolidate_max_age_hours`, `forget_max_age_days`, `forget_dry_run` and `emotion_intensity_factor` are read from the config file only. See the [Configuration Reference](#configuration-reference) table below for defaults.
 
 > Note: Redis password is compatible with empty value (no auth) or password provided for AUTH command.  
 > Note: Changes to config.json take effect immediately without restarting (just send `/new`).
@@ -317,6 +316,14 @@ Then reference it in config.json:
 
 | Config Item | Environment Variable | Default Value | Description |
 |-------------|---------------------|---------------|-------------|
+| `storage.backend` | — | `"redis"` | `redis` or `postgres`. Missing / empty / invalid falls back to `redis`. See [Storage Backends](#storage-backends-redis--postgresql) |
+| `storage.postgres.host` | — | `127.0.0.1` | PostgreSQL host (only read when `backend` is `postgres`) |
+| `storage.postgres.port` | — | `5432` | PostgreSQL port |
+| `storage.postgres.dbname` | — | `keepsake` | PostgreSQL database |
+| `storage.postgres.user` | — | `""` | PostgreSQL user |
+| `storage.postgres.password` | — | `""` | PostgreSQL password |
+| `storage.postgres.sslmode` | — | `""` | PostgreSQL sslmode |
+| `embed_dim` | — | `1536` | Vector width for the PG `embedding vector(N)` column. **Set this explicitly when no embedder is configured** — see [Storage Backends](#storage-backends-redis--postgresql) → `embed_dim` |
 | `redis_host` | `KEEPSAKE_REDIS_HOST` | `127.0.0.1` | Redis address |
 | `redis_port` | `KEEPSAKE_REDIS_PORT` | `6379` | Redis port |
 | `top_k` | `KEEPSAKE_TOP_K` | `5` | Number of final entries returned |
@@ -332,11 +339,11 @@ Then reference it in config.json:
 | `hot_topic_boost` | — | `1.2` | Hot topic weighting multiplier |
 | `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API key |
-| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API endpoint |
+| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1/embeddings` | API endpoint |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `consolidate_min_group` | — | `3` | Minimum entries to trigger consolidation |
-| `consolidate_min_overlap` | — | `3` | Minimum shared keywords for two entries to count as the same topic |
-| `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation |
+| `consolidate_min_overlap` | — | `3` | Minimum shared keywords for two entries to count as the same topic. Invalid values log a warning and fall back to `3`. See [Storage Backends](#storage-backends-redis--postgresql) → "Consolidation thresholds" |
+| `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation. **Not read from config.json** — pass it as `Consolidator(max_age_hours=…)` |
 | `forget_max_age_days` | — | `30` | Max age (days) before deletion |
 | `forget_dry_run` | — | `true` | Safe mode: `true` = count only, `false` = delete |
 | `agent_id` | — | `""` | Agent identity tag for isolation (e.g. `"main-brain"`) |
@@ -355,6 +362,174 @@ Then reference it in config.json:
 | `entity_cooc_min_count` | — | `2` | Min co-occurrence for entity association |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
+
+## Storage Backends (Redis / PostgreSQL)
+
+### Switching backends
+
+One config line selects the backend — `storage.backend`:
+
+```json
+"storage": {
+  "backend": "postgres",
+  "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
+               "user": "keepsake", "password": "***", "sslmode": ""}
+}
+```
+
+`redis` (the default) and `postgres` are **functionally equivalent**: write, BM25 + KNN search, consolidation and forgetting all work on both. Only the implementation differs — same `StorageBase` interface, two classes.
+
+- A missing, empty, non-string or unrecognised `backend` value **always falls back to `redis`**, so existing deployments are unaffected.
+- Install the optional dependency: `pip install 'keepsake-memory[postgres]'` (pulls `psycopg[binary]`). The database also needs **pgvector** — the KNN column is `embedding vector(N)` with an HNSW cosine index.
+- Importing `storage_pg` does not require `psycopg`; the import happens at connect time, so a missing optional dependency never breaks Redis-only installs.
+
+### `embed_dim`
+
+Top-level key, default `1536`. It sets the width of the PG `embedding vector(N)` column.
+
+**If no embedder is configured, set `embed_dim` explicitly** (e.g. `1024` for a library built with `bge-m3`). Without an embedder the provider falls back to the default `1536`; if the live column is `vector(1024)`, `ensure_index()` raises `_SchemaDimMismatch`, provider initialisation aborts, and every recall comes back empty. With an embedder configured, its registered dimension wins and `embed_dim` is only a fallback.
+
+### Schema self-healing
+
+`ensure_index()` is idempotent and repairs the schema on its own — it never blindly re-sends DDL:
+
+1. **Check before applying** — it queries `information_schema` / `pg_indexes` and issues DDL only for what is actually missing. A complete schema gets no DDL at all.
+2. **Once per process** — a memo keyed by `(target database, dimension)` short-circuits repeat calls.
+3. **Serialised and bounded** — a fixed `pg_advisory_lock` plus `SET LOCAL lock_timeout = 5000`, with up to 3 retries and exponential backoff. Exceeding the retries logs an error and **returns `False`** — an explicit failure, never a silent success.
+
+Concretely: an **old database missing columns** gets them back via `ALTER TABLE ... ADD COLUMN` for the maintenance columns and, when a dimension is known, for `content_tsv` / `embedding`; an **empty database** no longer collides with `CREATE TABLE` (the maintenance-column `ALTER`s carry `IF NOT EXISTS`, so the create path and the alter path are both idempotent).
+
+### Maintenance capabilities and the four backend-agnostic primitives
+
+Consolidation and forgetting reach storage **only** through four primitives on the `StorageBase` interface, which is why they behave identically on both backends:
+
+| Primitive | Redis | PostgreSQL |
+|-----------|-------|------------|
+| `scan_fragment_keys(cursor, limit, prefix)` | `SCAN` cursor | keyset pagination `WHERE key > :cursor ORDER BY key LIMIT n` (never a large `OFFSET`) |
+| `get_fragments_batch(keys)` | `HMGET` | `WHERE key = ANY(...)` |
+| `write_fragments_batch(rows)` | pipeline upsert | upsert, recomputing `content_tsv` / `embedding` |
+| `update_fragment_fields(key, fields)` | `HSET` | partial `UPDATE` (does not touch `content` / `content_tsv` / `embedding`) |
+| `delete_fragments_batch(keys)` | pipeline `DEL` | `DELETE ... WHERE key = ANY(...)` plus timeline cleanup |
+
+The cursor is an opaque string: `""` starts from the beginning, and an empty `next_cursor` means the scan is done.
+
+PG-side maintenance columns — `level`, `consumed_by`, `consumed_at` — are `TEXT NOT NULL DEFAULT ''`. **Test "not set" with `= ''`, never `IS NULL`**; the default keeps existing rows valid.
+
+Writing is equivalent too: same-content deduplication marks the old version `valid_until` / `is_archived` and files the new one under a `:<epoch>` key suffix, and the R6 rule "a duplicate hit never overwrites `content`" holds on both backends.
+
+### Consolidation thresholds
+
+Two top-level `config.json` keys (config file only — no environment variable):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `consolidate_min_overlap` | `3` | Minimum shared keywords for two entries to count as the same topic |
+| `consolidate_min_group` | `3` | Minimum entries in a group before it is actually merged |
+
+`consolidate_min_overlap` used to be hard-coded at `2`, which on a production sample merged 1498 of 2819 entries (53%); at `3` it merges roughly 13%. An invalid value (non-integer, boolean, or `< 1`) logs a warning and falls back to the default — it never crashes.
+
+Consolidation and forgetting are **constructed fresh each round by the ops script / cron**, not held by the provider — so changing these keys takes effect on the next round, **no restart required**. See [Consolidation Retirement](#consolidation-retirement-2026-09-09) for why the provider no longer keeps a consolidator.
+
+### Migrating Redis → PostgreSQL
+
+```bash
+python3 scripts/migrate_redis_to_pg.py --dry-run     # read-only, prints the plan
+python3 scripts/migrate_redis_to_pg.py --limit 100   # try 100 fragments first
+python3 scripts/migrate_redis_to_pg.py                # full migration
+python3 scripts/migrate_redis_to_pg.py --skip-aux     # fragments only, skip auxiliary structures
+python3 scripts/migrate_redis_to_pg.py --config /path/to/config.json
+```
+
+The script is **strictly read-only against Redis** (only `SCAN` / `HGETALL` / `PING`; an AST self-check rejects any write command at startup), is idempotent (`ON CONFLICT (key) DO UPDATE`), copies existing `embed_bin` vectors rather than recomputing them, and migrates the auxiliary structures (hot topics, attention, entity timelines, co-occurrence, synonyms) alongside the fragments — it prints both counts and fails if they disagree. Credentials come from keepsake's `config.json` / `KEEPSAKE_CONFIG`; nothing is hardcoded or logged.
+
+### Known backend differences
+
+Only corpus-maintenance and dead-field methods differ, and they fail loudly rather than silently:
+
+| Method | PostgreSQL behaviour | Why |
+|--------|---------------------|-----|
+| `discover_synonyms` | raises `NotImplementedError` | Corpus maintenance, orthogonal to search |
+| `generate_jieba_dict` | raises `NotImplementedError` | Same |
+| `touch_fragment` | returns `False` + logs | `ks_fragment` has no `touch_count` / `updated_at` columns; the fields have no reader anywhere in the repo |
+| `set_supersedes` | returns `False` + logs | No reader either — reverse sealing uses `supersede_fragment`, which works on both backends |
+
+### Post-switch self-check checklist
+
+Run these in order after pointing `storage.backend` at PostgreSQL. Each step is non-destructive until the last two, which are dry-runs.
+
+```bash
+export PYTHONPATH=src
+export KEEPSAKE_CONFIG="$HOME/.config/keepsake/config.json"   # adjust if yours lives elsewhere
+```
+
+**1. `ensure_index()` → True** (builds / repairs the schema; prints `schema ready on …`):
+
+```bash
+python3 - <<'PY'
+import os
+from keepsake.storage import resolve_backend, storage_from_config
+from keepsake import _load_json_config
+cfg = _load_json_config()
+print("backend =", resolve_backend(cfg))
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print("ensure_index =", st.ensure_index())
+PY
+```
+
+**2. Health check** (`SELECT 1` on PG):
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print("health_check =", st.health_check())
+PY
+```
+
+**3. One search** — expect hits with non-zero scores, not an empty list:
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+for hit in st.search("a phrase you know is in memory"):
+    print(hit.get("_key"), hit.get("_sim"), (hit.get("content") or "")[:60])
+PY
+```
+
+**4. Consolidation dry-run** (zero writes — scans, clusters, reports group counts only):
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+from keepsake.consolidator import Consolidator
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print(Consolidator(storage=st, config=cfg).consolidate(dry_run=True))
+PY
+```
+
+**5. Forgetting dry-run** (zero writes — counts candidates, deletes nothing):
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+from keepsake.forgetter import Forgetter
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print(Forgetter(storage=st, dry_run=True).forget())
+PY
+```
+
+Both dry-runs report `dry_run: True` with `deleted: 0` / `would_merge` counts. Neither touches a row — verify by comparing fragment counts before and after.
+
+> Credentials are read from `config.json` (or `KEEPSAKE_CONFIG`); none of the commands above take a password on the command line, and none of them print one.
 
 ### Embedding Models and Dimensions
 
@@ -444,7 +619,7 @@ keepsake/
 │   ├── plugin.yaml
 │   └── __init__.py
 ├── cron/                 # Cron wrapper scripts for scheduled tasks
-│   ├── memory-maintenance.py   # Every 2h — selective forgetting (consolidation retired 2026-09)
+│   ├── memory-maintenance.py   # Every 2h — selective forgetting (consolidation is ops-invoked)
 │   ├── dedup-memory.sh         # Every 1h — deduplication
 │   └── discover-synonyms.py    # Every 8h — synonym auto-discovery
 ├── scripts/              # Standalone utility scripts (dev/test)
@@ -507,20 +682,16 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 
 ## Consolidator Retirement (2026-09-09)
 
-`Consolidator`（基于 jieba 关键词聚类 + LLM 多级缝合的离线合并引擎）已被退役。运行接线在 v2 两相管线接管后被彻底摘除。
+**退役的只是 provider 的运行期接线，不是这个能力。** `Consolidator`（基于 jieba 关键词聚类 + LLM 多级缝合的离线合并引擎）的类源码完整保留在 `src/keepsake/consolidator.py`，在 **Redis 与 PostgreSQL 两个后端上都能跑**（它只通过[四个后端无关原语](#maintenance-capabilities-and-the-four-backend-agnostic-primitives)访问存储）。provider 的 `initialize()` 不再构造它、`maintenance()` 不再触发合并循环。
 
-**为什么退役：**
+**为什么摘掉接线：**
 - 输出质量差：LLM 多级合并产生的「无时态散文」与 v2 封边链（`superseded_by`）互不相认 —— 旧合并产物会被 v2 检索侧的封边过滤误伤或绕过。
 - 职责重叠：v2 两相管线的「提取相」窗口级事实提炼 +「更新相」supersede 封边，已全面覆盖 Consolidator 的碎片提纯职能。
 - 维护成本：双管线并存需要为同一份碎片库维护两套并查链路，得不偿失。
 
 **替代者：** `pipeline.py`（v2 两相管线）。每个 turn 窗口触发提取相 → 更新相，原地 supersede 旧碎片；运行时无独立合并 cron 任务。
 
-**如何复活（若需要）：**
-1. `src/keepsake/consolidator.py` 类源码完整保留（含 `Consolidator`、`resolve_llm_channel`、`_call_llm` 全部函数），git 可溯。
-2. 在 `src/keepsake/__init__.py` 的 `KeepsakeProvider.initialize()` 中恢复 `Consolidator(...)` 构造块，并在 `maintenance()` 中恢复 `if self._consolidator:` 分支。
-3. 在 `_maybe_maintain` / `maintenance` 的 docstring 恢复「Consolidation + Forget」描述。
-4. 重跑 `tests/test_consolidator_retired.py` —— 退役接线断言会自然报错提示回退。
+**怎么用合并：** 运维脚本 / cron **每轮现构造** —— `Consolidator(storage=storage_from_config(...), config=cfg).consolidate(dry_run=False)`。因为是每轮现读 config，改 `consolidate_min_overlap` / `consolidate_min_group` **下一轮即生效，无需重启**。阈值说明见 [Storage Backends](#storage-backends-redis--postgresql) → "Consolidation thresholds"，dry-run 用法见 [自检清单](#post-switch-self-check-checklist)。
 
 **运行时观测：** `maintenance()` 返回 stats 仍保留 `consolidator` 字段（`{"status": "retired", "reason": "v2 pipeline takeover"}`），便于 cron 探针 / 健康检查观测退役状态而非误报 missing-key。
 
@@ -565,7 +736,7 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
          ┌─────────▼─────────┐
          │   [cron] Every 2h     │  ← Background maintenance
          │   ① Selective Forgetting  │  ← Age>30d + no feedback + low emotion + low attention → delete
-         │   (Consolidator retired 2026-09 — see section above)
+         │   (consolidation is ops-invoked — see section above)
          └───────────────────┘
 ```
 

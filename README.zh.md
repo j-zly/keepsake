@@ -36,7 +36,9 @@
 | 📖 **同义词表** | 存 Redis Hash，实时加载展开搜索，无需部署 |
 | 😡 **情绪烈度** | 检测用户表达激烈程度，烈度高的条目权重更高 |
 | 👁️ **注意力追踪** | 用户反复提起的话题自动标记为高关注，相关条目在搜索中排名上升 |
-| 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简。（多级合并 Consolidator 已于 2026-09 退役，提纯职能归 v2 两相管线） |
+| 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简。 |
+| 🔁 **多级合并** | jieba 关键词聚类 + LLM 缝合的合并引擎。已从 provider 运行期摘除（2026-09），但**类仍在、Redis/PG 两后端都能跑**，由运维脚本每轮现构造 ⇒ 改阈值下一轮生效、无需重启（见「存储后端」节） |
+| 🐘 **双存储后端** | `storage.backend` 一行配置切 `redis`（缺省）或 `postgres`；**读写 / BM25+KNN 检索 / 合并 / 遗忘功能等价**，差异只在实现（见「存储后端」节） |
 | ⏰ **定时任务自动注册** | 作为 Hermes 插件使用时，初始化自动注册三条 cron（记忆维护 2h/去重 1h/同义词 8h），零手动配置 |
 | 🔀 **RRF 融合排序（v1.3）** | Reciprocal Rank Fusion 将 BM25 全文 + 语义 KNN 结果融合为单一排序，召回更准 |
 | 💻 **本地语义检索** | 可选自托管 Ollama 嵌入模型（如 `bge-m3`，1024 维）走 OpenAI 兼容 `/v1/embeddings` 端点，完全本地运行 |
@@ -61,7 +63,7 @@
 | 实体关联 | 实体共现追踪 —— "BTC"和"减半"无语义重叠但因共现被关联召回 |
 | 实体索引 | 就像人脑给记忆打标签 —— 自动提取实体名，搜索时双路召回 |
 | 记忆准入 | 显式 `memory(action='add')` 写入 + 每轮原文过写闸门、由 v2 管线提纯 |
-| 睡眠时整理记忆 | 每 2h 选择性遗忘 + 同义发现；v2 两相管线窗口级提纯（取代原 Consolidator） |
+| 睡眠时整理记忆 | 每 2h 选择性遗忘 + 同义发现；v2 两相管线窗口级提纯（合并引擎不从 provider 触发，由运维脚本现构造） |
 | 不同场景记忆隔离 | agent_id 标签体系 —— 分身各自记忆不交叉 |
 | 模糊但够用 | BM25 全文搜索 —— 不需要精确匹配就能回想起来 |
 
@@ -115,10 +117,10 @@ pip install git+https://github.com/j-zly/keepsake.git
   "redis_port": 6379,
   "redis_password": "",
 
-  // 存储后端（可选，缺省即 redis）
-  // 批 1：PostgreSQL 后端只实现读写 —— search/search_bm25/search_knn 会显式抛
-  // NotImplementedError（宁可炸给你看，也绝不静默搜不到）。
-  // 安装：pip install 'keepsake-memory[postgres]'
+  // 存储后端（可选，缺省即 redis）—— 切后端就改这一行。
+  // "postgres" 与 "redis" 功能等价：写入、BM25+KNN 检索、合并、遗忘都能跑。
+  // 安装：pip install 'keepsake-memory[postgres]'（数据库侧还需要 pgvector）
+  // ⚠️ 不配 embedder 时必须显式给顶层 "embed_dim"（如 1024）—— 见「存储后端」→ embed_dim
   // "storage": {
   //   "backend": "postgres",
   //   "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
@@ -190,30 +192,27 @@ pip install git+https://github.com/j-zly/keepsake.git
 
 > 注意：Redis 密码兼容性：留空表示无认证，提供密码会自动发送 AUTH 命令。
 >
-> 注意：`storage.backend` 缺省为 `redis`；缺行 / 空串 / 非法值一律回退 redis，现有部署行为逐字不变。`postgres` 是批 1 的读写后端，检索三方法在批 2（BM25 + KNN）落地前会抛 `NotImplementedError`。
+> 注意：`storage.backend` 缺省为 `redis`；缺行 / 空串 / 非法值一律回退 redis，现有部署行为逐字不变。`postgres` 与 `redis` 功能等价 —— 写入、BM25+KNN 检索、合并、遗忘都能跑，差异只在实现。详见「存储后端」节。
 
 ### 3. 环境变量对照表
 
 | 环境变量 | 对应配置项 | 说明 |
 |----------|------------|------|
+| `KEEPSAKE_CONFIG` | — | `config.json` 路径（缺省 `~/.config/keepsake/config.json`） |
 | `KEEPSAKE_REDIS_HOST` | `redis_host` | Redis 服务器地址 |
 | `KEEPSAKE_REDIS_PORT` | `redis_port` | Redis 服务器端口 |
 | `KEEPSAKE_REDIS_PASSWORD` | `redis_password` | Redis 认证密码 |
 | `KEEPSAKE_TOP_K` | `top_k` | 最终返回条目数 |
 | `KEEPSAKE_CANDIDATE_K` | `candidate_k` | 候选条目数（用于 KNN） |
-| `KEEPSAKE_BM25_LIMIT` | `bm25_limit` | BM25 搜索候选数 |
 | `KEEPSAKE_TAG_FILTER` | `tag_filter` | 标签过滤（逗号分隔） |
-| `KEEPSAKE_DECAY_HALF_DAYS` | `decay_half_days` | 时间衰减半衰期（天） |
-| `KEEPSAKE_HOT_TOPIC_DECAY_HALF_DAYS` | `hot_topic_decay_half_days` | 热门话题时间衰减半衰期（天） |
-| `KEEPSAKE_EMBED_CACHE_TTL` | `embed_cache_ttl` | Embedding 缓存时间（秒） |
+| `KEEPSAKE_AGENT_ID` | `agent_id` | 身份标签，用于记忆隔离 |
+| `KEEPSAKE_IS_PRIMARY` | `is_primary` | `true` = 看得见全部条目；`false` = 只看带自己标签的 |
 | `KEEPSAKE_EMBEDDER` | `embedder.provider` | 嵌入模型提供商（`openai`、`dashscope`） |
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
-| `KEEPSAKE_CONSOLIDATE_MIN_GROUP` | `consolidate_min_group` | 触发合并的最少条目数 |
-| `KEEPSAKE_CONSOLIDATE_MAX_AGE_HOURS` | `consolidate_max_age_hours` | 条目参与合并的最小年龄（小时） |
-| `KEEPSAKE_FORGET_MAX_AGE_DAYS` | `forget_max_age_days` | 条目保留天数后可能被遗忘 |
-| `KEEPSAKE_FORGET_DRY_RUN` | `forget_dry_run` | 遗忘安全模式：仅统计不删除 |
-| `KEEPSAKE_EMOTION_INTENSITY_FACTOR` | `emotion_intensity_factor` | 情绪烈度→权重系数（0=禁用，1=最大） |
+| `OPENAI_API_KEY` | `embedder.api_key` | 嵌入 API 密钥 |
+
+> **其余配置项一律只走 `config.json`，没有对应环境变量。** 特别是 `bm25_limit`、`decay_half_days`、`hot_topic_decay_half_days`、`embed_cache_ttl`、`storage.backend`、`embed_dim`、`consolidate_min_group`、`consolidate_min_overlap`、`consolidate_max_age_hours`、`forget_max_age_days`、`forget_dry_run`、`emotion_intensity_factor` 都只从配置文件读。默认值见下方[配置参考](#配置参考)表。
 
 > 注意：Redis 密码兼容空值（无认证）或提供密码进行 AUTH 认证。  
 > 注意：修改 config.json 立即生效（只需发送 `/new` 命令，无需重启）。
@@ -311,6 +310,14 @@ yeah
 
 | 配置项 | 环境变量 | 默认值 | 说明 |
 |--------|---------|--------|------|
+| `storage.backend` | — | `"redis"` | `redis` 或 `postgres`。缺行 / 空串 / 非法值一律回退 `redis`，见「存储后端」节 |
+| `storage.postgres.host` | — | `127.0.0.1` | PG 主机（仅当 backend=postgres 时读） |
+| `storage.postgres.port` | — | `5432` | PG 端口 |
+| `storage.postgres.dbname` | — | `keepsake` | PG 库名 |
+| `storage.postgres.user` | — | `""` | PG 用户 |
+| `storage.postgres.password` | — | `""` | PG 口令 |
+| `storage.postgres.sslmode` | — | `""` | PG sslmode |
+| `embed_dim` | — | `1536` | PG `embedding vector(N)` 列的维度。**不配 embedder 时必须显式给**，见「存储后端」→ embed_dim |
 | `redis_host` | `KEEPSAKE_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
 | `redis_port` | `KEEPSAKE_REDIS_PORT` | `6379` | Redis 端口 |
 | `top_k` | `KEEPSAKE_TOP_K` | `5` | 最终返回条目数 |
@@ -326,11 +333,11 @@ yeah
 | `hot_topic_boost` | — | `1.2` | 热门话题加权乘数 |
 | `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
-| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1` | API 端点 |
+| `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1/embeddings` | API 端点 |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |
 | `consolidate_min_group` | — | `3` | 合并触发最少条目数 |
-| `consolidate_min_overlap` | — | `3` | 判为同一主题所需的最少公共关键词数 |
-| `consolidate_max_age_hours` | — | `72` | 条目最少年龄（小时）后才参与合并 |
+| `consolidate_min_overlap` | — | `3` | 判为同一主题所需的最少公共关键词数。非法值告警并回落 `3`，见「存储后端」→ 合并阈值 |
+| `consolidate_max_age_hours` | — | `72` | 条目最少年龄（小时）后才参与合并。**不从 config.json 读** —— 用 `Consolidator(max_age_hours=…)` 传 |
 | `forget_max_age_days` | — | `30` | 条目保留天数后可能被遗忘 |
 | `forget_dry_run` | — | `true` | 遗忘安全模式：仅统计不删除 |
 | `hot_topic_decay_half_days` | — | `30` | 热门话题时间衰减半衰期（天） |
@@ -347,6 +354,173 @@ yeah
 | `entity_cooc_min_count` | — | `2` | 实体共现几次才算有效关联 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
+
+## 存储后端（Redis / PostgreSQL）
+
+### 切换后端
+
+后端由 `storage.backend` **一行配置**决定：
+
+```json
+"storage": {
+  "backend": "postgres",
+  "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
+               "user": "keepsake", "password": "***", "sslmode": ""}
+}
+```
+
+`redis`（缺省）与 `postgres` **功能等价**：写入、BM25 + KNN 检索、合并、遗忘在两个后端上都能跑。差异只在实现 —— 同一套 `StorageBase` 接口，两个实现类。
+
+- `backend` 缺行 / 空串 / 非字符串 / 非法值**一律回退 `redis`**，现有部署行为逐字不变。
+- 装可选依赖：`pip install 'keepsake-memory[postgres]'`（带 `psycopg[binary]`）。数据库侧还需要 **pgvector** —— KNN 列是 `embedding vector(N)` + HNSW 余弦索引。
+- import `storage_pg` **不需要**装 `psycopg`（连接时才 import），所以缺可选依赖不会把纯 Redis 部署拖挂。
+
+### `embed_dim`
+
+顶层键，默认 `1536`，决定 PG `embedding vector(N)` 列的宽度。
+
+**不配 embedder 时必须显式给 `embed_dim`**（例如库是 `bge-m3` 建的 1024 维，就写 `1024`）。不配 embedder 时 provider 会回落默认 `1536`；若线上列是 `vector(1024)`，`ensure_index()` 抛 `_SchemaDimMismatch` ⇒ provider 初始化中止、记忆 0 召回。配了 embedder 时以模型登记维度为准，`embed_dim` 只是兜底。
+
+### schema 自愈
+
+`ensure_index()` 幂等，且能自愈 schema —— 它**绝不无脑重发 DDL**：
+
+1. **先查后补** —— 查 `information_schema` / `pg_indexes`，**缺什么才发什么**；schema 齐备时一条 DDL 都不发。
+2. **进程内一次性** —— 按 `(目标库, 维度)` 记忆，重复调用直接返回，不发任何 SQL。
+3. **串行 + 有界** —— 固定 `pg_advisory_lock` + `SET LOCAL lock_timeout = 5000`，最多 3 次重试、退避递增。重试超限则记 ERROR 并**返回 `False`**（明确失败，绝不静默成功）。
+
+落到具体场景：**老库缺列**会通过 `ALTER TABLE ... ADD COLUMN` 自动补回维护列，维度已知时再补 `content_tsv` / `embedding`；**空库**不再与 `CREATE TABLE` 撞车（维护列的 `ALTER` 带 `IF NOT EXISTS`，建表路径与补列路径双向幂等）。
+
+### 维护能力与四个后端无关原语
+
+合并与遗忘**只**通过 `StorageBase` 上的四个原语访问存储，这正是两个后端行为一致的原因：
+
+| 原语 | Redis | PostgreSQL |
+|------|-------|------------|
+| `scan_fragment_keys(cursor, limit, prefix)` | `SCAN` 游标 | keyset 分页 `WHERE key > :cursor ORDER BY key LIMIT n`（**禁用大 OFFSET**） |
+| `get_fragments_batch(keys)` | `HMGET` | `WHERE key = ANY(...)` |
+| `write_fragments_batch(rows)` | pipeline upsert | upsert，并重算 `content_tsv` / `embedding` |
+| `update_fragment_fields(key, fields)` | `HSET` | 局部 `UPDATE`（不动 `content` / `content_tsv` / `embedding`） |
+| `delete_fragments_batch(keys)` | pipeline `DEL` | `DELETE ... WHERE key = ANY(...)` + 时间线清理 |
+
+游标是不透明字符串：`""` 表示从头开始，返回的 `next_cursor` 为空表示已扫完。
+
+PG 侧维护列 `level` / `consumed_by` / `consumed_at` 是 `TEXT NOT NULL DEFAULT ''`。**判「未设置」必须用 `= ''`，不得用 `IS NULL`**；默认值保证存量行兼容。
+
+写入语义同样等价：同内容去重时旧版本标 `valid_until` / `is_archived`，新版本另起 `:<epoch>` 后缀 key；R6「命中不覆盖 content」的规则在两个后端上都成立。
+
+### 合并阈值
+
+两个顶层 `config.json` 键（**只有配置文件，没有环境变量**）：
+
+| 键 | 默认值 | 含义 |
+|----|--------|------|
+| `consolidate_min_overlap` | `3` | 两条碎片判为同主题所需的最少公共关键词数 |
+| `consolidate_min_group` | `3` | 一组碎片达到多少条才真合并 |
+
+`consolidate_min_overlap` 此前写死 `2`，生产实测 2819 条里会并 1498 条（53%）；改成 `3` 后约 13%。非法值（非整数 / 布尔 / `< 1`）告警并回落默认值，绝不崩。
+
+合并与遗忘由**运维脚本 / cron 每轮现构造**，provider 不常驻 ⇒ 改这两个键**下一轮生效，无需重启**。为什么 provider 不再常驻合并器，见「Consolidator 退役」一节。
+
+### Redis → PostgreSQL 迁移
+
+```bash
+python3 scripts/migrate_redis_to_pg.py --dry-run     # 只读，只打印计划
+python3 scripts/migrate_redis_to_pg.py --limit 100   # 先迁 100 条试水
+python3 scripts/migrate_redis_to_pg.py                # 全量
+python3 scripts/migrate_redis_to_pg.py --skip-aux     # 只搬碎片，不搬辅助结构
+python3 scripts/migrate_redis_to_pg.py --config /path/to/config.json
+```
+
+该脚本对 Redis **严格只读**（只用 `SCAN` / `HGETALL` / `PING`，启动时用 AST 自检撞写命令黑名单）、**幂等**（`ON CONFLICT (key) DO UPDATE`）、已有的 `embed_bin` 向量**搬运而非重算**（保证两库同源可比），并把辅助结构（话题榜 / 注意力榜 / 实体时间线 / 共现 / 同义词）与碎片一并迁走 —— 迁完逐项打印两侧计数，对不上立即 FAIL。凭据一律来自 keepsake 的 `config.json` / `KEEPSAKE_CONFIG`，不硬编码、不打印、不进日志。
+
+### 已知后端差异
+
+只有语料维护类和两个「死字段」方法有差异，且都是**显式失败而非静默**：
+
+| 方法 | PostgreSQL 行为 | 原因 |
+|------|----------------|------|
+| `discover_synonyms` | 抛 `NotImplementedError` | 语料维护类，与检索正交 |
+| `generate_jieba_dict` | 抛 `NotImplementedError` | 同上 |
+| `touch_fragment` | 返回 `False` + 打日志 | `ks_fragment` 无 `touch_count` / `updated_at` 列；这两个字段全仓无读取方 |
+| `set_supersedes` | 返回 `False` + 打日志 | 同样无读取方 —— 反向封边走 `supersede_fragment`，两个后端都实现了 |
+
+### 切换后端后的自检清单
+
+把 `storage.backend` 指向 PostgreSQL 后，按序跑下面几步。前四步完全无副作用，后两步是 dry-run（零写入）。
+
+```bash
+export PYTHONPATH=src
+export KEEPSAKE_CONFIG="$HOME/.config/keepsake/config.json"   # 配置文件不在默认位置就改这里
+```
+
+**1. `ensure_index()` → True**（建 / 修 schema，成功时打印 `schema ready on …`）：
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import resolve_backend, storage_from_config
+cfg = _load_json_config()
+print("backend =", resolve_backend(cfg))
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print("ensure_index =", st.ensure_index())
+PY
+```
+
+**2. 健康检查**（PG 侧是 `SELECT 1`）：
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print("health_check =", st.health_check())
+PY
+```
+
+**3. 跑一次检索** —— 期望有命中且分数非零，而不是空列表：
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+for hit in st.search("一句你确定在记忆里的原话"):
+    print(hit.get("_key"), hit.get("_sim"), (hit.get("content") or "")[:60])
+PY
+```
+
+**4. 合并 dry-run**（零写入 —— 只扫描 + 聚类 + 报组数）：
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+from keepsake.consolidator import Consolidator
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print(Consolidator(storage=st, config=cfg).consolidate(dry_run=True))
+PY
+```
+
+**5. 遗忘 dry-run**（零写入 —— 只统计候选，一条都不删）：
+
+```bash
+python3 - <<'PY'
+from keepsake import _load_json_config
+from keepsake.storage import storage_from_config
+from keepsake.forgetter import Forgetter
+cfg = _load_json_config()
+st = storage_from_config(config=cfg, agent_id=cfg.get("agent_id", ""), is_primary=cfg.get("is_primary", False))
+print(Forgetter(storage=st, dry_run=True).forget())
+PY
+```
+
+两次 dry-run 都应报 `dry_run: True`，且 `deleted: 0` / `would_merge` 有计数。两者都不动数据 —— 比对前后碎片总数即可确认。
+
+> 凭据一律从 `config.json`（或 `KEEPSAKE_CONFIG`）读；上面命令**没有一条**在命令行传口令，**也没有一条**会打印口令。
 
 ### Embedding 模型与维度
 
@@ -412,7 +586,7 @@ keepsake/
 │   ├── plugin.yaml
 │   └── __init__.py
 ├── cron/                 # 定时任务包装脚本
-│   ├── memory-maintenance.py   # 每 2h — 记忆合并 + 遗忘
+│   ├── memory-maintenance.py   # 每 2h — 选择性遗忘（合并不在此脚本，见「维护能力」）
 │   ├── dedup-memory.sh         # 每 1h — 去重
 │   └── discover-synonyms.py    # 每 8h — 同义词自动发现
 ├── scripts/              # 独立工具脚本（开发/测试）
@@ -462,9 +636,19 @@ keepsake/
          ┌─────────▼─────────┐
          │   [cron] 每 2h     │  ← 后台 maintenance
          │   ① 选择性遗忘     │  ← 低价值条目清理
-         │   (Consolidator 已于 2026-09 退役，提纯归 v2 两相管线)
+         │   (合并由运维脚本每轮现构造，不在 provider 内触发)
          └───────────────────┘
 ```
+
+## Consolidator 退役（2026-09-09）
+
+**退役的只是 provider 的运行期接线，不是这个能力。** `Consolidator`（基于 jieba 关键词聚类 + LLM 多级缝合的离线合并引擎）类源码完整保留在 `src/keepsake/consolidator.py`，在 **Redis 与 PostgreSQL 两个后端上都能跑**（它只通过[四个后端无关原语](#维护能力与四个后端无关原语)访问存储）。provider 的 `initialize()` 不再构造它、`maintenance()` 不再触发合并循环；`cron/memory-maintenance.py` 只跑遗忘。
+
+**为什么摘掉接线：** LLM 多级合并产出的「无时态散文」与 v2 封边链（`superseded_by`）互不相认（旧产物会被封边过滤误伤或绕过）；提纯职能已被 v2 两相管线的「提取相 + 更新相」全面覆盖；双管线并存要为同一份碎片库维护两套并查链路，得不偿失。
+
+**怎么用合并：** 运维脚本 / cron **每轮现构造** —— `Consolidator(storage=storage_from_config(...), config=cfg).consolidate(dry_run=False)`。因为每轮现读 config，改 `consolidate_min_overlap` / `consolidate_min_group` **下一轮即生效，无需重启**。阈值见「存储后端」→ 合并阈值，dry-run 见「切换后端后的自检清单」。
+
+**运行时观测：** `maintenance()` 返回的 stats 仍保留 `consolidator` 字段（`{"status": "retired", "reason": "v2 pipeline takeover"}`），便于 cron 探针 / 健康检查观测退役状态而非误报 missing-key。
 
 ## 协议
 
