@@ -1,16 +1,18 @@
 """
-SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + schema 自愈）。
+SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + schema 自愈；批 2：检索）。
 
 🔴 **本批能力边界（务必先读）**
   已实现：health_check / ensure_index / close / store / get_fragment /
     get_fragments_batch / fragment_exists / touch_fragment / scan_fragment_keys /
     write_fragments_batch / update_fragment_fields / delete_fragments_batch /
     record_feedback / supersede_fragment / set_supersedes / correct_fragments
-  **未实现且显式抛 NotImplementedError**：search / search_bm25 / search_knn /
-    match_attention / match_hot_topics / get_hot_topics / entity_timeline /
-    discover_synonyms / generate_jieba_dict
-  —— 检索与加权信号属第 2/3 批（FTS5 + sqlite-vec）。**绝不返回空值假装成功**：
-  静默空 = 记忆搜不到且无告警，是本项目最危险的失败形态。
+    —— 批 2 —— search / search_bm25（jieba + FTS5 + bm25 + 共用重排 + 加权信号）
+    match_attention / match_hot_topics / get_hot_topics / entity_timeline
+  **未实现且显式抛 NotImplementedError**：search_knn（需要 `sqlite-vec` 扩展，
+    第 3 批可选懒加载）/ discover_synonyms / generate_jieba_dict
+  —— **绝不返回空值假装成功**：静默空 = 记忆搜不到且无告警，是本项目最危险的
+  失败形态。向量路径不可用时 `search_knn` **抛明确 NotImplementedError** 并说明
+  需要该扩展，`search` 则记 WARNING 后降级为 BM25 单路（降级可辨识、不静默）。
 
 ## 为什么是 SQLite（定位）
   单机 / 单代理场景的**嵌入式**后端：单文件、零服务、零第三方依赖。
@@ -47,11 +49,28 @@ SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + 
     supersedes             → `set_supersedes` 真正落库（PG 侧无该列、返回 False）
     hash                   → `store()` 落内容 hash（与 key 的哈希段同源）
     embed_bin              → `store()` 落 float32 blob（与 Redis 侧同一 struct.pack 格式）
-    content_tsv            → 第 2 批 FTS5 预处理文本（本批不写，留位）
+    content_tsv            → 批 2：FTS5 的分词文本（jieba 切词后空格分隔）
     attention_score        → 任务书要求的列集覆盖（本批无读取方，第 2/3 批用）
   二进制只走 BLOB 列（`embed_bin` / `embedding`），文本列一律 str —— 与
   `storage_pg._text_field` / `storage._decode_hash_value` 同一口径：
   **静默兜底解码把二进制毁成乱码，比报错更糟。**
+
+## 批 2：检索（FTS5 + jieba + BM25 + 共用重排 + 辅助结构）
+  * **分词在 Python 侧**（jieba），与 PG 同路：写库时切一次存进 `content_tsv`，
+    查库时 FTS5 只在**空格分隔的 token 串**上匹配。
+    🔴 为什么不用 trigram 分词器：它有 3 字下限，「证书续签」里的「证书」这种
+    2 字词查恒 0 —— 中文检索里 2 字词占大头，必须靠 jieba 预切 + 默认分词器。
+  * **打分用 FTS5 内建 `bm25()`**（零新依赖，SQLite 自带 FTS5 扩展）：
+    🔴 方向是本批最大的坑 —— FTS5 的 `bm25()` **返回值越小越相关（负数）**，
+    与 PG/Redis 的「分数越大越相关」相反。这里统一取 `-bm25()` 翻正，
+    契约与另两个后端一致（`_bm25_score` 越大越好），才敢共用
+    `storage_shared.rerank_with_decay`（它内部按 min-max 归一化，越大越好）。
+  * **排序/融合/过滤一律复用 `storage_shared`**（`rerank_with_decay` /
+    `apply_v2_filters` / `rrf_fuse` / `attention_boost_from_topics` /
+    `hot_topic_weighted_hits`）—— 三后端一份实现是用户明确要求，本文件不重写。
+  * **降级路径可辨识**：`sqlite-vec` 未装 ⇒ `search_knn` 抛
+    `NotImplementedError`（消息点名需要该扩展），**绝不静默返回空**；
+    `search` 在向量路不可用时记 WARNING 后降级 BM25 单路并照常返回结果。
 
 ## 向量
   **检索**本批不做（任务书明写）。但**写入已在**：`store()` 有 embedder 就落
@@ -75,13 +94,35 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .emotion import analyze_emotion
-from .splitter import extract_entities, extract_keywords
+from .splitter import extract_entities, extract_keywords, segment_query
 from .storage_base import StorageBase
+# 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
+from .storage_shared import (
+    DECAY_HALF_DAYS,
+    FEEDBACK_NEGATIVE_PENALTY,
+    FEEDBACK_POSITIVE_BOOST,
+    HOT_TOPIC_BOOST,
+    HOT_TOPIC_DECAY_HALF_DAYS,
+    SEARCH_FIELDS,
+    apply_v2_filters,
+    attention_boost_from_topics,
+    hot_topic_weighted_hits,
+    load_fragments_by_keys,
+    rrf_fuse,
+    rerank_with_decay,
+)
+# 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
+from .storage import _expand_terms, _sanitize_terms
 # 列集真相与 TTL 口径复用 PG 版同一份常量（不复制 —— 复制必漂移）。
 from .storage_pg import (
+    DEFAULT_BM25_LIMIT,
+    DEFAULT_CANDIDATE_COUNT,
+    DEFAULT_FINAL_LIMIT,
+    MAX_CONTENT_LEN,
     _ATTENTION_SCOPES,
     _ATTENTION_TTL,
     _ENTITY_COOC_TTL,
+    _TOPIC_SCOPE_ALL,
     _TOPIC_SCOPES,
     _TOPIC_TTL,
     FRAGMENT_COLUMNS,
@@ -151,6 +192,17 @@ _CREATE_FRAGMENT = (
     + "\n)"
 )
 
+#: FTS5 虚表名。**与 ks_fragment 解耦**（不是 external-content 表）——
+#: SQLite 的 external-content 表要求删除时手工喂旧 token 串（`'delete'` 命令），
+#: 一旦某条路径漏喂就留下不可见的僵尸行；独立虚表 `DELETE FROM ... WHERE key=?`
+#: 语义直白、不可能漏。代价是 token 串存两份（content_tsv 是「真相」，虚表是索引）。
+FTS_TABLE = "ks_fragment_fts"
+_CREATE_FTS = (
+    f"CREATE VIRTUAL TABLE IF NOT EXISTS {FTS_TABLE} USING fts5("
+    # key 只作回表锚点，不进索引（UNINDEXED），与 PG 侧 tsvector 不含 key 同理。
+    f"frag_key UNINDEXED, content_tok, tokenize='unicode61')"
+)
+
 # 表定义：(表名, CREATE TABLE 语句)
 _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
     ("ks_fragment", _CREATE_FRAGMENT),
@@ -205,14 +257,14 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
         synonyms TEXT NOT NULL DEFAULT '[]'
     )
     """),
+    # 批 2：FTS5 虚表（与上表同源，ensure_index 的「先查后补」循环一并建）
+    (FTS_TABLE, _CREATE_FTS),
 )
 
 _DDL_INDEXES: Tuple[Tuple[str, str], ...] = (
     ("idx_ks_entity_timeline_ts",
      "CREATE INDEX IF NOT EXISTS idx_ks_entity_timeline_ts "
      "ON ks_entity_timeline (entity, ts DESC)"),
-    # 第 2 批的 FTS5 / KNN 索引不在本批建（那时才有读取方）；
-    # 这里只建维护路径真正要用的两条。
     ("idx_ks_fragment_consumed_by",
      "CREATE INDEX IF NOT EXISTS idx_ks_fragment_consumed_by "
      "ON ks_fragment (consumed_by)"),
@@ -281,6 +333,38 @@ def _sha12(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
+def _tok_string(text: str) -> str:
+    """文本 → FTS5 可索引的**空格分隔 token 串**（jieba 切词，与 PG 同路）。
+
+    🔴 为什么必须切：FTS5 的 `unicode61` 分词器按「非字母数字」切，
+    一整串中文会被当成**一个** token ⇒ 查「流程」永远命中不了「部署流程」。
+    预切 + 空格分隔后，unicode61 把空格当天然边界，索引/查询两侧口径一致。
+
+    🔴 为什么不用 trigram 分词器：它有 3 字下限，中文里 2 字词（网关/备份）
+    占大头 ⇒ 查 2 字恒 0 命中。任务书明写「不要 trigram」。
+    """
+    import jieba  # noqa: PLC0415 — 与 splitter / storage_pg 同款延迟 import（首调建词典）
+
+    out: List[str] = []
+    for w in jieba.lcut(text or ""):
+        w = w.strip()
+        if not w or not any(ch.isalnum() for ch in w):
+            continue    # 纯标点/空白 → 只会造出噪音 token
+        out.append(w)
+    return " ".join(out)
+
+
+def _fts_match_expr(terms: List[str]) -> str:
+    """查询词 → FTS5 MATCH 表达式（每个词用双引号包住，OR 连接）。
+
+    为什么逐词加引号：FTS5 查询式里裸词含 `-` `.` `:` 等会被当语法（NEAR/`-` 排除），
+    一个特殊符号就**整条查询报错** → 静默 0 召回（本项目最典型的静默失败形态）。
+    引号内按字面量匹配，双引号本身按 FTS5 规则写两遍转义。
+    """
+    parts = ['"' + t.replace('"', '""') + '"' for t in terms if t]
+    return " OR ".join(parts)
+
+
 # `INSERT ... ON CONFLICT(key) DO UPDATE`（SQLite ≥3.24 内建 upsert，无外部依赖）。
 # 列集是模块常量 ⇒ 语句拼一次即可。
 _UPSERT_SQL = (
@@ -305,6 +389,12 @@ class SqliteStorage(StorageBase):
     fail-open + 汇总告警，与 PG/Redis 同口径。
     """
 
+    # ---- 检索后处理：与 Redis / PG **同一个函数对象**（三后端一份实现）----
+    _rrf_fuse = rrf_fuse
+    _apply_v2_filters = apply_v2_filters
+    _rerank_with_decay = rerank_with_decay
+    _load_fragments_by_keys = load_fragments_by_keys
+
     def __init__(
         self,
         path: str = "",
@@ -313,8 +403,20 @@ class SqliteStorage(StorageBase):
         embedder: Optional[Any] = None,
         embed_dim: int = 1536,
         busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+        # ---- 检索参数（键名/默认值与 PG 版逐字同源，值全部来自配置）----
+        candidate_count: int = DEFAULT_CANDIDATE_COUNT,
+        final_limit: int = DEFAULT_FINAL_LIMIT,
+        bm25_limit: int = DEFAULT_BM25_LIMIT,
+        decay_half_days: int = DECAY_HALF_DAYS,
+        attention_boost_max: float = 1.5,
         attention_base_increment: float = 2.0,
         attention_emotion_factor: float = 1.5,
+        hot_topic_decay_half_days: int = HOT_TOPIC_DECAY_HALF_DAYS,
+        hot_topic_boost: float = HOT_TOPIC_BOOST,
+        emotion_intensity_factor: float = 0.4,
+        feedback_positive_boost: float = FEEDBACK_POSITIVE_BOOST,
+        feedback_negative_penalty: float = FEEDBACK_NEGATIVE_PENALTY,
+        v2_min_score: float = 0.05,
         **_: Any,
     ):
         self._path = str(path or DEFAULT_SQLITE_PATH)
@@ -339,8 +441,20 @@ class SqliteStorage(StorageBase):
                 embed_dim = int(getattr(embedder, "dimension", embed_dim) or embed_dim)
         self._embed_dim = int(embed_dim)
         self._busy_timeout_ms = int(busy_timeout_ms)
+        # ---- 检索参数（与 PG 同名同义：共用重排按这些键取值，一个都不能少）----
+        self._candidate_count = int(candidate_count)
+        self._final_limit = int(final_limit)
+        self._bm25_limit = int(bm25_limit)
+        self._decay_half_days = int(decay_half_days)
+        self._emotion_intensity_factor = float(emotion_intensity_factor)
+        self._feedback_positive_boost = float(feedback_positive_boost)
+        self._feedback_negative_penalty = float(feedback_negative_penalty)
+        self._hot_topic_boost = float(hot_topic_boost)
+        self._v2_min_score = float(v2_min_score)
+        self._attention_boost_max = float(attention_boost_max)
         self._attention_base_increment = float(attention_base_increment)
         self._attention_emotion_factor = float(attention_emotion_factor)
+        self._hot_topic_decay_half_days = int(hot_topic_decay_half_days)
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         # 最近一次 ensure_index 的结果（进异常消息 ⇒ 「未就绪」可定位，不用猜）
@@ -532,8 +646,19 @@ class SqliteStorage(StorageBase):
                 #    先建索引就是 `no such column: consumed_by` ⇒ ensure_index False。
                 for _, ddl in _DDL_INDEXES:
                     cur.execute(ddl)
+                # 🔴 FTS 自愈（批 2）：批 1 建的库**有数据但索引是空的**
+                #    （虚表当时才建/才补）。行数不一致就全量重建一次。
+                #    判据用「计数」而不是「是否存在」—— 空索引与满索引长得一样，
+                #    只有计数能区分；重建是幂等的（DELETE + 逐行重插）。
+                n_frag = cur.execute("SELECT COUNT(*) FROM ks_fragment").fetchone()[0]
+                n_fts = cur.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()[0]
+                rebuilt = 0
+                if n_frag != n_fts:
+                    rebuilt = self._fts_rebuild(cur)
             if added:
                 logger.info("storage_sqlite: ks_fragment 补列 %d 个: %s", len(added), added)
+            if rebuilt:
+                logger.info("storage_sqlite: FTS 索引重建 %d 行（批 1 老库补索引）", rebuilt)
             logger.info("storage_sqlite: schema ready on %s", self._path)
             self._last_ensure_ok, self._last_ensure_error = True, None
             return True
@@ -544,20 +669,27 @@ class SqliteStorage(StorageBase):
             return False
 
     def _schema_ready(self) -> Tuple[bool, Optional[str]]:
-        """`ks_fragment` 是否已具备**全部列**（写路径的前提）。
+        """`ks_fragment` 是否已具备**全部列** + FTS 虚表是否在（读写路径的前提）。
 
-        只发 `PRAGMA table_info`（只读、不拿 schema 锁、不发 DDL），健康路径成本可忽略。
-        表不存在 ⇒ 返回空集合 ⇒ 判为未就绪。**探测本身出错也判未就绪**（不是就绪）。
-        返回 (是否就绪, 探测失败时的原因)。
+        只发 `PRAGMA table_info` / 查 `sqlite_master`（只读、不拿 schema 锁、不发 DDL），
+        健康路径成本可忽略。表不存在 ⇒ 返回空集合 ⇒ 判为未就绪。
+        **探测本身出错也判未就绪**（不是就绪）。返回 (是否就绪, 探测失败时的原因)。
         """
         try:
             with self._lock:
-                have = self._table_columns(self._db().cursor(), "ks_fragment")
+                cur = self._db().cursor()
+                have = self._table_columns(cur, "ks_fragment")
+                has_fts = cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (FTS_TABLE,),
+                ).fetchone() is not None
         except Exception as e:      # noqa: BLE001 — 探测失败即「未就绪」，绝不当作就绪
             return False, f"{type(e).__name__}: {e}"
-        if set(ALL_COLUMNS) <= have:
-            return True, None
-        return False, "ks_fragment 缺列: " + ",".join(sorted(set(ALL_COLUMNS) - have))
+        if not set(ALL_COLUMNS) <= have:
+            return False, "ks_fragment 缺列: " + ",".join(sorted(set(ALL_COLUMNS) - have))
+        if not has_fts:
+            return False, f"{FTS_TABLE} 虚表不存在（FTS5 索引未就绪）"
+        return True, None
 
     def _require_ready(self, op: str) -> None:
         """读写路径入口守卫：schema 未就绪 ⇒ **补跑一次** `ensure_index()`，仍不就绪就抛。
@@ -627,6 +759,18 @@ class SqliteStorage(StorageBase):
         try:
             with self._write() as cur:
                 cur.execute(_UPSERT_SQL, params)
+                # FTS 索引：按**主表落库后的实际值**建（upsert 可能只覆盖部分列，
+                # 用 fields 里的值会漏掉未传的 content/entities/tags）。
+                row = cur.execute(
+                    "SELECT content, COALESCE(entities,''), COALESCE(tags,'') "
+                    "FROM ks_fragment WHERE key = ?", (str(key),),
+                ).fetchone()
+                if row is not None:
+                    cur.execute(
+                        "UPDATE ks_fragment SET content_tsv = ? WHERE key = ?",
+                        (self._fts_tokens(*row), str(key)),
+                    )
+                    self._fts_write(cur, str(key), self._fts_tokens(*row))
             return True
         except (_BytesFieldError, StorageNotReadyError):
             raise
@@ -674,13 +818,16 @@ class SqliteStorage(StorageBase):
                     )
                     key = f"{key}:{int(time.time())}"
                 entities_str = ",".join(entities) if entities else ""
+                # 批 2：分词文本与 FTS 索引**同一个写事务**、且在主表之后
+                # —— 任一步抛错都整体 ROLLBACK，绝不出现「主表有行、索引没有」。
+                tokens = self._fts_tokens(text, entities_str, final_tags)
                 cur.execute(
                     """
                     INSERT INTO ks_fragment (
                         key, content, tags, category, source, created, updated, hash,
                         sentiment_score, sentiment_label, feedback_score,
-                        entities, fragment_type, embed_bin
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        entities, fragment_type, embed_bin, content_tsv
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(key) DO UPDATE SET
                         content=excluded.content, tags=excluded.tags,
                         category=excluded.category, source=excluded.source,
@@ -690,12 +837,14 @@ class SqliteStorage(StorageBase):
                         sentiment_label=excluded.sentiment_label,
                         feedback_score=excluded.feedback_score,
                         entities=excluded.entities, fragment_type=excluded.fragment_type,
-                        embed_bin=COALESCE(excluded.embed_bin, ks_fragment.embed_bin)
+                        embed_bin=COALESCE(excluded.embed_bin, ks_fragment.embed_bin),
+                        content_tsv=excluded.content_tsv
                     """,
                     (key, text, final_tags, category, source, now_iso, now_iso,
                      content_hash, str(intensity), label, existing_feedback,
-                     entities_str, fragment_type, self._text_to_blob(text)),
+                     entities_str, fragment_type, self._text_to_blob(text), tokens),
                 )
+                self._fts_write(cur, key, tokens)
                 self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
                 if entities:
                     self._record_entity_cooc(cur, entities, now_ts=now.timestamp())
@@ -712,6 +861,47 @@ class SqliteStorage(StorageBase):
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: store error: %s", e)
             return False
+
+    # ------------------------------------------------------------------
+    # FTS5 索引维护（批 2）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fts_tokens(content: str, entities: str, tags: str) -> str:
+        """分词文本 = content 的 jieba 词 + entities/tags 的 jieba 词。
+
+        与 PG 侧 `content_tsv = A(content) || B(entities + tags)` **同一召回面**：
+        正文、实体、标签三路都进索引（对应 Redis 的 `@content|@entities|@tags`）。
+        """
+        return " ".join(x for x in (_tok_string(content or ""),
+                                    _tok_string(f"{entities or ''} {tags or ''}")) if x)
+
+    def _fts_write(self, cur: sqlite3.Cursor, key: str, tokens: str) -> None:
+        """FTS 行 upsert（先删后插 —— FTS5 没有 ON CONFLICT）。"""
+        cur.execute(f"DELETE FROM {FTS_TABLE} WHERE frag_key = ?", (key,))
+        if tokens:
+            cur.execute(
+                f"INSERT INTO {FTS_TABLE} (frag_key, content_tok) VALUES (?,?)",
+                (key, tokens),
+            )
+
+    def _fts_delete(self, cur: sqlite3.Cursor, key: str) -> None:
+        cur.execute(f"DELETE FROM {FTS_TABLE} WHERE frag_key = ?", (key,))
+
+    def _fts_rebuild(self, cur: sqlite3.Cursor) -> int:
+        """**全量重建** FTS（老库首次补索引 / 自愈用）。
+
+        🔴 为什么需要：批 1 建的库已有数据但没有 FTS 表，补建虚表后索引是空的
+        ⇒ 检索恒 0 命中，而「表在、查询正常执行、结果永远为空」正是最危险的
+        静默失败形态。`ensure_index()` 用「行数不一致就重建」这条幂等判据兜住。
+        """
+        cur.execute(f"DELETE FROM {FTS_TABLE}")
+        rows = cur.execute(
+            "SELECT key, content, COALESCE(entities,''), COALESCE(tags,'') FROM ks_fragment"
+        ).fetchall()
+        for key, content, entities, tags in rows:
+            self._fts_write(cur, key, self._fts_tokens(content, entities, tags))
+        return len(rows)
 
     def _upsert_scores(self, cur: sqlite3.Cursor, table: str, key_cols: Tuple[str, ...],
                        rows: List[tuple]) -> None:
@@ -981,6 +1171,11 @@ class SqliteStorage(StorageBase):
         """局部 UPDATE，**不碰 content / content_tsv / embedding**。
 
         只更新白名单列里出现的字段；其它 key 一律忽略（拼 SQL 前必须白名单校验）。
+
+        🔴 批 2 追加：若本次更新碰了**进索引的三列**（content/entities/tags），
+        就地重算 `content_tsv` 并同步 FTS —— 否则正文改了、索引还是旧的，
+        检索结果**静默错**（不是召回不到，是召回错误内容）。与 PG 侧
+        `update_fragment_fields` 不碰 content_tsv 的差异就此消掉。
         """
         if not key or not fields:
             return False
@@ -991,10 +1186,22 @@ class SqliteStorage(StorageBase):
         set_sql = ", ".join(f"{c} = ?" for c in cols)
         params = [(_blob_value(fields[c]) if c in _BLOB_COLUMNS else _as_text(fields[c]))
                   for c in cols] + [key]
+        reindex = bool({"content", "entities", "tags"} & set(cols))
         try:
             with self._write() as cur:
                 cur.execute(f"UPDATE ks_fragment SET {set_sql} WHERE key = ?", params)
-                return cur.rowcount > 0
+                ok = cur.rowcount > 0
+                if ok and reindex:
+                    row = cur.execute(
+                        "SELECT content, COALESCE(entities,''), COALESCE(tags,'') "
+                        "FROM ks_fragment WHERE key = ?", (key,),
+                    ).fetchone()
+                    if row is not None:
+                        tokens = self._fts_tokens(*row)
+                        cur.execute("UPDATE ks_fragment SET content_tsv = ? WHERE key = ?",
+                                    (tokens, key))
+                        self._fts_write(cur, key, tokens)
+                return ok
         except StorageNotReadyError:
             raise
         except Exception as e:      # noqa: BLE001
@@ -1022,6 +1229,11 @@ class SqliteStorage(StorageBase):
                     deleted += cur.execute(
                         f"DELETE FROM ks_fragment WHERE key IN ({placeholders})", chunk,
                     ).rowcount
+                    # 🔴 FTS 必须同步删：不删就是**僵尸行** —— 正文已不存在，
+                    # 检索仍能召回它，取回正文时又查不到 ⇒ 静默错结果。
+                    cur.execute(
+                        f"DELETE FROM {FTS_TABLE} WHERE frag_key IN ({placeholders})", chunk,
+                    )
         except StorageNotReadyError:
             raise
         except Exception as e:      # noqa: BLE001
@@ -1085,32 +1297,336 @@ class SqliteStorage(StorageBase):
             return False
 
     # ------------------------------------------------------------------
-    # 留桩（批 2/3）—— 显式抛错，绝不静默返回空值
+    # 检索（批 2：jieba + FTS5 + bm25 + 共用重排）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_tag(tag: str) -> str:
+        """tag 值清理 —— 与 PG `PgStorage._clean_tag` / Redis `_tag_safe` 同意图。"""
+        for ch in ("\\", "{", "}", "|", ",", '"', "'", " "):
+            tag = tag.replace(ch, "")
+        return tag.strip()
+
+    def _search_filter_sql(
+        self,
+        tag_filter: str,
+        agent_id: str,
+        is_primary: Optional[bool],
+    ) -> Tuple[str, List[Any]]:
+        """检索 WHERE 片段（标签 + agent 隔离 + 活记忆），语义逐条对齐 PG/Redis。
+
+        🔴 tag 匹配用 `instr('|'||tags||'|', '|tag|') > 0` 而不是 LIKE：
+        与 PG 侧 `strpos` 同理 —— 只在**完整标签边界**上匹配（`agent:a` 不会命中
+        `agent:ab`），且 tag 里的 `%` `_` 不会被当通配符。
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        effective_agent_id = agent_id if agent_id else self._agent_id
+        effective_is_primary = is_primary if is_primary is not None else self._is_primary
+
+        if not effective_is_primary:
+            if effective_agent_id:
+                clauses.append(
+                    "(instr('|'||tags||'|', ?) > 0 OR instr('|'||tags||'|', '|shared|') > 0)"
+                )
+                params.append(f"|{self._clean_tag(f'agent:{effective_agent_id}')}|")
+            else:
+                clauses.append("instr('|'||tags||'|', '|shared|') > 0")
+
+        if tag_filter:
+            needles = [f"|{self._clean_tag(t)}|"
+                       for t in (x.strip() for x in tag_filter.split(","))
+                       if self._clean_tag(t)]
+            if needles:
+                clauses.append("(instr('|'||tags||'|', ?) > 0 OR "
+                               + " OR ".join(["instr('|'||tags||'|', ?) > 0"]
+                                             * (len(needles) - 1)) + ")")
+                params.extend(needles)
+
+        clauses.append("invalid_at = ''")
+        clauses.append("valid_until = ''")
+        clauses.append(f"content <> '' AND length(content) <= {int(MAX_CONTENT_LEN)}")
+        return " AND ".join(clauses), params
+
+    def _load_synonym_map(self) -> Dict[str, set]:
+        """同义词表（对齐 Redis `keepsake:synonyms` / PG `ks_synonym`）。
+
+        🔴 必须同源：PG/Redis 的 BM25 都拿它做查询式扩展，本后端自己造一张表
+        就等于「同义词这条召回面单边失效」，三后端对照直接失真。
+        """
+        out: Dict[str, set] = {}
+        try:
+            with self._lock:
+                rows = self._db().execute("SELECT term, synonyms FROM ks_synonym").fetchall()
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: load synonyms error: %s", e)
+            return out
+        for term, syns in rows:
+            key = (term or "").lower().strip()
+            if not key:
+                continue
+            bucket = out.setdefault(key, set())
+            for s in (syns or []):
+                sl = str(s).lower().strip()
+                if sl and sl != key:
+                    bucket.add(sl)
+        return out
+
+    def _fetch_superseded_by(self, keys: List[str]) -> Dict[str, str]:
+        """storage_shared 的后端钩子：批量读封边标记（一条 SQL，不 N+1）。"""
+        if not keys:
+            return {}
+        out: Dict[str, str] = {}
+        try:
+            with self._lock:
+                cur = self._db().cursor()
+                for chunk in _chunks(list(keys)):
+                    placeholders = ", ".join("?" for _ in chunk)
+                    for k, sb in cur.execute(
+                        f"SELECT key, superseded_by FROM ks_fragment "
+                        f"WHERE key IN ({placeholders})", chunk,
+                    ):
+                        if sb:
+                            out[k] = sb
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: _fetch_superseded_by failed: %s", e)
+        return out
+
+    def _fetch_fragments(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """storage_shared 的后端钩子：批量读碎片（字段裁到检索形状）。"""
+        if not keys:
+            return {}
+        cols = ("key",) + tuple(c for c in SEARCH_FIELDS if c != "key")
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            with self._lock:
+                cur = self._db().cursor()
+                for chunk in _chunks(list(keys)):
+                    placeholders = ", ".join("?" for _ in chunk)
+                    for row in cur.execute(
+                        f"SELECT {', '.join(cols)} FROM ks_fragment "
+                        f"WHERE key IN ({placeholders})", chunk,
+                    ):
+                        out[row[0]] = self._row_to_fragment(row, cols)
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: _fetch_fragments failed: %s", e)
+        return out
+
+    @staticmethod
+    def _tiebreak(fragments: List[Dict[str, Any]],
+                  score_key: str = "_combined_score") -> List[Dict[str, Any]]:
+        """**并列 tiebreaker**：同分时按 `key` 字典序（升序）定序。
+
+        与 `PgStorage._tiebreak` 同语义：共用重排只用一个分字段，
+        BM25 归一化后大量候选挤在同一值上 ⇒ 排序不稳定会让「同一题连查多次
+        结果不一致」。规则只改同分项之间的相对次序，不改分数、不改条数。
+        """
+        if len(fragments) < 2:
+            return fragments
+        return sorted(fragments,
+                      key=lambda f: (-float(f.get(score_key, 0.0) or 0.0),
+                                     f.get("_key") or ""))
 
     def search(self, query: str, tag_filter: str = "", agent_id: str = "",
                is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="search"))
+        """统一检索入口（与 `RedisStorage.search` / `PgStorage.search` 同构）。
+
+          1. BM25 全文（jieba + FTS5 + 内建 bm25）
+          2. KNN 向量路（`sqlite-vec`，第 3 批可选懒加载）
+          3. 两路都非空 → RRF 融合 → v2 后置过滤
+
+        🔴 **降级路径可辨识**：向量扩展不可用时记一条 WARNING 后走 BM25 单路
+        （与 PG「无 embedder 就只走 BM25」同构），**不是静默返回空**；
+        需要向量结果的调用方请直接调 `search_knn`，那里抛的是明确的
+        `NotImplementedError`。
+        """
+        effective_agent_id = agent_id if agent_id else self._agent_id
+        effective_is_primary = is_primary if is_primary is not None else self._is_primary
+
+        bm25_results = self.search_bm25(query, tag_filter, effective_agent_id,
+                                        effective_is_primary)
+        try:
+            knn_results = self.search_knn(query, tag_filter, effective_agent_id,
+                                          effective_is_primary)
+        except NotImplementedError as e:
+            logger.warning(
+                "storage_sqlite: search() 向量路不可用，降级为 BM25 单路（不是静默空结果）：%s", e)
+            knn_results = []
+        if knn_results:
+            fused = self._tiebreak(self._rrf_fuse(bm25_results, knn_results))
+            return self._apply_v2_filters(fused)
+        return self._apply_v2_filters(bm25_results)
 
     def search_bm25(self, query: str, tag_filter: str = "", agent_id: str = "",
                     is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="search_bm25"))
+        """BM25 全文搜索（jieba 切词 → FTS5 MATCH 召回 → FTS5 内建 `bm25()` 打分
+        → 共用 `rerank_with_decay` 重排 → 取 `final_limit` 条）。
+
+        🔴 **打分方向（本批最大的坑）**：FTS5 的 `bm25()` 返回**负数、越小越相关**，
+        与 PG/Redis 的「越大越相关」相反。这里统一取 `-bm25()` 翻正，
+        `_bm25_score` 契约才与另两个后端一致，共用重排的 min-max 归一化才成立。
+
+        返回字段与 PG `search_bm25` 逐字段对齐（`SEARCH_FIELDS` + `_key` /
+        `_bm25_score` / `_sim` / `_combined_score` / `_weights`）。
+        """
+        if not (query or "").strip():
+            logger.warning("storage_sqlite: search_bm25 called with an empty query — "
+                           "returning no results (explicit, not a backend outage)")
+            return []
+        self._require_ready("search_bm25")
+
+        # 1. 查询式构造：与 PG 侧逐字同一套（同义词扩展 + sanitize 拆子词）
+        terms = _sanitize_terms(
+            _expand_terms(segment_query(query), self._load_synonym_map()))
+        if not terms:
+            logger.warning("storage_sqlite: query %r sanitized down to zero terms — "
+                           "returning no results (explicit)", query[:50])
+            return []
+
+        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
+        expr = _fts_match_expr(terms)
+        try:
+            with self._lock:
+                cur = self._db().cursor()
+                cur.execute(
+                    f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
+                    f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
+                    f"f.entities, f.fragment_type, f.invalid_at, "
+                    # 🔴 取负翻正（越大越相关），排序键同向 ⇒ ORDER BY 用 DESC
+                    f"-bm25({FTS_TABLE}) AS bm25_pos "
+                    f"FROM {FTS_TABLE} JOIN ks_fragment f ON f.key = {FTS_TABLE}.frag_key "
+                    f"WHERE {FTS_TABLE} MATCH ? AND {where_sql} "
+                    f"ORDER BY bm25_pos DESC, f.key LIMIT ?",
+                    [expr, *params, self._bm25_limit],
+                )
+                rows = cur.fetchall()
+        except sqlite3.OperationalError as e:
+            # FTS5 查询式语法错/表缺失 → **显式告警**（PG/Redis 都犯过「语法错被
+            # debug 吞掉 ⇒ 整类查询静默 0 召回」的错，这里提到 warning 并向上抛）。
+            logger.error("storage_sqlite: FTS MATCH 失败 (query=%r): %s", query[:50], e)
+            raise
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: search_bm25 error: %s: %s", type(e).__name__, e)
+            return []
+
+        fragments: List[Dict[str, Any]] = []
+        for row in rows:
+            key, content, tags, category, source, created, sent, label, fb, \
+                entities, ftype, invalid_at, score = row
+            frag: Dict[str, Any] = {"_key": key, "_bm25_score": float(score or 0.0)}
+            for name, value in (
+                ("content", content), ("tags", tags), ("category", category),
+                ("source", source), ("created", created), ("sentiment_score", sent),
+                ("sentiment_label", label), ("feedback_score", fb),
+                ("entities", entities), ("fragment_type", ftype), ("invalid_at", invalid_at),
+            ):
+                if value is None or value == "":
+                    continue          # 稀疏语义：空值不进 dict（同 PG/Redis）
+                frag[name] = value if isinstance(value, str) else str(value)
+            if frag.get("content"):
+                fragments.append(frag)
+        if not fragments:
+            return []
+
+        # 2. 共用重排（时间衰减 × 情绪 × 反馈 × 热门 × 注意力）+ tiebreak + 截断。
+        #    与 PG `search_bm25` 逐步同序：重排 → tiebreak → [:final_limit]。
+        ranked = self._rerank_with_decay(fragments, score_key="_bm25_score")
+        return self._tiebreak(ranked)[: self._final_limit]
+
+    # ------------------------------------------------------------------
+    # 加权信号（批 2）
+    # ------------------------------------------------------------------
+
+    def _hot_snapshot(self, limit: int) -> Tuple[List[str], Dict[str, float]]:
+        """热词榜（scope=all、未过期）+ last_seen —— 与 PG 侧同源同口径。"""
+        now_ts = time.time()
+        with self._lock:
+            cur = self._db().cursor()
+            topics = [t for (t,) in cur.execute(
+                f"SELECT topic FROM ks_hot_topic WHERE scope = ? AND expire_ts > ? "
+                f"ORDER BY score DESC LIMIT ?", (_TOPIC_SCOPE_ALL, now_ts, int(limit)),
+            )]
+            last_seen: Dict[str, float] = {}
+            if topics:
+                placeholders = ", ".join("?" for _ in topics)
+                last_seen = {t: float(ls) for t, ls in cur.execute(
+                    f"SELECT topic, last_seen FROM ks_hot_topic_seen "
+                    f"WHERE topic IN ({placeholders})", topics,
+                )}
+        return topics, last_seen
+
+    def _attn_snapshot(self, top_n: int) -> List[tuple]:
+        """注意力榜（scope=all、未过期）—— 与 PG 侧同源同口径。"""
+        with self._lock:
+            return self._db().execute(
+                "SELECT topic, score FROM ks_attention "
+                "WHERE scope = ? AND expire_ts > ? ORDER BY score DESC LIMIT ?",
+                (_TOPIC_SCOPE_ALL, time.time(), int(top_n)),
+            ).fetchall()
+
+    def match_attention(self, content: str, top_n: int = 10) -> float:
+        """内容命中高注意力话题的加权值（公式 = 共用 `attention_boost_from_topics`）。"""
+        if not content:
+            return 1.0
+        return attention_boost_from_topics(self._attn_snapshot(top_n), content,
+                                           self._attention_boost_max)
+
+    def match_hot_topics(self, text: str, limit: int = 10) -> float:
+        """内容命中热词的衰减加权命中数（公式 = 共用 `hot_topic_weighted_hits`）。"""
+        if not text:
+            return 0.0
+        topics, last_seen = self._hot_snapshot(limit)
+        if not topics:
+            return 0.0
+        return hot_topic_weighted_hits(
+            topics, last_seen, text, time.time(),
+            decay_half_days=self._hot_topic_decay_half_days,
+        )
+
+    def get_hot_topics(self, limit: int = 10, period: str = "all") -> List[Dict[str, Any]]:
+        """热门话题榜；period ∈ {all, daily, weekly}（未知值回落 all，同 PG/Redis）。"""
+        scope = period if period in _TOPIC_SCOPES else _TOPIC_SCOPE_ALL
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT topic, score FROM ks_hot_topic "
+                "WHERE scope = ? AND expire_ts > ? ORDER BY score DESC LIMIT ?",
+                (scope, time.time(), int(limit)),
+            ).fetchall()
+        return [{"topic": t, "count": round(float(s), 1)} for t, s in rows]
+
+    def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """按时间倒序返回某实体的记忆时间线（字段与 PG 侧逐字同形）。"""
+        if not entity or not entity.strip():
+            return []
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT f.content, f.created, f.valid_until "
+                "FROM ks_entity_timeline t JOIN ks_fragment f ON f.key = t.frag_key "
+                "WHERE t.entity = ? ORDER BY t.ts DESC LIMIT ?",
+                (entity.strip(), int(limit)),
+            ).fetchall()
+        return [
+            {"content": c, "created": cr or None, "valid_until": vu or None}
+            for c, cr, vu in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # 留桩（第 3 批 / 仍未实现）—— 显式抛错，绝不静默返回空值
+    # ------------------------------------------------------------------
 
     def search_knn(self, query: str, tag_filter: str = "", agent_id: str = "",
                    is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="search_knn"))
+        """向量检索 —— 需要 `sqlite-vec` 扩展（第 3 批可选懒加载），本批未实现。
 
-    def match_attention(self, content: str, top_n: int = 10) -> float:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="match_attention"))
-
-    def match_hot_topics(self, text: str, limit: int = 10) -> float:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="match_hot_topics"))
-
-    def get_hot_topics(self, limit: int = 10, period: str = "all") -> List[Dict[str, Any]]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="get_hot_topics"))
-
-    def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
-        raise NotImplementedError(_NOT_IMPLEMENTED.format(name="entity_timeline"))
+        🔴 **绝不静默返回空列表**：向量路不可用时唯一正确的形态是抛错，
+        让调用方明确知道「这条路没通」。`search()` 会捕获它并降级为 BM25 单路
+        （且打 WARNING）。
+        """
+        raise NotImplementedError(
+            "sqlite backend: search_knn 需要 sqlite-vec 扩展（向量检索属第 3 批，"
+            "可选懒加载依赖）。本后端当前只有 BM25 全文检索可用；"
+            "请调 search_bm25/search，或安装 sqlite-vec 后再启用向量路。"
+        )
 
     def discover_synonyms(self, rebuild: bool = False) -> Dict[str, Any]:
         raise NotImplementedError(_NOT_IMPLEMENTED.format(name="discover_synonyms"))

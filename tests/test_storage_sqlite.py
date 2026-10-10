@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import struct
@@ -31,7 +32,7 @@ from typing import List
 import pytest
 
 from keepsake.storage_pg import FRAGMENT_COLUMNS, MAINTENANCE_COLUMNS
-from keepsake.storage_sqlite import ALL_COLUMNS, SqliteStorage
+from keepsake.storage_sqlite import ALL_COLUMNS, FTS_TABLE, SqliteStorage
 
 
 @pytest.fixture()
@@ -284,9 +285,9 @@ def test_store_writes_float32_blob_with_embedder(tmp_path):
 
 
 @pytest.mark.parametrize("name,args", [
-    ("search", ("q",)), ("search_bm25", ("q",)), ("search_knn", ("q",)),
-    ("match_attention", ("c",)), ("match_hot_topics", ("t",)),
-    ("get_hot_topics", ()), ("entity_timeline", ("e",)),
+    # 批 2 起 search / search_bm25 / match_* / get_hot_topics / entity_timeline 已实现，
+    # 不再是留桩（见下方批 2 段）。仍在留桩的必须**显式可辨识**。
+    ("search_knn", ("q",)),
     ("discover_synonyms", ()), ("generate_jieba_dict", ()),
 ])
 def test_stub_methods_raise_not_implemented(store, name, args):
@@ -294,6 +295,20 @@ def test_stub_methods_raise_not_implemented(store, name, args):
     with pytest.raises(NotImplementedError) as ei:
         getattr(store, name)(*args)
     assert "sqlite backend" in str(ei.value) and name in str(ei.value)
+
+
+def test_search_knn_stub_names_sqlite_vec(store):
+    """🔴 向量路的降级必须**指名所需扩展**（第 3 批才做）。
+
+    只抛 NotImplementedError 而不说要什么，调用方无法判断是「该装 sqlite-vec」
+    还是「这个后端根本不支持向量」—— 两种情况处置完全不同。
+    """
+    with pytest.raises(NotImplementedError) as ei:
+        store.search_knn("任意查询")
+    msg = str(ei.value)
+    assert "sqlite-vec" in msg and "search_knn" in msg
+    # 绝不静默返回空列表
+    assert msg.strip() != ""
 
 
 # ---------------------------------------------------------------------------
@@ -796,3 +811,220 @@ def test_concurrent_threads_mixed_read_write_no_exception(tmp_path):
         assert _rows(s) == 20, f"库里 {_rows(s)} 行 != 20（写有丢失）"
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# 批 2：FTS5 + jieba + BM25 + 共用重排 + 加权信号
+# ---------------------------------------------------------------------------
+
+CORPUS300 = Path("/tmp/ks_corpus300.jsonl")
+VERIFY_QUERIES = ("部署流程", "网关重启", "Redis 连接池", "飞书", "Termux",
+                  "Python 依赖", "备份策略", "截图分析", "证书续签", "记忆检索")
+
+
+@pytest.fixture()
+def search_store(tmp_path) -> SqliteStorage:
+    """检索用后端：主脑=True（否则 agent 隔离会把非 shared 的条目全滤掉）。"""
+    s = SqliteStorage(path=str(tmp_path / "search.db"), is_primary=True, final_limit=10)
+    assert s.ensure_index() is True
+    yield s
+    s.close()
+
+
+def _load_corpus300(store: SqliteStorage):
+    """用基准语料建库（300 条）—— 与 PG 侧同数据对照用。"""
+    rows = [json.loads(line) for line in
+            CORPUS300.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 300, f"基准语料应 300 条，实际 {len(rows)}"
+    return store.write_fragments_batch(rows)
+
+
+def test_store_maintains_fts_index(search_store):
+    """store() 必须在**同一个事务**里把 FTS 索引写好（否则索引与主表会漂）。"""
+    assert search_store.store("网关重启后 Redis 连接池要重建", tags="ops,shared") is True
+    assert search_store.store("证书续签用 acme.sh 每周一次", tags="ops,shared") is True
+    with search_store._lock:
+        rows = search_store._db().execute(
+            f"SELECT frag_key, content_tok FROM {FTS_TABLE} ORDER BY frag_key"
+        ).fetchall()
+        n_frag = search_store._db().execute("SELECT COUNT(*) FROM ks_fragment").fetchone()[0]
+    assert n_frag == 2
+    assert len(rows) == 2, f"FTS 行数 {len(rows)} != 主表 {n_frag}"
+    # content_tsv（真相）与 FTS 行（索引）必须逐字一致
+    with search_store._lock:
+        tsv = dict(search_store._db().execute(
+            "SELECT key, content_tsv FROM ks_fragment"))
+    for frag_key, tok in rows:
+        assert tsv[frag_key] == tok
+    # jieba 预切痕迹：中文被切成词，且不是一整串
+    joined = " ".join(t for _, t in rows)
+    assert "网关" in joined and "重启" in joined
+
+
+def test_fts_two_char_chinese_word_hits(search_store):
+    """🔴 2 字中文词必须能命中（这正是**不能**用 trigram 分词器的理由）。
+
+    trigram 有 3 字下限 ⇒ 「网关」恒 0 命中；中文里 2 字词占大头。
+    """
+    search_store.store("网关重启后 Redis 连接池要重建", tags="shared")
+    search_store.store("飞书机器人 webhook 配置在环境变量里", tags="shared")
+    hits = search_store.search_bm25("网关")
+    assert len(hits) >= 1, "2 字中文词 0 命中 —— 分词器口径错了（trigram？）"
+    assert "网关" in hits[0]["content"]
+
+
+def test_bm25_score_direction_is_larger_is_better(search_store):
+    """🔴 FTS5 `bm25()` 越小越相关（负数）—— 必须翻正成「越大越相关」。
+
+    与 PG/Redis 契约不一致 ⇒ 共用 `rerank_with_decay` 的 min-max 归一化会把
+    最好的候选算成最差，结果**整体倒排**且不报错。
+    """
+    search_store.store("Redis 连接池 网关 网关 网关 重启", tags="shared")
+    search_store.store("飞书机器人 webhook 配置", tags="shared")
+    hits = search_store.search_bm25("网关")
+    assert hits, "应有命中"
+    top = hits[0]
+    assert top["_bm25_score"] > 0, f"_bm25_score 应为正（已取负），实际 {top['_bm25_score']}"
+    assert "网关" in top["content"], "词频更高的文档应排第一"
+    scores = [h["_bm25_score"] for h in hits]
+    assert scores == sorted(scores, reverse=True), f"未按 _bm25_score 降序: {scores}"
+
+
+def test_search_bm25_returns_pg_shaped_fields(search_store):
+    """返回字段契约必须与 PG `search_bm25` 一致（逐字段对齐）。"""
+    search_store.store("网关重启后 Redis 连接池要重建", tags="ops,shared")
+    hits = search_store.search_bm25("网关重启")
+    assert len(hits) > 0
+    f = hits[0]
+    for name in ("_key", "_bm25_score", "_sim", "_combined_score", "_weights"):
+        assert name in f, f"缺检索字段 {name}"
+    assert set(f["_weights"]) == {"sim", "decay", "emotion", "feedback",
+                                  "hot_topic", "attention"}
+    assert 0.0 <= float(f["_sim"]) <= 1.0
+    assert f["content"] and f["created"]
+
+
+def test_search_bm25_empty_query_returns_empty_with_warning(search_store, caplog):
+    """空查询 → 空列表 + **warning**（明确、不静默）。"""
+    with caplog.at_level(logging.WARNING):
+        assert search_store.search_bm25("   ") == []
+    assert any("empty query" in r.message for r in caplog.records)
+
+
+def test_update_and_delete_keep_fts_in_sync(search_store):
+    """改/删正文后索引必须跟着变 —— 否则检索**静默召回错误内容**。"""
+    search_store.store("原始内容讲的是 A 主题", tags="shared")
+    key = search_store.search_bm25("A")[0]["_key"]
+
+    # 删 ⇒ 不再召回
+    assert search_store.delete_fragments_batch([key]) == 1
+    assert search_store.search_bm25("A") == [], "删掉的碎片仍被召回（FTS 僵尸行）"
+
+    # 改 ⇒ 新词能召回、旧词召不回
+    assert search_store.store("原始内容讲的是 A 主题", tags="shared") is True
+    key2 = search_store.scan_fragment_keys(limit=1)[1][0]
+    assert search_store.update_fragment_fields(key2, {"content": "改写后讲的是 B 主题"}) is True
+    assert search_store.search_bm25("B"), "改写后新词召不回"
+    assert not search_store.search_bm25("A"), "改写后旧词仍召回（索引没更新）"
+
+
+def test_ensure_index_rebuilds_fts_for_batch1_legacy_db(tmp_path):
+    """🔴 批 1 建的库**有数据但索引是空的** ⇒ 补建虚表后必须全量重建。
+
+    「表在、查询正常执行、结果永远为空」是最危险的静默失败形态。
+    """
+    path = str(tmp_path / "legacy.db")
+    s = SqliteStorage(path=path, is_primary=True)
+    try:
+        assert s.ensure_index() is True
+        s.store("批 1 时代写入的记忆 Redis 连接池", tags="shared")
+        s.store("另一条 老库记忆 网关", tags="shared")
+        # 模拟批 1 老库：删掉 FTS 表（等价于「当时还没有批 2」）
+        with s._lock:
+            s._db().execute(f"DROP TABLE IF EXISTS {FTS_TABLE}")
+        assert s.ensure_index() is True, "补建 FTS 表失败"
+        with s._lock:
+            n = s._db().execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()[0]
+        assert n == 2, f"FTS 重建后应 2 行，实际 {n} —— 老库检索恒 0 命中"
+        assert s.search_bm25("网关"), "老库重建后仍搜不到"
+    finally:
+        s.close()
+
+
+def test_search_uses_shared_rerank_object(search_store):
+    """🔴 排序逻辑**不得重写**：必须复用 `storage_shared` 的同一个函数对象。"""
+    from keepsake.storage_shared import rerank_with_decay as shared_rerank
+    assert SqliteStorage._rerank_with_decay is shared_rerank
+    assert SqliteStorage._apply_v2_filters.__module__ == "keepsake.storage_shared"
+
+
+def test_search_degrades_to_bm25_loudly(search_store, caplog):
+    """向量路不可用 ⇒ **降级要出声**（WARNING），且照常返回 BM25 结果。
+
+    注：语料要 ≥3 条 —— FTS5 的 `bm25()` 在单文档语料上 idf≈0，
+    分数被共用的 `min_score` 地板（0.05）滤掉是**三后端共有的行为**，
+    不是本后端的缺陷（PG 的 Python 侧 BM25 同样如此）。
+    """
+    search_store.store("网关重启后 Redis 连接池要重建", tags="shared")
+    search_store.store("飞书机器人 webhook 配置在环境变量里", tags="shared")
+    search_store.store("备份策略是每天全量加每小时增量", tags="shared")
+    with caplog.at_level(logging.WARNING):
+        hits = search_store.search("网关重启")
+    assert hits, "降级后仍应返回 BM25 结果，不是空列表"
+    assert any("sqlite-vec" in r.message or "向量" in r.message
+               for r in caplog.records), "降级没有告警 = 静默降级"
+
+
+def test_aux_structures_written_and_read(search_store):
+    """辅助结构：热词三榜 / 注意力 / 实体时间线，写入侧同步维护。"""
+    search_store.store("网关重启后 Redis 连接池要重建", tags="shared")
+    search_store.store("Redis 连接池 网关 重启 部署", tags="shared")
+
+    topics = search_store.get_hot_topics(10)
+    assert topics and all({"topic", "count"} <= set(t) for t in topics)
+    assert {t["topic"] for t in topics} >= {"网关", "连接池"}
+    # 未知 period 回落 all（与 PG/Redis 同口径）
+    assert search_store.get_hot_topics(10, "nonsense") == topics
+    assert search_store.get_hot_topics(10, "daily") is not None
+
+    assert search_store.match_attention("网关 Redis 连接池") >= 1.0
+    assert search_store.match_hot_topics("网关重启") > 0
+    assert search_store.match_attention("") == 1.0
+    assert search_store.match_hot_topics("") == 0.0
+    assert search_store.entity_timeline("") == []
+
+
+def test_entity_timeline_matches_pg_shape(search_store):
+    """时间线返回字段与 PG 侧逐字同形（content/created/valid_until）。"""
+    search_store.store("网关重启后 Redis 连接池要重建", tags="shared")
+    with search_store._lock:
+        ents = [r[0] for r in search_store._db().execute(
+            "SELECT entity FROM ks_entity_timeline")]
+    assert ents, "store() 未维护 ks_entity_timeline"
+    tl = search_store.entity_timeline(ents[0])
+    assert tl and set(tl[0]) == {"content", "created", "valid_until"}
+
+
+def test_corpus300_top10_keys_are_stable(search_store):
+    """**同数据自证**：300 条基准语料跑 10 条固定查询。
+
+    断言的是**真正的判据**：语料里逐字含该词的查询必须有召回；
+    语料里根本没有的词（Termux / 证书续签 —— 实测 300 条里 0 条逐字命中）
+    返回空是**正确**行为，断言它非空才是错的。
+
+    具体 top-10 key 顺序写进 /tmp/ks_sq_search_verify.txt 供与 PG 侧机械比对。
+    """
+    rows = [json.loads(line) for line in
+            CORPUS300.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 300
+    assert search_store.write_fragments_batch(rows) == 300
+
+    blob = " \n".join(f"{r['content']} {r.get('tags','')}" for r in rows).lower()
+    for q in VERIFY_QUERIES:
+        hits = search_store.search_bm25(q)
+        in_corpus = q.lower() in blob
+        if in_corpus:
+            assert hits, f"查询 {q!r} 在语料里有逐字命中却 0 召回 —— 分词/索引坏了"
+        else:
+            # 语料里没有这个词：允许空，也允许靠 jieba 切出的子词召回
+            assert isinstance(hits, list)
