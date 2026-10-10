@@ -222,6 +222,16 @@ class _BytesFieldError(TypeError):
     """文本列收到 bytes —— 显式报错，绝不静默 str() 毁掉二进制。"""
 
 
+class StorageNotReadyError(RuntimeError):
+    """schema 未就绪 ⇒ 读/写路径**显式拒绝**（消息带 path 与最近一次 ensure 结果）。
+
+    为什么不用「返回 False / 返回空」：表不存在时每条 upsert 都 `no such table`，
+    逐条 warning 之后**进程照样退出码 0、库里 0 行** —— 静默丢数据，是本项目
+    最危险的失败形态（实测见 docs 与 /tmp/ks_sqfl_mechanism_hold20.txt）。
+    抛错后调用方至少能拿到非零退出码 + 明确的库路径，而不是「看起来成功」。
+    """
+
+
 def _text_value(value: Any, field: str) -> str:
     """列值 → str。bytes/bytearray **显式报错**（同 PG `_text_field`）。
 
@@ -286,6 +296,12 @@ class SqliteStorage(StorageBase):
     与另两个后端的**失败姿态**刻意一致：写/删路径出错记日志并返回 falsy
     （沿用 Redis 历史契约），但**留桩方法显式抛 NotImplementedError**，
     检索类绝不静默返回空列表。
+
+    🔴 **唯一的例外是 schema 未就绪**（p1.2）：此时抛 `StorageNotReadyError`
+    而不是 fail-open。理由：表不存在时 fail-open 的形态是「每条 upsert 打一行
+    `no such table` warning，进程退出码仍是 0、库里 0 行」—— fail-open 在这里
+    等于**静默丢数据**，比抛错坏得多。逐条级错误（锁竞争、单条脏值）仍然
+    fail-open + 汇总告警，与 PG/Redis 同口径。
     """
 
     def __init__(
@@ -326,6 +342,12 @@ class SqliteStorage(StorageBase):
         self._attention_emotion_factor = float(attention_emotion_factor)
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
+        # 最近一次 ensure_index 的结果（进异常消息 ⇒ 「未就绪」可定位，不用猜）
+        self._last_ensure_ok: Optional[bool] = None
+        self._last_ensure_error: Optional[str] = None
+        # 最近一次 upsert_fragment 的失败原因（批量写的汇总告警要「原因分类」，
+        # 而 upsert 本身是 fail-open 不抛 ⇒ 只能就地留痕）
+        self._last_upsert_error: Optional[str] = None
 
     def _has_embedder(self) -> bool:
         """能否写向量（判据与 RedisStorage._has_embedder 一致）。"""
@@ -409,7 +431,11 @@ class SqliteStorage(StorageBase):
 
         重试只包住**拿写锁**这一步（`BEGIN`），不包事务体 —— 事务体重跑等于把
         上半截副作用再执行一遍。重试用尽 → 向上抛（调用点各自决定 fail-open 还是报错）。
+
+        ★ 守卫放这里（而不是每个写方法各写一遍）：所有写路径都经过 `_write()`，
+        一处守卫覆盖 store/upsert/删/改/反馈全部入口 —— 漏一个就是一个静默丢数据的洞。
         """
+        self._require_ready("写路径")
         conn = self._begin_immediate()
         cur = conn.cursor()
         try:
@@ -498,10 +524,50 @@ class SqliteStorage(StorageBase):
             if added:
                 logger.info("storage_sqlite: ks_fragment 补列 %d 个: %s", len(added), added)
             logger.info("storage_sqlite: schema ready on %s", self._path)
+            self._last_ensure_ok, self._last_ensure_error = True, None
             return True
         except Exception as e:      # noqa: BLE001 — 接口约定：失败返回 False
             logger.error("storage_sqlite: ensure_index 失败: %s: %s", type(e).__name__, e)
+            self._last_ensure_ok = False
+            self._last_ensure_error = f"{type(e).__name__}: {e}"
             return False
+
+    def _schema_ready(self) -> Tuple[bool, Optional[str]]:
+        """`ks_fragment` 是否已具备**全部列**（写路径的前提）。
+
+        只发 `PRAGMA table_info`（只读、不拿 schema 锁、不发 DDL），健康路径成本可忽略。
+        表不存在 ⇒ 返回空集合 ⇒ 判为未就绪。**探测本身出错也判未就绪**（不是就绪）。
+        返回 (是否就绪, 探测失败时的原因)。
+        """
+        try:
+            with self._lock:
+                have = self._table_columns(self._db().cursor(), "ks_fragment")
+        except Exception as e:      # noqa: BLE001 — 探测失败即「未就绪」，绝不当作就绪
+            return False, f"{type(e).__name__}: {e}"
+        if set(ALL_COLUMNS) <= have:
+            return True, None
+        return False, "ks_fragment 缺列: " + ",".join(sorted(set(ALL_COLUMNS) - have))
+
+    def _require_ready(self, op: str) -> None:
+        """读写路径入口守卫：schema 未就绪 ⇒ **补跑一次** `ensure_index()`，仍不就绪就抛。
+
+        为什么要守卫：表不存在时每条 upsert 都会 `no such table`，逐条 warning 之后
+        进程**照样退出码 0、库里 0 行** —— 这就是「静默丢数据」，必须消除。
+
+        为什么允许补跑（而不是一次 ensure 失败就抛）：WAL 下「另一进程正在建表」
+        是**可重试的竞争**（`ensure_index` 自带 busy_timeout 排队），此时显式拒绝会
+        把「对方 3s 后就建好了」误判成永久故障。补跑一次仍不就绪 ⇒ 才判定为真故障。
+        """
+        ready, why = self._schema_ready()
+        if not ready and self.ensure_index():
+            ready, why = self._schema_ready()
+        if not ready:
+            raise StorageNotReadyError(
+                f"storage_sqlite: {op} 被拒绝 —— schema 未就绪（path={self._path}；"
+                f"补跑后仍不就绪：{why or '未知'}；最近一次 ensure_index()="
+                f"{self._last_ensure_ok!r} err={self._last_ensure_error}）。"
+                f"不做逐条写入 —— 那只会得到「进程退出码 0 + 库里 0 行」的静默丢数据。"
+            )
 
     # ------------------------------------------------------------------
     # 写入
@@ -531,7 +597,9 @@ class SqliteStorage(StorageBase):
         key = fields.get("key")
         if not key:
             logger.warning("storage_sqlite: upsert_fragment 缺 key，跳过")
+            self._last_upsert_error = "缺 key"
             return False
+        self._last_upsert_error = None
         row: Dict[str, Any] = {}
         for col in ALL_COLUMNS:
             if col == "key":
@@ -549,10 +617,11 @@ class SqliteStorage(StorageBase):
             with self._write() as cur:
                 cur.execute(_UPSERT_SQL, params)
             return True
-        except _BytesFieldError:
+        except (_BytesFieldError, StorageNotReadyError):
             raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: upsert_fragment(%s) failed: %s", key, e)
+            self._last_upsert_error = f"{type(e).__name__}: {e}"
             return False
 
     def store(
@@ -627,6 +696,8 @@ class SqliteStorage(StorageBase):
                     )
                 self._record_topics(cur, keywords, label, now_ts=now.timestamp())
             return True
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: store error: %s", e)
             return False
@@ -694,6 +765,8 @@ class SqliteStorage(StorageBase):
                     (new_key or "__void__", datetime.now(timezone.utc).isoformat(), old_key),
                 )
             return True
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: supersede_fragment %s→%s failed: %s",
                            old_key, new_key, e)
@@ -729,6 +802,8 @@ class SqliteStorage(StorageBase):
                                 " corrected_at = ? WHERE key = ?", (now_iso, key),
                             )
                         count += 1
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: correct_fragments failed: %s", e)
             return 0
@@ -752,6 +827,8 @@ class SqliteStorage(StorageBase):
                     (delta, fragment_key),
                 )
             return True
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: record_feedback(%s) failed: %s", fragment_key, e)
             return False
@@ -776,9 +853,10 @@ class SqliteStorage(StorageBase):
         return out
 
     def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
-        """读单个碎片全字段；不存在返回 None。"""
+        """读单个碎片全字段；不存在返回 None。**schema 未就绪则显式拒绝**（见 `_require_ready`）。"""
         if not key:
             return None
+        self._require_ready("get_fragment")
         try:
             with self._lock:
                 row = self._db().execute(
@@ -801,6 +879,7 @@ class SqliteStorage(StorageBase):
         keys = [k for k in keys if k]
         if not keys:
             return out
+        self._require_ready("get_fragments_batch")
         cols = ("key",) + tuple(c for c in READ_COLUMNS if c != "key")
         sql = f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key IN ({{}})"
         try:
@@ -835,6 +914,7 @@ class SqliteStorage(StorageBase):
         （页不满即到底；页恰好满则下一轮返回空页 + `""`，多一次空查询，不影响正确性）。
         """
         limit = max(1, int(limit))
+        self._require_ready("scan_fragment_keys")
         try:
             with self._lock:
                 rows = self._db().execute(
@@ -857,13 +937,33 @@ class SqliteStorage(StorageBase):
 
         合并每组只写 1 条 consolidated 碎片 ⇒ 逐条调用即可，
         **不引入第二条写路径**（一条新路径 = 一份要单独测的语义，同 PG 版口径）。
+
+        🔴 **失败可见**（p1.2）：返回值是**实际成功条数**，且有失败时打**一条**汇总
+        WARNING（成功 M / 失败 N + 原因分类）。「缺 key」的旧行为是静默 `continue`
+        —— 调用方拿到 0 却不知道自己丢了东西；现在它计入失败数并出现在汇总里。
+        与 PG/Redis 一致仍是 **fail-open**（个别条失败不抛；schema 整体未就绪由
+        `_write()` 的守卫抛 `StorageNotReadyError`，那是另一回事、不在此列）。
         """
+        if not rows:
+            return 0
         n = 0
+        reasons: Dict[str, int] = {}
         for row in rows:
             if not row.get("key"):
-                continue
-            if self.upsert_fragment(row):
+                why = "缺 key"
+            elif self.upsert_fragment(row):
                 n += 1
+                continue
+            else:
+                why = self._last_upsert_error or "未知原因"
+            reasons[why] = reasons.get(why, 0) + 1
+        if reasons:
+            logger.warning(
+                "storage_sqlite: write_fragments_batch 部分失败：成功 %d / 共 %d（失败 %d）；"
+                "原因分类: %s",
+                n, len(rows), len(rows) - n,
+                "; ".join(f"{why} ×{c}" for why, c in reasons.items()),
+            )
         return n
 
     def update_fragment_fields(self, key: str, fields: Dict[str, Any]) -> bool:
@@ -884,6 +984,8 @@ class SqliteStorage(StorageBase):
             with self._write() as cur:
                 cur.execute(f"UPDATE ks_fragment SET {set_sql} WHERE key = ?", params)
                 return cur.rowcount > 0
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: update_fragment_fields(%s) failed: %s", key, e)
             return False
@@ -909,6 +1011,8 @@ class SqliteStorage(StorageBase):
                     deleted += cur.execute(
                         f"DELETE FROM ks_fragment WHERE key IN ({placeholders})", chunk,
                     ).rowcount
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: delete_fragments_batch failed: %s", e)
             return 0
@@ -927,6 +1031,7 @@ class SqliteStorage(StorageBase):
         """EXISTS 的等价实现：主键点查。真查库（不可达时异常向上抛，绝不返回 None 假装「查不到」）。"""
         if not key:
             return False
+        self._require_ready("fragment_exists")
         with self._lock:
             return self._db().execute(
                 "SELECT 1 FROM ks_fragment WHERE key = ?", (key,)
@@ -945,6 +1050,8 @@ class SqliteStorage(StorageBase):
                     (datetime.now(timezone.utc).isoformat(), key),
                 )
                 return cur.rowcount > 0
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: touch_fragment(%s) failed: %s", key, e)
             return False
@@ -959,6 +1066,8 @@ class SqliteStorage(StorageBase):
                     "UPDATE ks_fragment SET supersedes = ? WHERE key = ?", (old_key, new_key)
                 )
                 return cur.rowcount > 0
+        except StorageNotReadyError:
+            raise
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: set_supersedes(%s<-%s) failed: %s",
                            new_key, old_key, e)

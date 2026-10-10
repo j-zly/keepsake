@@ -9,12 +9,15 @@
   6. `update_fragment_fields` / `delete_fragments_batch` 后计数正确
   7. 留桩方法**显式抛 NotImplementedError**（绝不静默返回空）
   8. 并发：两进程并发写不丢数据；写事务进行中只读进程仍可读
+  9. p1.2 守卫：schema 未就绪 ⇒ 写/读路径显式抛 `StorageNotReadyError`
+    （不许「进程退出码 0 + 库里 0 行」的静默丢数据）；批量写失败要看得见
 
 本文件 **hermetic**：全部用 `tmp_path` 里的临时库文件，不连任何外部服务。
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import struct
 import subprocess
@@ -521,3 +524,158 @@ def test_sqlite_columns_cover_pg_baseline():
     """列对齐基准检查（PG 版 FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS 全覆盖）。"""
     pg_set = set(FRAGMENT_COLUMNS) | set(MAINTENANCE_COLUMNS)
     assert pg_set <= set(ALL_COLUMNS), f"未覆盖 PG 基准列: {pg_set - set(ALL_COLUMNS)}"
+
+
+# ---------------------------------------------------------------------------
+# 9. p1.2 写路径守卫：schema 未就绪必须**显式拒绝**，不许「退出码 0 + 库里 0 行」
+#
+#    实测形态（/tmp/ks_sqfl_mechanism_hold20.txt）：另一进程在**全新空库**上
+#    持 EXCLUSIVE 时，`ensure_index()` 返回 False，随后每条写都是
+#    `no such table: ks_fragment`，而**进程 stdout 仍是 DONE、退出码仍是 0**。
+#    下面的断言只锁契约，不锁时序：两种结局（写成功 / 显式抛错）都算过。
+# ---------------------------------------------------------------------------
+
+# 持锁方：全新空库上 `BEGIN EXCLUSIVE`（写锁 + schema 锁）并在事务内建一张**极简**
+# ks_fragment，全程不提交、最后 ROLLBACK。⇒ 另一个进程：能读（WAL 读不阻塞）但
+# **看不到任何表**，且它的 DDL 会一直排队到 A 放手为止 —— 即实测里
+# `ensure_index() False + 每条 no such table + 退出码 0` 的那个形态。
+_SCHEMA_EXCLUSIVE_HOLDER = textwrap.dedent("""
+    import sqlite3, time
+    conn = sqlite3.connect({path!r}, timeout=0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("BEGIN EXCLUSIVE")
+    conn.execute("CREATE TABLE ks_fragment (key TEXT PRIMARY KEY)")
+    print("LOCKED", flush=True)
+    time.sleep({hold_s})
+    conn.execute("ROLLBACK")      # 放手：库回到「全新空库」
+    conn.close()
+    print("DONE", flush=True)
+""")
+
+# 写者：**不预先 ensure_index**（真实调用方不会替存储后端补建表）。异常一律不吞 ——
+# 「显式抛错 ⇒ 非零退出」正是本测试要能观察到的另一半结局。
+_RACE_WRITER = textwrap.dedent("""
+    import sys, time
+    sys.path.insert(0, {src!r})
+    from keepsake.storage_sqlite import SqliteStorage
+    s = SqliteStorage(path={path!r}, busy_timeout_ms={busy_ms!r})
+    ok = 0
+    for i in range({n}):
+        ok += s.write_fragments_batch(
+            [{{"key": "memory:frag:{tag}-%03d" % i, "content": "并发写入 {tag} %d" % i}}])
+    s.close()
+    print("STAT %d %d" % (ok, {n}), flush=True)
+    print("DONE", flush=True)
+""")
+
+
+def test_fresh_db_racing_exclusive_creator_never_reports_success_with_zero_rows(tmp_path):
+    """A 在新库上建 schema 并持 EXCLUSIVE 3s，B 同时打开同一库写入。
+
+    **唯一断言**：不允许出现「B 报成功（退出码 0）但库里 0 行」。
+      分支 1（守卫补跑的 ensure 生效）：B 退出码 0 ⇒ 自报成功数 == 尝试数，
+              且**库里的权威行数**与之逐条相等。
+      分支 2（显式拒绝）：B 非零退出 ⇒ stderr 必须出现 `StorageNotReadyError`
+              与库路径（失败可定位，不许只有一行 no-such-table warning）。
+    不锁时序分支：任一分支都算过，正是因为两条结局都是**契约**（旧实现两条都不满足）。
+    """
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    path = str(tmp_path / "race.db")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _SCHEMA_EXCLUSIVE_HOLDER.format(path=path, hold_s=3.0)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "LOCKED", "持锁方没建到 schema 就退出了"
+        out = subprocess.run(
+            [sys.executable, "-c",
+             _RACE_WRITER.format(src=src, path=path, tag="race", n=5, busy_ms=5000)],
+            capture_output=True, text=True, timeout=180)
+        holder.wait(timeout=60)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+
+    ret, attempts = _stat(out)
+    conn = sqlite3.connect(path)
+    try:
+        landed = conn.execute(
+            "SELECT COUNT(*) FROM ks_fragment WHERE key LIKE 'memory:frag:race-%'").fetchone()[0]
+    except sqlite3.OperationalError as e:        # 表压根没建出来（分支 2 的常态）
+        landed = 0
+        assert "no such table: ks_fragment" in str(e)
+    finally:
+        conn.close()
+
+    if out.returncode == 0:
+        assert attempts == 5, f"写者没走完账: STAT={ret}/{attempts} {out.stderr[-800:]}"
+        assert ret == attempts, (
+            f"🔴 静默丢数据：进程退出码 0、自报成功 {ret}/{attempts}，库里只有 {landed} 行")
+    else:
+        assert ret == -1, f"写者中途退出却已经打过账: STAT={ret}/{attempts}"
+        assert "StorageNotReadyError" in out.stderr, (
+            f"非零退出但不是显式拒绝（看不出根因）: {out.stderr[-800:]}")
+        assert path in out.stderr, f"异常消息必须带库路径: {out.stderr[-800:]}"
+    assert landed == ret, f"库里 {landed} 行 != 自报成功 {ret} 行（静默丢数据）"
+
+
+def test_write_path_raises_storage_not_ready_when_schema_unbuildable(tmp_path):
+    """ensure **必然**失败的场景 ⇒ 必须抛明确异常，且消息带 path。
+
+    用「父路径是个普通文件」构造不可写位置：`_connect` 的 `mkdir(parents=True)`
+    必然抛错 ⇒ `ensure_index()` 必然 False（与 uid/root 无关，比 chmod 稳）。
+    """
+    from keepsake.storage_sqlite import StorageNotReadyError   # 修前不存在 ⇒ 本测试红
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("占位")
+    s = SqliteStorage(path=str(blocker / "ks.db"))
+    try:
+        assert s.ensure_index() is False, "构造失效：ensure_index 竟然成功了"
+
+        with pytest.raises(StorageNotReadyError) as ei:
+            s.write_fragments_batch([{"key": "memory:frag:x", "content": "写不进"}])
+        assert str(blocker) in str(ei.value), f"异常消息必须带库路径: {ei.value}"
+        assert "ensure_index()" in str(ei.value), f"异常消息必须带最近一次 ensure 结果: {ei.value}"
+
+        # 读路径同款决策：未就绪时**同样显式拒绝**（静默返回空 = 「记忆搜不到」的
+        # 最危险形态，与本模块 docstring 的既有立场一致），不返回 None/{} 假装「查不到」。
+        for call in (lambda: s.get_fragment("memory:frag:x"),
+                     lambda: s.get_fragments_batch(["memory:frag:x"]),
+                     lambda: s.scan_fragment_keys()):
+            with pytest.raises(StorageNotReadyError):
+                call()
+    finally:
+        s.close()
+
+
+def test_write_fragments_batch_reports_partial_failure(store, caplog, monkeypatch):
+    """失败可见：成功数 == 总数-失败数，且**只打一条**汇总 WARNING（含原因分类）。
+
+    两种失败同时制造，覆盖两条不同的失败路径：
+      * 缺 key —— 旧实现静默 `continue`（调用方拿到 0 却不知道自己丢了东西）
+      * 取锁失败 —— 真·DB 错误（由 `_begin_immediate` 抛出，走 upsert 的 fail-open 分支）
+    """
+    real_begin = store._begin_immediate
+    calls = {"n": 0}
+
+    def flaky_begin():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_begin()
+
+    monkeypatch.setattr(store, "_begin_immediate", flaky_begin)
+    with caplog.at_level(logging.WARNING, logger="keepsake.storage_sqlite"):
+        n = store.write_fragments_batch([
+            {"key": "memory:frag:ok1", "content": "好的一条"},
+            {"content": "没有 key 的坏行"},
+            {"key": "memory:frag:bad", "content": "锁失败的坏行"},
+        ])
+    assert n == 1, f"返回值必须是实际成功条数: {n}（3 条里只应有 1 条成功）"
+    assert _rows(store) == 1, "失败的行竟然落库了"
+
+    summary = [r.getMessage() for r in caplog.records
+               if "write_fragments_batch 部分失败" in r.getMessage()]
+    assert len(summary) == 1, f"必须只有一条汇总告警（不许刷屏）: {summary}"
+    msg = summary[0]
+    assert "成功 1 / 共 3" in msg and "失败 2" in msg, msg
+    assert "缺 key ×1" in msg and "OperationalError: database is locked ×1" in msg, msg
