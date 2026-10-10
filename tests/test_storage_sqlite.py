@@ -946,11 +946,10 @@ def test_search_bm25_tag_filter_single_and_multi(search_store):
     `(instr(...) > 0 OR )` —— **任何单标签过滤必抛** `near ")": syntax error`
     （p2.1 做 PG 对照时实测踩到，整个检索直接不可用）。
 
-    ⚠️ 这里**只断言「不崩 + 无过滤时照常有结果」**：`instr('|tags|','|tag|')`
-    这个边界匹配对**逗号分隔**的 tags 一条都匹配不上（只有整串首尾各补一个 `|`，
-    中间的 tag 两侧是逗号不是竖线）—— 这是 **PG 与 SQLite 共有的既存缺陷**
-    （PG 的 `strpos('|'||tags||'|', …)` 逐字同款，实测两侧都恒返 0 条）。
-    修它要动两个后端 + 定分隔符语义，属跨后端改动，不在本任务范围（见 verdict）。
+    ℹ️ 命中语义（分隔符/精确相等/空格容错/多标签并集）另有
+    `tests/test_tag_filter_semantics.py` 专测：原先这里用竖线边界
+    `instr('|'||tags||'|', '|tag|')` 匹配**逗号分隔**的 tags，一条都匹配不上
+    （PG 的 `strpos('|'||tags||'|', …)` 逐字同款），现已改为逗号边界。
     """
     search_store.store("网关重启后 Redis 连接池要重建", tags="ops,shared")
     search_store.store("备份策略每天全量加每周归档", tags="backup,shared")

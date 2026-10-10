@@ -75,6 +75,46 @@ _FRAG_CACHE_TTL = 60.0
 
 
 # ---------------------------------------------------------------------------
+# 纯计算：tag 过滤的 SQL 片段（PG / SQLite 共用同一份；Redis 侧靠索引的 TAG 字段）
+# ---------------------------------------------------------------------------
+
+#: `tags` 列的**真实落库形态**是**逗号串**（`a,b` / `x,agent:worker`；PG 与 SQLite
+#: 实测 `SELECT DISTINCT tags` 见 /tmp/ks_tag_pre.txt），Redis 侧索引也是
+#: `tags TAG SEPARATOR ,`（RediSearch 按逗号切 token 后精确匹配）。
+#: 所以 SQL 侧的命中判据必须是「**逗号**边界上的完整标签相等」。
+#:
+#: 🔴 历史上这里写的是「**竖线**包裹 + 子串」（`instr('|'||tags||'|', '|tag|')`），
+#:    竖线在库里根本不存在 ⇒ 只要该行有第二个标签就永远匹配不上（`tag_filter`
+#:    非空时召回恒 0，`agent:` 隔离同病）。现在改成逗号边界，语义对齐 Redis。
+#: 用 `instr`/`replace` 而不是 `LIKE`：tag 里的 `%` `_` 不当通配符；
+#: `replace(x, a, b)` 两边都有；**取位置的函数名两边不同**：PG 只有 4 参版的
+#: `instr(string, substring, start, occurrence)`（PG11+），两参形式不存在
+#: （实测 PG 18.6 报 `function instr(text, unknown) does not exist`）⇒ PG 侧必须用
+#: `strpos`，SQLite 侧才是两参的 `instr`。
+#:
+#: ponytail: 空格容错只做「逗号两侧各一个空格」这一轮 replace（迁移进来的原样行
+#:            就是 `c, d` 这种形态）。连续多个空格（`a,  b`）不归一，若真出现
+#:            再把这两层 replace 套两遍即可 —— 现在不套，避免每行多两次字符串扫描。
+_TAG_COL_NORM = "replace(replace(',' || {col} || ',', ' ,', ','), ', ', ',')"
+
+
+def tag_match_sql(col: str, tags: List[str], placeholder: str,
+                  pos_fn: str = "instr") -> Tuple[str, List[str]]:
+    """「tags 里含其中任一标签」的 SQL 片段 + 参数（多标签是**并集/OR**）。
+
+    `tags` 必须已按 `_clean_tag` 清理（分隔符/引号/空格都剔掉了，否则会自己造边界）。
+    `placeholder` 是驱动占位符：PG 是 `%s`，SQLite 是 `?`；
+    `pos_fn` 是取子串位置的函数名：PG 传 `strpos`（PG 没有两参 `instr`），
+    SQLite 传 `instr`；两者都返回首个匹配位置，0 = 不匹配。
+    """
+    if not tags:
+        return "", []
+    hay = _TAG_COL_NORM.format(col=col)
+    sql = "(" + " OR ".join([f"{pos_fn}({hay}, {placeholder}) > 0"] * len(tags)) + ")"
+    return sql, [f",{t}," for t in tags]
+
+
+# ---------------------------------------------------------------------------
 # 纯计算：注意力 / 热词加权（两个后端共用同一份公式）
 # ---------------------------------------------------------------------------
 

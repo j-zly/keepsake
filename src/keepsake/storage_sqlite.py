@@ -128,6 +128,7 @@ from .storage_shared import (
     rerank_with_decay,
     synonym_rows,
     synonym_words,
+    tag_match_sql,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
 from .storage import _expand_terms, _sanitize_terms
@@ -1381,9 +1382,16 @@ class SqliteStorage(StorageBase):
     ) -> Tuple[str, List[Any]]:
         """检索 WHERE 片段（标签 + agent 隔离 + 活记忆），语义逐条对齐 PG/Redis。
 
-        🔴 tag 匹配用 `instr('|'||tags||'|', '|tag|') > 0` 而不是 LIKE：
-        与 PG 侧 `strpos` 同理 —— 只在**完整标签边界**上匹配（`agent:a` 不会命中
-        `agent:ab`），且 tag 里的 `%` `_` 不会被当通配符。
+        🔴 tag 匹配用 `storage_shared.tag_match_sql`（`instr(','||tags||',', ',tag,')`）
+        而不是 LIKE：库里 `tags` 是**逗号串**（`a,b`，Redis 侧索引也是
+        `tags TAG SEPARATOR ,`）⇒ 判据必须是逗号边界上的**完整标签相等**
+        （`agent:a` 不会命中 `agent:ab`），且 tag 里的 `%` `_` 不会被当通配符。
+
+        🔴 修的是「竖线包裹」这个既有缺陷：竖线在库里不存在 ⇒ `tag_filter` 非空时
+        召回恒 0、非主脑的 agent 隔离恒 0（实测见 /tmp/ks_tag_pre.txt）。
+        多标签是 OR 并集（拼法用「重复 N 次再 OR 连起来」：**单标签时不能写成
+        `(instr(...) > 0 OR )`** —— 那是语法错，整条检索抛 `near ")": syntax
+        error`，p2.1 实测过）。
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -1391,25 +1399,22 @@ class SqliteStorage(StorageBase):
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
         if not effective_is_primary:
-            if effective_agent_id:
-                clauses.append(
-                    "(instr('|'||tags||'|', ?) > 0 OR instr('|'||tags||'|', '|shared|') > 0)"
-                )
-                params.append(f"|{self._clean_tag(f'agent:{effective_agent_id}')}|")
-            else:
-                clauses.append("instr('|'||tags||'|', '|shared|') > 0")
+            agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
+                          if effective_agent_id else []) + ["shared"]
+            sql, args = tag_match_sql("tags", agent_tags, "?")
+            clauses.append(sql)
+            params.extend(args)
 
         if tag_filter:
-            needles = [f"|{self._clean_tag(t)}|"
-                       for t in (x.strip() for x in tag_filter.split(","))
-                       if self._clean_tag(t)]
-            if needles:
-                # 🔴 拼法用「重复 N 次再 OR 连起来」：**单标签时不能写成
-                #    `(instr(...) > 0 OR )`** —— 那是语法错，整条检索抛
-                #    `near ")": syntax error`（p2.1 实测：单 tag_filter 必崩）。
-                clauses.append("(" + " OR ".join(["instr('|'||tags||'|', ?) > 0"]
-                                                 * len(needles)) + ")")
-                params.extend(needles)
+            tags = [
+                clean for clean in
+                (self._clean_tag(t) for t in tag_filter.split(","))
+                if clean
+            ]
+            sql, args = tag_match_sql("tags", tags, "?")
+            if sql:
+                clauses.append(sql)
+                params.extend(args)
 
         clauses.append("invalid_at = ''")
         clauses.append("valid_until = ''")

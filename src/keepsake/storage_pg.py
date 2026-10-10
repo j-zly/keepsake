@@ -97,6 +97,7 @@ from .storage_shared import (          # 与 Redis 共用的检索后处理（�
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
+    tag_match_sql,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
     accumulate_co_occurrence,
     accumulate_word_freq,
@@ -1169,8 +1170,9 @@ class PgStorage(StorageBase):
     def _clean_tag(tag: str) -> str:
         r"""tag 值清理：去结构字符（| , { } " ' 与空白）—— 与 Redis `_tag_safe` 同意图。
 
-        PG 侧用 `strpos('|'||tags||'|', '|tag|')` 做 TAG 语义匹配，
-        两侧用同一套「首尾补竖线 + 子串」判据，所以 tag 里不能出现 `|`。
+        PG 侧用 `storage_shared.tag_match_sql` 做 TAG 语义匹配（逗号边界 +
+        完整标签相等），所以 tag 值里不能出现分隔符 `,`；`|` 也一并剔掉，
+        与 SQLite 侧、Redis 侧 `_tag_safe` 同一套字符集。
         """
         for ch in ("\\", "{", "}", "|", ",", '"', "'", " "):
             tag = tag.replace(ch, "")
@@ -1246,10 +1248,18 @@ class PgStorage(StorageBase):
     ) -> tuple:
         """检索 WHERE 片段（标签 + agent 隔离），语义逐条对齐 Redis 侧。
 
-        Redis：`@tags:{...}` + `@tags:{agent:X} || @tags:{shared}`（TAG 精确匹配）
-        PG   ：`strpos('|'||tags||'|', '|tag|') > 0`（同样只在完整标签边界上匹配，
-               不会让 `agent:a` 命中 `agent:ab`）。用 strpos 而不是 LIKE，
-               是为了不让 tag/agent_id 里的 `%` `_` 被当通配符。
+        Redis：`@tags:{...}` + `@tags:{agent:X} || @tags:{shared}`
+               （索引是 `tags TAG SEPARATOR ,`，按逗号切 token 后**精确匹配**）
+        PG   ：`strpos(','||tags||',', ',tag,') > 0`（`storage_shared.tag_match_sql`
+               生成的同一份逗号边界判据：只在完整标签边界上匹配，`agent:a` 不会
+               命中 `agent:ab`；用 strpos 而不是 LIKE 是为了让 tag 里的 `%` `_`
+               不被当通配符）。
+
+        🔴 修的是**竖线包裹**这个既有缺陷：库里 `tags` 是逗号串（`a,b`），
+        `strpos('|'||tags||'|', '|tag|')` 对多标签行永远匹配不上 ⇒
+        `tag_filter` 非空时召回恒 0、非主脑的 agent 隔离恒 0（实测见
+        /tmp/ks_tag_pre.txt）。多标签此前还被拼成**一个** `strpos(…, p1 || p2)`
+        的相邻子串（要求库里出现 `|a,b|` 这种连续形态），一并改成 OR 并集。
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -1259,26 +1269,22 @@ class PgStorage(StorageBase):
 
         # 非主脑：只能搜 agent 自己的 或 shared 的碎片
         if not effective_is_primary:
-            if effective_agent_id:
-                agent_tag = self._clean_tag(f"agent:{effective_agent_id}")
-                clauses.append(
-                    "(strpos('|' || tags || '|', %s) > 0"
-                    " OR strpos('|' || tags || '|', '|shared|') > 0)"
-                )
-                params.append(f"|{agent_tag}|")
-            else:
-                clauses.append("strpos('|' || tags || '|', '|shared|') > 0")
+            agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
+                          if effective_agent_id else []) + ["shared"]
+            sql, args = tag_match_sql("tags", agent_tags, "%s", pos_fn="strpos")
+            clauses.append(sql)
+            params.extend(args)
 
         if tag_filter:
             tags = [
-                f"|{self._clean_tag(t)}|"
-                for t in (x.strip() for x in tag_filter.split(","))
-                if self._clean_tag(t)
+                clean for clean in
+                (self._clean_tag(t) for t in tag_filter.split(","))
+                if clean
             ]
-            if tags:
-                clauses.append("strpos('|' || tags || '|', " + " || ".join(["%s"] * len(tags))
-                               + ") > 0")
-                params.extend(tags)
+            sql, args = tag_match_sql("tags", tags, "%s", pos_fn="strpos")
+            if sql:
+                clauses.append(sql)
+                params.extend(args)
 
         # 两版检索共同的「不是活记忆」过滤（对齐 Redis search_* 里的 continue）
         clauses.append("invalid_at = ''")
