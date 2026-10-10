@@ -23,8 +23,10 @@ import struct
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
+from typing import List
 
 import pytest
 
@@ -679,3 +681,118 @@ def test_write_fragments_batch_reports_partial_failure(store, caplog, monkeypatc
     msg = summary[0]
     assert "成功 1 / 共 3" in msg and "失败 2" in msg, msg
     assert "缺 key ×1" in msg and "OperationalError: database is locked ×1" in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# 10. p1.3 **同进程多线程**：`check_same_thread=False` 的共享连接必须靠 Python 侧串行
+#
+#    p1.2 遗留②：`_lock` 原先只在 `_begin_immediate()` 内持有/释放，**事务体在锁外**
+#    ⇒ 两个线程共用一条连接，各自 BEGIN 后语句交错 ⇒
+#    `cannot start a transaction within a transaction`，或一个线程 COMMIT 掉
+#    另一个线程的半个事务（静默丢数据）。跨进程语义（WAL）不受影响，本组只测进程内。
+# ---------------------------------------------------------------------------
+
+def _run_threads(fn, n_threads: int) -> List[List[str]]:
+    """并发跑 n_threads 个 fn(i) ⇒ 每线程一串 repr 化结果（异常也算一条，不许吞）。
+
+    ★ 为什么收集而不是直接让线程抛：fail-open 的写路径把异常吞成 `False`，
+    异常必须由测试自己**逐条记账**才看得见（与 p1.2 的「失败必须显式」同一口径）。
+    """
+    import concurrent.futures as cf
+
+    with cf.ThreadPoolExecutor(max_workers=n_threads) as pool:
+        return [f.result() for f in [pool.submit(fn, i) for i in range(n_threads)]]
+
+
+def test_concurrent_threads_write_same_instance_lose_nothing(tmp_path):
+    """8 线程 × 各 10 条共写同一个 `SqliteStorage` ⇒ 恰好 80 行、**零异常**。
+
+    🔴 这是 p1.2 遗留②的直接复现：共享连接 + 事务体在锁外 ⇒
+    `cannot start a transaction within a transaction`（或交错的事务被提前提交）。
+    断言「80 行 + 0 异常」而不是「退出码 0」：写路径 fail-open，只看返回值会漏掉
+    「声称写成功其实没落库」和「异常被吞成 False」两种最危险的形态。
+    """
+    s = SqliteStorage(path=str(tmp_path / "mt_write.db"))
+    assert s.ensure_index() is True
+    try:
+        def worker(tid: int) -> List[str]:
+            out = []
+            for i in range(10):
+                k = f"memory:frag:t{tid}-{i:02d}"
+                try:
+                    ok = s.write_fragments_batch([{"key": k, "content": f"线程{tid}第{i}条"}])
+                    out.append(f"{k}={ok}")
+                except Exception as e:      # noqa: BLE001 — 异常必须显式记账，不许吞
+                    out.append(f"{k}=EXC {type(e).__name__}: {e}")
+            return out
+
+        results = _run_threads(worker, 8)
+        flat = [line for r in results for line in r]
+        assert len(flat) == 80, f"线程没走完账（中途异常/退出）: {len(flat)}/80"
+        exc = [line for line in flat if "=EXC " in line]
+        assert not exc, f"同进程多线程写出现异常 {len(exc)}/80，例: {exc[:5]}"
+        assert not any("transaction within a transaction" in line for line in flat), \
+            "出现「cannot start a transaction within a transaction」（事务体在锁外）"
+        assert all(line.endswith("=1") for line in flat), \
+            f"有写调用返回 falsy（静默丢数据）: {[l for l in flat if not l.endswith('=1')][:5]}"
+
+        assert _rows(s) == 80, f"库里 { _rows(s) } 行 != 80（有写被交错事务吞掉）"
+        _, keys = s.scan_fragment_keys(prefix="memory:frag:t", limit=200)
+        assert len(keys) == 80 and len(set(keys)) == 80, f"扫出来的 key 数不对: {len(keys)}"
+    finally:
+        s.close()
+
+
+def test_concurrent_threads_mixed_read_write_no_exception(tmp_path):
+    """4 写 + 4 读并发打同一个实例 ⇒ 写全落库、读**零异常**。
+
+    写方走完整 `store()` 路径（事务内**先 SELECT 再写**，正是最容易与另一个事务
+    交错的那种写法）；读方混合 `get_fragment` / `get_fragments_batch` /
+    `scan_fragment_keys` / `fragment_exists`，断言读路径也不炸、不返回 None 假装。
+    """
+    s = SqliteStorage(path=str(tmp_path / "mt_mix.db"))
+    assert s.ensure_index() is True
+    try:
+        barrier = threading.Barrier(8)
+
+        def writer(tid: int) -> List[str]:
+            barrier.wait()
+            out = []
+            for i in range(5):
+                try:
+                    # 内容带 tid+i ⇒ 内容 hash 唯一 ⇒ key 唯一 ⇒ 行数可精确对账
+                    ok = s.store(f"混合并发 线程{tid} 条目{i} 的唯一内容")
+                    out.append(f"w{tid}-{i}={ok}")
+                except Exception as e:      # noqa: BLE001
+                    out.append(f"w{tid}-{i}=EXC {type(e).__name__}: {e}")
+            return out
+
+        def reader(tid: int) -> List[str]:
+            barrier.wait()
+            out = []
+            for _ in range(20):
+                try:
+                    keys = [f"memory:frag:{h}" for h in ("a", "b", "不存在的")]
+                    s.get_fragments_batch(keys)
+                    s.scan_fragment_keys(limit=10)
+                    s.fragment_exists(keys[0])
+                    s.get_fragment(keys[0])
+                    out.append(f"r{tid}=ok")
+                except Exception as e:      # noqa: BLE001
+                    out.append(f"r{tid}=EXC {type(e).__name__}: {e}")
+            return out
+
+        def mixed(tid: int) -> List[str]:
+            return writer(tid) if tid < 4 else reader(tid - 4)
+
+        flat = [line for r in _run_threads(mixed, 8) for line in r]
+        exc = [line for line in flat if "=EXC " in line]
+        assert not exc, f"读写混合出现异常 {len(exc)}/{len(flat)}，例: {exc[:5]}"
+        wrote = [line for line in flat if line.startswith("w")]
+        assert len(wrote) == 20, f"写线程没走完账: {len(wrote)}/20"
+        assert all(line.endswith("=True") for line in wrote), \
+            f"有 store() 返回 falsy: {[l for l in wrote if not l.endswith('=True')][:5]}"
+        assert len([l for l in flat if l.startswith("r")]) == 80, "读线程没走完账"
+        assert _rows(s) == 20, f"库里 {_rows(s)} 行 != 20（写有丢失）"
+    finally:
+        s.close()

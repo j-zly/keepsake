@@ -25,7 +25,8 @@ SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + 
   * 写事务一律 `BEGIN IMMEDIATE`：开口就拿写锁，**不等到提交时才升级**
     （延迟升级是 SQLite 最典型的 `database is locked` 死锁来源）。
   * 同一实例内所有语句走一把 `RLock`：`check_same_thread=False` 的连接对象
-    本身不是线程安全的，Python 侧必须自己串行化。
+    本身不是线程安全的，Python 侧必须自己串行化。写事务是**整个事务体**都在锁内
+    （BEGIN → 语句 → COMMIT，见 `_write`），不是只锁 BEGIN 那一步。
     ponytail: 进程内读写互斥（粗粒度）。跨进程读仍是并发的（WAL）。
     升级路径：读路径另开一条只读连接（`file:...?mode=ro`），不共用这把锁。
 
@@ -434,28 +435,38 @@ class SqliteStorage(StorageBase):
 
         ★ 守卫放这里（而不是每个写方法各写一遍）：所有写路径都经过 `_write()`，
         一处守卫覆盖 store/upsert/删/改/反馈全部入口 —— 漏一个就是一个静默丢数据的洞。
+
+        🔴 **p1.3：整个事务体（BEGIN → 语句 → COMMIT/ROLLBACK）都在 `self._lock` 内**
+        —— 原来锁只在 `_begin_immediate()` 里持有/释放、事务体在锁外，于是同一实例
+        的两个线程会共用一条 `check_same_thread=False` 的连接各开各的事务：
+        后开的那个直接 `cannot start a transaction within a transaction`，
+        先开的那个会被另一个线程的 COMMIT 提前提交（**静默丢数据**）。
+        跨进程语义不变：WAL 照旧、`busy_timeout` 照旧 —— 进程内串行、跨进程仍排队。
+        代价：同进程读写**粗粒度互斥**（写事务期间读要排队），单进程吞吐换正确性。
+        ponytail: 单连接一把锁。要放开读并发就另开 `file:...?mode=ro` 只读连接。
         """
         self._require_ready("写路径")
-        conn = self._begin_immediate()
-        cur = conn.cursor()
-        try:
-            yield cur
-        except Exception:
+        with self._lock:
+            conn = self._begin_immediate()
+            cur = conn.cursor()
             try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
-            raise
-        try:
-            conn.execute("COMMIT")
-        except sqlite3.OperationalError as e:
+                yield cur
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
-            raise sqlite3.OperationalError(
-                f"storage_sqlite: COMMIT 失败（并发写被挤掉）: {e}"
-            ) from e
+                conn.execute("COMMIT")
+            except sqlite3.OperationalError as e:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise sqlite3.OperationalError(
+                    f"storage_sqlite: COMMIT 失败（并发写被挤掉）: {e}"
+                ) from e
 
     def _begin_immediate(self) -> sqlite3.Connection:
         """拿写锁（带重试 + 指数退避抖动），返回已开启事务的连接。"""
