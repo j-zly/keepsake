@@ -85,6 +85,34 @@ HOT_TOPIC_DAILY = "keepsake:hot_topics:daily"  # 日榜
 HOT_TOPIC_WEEKLY = "keepsake:hot_topics:weekly"  # 周榜
 HOT_TOPIC_LAST_SEEN = "keepsake:hot_topics:last_seen"  # 最后提及时间
 
+
+def _decode_hash_value(v: Any) -> Any:
+    """Redis hash 字段值 → Python 值：文本解成 str，**二进制原样留 bytes**。
+
+    🔴 2026-10-10 真 Redis（180）实测的 bug：碎片 hash 里带 `embed_bin`
+    （`struct.pack('6f', ...)` 的 float32 blob，见 `store()`），而批量读路径
+    对**每个字段一律** `v.decode("utf-8")` ⇒ 抛 UnicodeDecodeError ⇒ 被
+    `except Exception` 吞掉 ⇒ `get_fragments_batch` 返回空 dict ⇒ 合并/遗忘
+    在 Redis 上恒扫 0 条且**不报错**。
+
+    为什么是「保留 bytes」而不是 `errors="surrogateescape"` / `errors="replace"`：
+    兜底解码会把向量 blob **静默改成乱码** —— 那样返回值是假的（读出来是 str，
+    写回去就是 `"b'\\xcd...'"`），下游任何一次 str()/json 序列化再悄悄毁一次。
+    与 `storage_pg._text_field` 的既有口径一致：「静默兜底解码把二进制毁成乱码，
+    比报错更糟」。上游（consolidator/forgetter）只读文本字段，不碰二进制字段，
+    保留 bytes 对它们**零影响**。
+
+    也不做「二进制字段白名单」（如 `{"embed_bin"}`）：白名单要跟着新字段维护，
+    漏一个就静默回归同样的 bug。这里是「解不了就原样留」—— 任何未来出现的
+    二进制字段自动免疫，且**普通文本字段的返回值与改动前逐字相同**。
+    """
+    if not isinstance(v, (bytes, bytearray)):
+        return v
+    try:
+        return bytes(v).decode("utf-8")
+    except UnicodeDecodeError:
+        return bytes(v)
+
 # ---- 2026-09-14 延迟修复：热门话题榜单进程级 TTL 缓存 ----
 # 背景：rerank 对**每条候选**都调 match_hot_topics，而它取的是「全局榜单」
 # （与候选内容无关）⇒ 单次检索 99 次 Redis 往返 × ~170 ms ≈ 16.8 s（cProfile 实证）。
@@ -1087,7 +1115,8 @@ class RedisStorage(StorageBase):
     def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
         """读一个碎片的完整 hash（v2 pipeline UPDATE 阶段需要看旧事实全文）。
 
-        返回所有字段已 bytes → str 解码；key 不存在或 Redis 不可用返回 None。
+        文本字段已 bytes → str 解码；**二进制字段（embed_bin 等）保持 bytes 原样**
+        （见 `_decode_hash_value`）。key 不存在或 Redis 不可用返回 None。
         非破坏性新增，不改既有方法签名。
         """
         if not key:
@@ -1102,17 +1131,17 @@ class RedisStorage(StorageBase):
             out: Dict[str, Any] = {}
             for k_b, v_b in raw.items():
                 k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
-                v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
-                out[k] = v
+                out[k] = _decode_hash_value(v_b)
             return out
         except Exception as e:
-            logger.debug("storage: get_fragment error for %s: %s", key, e)
+            logger.warning("storage: get_fragment error for %s: %s", key, e)
             return None
 
     def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量读碎片 hash（pipeline 在封边前批量校验候选 key 是否已被封）。
 
         返回 {key: fragment_dict}；缺失或读取失败的 key 不出现在结果里。
+        文本字段已解码，二进制字段（embed_bin 等）保持 bytes 原样。
         """
         out: Dict[str, Dict[str, Any]] = {}
         if not keys:
@@ -1131,11 +1160,14 @@ class RedisStorage(StorageBase):
                 doc: Dict[str, Any] = {}
                 for k_b, v_b in raw.items():
                     kk = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
-                    vv = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
-                    doc[kk] = vv
+                    doc[kk] = _decode_hash_value(v_b)
                 out[key] = doc
         except Exception as e:
-            logger.debug("storage: get_fragments_batch error: %s", e)
+            # 🔴 不能是 debug：2026-10-10 生产 Redis 上这条路径恒空（整批 decode
+            # 失败被吞、只打 debug、生产看不见）⇒ 合并/遗忘静默扫 0 条。降级/跳过
+            # 路径必须留可辨识痕迹。带上 key 数便于判断是单页问题还是全库问题。
+            logger.warning("storage: get_fragments_batch failed (%d keys, "
+                           "got %d): %s", len(keys), len(out), e)
         return out
 
     # ------------------------------------------------------------------
@@ -1163,7 +1195,11 @@ class RedisStorage(StorageBase):
         return ("" if int(next_cursor) == 0 else str(int(next_cursor))), out
 
     def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:
-        """批量 HSET（pipeline 一把梭）。返回写入条数。"""
+        """批量 HSET（pipeline 一把梭）。返回写入条数。
+
+        bytes 值原样写入（不 str()）—— 与 `get_fragments_batch` 对称，读→写回环
+        不会把二进制字段毁成 `"b'\\xcd...'"`。
+        """
         if not rows:
             return 0
         client = self._get_client()
@@ -1175,7 +1211,8 @@ class RedisStorage(StorageBase):
             key = row.get("key")
             if not key:
                 continue
-            mapping = {k: ("" if v is None else str(v))
+            mapping = {k: ("" if v is None
+                           else (bytes(v) if isinstance(v, (bytes, bytearray)) else str(v)))
                        for k, v in row.items() if k != "key"}
             pipe.hset(key, mapping=mapping)
             n += 1
@@ -1191,8 +1228,10 @@ class RedisStorage(StorageBase):
         if not client:
             return False
         try:
-            client.hset(key, mapping={k: ("" if v is None else str(v))
-                                      for k, v in fields.items()})
+            client.hset(key, mapping={
+                k: ("" if v is None
+                    else (bytes(v) if isinstance(v, (bytes, bytearray)) else str(v)))
+                for k, v in fields.items()})
             return True
         except Exception as e:
             logger.debug("storage: update_fragment_fields(%s) failed: %s", key, e)
