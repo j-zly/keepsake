@@ -113,6 +113,26 @@ def _decode_hash_value(v: Any) -> Any:
     except UnicodeDecodeError:
         return bytes(v)
 
+
+def _tags_padded(tags: str) -> str:
+    """tags 列 → 首尾补逗号、归一化分隔符的匹配串（`storage_shared.tag_match_sql` 的 Python 版）。
+
+    🔴 库里的 `tags` **真实形态是逗号串**（`a,b` / `x,agent:worker`），但迁移进来的
+    早期行存在「分隔符两侧带空格」（`c, d`）的历史变体 —— 所以先归一化再首尾补逗号，
+    命中判据就是「逗号边界的完整标签相等」。与 PG/SQLite 侧 `_TAG_COL_NORM`
+    （两轮 replace）**同一口径**，`core` 因此绝不会命中 `core-x` / `xcore`。
+
+    竖线一并归一成逗号：库里不存在竖线分隔的 tags，但历史 SQL 曾按竖线判据写过，
+    留着这一行让两种写法落在同一个匹配串上（无竖线时是纯 no-op）。
+
+    ponytail: 空格容错只做「分隔符两侧各一个空格」这一轮；连续多个空格
+               （`a,  b`）不归一，真出现了把这两轮 replace 套两遍即可。
+    """
+    norm = str(tags).replace("|", ",")
+    for ch in ((" ,", ","), (", ", ",")):
+        norm = norm.replace(*ch)
+    return f",{norm},"
+
 # ---- 2026-09-14 延迟修复：热门话题榜单进程级 TTL 缓存 ----
 # 背景：rerank 对**每条候选**都调 match_hot_topics，而它取的是「全局榜单」
 # （与候选内容无关）⇒ 单次检索 99 次 Redis 往返 × ~170 ms ≈ 16.8 s（cProfile 实证）。
@@ -1219,6 +1239,55 @@ class RedisStorage(StorageBase):
             logger.warning("storage: get_fragments_batch failed (%d keys, "
                            "got %d): %s", len(keys), len(out), e)
         return out
+
+    # ------------------------------------------------------------------
+    # 常驻核心层（StorageBase 接口，2026-10 keepsake_core_tier_v1）
+    # ------------------------------------------------------------------
+
+    def list_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        """按标签列碎片（逗号边界匹配）。见 `StorageBase.list_by_tag`。
+
+        🔴 刻意**不走 RediSearch 的 `@tags:{...}` 过滤**：那条路要拼查询表达式、
+        过 TAG 转义、还受 `LIMIT` 影响；核心层要的是「全量、按固定顺序、可缓存」
+        的确定性子集。SCAN + pipeline HMGET 一把拿到 tags/content/updated_at，
+        匹配判据与 `storage_shared.tag_match_sql` 同源（逗号边界的完整标签相等），
+        与 RediSearch 索引的 `tags TAG SEPARATOR ,` 语义对齐。
+
+        `updated_at` 是 Redis 侧的「最近命中」时间戳（R6 `touch_fragment` 刷的），
+        老碎片可能压根没这根字段 —— 回落到 `created`，保证排序键恒存在
+        （否则混排时 None 与 str 比较会抛 TypeError）。
+        """
+        needle = f",{tag},"
+        rows: List[Dict[str, Any]] = []
+        client = self._get_client()
+        if not client:
+            # 🔴 不返回空列表：核心层为空 = agent 悄悄丢掉全部常驻记忆且无告警。
+            # 契约要求未就绪必须显式失败，调用方（system_prompt_block）负责 fail-open。
+            raise RuntimeError("storage: list_by_tag 需要可达的 Redis 连接")
+        cursor = 0
+        while True:
+            cursor, keys = client.scan(cursor=cursor, match="memory:frag:*", count=500)
+            keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in (keys or [])]
+            if keys:
+                pipe = client.pipeline()
+                for k in keys:
+                    pipe.hmget(k, "content", "tags", "updated_at", "created")
+                for key, vals in zip(keys, pipe.execute()):
+                    content, tags, updated_at, created = (
+                        _decode_hash_value(v) for v in vals
+                    )
+                    if not tags or needle not in _tags_padded(tags):
+                        continue
+                    rows.append({
+                        "key": key,
+                        "content": content or "",
+                        "tags": tags,
+                        "updated_at": updated_at or created or "",
+                    })
+            if int(cursor) == 0:
+                break
+        rows.sort(key=lambda r: (r["updated_at"], r["key"]))
+        return rows
 
     # ------------------------------------------------------------------
     # 维护原语（合并 / 遗忘）—— StorageBase 接口，Redis 侧直译 SCAN/pipeline

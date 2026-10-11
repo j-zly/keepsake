@@ -1164,6 +1164,39 @@ class SqliteStorage(StorageBase):
         return out
 
     # ------------------------------------------------------------------
+    # 常驻核心层（StorageBase 接口，2026-10 keepsake_core_tier_v1）
+    # ------------------------------------------------------------------
+
+    def list_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        """按标签列碎片（逗号边界匹配）。见 `StorageBase.list_by_tag`。
+
+        与 PG 侧同款：匹配判据复用 `storage_shared.tag_match_sql`（`instr` 两参形，
+        占位符 `?`），排序键用本后端**真有的** `updated` 列（R6 刷的最近命中时间），
+        空串回落 `created` —— 与 Redis 侧同一语义。
+        """
+        clean = self._clean_tag(tag)
+        if not clean:
+            return []
+        self._require_ready("list_by_tag")
+        clause, args = tag_match_sql("tags", [clean], "?")
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT key, content, tags, updated, created FROM ks_fragment "
+                f"WHERE {clause} "
+                "ORDER BY COALESCE(NULLIF(updated, ''), created) ASC, key ASC",
+                tuple(args),
+            ).fetchall()
+        return [
+            {
+                "key": r[0],
+                "content": r[1] or "",
+                "tags": r[2] or "",
+                "updated_at": r[3] or r[4] or "",
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
     # 维护原语（合并 / 遗忘）
     #
     # 🔴 扫描用 **keyset 分页**（`key > cursor ORDER BY key LIMIT n`），**禁止 OFFSET**：

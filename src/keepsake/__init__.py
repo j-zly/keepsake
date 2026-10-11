@@ -106,6 +106,44 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 
+# ---------------------------------------------------------------------------
+# 常驻核心层（core tag）—— 2026-10 keepsake_core_tier_v1
+#
+# core 碎片 = `tags` 里含 `core` 的**普通碎片**（不新增表、不新增列，三后端共用）。
+# ---------------------------------------------------------------------------
+
+#: 核心层标记 tag。检索层见到它就跳过（`prefetch`），写入层见它就原文入库。
+_CORE_TAG = "core"
+
+#: 核心层缓存 TTL（秒）。每轮都查库没有意义 —— core 层是低频变的常驻记忆。
+_CORE_CACHE_TTL = 60.0
+
+#: 单次核心层读取的时间预算（秒）。超了就本轮不注入（fail-open），宁可少一轮
+#: 上下文也不能让对话卡住 —— 记忆缺失是降级，卡死是事故。
+_CORE_READ_BUDGET_S = 2.0
+
+#: 核心层注入的字符预算。MEMORY.md/USER.md 原先全量注入约 8 万字符，
+#: 8 万 token 级的内容会挤爆上下文，所以设一个硬上限并**显式标注截断**。
+_CORE_MAX_CHARS = 60000
+
+#: 进程级缓存 `{"ts": 单调时刻, "frags": [{key, content, tags, updated_at}, ...]}`
+_CORE_CACHE: Dict[str, Any] = {"ts": 0.0, "frags": None}
+
+
+def _has_tag(tags: Any, tag: str) -> bool:
+    """`tags` 字段（逗号串）里是否含 `tag` —— **逗号边界的完整标签相等**。
+
+    与 `storage_shared.tag_match_sql`（PG/SQLite 的 SQL 判据）、
+    `storage._tags_padded`（Redis 的 Python 判据）同一口径：`core` 不会命中
+    `core-x` / `xcore`。三处判据必须同步改，否则「写进去了但检索排不掉」。
+    """
+    if not tags or not tag:
+        return False
+    norm = str(tags).replace("|", ",")
+    for ch in ((" ,", ","), (", ", ",")):
+        norm = norm.replace(*ch)
+    return f",{tag}," in f",{norm},"
+
 
 def _load_json_config() -> dict:
     """从 JSON 配置文件加载配置。
@@ -614,7 +652,75 @@ class KeepsakeProvider(MemoryProvider):
             "负反馈用 keepsake_feedback(key, positive=False) 标记没用。",
             "热门话题用 keepsake_topics() 查询。",
         ]
+        block = self._core_block()
+        if block:
+            parts.append("")
+            parts.append(block)
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # 常驻核心层（core tag）—— 2026-10 keepsake_core_tier_v1
+    #
+    # 两套记忆并存的根因：Hermes 本体每轮全量注入 MEMORY.md/USER.md（约 8 万字符），
+    # keepsake 只做按查询召回的「相关记忆」段落。本层把常驻记忆收进碎片库，
+    # 让 keepsake 成为**单一记忆系统**：core 碎片每轮原文全量注入，
+    # 其余碎片仍走 prefetch 检索。
+    #
+    # 🔴 **本层绝不抛异常、绝不阻塞对话**（fail-open）：
+    #   * 读库异常 / 耗时超预算 → 只返回静态文案 + logger.warning
+    #   * 截断时必须留一行可见的截断说明，不许静默丢条目
+    # 理由：`system_prompt_block` 在 Hermes 每轮组装 system prompt 的关键路径上，
+    # 在这里抛出去等于整轮对话失败 —— 记忆是增强项，不该有能力让对话瘫掉。
+    # ------------------------------------------------------------------
+
+    def _core_fragments(self) -> List[Dict[str, Any]]:
+        """取核心层碎片，带 60s 进程内缓存；任何异常/超时都退化成空列表 + warning。
+
+        缓存是进程级而非实例级：core 层在一次对话里只应查一次库，而 Hermes
+        可能为多 session 构造 provider 实例。
+        """
+        import time as _time
+
+        now = _time.time()
+        cached = _CORE_CACHE.get("frags")
+        if cached is not None and now - _CORE_CACHE["ts"] < _CORE_CACHE_TTL:
+            return cached
+        try:
+            start = _time.time()
+            frags = list(self._storage.list_by_tag(_CORE_TAG))
+            elapsed = _time.time() - start
+        except Exception as e:
+            logger.warning("keepsake: core 层读取失败（fail-open，只注入静态文案）: %s", e)
+            return []
+        if elapsed > _CORE_READ_BUDGET_S:
+            logger.warning("keepsake: core 层读取耗时 %.1fs 超预算 %.1fs（fail-open，本轮不注入）",
+                           elapsed, _CORE_READ_BUDGET_S)
+            return []
+        _CORE_CACHE["ts"] = now
+        _CORE_CACHE["frags"] = frags
+        return frags
+
+    def _core_block(self) -> str:
+        """渲染 `<keepsake-core>…</keepsake-core>` 块；无内容时返回空串（不留空行）。"""
+        if not self._storage:
+            return ""
+        frags = self._core_fragments()
+        if not frags:
+            return ""
+        lines = [f"- {f.get('content', '')}" for f in frags]
+        if sum(len(x) for x in lines) > _CORE_MAX_CHARS:
+            # 按 list_by_tag 的稳定顺序（updated_at 升序、key 升序）**从头截** ——
+            # 老条目是常驻记忆里最该被无条件看到的那部分，末尾的超预算条目才丢。
+            kept, total = [], 0
+            for line in lines:
+                if total + len(line) > _CORE_MAX_CHARS:
+                    break
+                kept.append(line)
+                total += len(line)
+            lines = kept + [f"[core 层已截断：共 {len(frags)} 条，本次注入 {len(kept)} 条]"]
+            logger.warning("keepsake: core 层超 %d 字符预算，截断为 %d 条",
+                           _CORE_MAX_CHARS, len(kept))
+        return "\n".join(["<keepsake-core>", *lines, "</keepsake-core>"])
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
@@ -641,6 +747,10 @@ class KeepsakeProvider(MemoryProvider):
             tag_filter=self._tag_filter,
         )
         elapsed = _time.time() - start
+
+        # core 碎片由 system_prompt_block 无条件全量注入，这里必须排除 ——
+        # 否则同一条记忆每轮出现两次（一次全量、一次检索），且两份可能不同版本。
+        fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
 
         if not fragments:
             return ""
@@ -910,10 +1020,104 @@ class KeepsakeProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """builtin memory 写入时同步存到碎片库（完整内容，不做切分）。
+        """Hermes 常驻记忆（MEMORY.md / USER.md）写入时，**原文**存为 core 碎片。
 
-        2026-09 ingest_gate v1：MEMORY.md 与碎片库分离，关闭同步双份入库。
-        保留方法签名（Hermes MemoryProvider ABC 要求）。
+        2026-10 keepsake_core_tier_v1：这是把常驻记忆收进 keepsake 的唯一入口 ——
+        与本方法原先的「直接 return」（2026-09 ingest_gate R5 关闭双份入库）相反，
+        现在两侧合并成同一套：常驻记忆存进碎片库并打上 `core` 标签，
+        `system_prompt_block` 每轮原文全量注入，检索层不再重复召回。
+
+        🔴 **原文逐字入库，绝不经 LLM 提炼 / 摘要改写**：常驻记忆是 agent 行为的
+        硬约束（「端口是 8091」被改写成「用户偏好某端口」就是记忆损坏）。
+        仍走 `scrub_secrets` 打码 —— 那是安全闸（R7），不是内容改写。
+
+        🔴 **任何异常都吞掉 + warning，绝不影响 Hermes 主流程**：本方法由 Hermes
+        在 memory 工具的成功路径上同步调用，抛出去会让用户的记忆写入失败。
         """
-        # → ingest_gate R5（builtin_dup）：两套体系分离，不再复制 MEMORY.md 进碎片库
-        return
+        try:
+            self._core_write(action, target, content, metadata or {})
+        except Exception as e:
+            logger.warning("keepsake: on_memory_write(%s/%s) 失败（已吞掉）: %s",
+                           action, target, e)
+
+    def _core_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """`on_memory_write` 的实际动作。**调用方保证异常已被吞掉。**
+
+        action 语义（对齐 Hermes memory 工具）：
+          * `add`                  → 入库为 core 碎片
+          * `replace` / `update`    → 先删旧（metadata 的 key 或 old_text）再写新
+          * `remove`                → 删掉 metadata 指的那条
+        识别不了的 action 一律 warning + 跳过，绝不猜。
+        """
+        if not self._storage:
+            return
+        if not content or not content.strip():
+            return
+
+        # R7：入库前凭据打码（与 _v1_store_after_decide 同一入口，同一口径）。
+        # 只打码、不改写其余文字 —— 原文入库是硬要求。
+        from .ingest_gate import scrub_secrets
+        try:
+            scrubbed, _n = scrub_secrets(content)
+            if scrubbed and scrubbed.strip():
+                content = scrubbed
+        except Exception as e:
+            logger.debug("keepsake: scrub_secrets failed in _core_write: %s", e)
+
+        action = (action or "").strip().lower()
+        tags = f"{_CORE_TAG},{target or 'memory'}"
+
+        if action == "remove":
+            self._core_delete(metadata, content)
+        elif action in ("replace", "update"):
+            # 先删旧再写新。找不到旧条目时退化成「新增」—— 用户重写一条记忆
+            # 而 Hermes 没给 old_text/key 时，这是唯一不丢内容的做法。
+            self._core_delete(metadata, metadata.get("old_text") or "")
+            self._core_add(content, tags)
+        elif action == "add":
+            self._core_add(content, tags)
+        else:
+            logger.warning("keepsake: on_memory_write action=%r 无法识别，跳过", action)
+            return
+
+        # 写入/删除成功 ⇒ 核心层缓存立即失效（下一轮立刻看到新内容）。
+        _CORE_CACHE["ts"] = 0.0
+        _CORE_CACHE["frags"] = None
+
+    def _core_add(self, content: str, tags: str) -> None:
+        """原文入库为 core 碎片；同 content 已存在则不重复入库（幂等）。
+
+        幂等判据用「现存 core 碎片里有逐字相同的一条」而不是靠 `store()` 的
+        内容 hash 去重 —— 后者对 PG/SQLite 的版本化语义不保证，而常驻记忆
+        被重复注入是要用户能看出来的故障。
+        """
+        for f in self._core_fragments():
+            if f.get("content") == content:
+                return
+        self._storage.store(
+            text=content,
+            tags=tags,
+            category="core",
+            source="builtin_memory",
+            fragment_type="core",
+        )
+
+    def _core_delete(self, metadata: Dict[str, Any], fallback_text: str) -> None:
+        """删掉 metadata 指向的那条 core 碎片（按 `key` 优先，其次 `old_text` 全文匹配）。"""
+        key = metadata.get("key")
+        if not key:
+            text = metadata.get("old_text") or fallback_text
+            if not text:
+                return
+            for f in self._core_fragments():
+                if f.get("content") == text:
+                    key = f.get("key")
+                    break
+        if key:
+            self._storage.delete_fragments_batch([key])

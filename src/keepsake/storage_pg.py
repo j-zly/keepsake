@@ -2624,6 +2624,38 @@ class PgStorage(StorageBase):
         return out
 
     # ------------------------------------------------------------------
+    # 常驻核心层（StorageBase 接口，2026-10 keepsake_core_tier_v1）
+    # ------------------------------------------------------------------
+
+    def list_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        """按标签列碎片（逗号边界匹配）。见 `StorageBase.list_by_tag`。
+
+        匹配判据直接复用 `storage_shared.tag_match_sql`（与检索侧 `tag_filter`
+        同一份 SQL 片段），排序在 SQL 里做 —— PG 侧没有 `updated_at` 列
+        （见 `touch_fragment` 的说明），排序键回落到 `created`，
+        对齐 Redis 侧「`updated_at` 缺失时回落 created」的同一语义。
+        """
+        clean = self._clean_tag(tag)
+        if not clean:
+            return []
+        clause, args = tag_match_sql("tags", [clean], "%s", pos_fn="strpos")
+        with self._ro() as cur:
+            cur.execute(
+                f"SELECT key, content, tags, created FROM ks_fragment "
+                f"WHERE {clause} ORDER BY created ASC, key ASC",
+                tuple(args),
+            )
+            return [
+                {
+                    "key": r[0],
+                    "content": r[1] or "",
+                    "tags": r[2] or "",
+                    "updated_at": r[3] or "",
+                }
+                for r in cur.fetchall()
+            ]
+
+    # ------------------------------------------------------------------
     # 维护原语（合并 / 遗忘）—— StorageBase 接口，PG 侧实现
     #
     # 🔴 扫描用 **keyset 分页**（`key > cursor ORDER BY key LIMIT n`），

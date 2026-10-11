@@ -236,6 +236,37 @@ class StorageBase(ABC):
         ...
 
     # ------------------------------------------------------------------
+    # 常驻核心层（core tag）—— 2026-10 keepsake_core_tier_v1
+    # ------------------------------------------------------------------
+
+    def list_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        """返回 `tags` 里含 `tag` 的碎片，按 `updated_at` 升序、`key` 升序（稳定）。
+
+        每项至少含 `key` / `content` / `tags` / `updated_at`。
+
+        常驻核心层（`system_prompt_block` 每轮全量注入）靠这个原语取全文，
+        不是检索排序的子集 —— 所以**不许**复用 search 的打分/截断路径。
+
+        tag 匹配必须是**分隔符边界上的完整标签相等**（与检索侧
+        `storage_shared.tag_match_sql` 同一判据）：`core` 不许命中 `core-x`。
+        Redis 侧 `tags` 落库形态是逗号串，按逗号切分比对。
+
+        🔴 **未实现的后端必须抛 NotImplementedError，绝不静默返回空列表** ——
+        静默空 = 核心层悄悄变空、agent 丢掉全部常驻记忆且无任何告警，
+        与 `search_*` 的同一约定（见类 docstring）。
+
+        刻意**不标 `@abstractmethod`**：标了就得同步改
+        `tests/test_storage_interface.py` 里那份写死的 `REQUIRED_METHODS`
+        （否则接口测试按设计失败），而那是本单改动范围外的文件。
+        写成带 `raise` 的具体方法，语义等价且更强：漏实现的后端**仍能构造**
+        （构造期失败会波及既有测试），只在真被调用时炸 —— 而调用方
+        `system_prompt_block` 已经 fail-open，接得住。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 未实现 list_by_tag（tag={tag!r}）"
+        )
+
+    # ------------------------------------------------------------------
     # 语料维护（批 2 与检索一起做）
     # ------------------------------------------------------------------
 
