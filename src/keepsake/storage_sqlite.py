@@ -103,6 +103,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from .emotion import analyze_emotion
 from .splitter import extract_entities, extract_keywords, segment_query
 from .storage_base import StorageBase
+from . import storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
 from .storage_shared import (
     DECAY_HALF_DAYS,
@@ -129,6 +130,10 @@ from .storage_shared import (
     synonym_rows,
     synonym_words,
     tag_match_sql,
+    # 分词口径单源 + 确定性 tiebreaker（2026-10 ks_recall_v1，见 storage_shared 的说明）
+    query_lexemes,
+    tiebreak_by_key,
+    tsv_lexemes,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
 from .storage import _expand_terms, _sanitize_terms
@@ -368,7 +373,9 @@ def _sha12(text: str) -> str:
 
 
 #: unicode61 的词元口径 = `\w+`（含下划线，ASCII 大小写由 unicode61 折叠）。
-_WORD_RE = re.compile(r"\w+", re.UNICODE)
+#: 2026-10 ks_recall_v1：这个词元口径改为与 PG 侧共用 `storage_shared.LEXEME_RE`
+#: （同一个函数对象）—— 两个后端的「词」从此有同一个定义。
+_WORD_RE = storage_shared.LEXEME_RE
 
 
 def _tsv_lexemes(text: str) -> List[str]:
@@ -393,10 +400,12 @@ def _tok_string(text: str) -> str:
 
     🔴 为什么不用 trigram 分词器：它有 3 字下限，中文里 2 字词（网关/备份）
     占大头 ⇒ 查 2 字恒 0 命中。任务书明写「不要 trigram」。
-    """
-    import jieba  # noqa: PLC0415 — 与 splitter / storage_pg 同款延迟 import（首调建词典）
 
-    return " ".join(_tsv_lexemes(" ".join(w.strip() for w in jieba.lcut(text or ""))))
+    2026-10 ks_recall_v1：函数体改为直接复用 `storage_shared.tsv_lexemes`
+    （PG 侧 `_tsv_tokens` 用的同一个函数对象）⇒ 入库侧与查询侧共用一份分词实现，
+    词典缺失时统一 WARNING，不静默退回另一套分词。
+    """
+    return " ".join(tsv_lexemes(text))
 
 
 def _fts_match_expr(terms: List[str]) -> str:
@@ -467,9 +476,13 @@ class SqliteStorage(StorageBase):
         synonym_jaccard_threshold: float = 0.5,
         synonym_min_co_occurrence: int = 3,
         synonym_scan_batch: int = 500,
+        # 2026-10 ks_recall_v1：只读连接（评测器用）——`file:...?mode=ro` URI，
+        # 让「评测绝不写库」由**数据库本身**兜底，而不是靠调用方自觉不调写方法。
+        readonly: bool = False,
         **_: Any,
     ):
         self._path = str(path or DEFAULT_SQLITE_PATH)
+        self._readonly = bool(readonly)
         self._agent_id = agent_id
         self._is_primary = bool(is_primary)
         # ---- embedding 写开关（判据与 Redis/PG 两侧逐字同一套）----
@@ -554,7 +567,21 @@ class SqliteStorage(StorageBase):
 
         WAL + busy_timeout 是并发正确性的两个前提，每次建连都设一遍
         （WAL 是**文件级**属性但只在建连时生效一次，busy_timeout 是连接级）。
+
+        🔴 `readonly=True`（2026-10 ks_recall_v1，评测器用）：走 `file:…?mode=ro`
+        URI，**由 SQLite 自己**拒掉一切写语句 —— 「评测不污染记忆库」不再依赖
+        调用方自觉。只读连接不能切 journal_mode（WAL 写文件头），故跳过该 PRAGMA。
         """
+        if self._readonly:
+            if self._path == ":memory:":
+                raise ValueError("storage_sqlite: readonly=True 不支持 :memory:（无库可读）")
+            conn = sqlite3.connect(
+                f"file:{Path(self._path).expanduser().as_posix()}?mode=ro",
+                uri=True, timeout=self._busy_timeout_ms / 1000.0,
+                check_same_thread=False, isolation_level=None,
+            )
+            conn.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
+            return conn
         if self._path != ":memory:":
             Path(self._path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
@@ -760,6 +787,12 @@ class SqliteStorage(StorageBase):
         把「对方 3s 后就建好了」误判成永久故障。补跑一次仍不就绪 ⇒ 才判定为真故障。
         """
         ready, why = self._schema_ready()
+        if not ready and self._readonly:
+            # 只读连接**不许**补建 schema（那要发 DDL）——评测绝不允许写库。
+            raise StorageNotReadyError(
+                f"storage_sqlite: {op} 被拒绝 —— 只读连接（readonly=True）下 schema 未就绪"
+                f"（path={self._path}；{why or '未知'}）。只读连接不会补建 schema。"
+            )
         if not ready and self.ensure_index():
             ready, why = self._schema_ready()
         if not ready:
@@ -1545,15 +1578,12 @@ class SqliteStorage(StorageBase):
                   score_key: str = "_combined_score") -> List[Dict[str, Any]]:
         """**并列 tiebreaker**：同分时按 `key` 字典序（升序）定序。
 
-        与 `PgStorage._tiebreak` 同语义：共用重排只用一个分字段，
+        与 `PgStorage._tiebreak` 同语义（2026-10 ks_recall_v1 起三者共用
+        `storage_shared.tiebreak_by_key` 同一个函数对象）：共用重排只用一个分字段，
         BM25 归一化后大量候选挤在同一值上 ⇒ 排序不稳定会让「同一题连查多次
         结果不一致」。规则只改同分项之间的相对次序，不改分数、不改条数。
         """
-        if len(fragments) < 2:
-            return fragments
-        return sorted(fragments,
-                      key=lambda f: (-float(f.get(score_key, 0.0) or 0.0),
-                                     f.get("_key") or ""))
+        return tiebreak_by_key(fragments, score_key=score_key)
 
     def search(self, query: str, tag_filter: str = "", agent_id: str = "",
                is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
@@ -1652,6 +1682,10 @@ class SqliteStorage(StorageBase):
         # 1. 查询式构造：与 PG 侧逐字同一套（同义词扩展 + sanitize 拆子词）
         terms = _sanitize_terms(
             _expand_terms(segment_query(query), self._load_synonym_map()))
+        # 🔴 2026-10 ks_recall_v1：查询侧按**索引侧同一个 `\w+` 口径**归一词元
+        # （PG 侧 `query_lexemes` 同一个函数对象）——改前 `2026-09-22` 这类带符号
+        # 整块原样进 MATCH，而 `content_tsv` 里根本没有这个 token ⇒ 恒 0 命中。
+        terms = query_lexemes(terms)
         if not terms:
             logger.warning("storage_sqlite: query %r sanitized down to zero terms — "
                            "returning no results (explicit)", query[:50])

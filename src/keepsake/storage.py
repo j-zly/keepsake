@@ -40,6 +40,7 @@ from .storage_shared import (          # noqa: F401 — 常量与函数均为有
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
+    tiebreak_by_key,
 )
 from .splitter import extract_keywords, extract_entities, segment_query
 from .emotion import analyze_emotion
@@ -59,7 +60,12 @@ logger = logging.getLogger(__name__)
 RS_INDEX = "idx:memories"
 
 # BM25 检索参数
-DEFAULT_BM25_LIMIT = 20        # BM25 搜多少条候选（v1.4: 10→20 减少截断丢失）
+# 🔴 2026-10 ks_recall_v1：20 → 200。**候选池过小是本单第一号失手原因**
+# （生产实测 3,740 条碎片、`search_bm25("StrategyCompare")` 返 0 条，而同一条碎片
+#   `content_tsv @@ plainto_tsquery('simple','回测')` = true ⇒ 在索引里，
+#   只是排在候选窗口第 20 名之外）。
+# 旧配置键 `bm25_limit` 原样保留且优先，改配置即可回到小池做对照。
+DEFAULT_BM25_LIMIT = 200       # BM25 搜多少条候选（v1.4: 10→20；v1.6: 20→200 扩大召回池）
 DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
 
 # KNN 参数（embedding 模式用）
@@ -335,7 +341,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             # 同一份取值来源（PG 分支就是从这里拿的）。修前这三个键一个都不传
             # ⇒ sqlite 恒用模块默认 5/20/20 ⇒ 同一 query 与 PG 差一个数量级。
             final_limit=int(cfg.get("top_k", 15)),
-            bm25_limit=int(cfg.get("bm25_limit", 20)),
+            bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
             candidate_count=int(cfg.get("candidate_k", 20)),
             # 2026-10 ks_sqlite_p3_1：同义词三阈值**同源接线**（与 redis/provider 侧
             # 同一份 cfg 顶层键、同一组默认值；provider 把它们当 kwargs 传进来时
@@ -372,7 +378,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             embed_dim=int(cfg.get("embed_dim", 1536)),
             is_primary=bool(cfg.get("is_primary", False)),
             final_limit=int(cfg.get("top_k", 15)),
-            bm25_limit=int(cfg.get("bm25_limit", 20)),
+            bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
             candidate_count=int(cfg.get("candidate_k", 20)),
             # 2026-10 ks_pg_syn：同义词三阈值**同源接线**（与 redis / sqlite 分支
             # 同一份 cfg 顶层键、同一组默认值 10/0.5/3；provider 把它们当 kwargs
@@ -405,7 +411,7 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         agent_id=cfg.get("agent_id", ""),
         is_primary=bool(cfg.get("is_primary", False)),
         final_limit=int(cfg.get("top_k", 15)),
-        bm25_limit=int(cfg.get("bm25_limit", 20)),
+        bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
         candidate_count=int(cfg.get("candidate_k", 20)),
         **_resolve_knobs(cfg, {}),
     )
@@ -1787,6 +1793,12 @@ class RedisStorage(StorageBase):
                     fragments.append(frag)
 
             fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
+            # 🔴 2026-10 ks_recall_v1：Redis 侧此前**没有** tiebreaker（PG/SQLite 早就有）。
+            # 共用重排只按一个分字段排，而分是浮点连乘、同分极常见 ⇒ 同分行的相对名次
+            # 会随 RediSearch 返回序逐次飘（PG 侧 HNSW 同款问题）。这里补齐，
+            # 与 PG/SQLite 同一个 `tiebreak_by_key` 函数对象，规则逐字相同：
+            # 只改同分项之间的相对次序，不改分数、不改条数。
+            fragments = tiebreak_by_key(fragments)
             final_fragments = fragments[: self._final_limit]
 
             # 2026-09 ks_retr: 召回分数分布记录（为 min_score 调参攒数据）

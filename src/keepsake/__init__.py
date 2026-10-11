@@ -38,7 +38,7 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
         return f"[tool_error] {msg}"
 
 from .embedder import create_embedder
-from .storage import RedisStorage, storage_from_config
+from .storage import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
 from .forgetter import Forgetter
 # v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
 from .pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
@@ -445,7 +445,10 @@ class KeepsakeProvider(MemoryProvider):
             candidate_count=candidate_k,
             final_limit=top_k,
             embed_dim=embed_dim,
-            bm25_limit=int(cfg.get("bm25_limit", 10)),
+            # 🔴 2026-10 ks_recall_v1：候选池默认值与三个后端的 DEFAULT_BM25_LIMIT
+            # 同源（此前这里写死 10，storage.py 侧写死 20，两处默认值本身就不一致）。
+            # 旧配置键 `bm25_limit` 不变，配了就以配置为准。
+            bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
             decay_half_days=int(cfg.get("decay_half_days", 60)),
             embed_cache_ttl=int(cfg.get("embed_cache_ttl", 3600)),
             sentiment_boost_positive=float(cfg.get("sentiment_boost_positive", 1.5)),

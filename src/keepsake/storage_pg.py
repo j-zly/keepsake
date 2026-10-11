@@ -107,6 +107,10 @@ from .storage_shared import (          # 与 Redis 共用的检索后处理（�
     merge_synonym_maps,
     synonym_rows,
     synonym_words,
+    # 分词口径单源 + 确定性 tiebreaker（2026-10 ks_recall_v1，见 storage_shared 的说明）
+    query_lexemes,
+    tiebreak_by_key,
+    tsv_lexemes,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 路径/连字符拆子词的 sanitize）。
 # 复用而不是重抄：上游 58bf19c/d00b7eb 修过这套的坑，两边各写一份必漂移。
@@ -117,7 +121,12 @@ logger = logging.getLogger(__name__)
 
 # 检索参数默认值 —— 与 storage.py 的 DEFAULT_* 逐字对齐
 DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
-DEFAULT_BM25_LIMIT = 20        # BM25 候选数
+# 🔴 2026-10 ks_recall_v1：20 → 200。**候选池过小是本单第一号失手原因**
+# （生产实测 3,740 条碎片、`search_bm25("StrategyCompare")` 返 0 条，而同一条碎片
+#   `content_tsv @@ plainto_tsquery('simple','回测')` = true ⇒ 在索引里，
+#   只是排在候选窗口第 20 名之外）。
+# 旧配置键 `bm25_limit` 原样保留且优先，改配置即可回到小池做对照。
+DEFAULT_BM25_LIMIT = 200
 DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
 MAX_CONTENT_LEN = 600          # 超长条目视为噪音跳过（对齐 Redis search_bm25）
 TS_RANK_NORM = 32              # ts_rank_cd 归一化位：rank/(1+rank)（只用于召回窗口粗排）
@@ -720,13 +729,13 @@ class PgStorage(StorageBase):
         不改条数（`final_limit` 仍按原样截断）。Redis 侧零改动 ——
         本函数只在 PgStorage 内调用。
 
-        无 `_key` 的行排在最后（`or ""` 兜底），不与有 key 的行抢位置。
+        无 `_key` 的行按 `or ""` 兜底（同分时排在有 key 的行之前，检索结果恒带 `_key`；
+        这行说明的是**代码的实际行为**，与共用实现 `tiebreak_by_key` 同款）。
+
+        2026-10 ks_recall_v1：函数体改为直接复用 `storage_shared.tiebreak_by_key`
+        （三个后端同一份实现），语义与改前逐字相同。
         """
-        if len(fragments) < 2:
-            return fragments
-        return sorted(fragments,
-                      key=lambda f: (-float(f.get(score_key, 0.0) or 0.0),
-                                     f.get("_key") or ""))
+        return tiebreak_by_key(fragments, score_key=score_key)
 
     def __init__(
         self,
@@ -1417,6 +1426,14 @@ class PgStorage(StorageBase):
         # 1. 查询式构造 —— 复用 Redis 侧的同义词扩展 + sanitize（含拆子词那套）
         terms = _expand_terms(segment_query(query), self._load_synonym_map())
         terms = _sanitize_terms(terms)
+        # 🔴 2026-10 ks_recall_v1：**查询侧与文档侧分词口径对齐**（共用一份实现）。
+        # 改前这里原样把 sanitize 的结果送进 tsquery，而 sanitize 只按 `/-_.` 拆、
+        # 不过 `segment_query`（纯英文查询压根不过 jieba）⇒ `2026-09-22`、`回测（`
+        # 这类带符号整块在 content_tsv 里没有对应 lexeme，恒 0 命中
+        # （生产实测 `search_bm25("StrategyCompare")` 返 0 条即此类）。
+        # `query_lexemes` 按索引侧同一个 `\w+` 口径拆成子词（**只增不减**），
+        # 词典缺失时由 `tsv_lexemes` 侧统一 WARNING，不静默换一套分词。
+        terms = query_lexemes(terms)
         if not terms:
             logger.warning("storage_pg: query %r sanitized down to zero terms — "
                            "returning no results (explicit)", query[:50])
@@ -2080,21 +2097,20 @@ class PgStorage(StorageBase):
 
     @staticmethod
     def _tsv_tokens(text: str) -> List[str]:
-        """文本 → tsvector 的词元串（jieba 切，纯 Python，不依赖任何 PG 扩展）。
+        """文本 → tsvector 的词元串（**分词口径单源**，纯 Python，不依赖任何 PG 扩展）。
 
         🔴 这是「不装 pg_jieba/zhparser」的落点：中文分词全在 Python 侧做，
         写进库时就算成 tsvector 存列，检索时只做 tsquery 匹配，PG 全程不碰分词。
         'simple' 配置只小写化、不做词干还原 ⇒ 一词一 token，不会二次合并。
-        """
-        import jieba  # noqa: PLC0415 — 与 splitter 同款延迟 import（jieba 首调建词典）
 
-        out: List[str] = []
-        for w in jieba.lcut(text or ""):
-            w = w.strip()
-            if not w or not any(ch.isalnum() for ch in w):
-                continue   # 纯标点/空白 → to_tsvector 只会造出噪音 token
-            out.append(w)
-        return out
+        2026-10 ks_recall_v1：函数体改为直接复用 `storage_shared.tsv_lexemes`
+        （jieba 切 + `\\w+` 词元口径），与查询侧 `query_lexemes` **同一份实现**。
+        原实现不在 Python 侧切 `\\w+`，靠 PG 的 `to_tsvector` 代切 ⇒ 文档侧看到的
+        词元与查询侧送进去的词元口径对不齐（`2026-09-22` / `回测（` 这类带符号整块
+        在索引里根本不存在对应 lexeme ⇒ 恒 0 命中）。提前切只是把 PG 本来就要做的
+        那一步提前，索引内容与召回面不变。
+        """
+        return tsv_lexemes(text)
 
     # ------------------------------------------------------------------
     # 写入

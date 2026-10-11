@@ -34,11 +34,104 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 分词口径单源（2026-10 ks_recall_v1）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么要有这一节：改前**文档侧与查询侧走的是两套分词**，是「有索引却查不到」
+#   的第一号成因（生产实测：`search_bm25("StrategyCompare")` 返 0 条，而同一条碎片
+#   `content_tsv @@ plainto_tsquery('simple','回测')` = true）。
+#
+#   文档侧：`_tsv_tokens` / `_tok_string` = `jieba.lcut` 后交给 PG `to_tsvector('simple')`
+#           或 SQLite `unicode61` —— 两边都会**再按 `\w+` 切一刀**（连字符/括号都被切掉）。
+#   查询侧：`segment_query` 对**纯英文查询直接 `query.split()`、根本不过 jieba**，
+#           且原样保留了 `2026-09-22`、`（` 这类带符号的整块 → 索引里压根没有这个 lexeme
+#           ⇒ 该词恒 0 命中，而整条查询因为还有别的词命中而「看起来正常」。
+#
+# 本节把口径钉成**一份实现**：文档侧与查询侧都调 `tsv_lexemes` / `query_lexemes`，
+# 查询词在建 tsquery / FTS MATCH 之前先归一成与索引**逐字同形**的词元。
+# 三条约束：
+#   1. 零新依赖 —— 只用已在依赖里的 jieba + 标准库 `re`；
+#   2. 词典必须一致 —— 两侧都依赖 `splitter` 导入时加载的 jieba 自定义词典；
+#      词典文件缺失时**显式 logger.warning**，绝不静默退回另一套分词（见 `tsv_lexemes`）；
+#   3. 只增不减 —— 查询词归一**只把一个词拆成若干子词**（超集），
+#      召回面只会变大，不会把原来能命中的词删掉。
+
+#: 与 PG `to_tsvector('simple')` / SQLite `unicode61` 的词元口径逐字对齐：`\w+`。
+LEXEME_RE = re.compile(r"\w+", re.UNICODE)
+
+#: jieba 自定义领域词典路径（与 `splitter._DOMAIN_DICT` 同一份，见该模块注释）
+_DOMAIN_DICT = Path.home() / ".config" / "keepsake" / "jieba_dict.txt"
+_dict_warned = False
+
+
+def warn_if_domain_dict_missing() -> bool:
+    """jieba 自定义领域词典不存在 ⇒ **只告警一次**的 WARNING，返回是否缺失。
+
+    🔴 为什么必须显式告警：文档侧与查询侧都靠这份词典把「回测」这类领域词切成
+    一个整词。词典缺失时两侧**仍然用 jieba 默认词典**（不是另一套实现，但切法会漂），
+    而漂了的直接后果是「入库时切成 A、查询时切成 B」⇒ 静默 0 召回。
+    这类问题不报错、不打日志就完全不可见，所以这里明确说出来。
+    """
+    global _dict_warned
+    if _DOMAIN_DICT.exists():
+        return False
+    if not _dict_warned:
+        _dict_warned = True
+        logger.warning(
+            "keepsake: jieba 领域词典缺失（%s）—— 退回 jieba 默认词典。"
+            "分词口径仍与索引侧同源（同一份 tsv_lexemes），但领域词切法可能与入库时不同，"
+            "易表现为「有索引却查不到」。生成词典：PgStorage/SqliteStorage.generate_jieba_dict()",
+            _DOMAIN_DICT,
+        )
+    return True
+
+
+def tsv_lexemes(text: str) -> List[str]:
+    r"""正文/查询 → tsvector 词元（**分词口径的唯一实现**，入库与查询共用）。
+
+    流程与原 `_tsv_tokens` / `_tok_string` 逐字相同：jieba 切 → 按 `\w+` 取词元
+    （PG `to_tsvector('simple')` 与 SQLite `unicode61` 本来就这么切，提前切只是为了
+    让 Python 侧的 doclen/tf/df 计数与索引侧的词元逐字对齐）。
+    """
+    import jieba                                        # noqa: PLC0415 — 首调建词典
+    warn_if_domain_dict_missing()
+    return LEXEME_RE.findall(" ".join(w.strip() for w in jieba.lcut(text or "")))
+
+
+def query_lexemes(terms: List[str]) -> List[str]:
+    """查询词列表 → 与索引**逐字同形**的词元列表（保序去重）。
+
+    改前查询词原样进 tsquery / FTS MATCH，`2026-09-22`、`回测（` 这类带符号的整块
+    在索引里不存在对应 lexeme ⇒ 恒 0 命中。这里按 `LEXEME_RE` 拆成子词（超集），
+    再丢掉纯符号词元（拆完可能只剩标点）与纯数字里长度 ≤ 2 的碎渣（`09`/`22` 这类
+    日期残片，留着只会把候选池灌满噪声）。**只增不减**：原来能命中的词一个都没丢。
+    """
+    out: List[str] = []
+    seen = set()
+    for t in terms or []:
+        for lex in LEXEME_RE.findall(str(t)):
+            low = lex.lower()
+            if not low or low in seen:
+                continue
+            # 拆完只剩标点的、以及 ≤2 位纯数字（日期残片）：索引侧词元存在但
+            # 毫无区分度，命中它等于把候选池灌满噪声。
+            if not any(ch.isalnum() for ch in lex):
+                continue
+            if low.isdigit() and len(low) <= 2:
+                continue
+            seen.add(low)
+            out.append(lex)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # 排序权重常量（原本写在 storage.py 模块顶部，两个后端共用同一份定义）
@@ -257,6 +350,34 @@ def rrf_fuse(
     for frag in fused:
         frag["_combined_score"] = scores.get(frag.get("content"), 0.0)
     return fused[: storage._final_limit]   # noqa: SLF001 — 实例权重，两个后端都有
+
+
+# ---------------------------------------------------------------------------
+# 共用：确定性 tiebreaker（同分按 key 升序）
+# ---------------------------------------------------------------------------
+
+def tiebreak_by_key(
+    fragments: List[Dict[str, Any]],
+    score_key: str = "_combined_score",
+) -> List[Dict[str, Any]]:
+    """**并列 tiebreaker**：同分时按 `key` 字典序（升序）定序。
+
+    🔴 为什么需要（2026-10 ks_recall_v1 验收锚点）：排序只用一个分字段，而分是
+    浮点连乘（sim × decay × emotion × feedback × hot × attention），**同分极其常见**
+    （BM25 归一化后大量候选挤在同一个值上）。`list.sort` 稳定 ⇒ 同分行沿用输入次序，
+    而输入次序来自候选 SQL 的返回序 / HNSW 的近似返回序，跨次运行不保证一致 ⇒
+    「同一查询连查多次 key 序列不同」的抖动就是这么来的。
+
+    规则：**只改同分项之间的相对次序**，不改任何一行的分数、不改条数、不改分档。
+    无 `_key` 的行按 `or ""` 兜底 ⇒ 同分时排在有 key 的行**之前**（检索结果恒带
+    `_key`，这条只兜异常形状；PG 侧原 docstring 写的是「排在最后」，与代码不符，
+    这里按代码的实际行为写，别再让文档骗人）。
+    """
+    if len(fragments) < 2:
+        return fragments
+    return sorted(fragments,
+                  key=lambda f: (-float(f.get(score_key, 0.0) or 0.0),
+                                 f.get("_key") or ""))
 
 
 # ---------------------------------------------------------------------------
