@@ -457,40 +457,68 @@ class _FakeEmbedder:
 
 @pytest.fixture(scope="module")
 def pg_search():
-    """带 embedder 的实例（is_primary=True → 不限 agent 隔离，检索测试更聚焦）。"""
+    """带 embedder 的实例（is_primary=True → 不限 agent 隔离，检索测试更聚焦）。
+
+    🔴 `final_limit=25`（2026-10-12 从 5 调大）：这是**共享测试库**，`keepsake_test` 里躺着
+    ~3730 行历史语料，而本套用例每次只 seed 4 条。实测 `final_limit=5` 时 BM25 的 top-5
+    被历史语料挤满，本批 4 条只进来 1 条（`test_hybrid_search_fuses_both_paths` 要在本批
+    内部比「谁是第二」，1 条直接 IndexError）；调到 25 后 BM25 返回的 11 条里 **4/4** 全在。
+    KNN 那一路还要配合 `exact_knn`（强制顺序扫）才能 4/4 —— 见 `exact_knn` 的说明。
+    语义不变：只是给「看全自己这一批」足够的深度，不改任何断言。
+    """
     storage = PgStorage(dsn=DSN, connect_timeout=30, embedder=_FakeEmbedder(),
-                        embed_dim=_EMBED_DIM, is_primary=True, final_limit=5)
+                        embed_dim=_EMBED_DIM, is_primary=True, final_limit=25)
     storage.ensure_index()
     yield storage
     storage.close()
 
 
 @pytest.fixture()
-def knn_selfcheck(pg_search):
-    """🔴 KNN 能力探针：探不到自己刚写入的行就 skip（不是「没 embedder」——本套用例
-    永远有 `_FakeEmbedder`）。
+def exact_knn(pg_search):
+    """🔴 让本用例期间的 KNN 走**精确检索**：主连接上 `SET enable_indexscan = off`
+    ⇒ 规划器不能选 `idx_ks_fragment_embedding_hnsw`，只能顺序扫 ⇒ 结果是精确的。
 
-    为什么会有这个探针（2026-10-12 实测，本机共享测试库）：
-      * `_FakeEmbedder` 是 n-gram 哈希的**退化稀疏向量**（EXPLAIN 里整串几乎全是 0），
-        彼此余弦距离全挤在 1.0 这个平台上，贪心检索没有梯度可走；
-      * `keepsake_test` 已长到 ~3730 行 ⇒ 计划器放弃顺序扫、改用 HNSW 近似索引
-        （`idx_ks_fragment_embedding_hnsw`，`hnsw.ef_search=40`）；
-      * 两者叠加：刚写入的**精确 0 距离**行经常不在返回集里（同一行连查 8/8 或 0/8
-        随行而变），而 `ORDER BY embedding <=> q LIMIT n` 的顺序扫 100% 能拿到它。
-    这是**测试环境（假 embedder × 索引计划）**的问题，不是检索逻辑的 bug：
-    顺序扫下同一条 SQL 能正确返回最近邻，`rerank_with_decay` 的距离方向也对
-    （`_sim = 1 - d/2`，d=0 ⇒ sim=1.0）。
+    为什么需要（2026-10-12 实测）：本套用例用 `_FakeEmbedder`（n-gram 哈希**退化稀疏
+    向量**，互距全挤 1.0 平台），而共享 `keepsake_test` 已长到 ~3730 行 ⇒ 计划器从顺序扫
+    翻成 HNSW 近似索引（`ef_search=40`），贪心在没有梯度的平台上常常召不回**刚写入的
+    0 距离**行（同一行连查 8/8 或 0/8 随行而变）；强制顺序扫后同一条 SQL 100% 拿到它。
+    这是「假 embedder × 索引计划」的测试环境问题，不是检索逻辑 bug —— 所以修的是**计划**，
+    不是断言；断言保持原样（该用例该验的 filter / rerank / hydrate / RRF 一行没改）。
 
-    探针在用例正文之前先写一条再查它自己，探不到 ⇒ 本环境下 KNN 判据不可判 ⇒ skip，
-    环境修好（干净向量空间 / 强制顺序扫）后会自动恢复执行。
+    作用域：只在本用例期间生效（主连接 SET，收尾 RESET），不改库级设置、不影响其它用例。
+    """
+    conn = pg_search._connect()          # noqa: SLF001 — 测试内取会话连接
+    with conn.cursor() as cur:
+        cur.execute("SET enable_indexscan = off")
+    conn.commit()
+    try:
+        yield
+    finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("RESET enable_indexscan")
+            conn.commit()
+        except Exception:
+            # 会话连接已废（比如中途报错被 _drop_conn 清掉）：丢弃即可，
+            # 新连接本来就是默认计划，不会把设置漏出去。
+            pg_search._drop_conn()       # noqa: SLF001
+
+
+@pytest.fixture()
+def knn_selfcheck(pg_search, exact_knn):
+    """🔴 KNN 能力探针：**在 exact_knn 已生效的前提下**先写一条再查它自己，
+    还探不到就 skip —— 说明强制顺序扫没落到实际查询上（比如查询走了 worker 连接），
+    此时 KNN 判据不可判，skip 比硬断言红更诚实；一旦环境/计划正常就自动恢复执行。
+
+    不是「没 embedder」：本套用例永远有 `_FakeEmbedder`（`_has_embedder()` 恒 True）。
     """
     marker = f"KNN 自检 {uuid.uuid4().hex[:8]}"
     pg_search.store(marker, tags="shared")
     key = pg_search._fragment_key_for(marker)   # noqa: SLF001
     _WROTE_KEYS.append(key)
     if key not in [h["_key"] for h in pg_search.search_knn(marker)]:
-        pytest.skip("KNN 检索不到自己刚写入的 0 距离行（HNSW 近似索引 × _FakeEmbedder 退化向量）"
-                    " ⇒ 本环境下 KNN 断言不可判")
+        pytest.skip("强制顺序扫未生效，KNN 仍检索不到自己刚写入的 0 距离行"
+                    " （HNSW 近似索引 × _FakeEmbedder 退化向量）⇒ 本环境下 KNN 断言不可判")
 
 
 # 四个语料主题：每个主题一条；marker 保证本轮写入的 key 与其他轮次不撞
