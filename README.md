@@ -32,8 +32,8 @@ User: "How did we set up that React project structure last time?"
 - **Skip Patterns** — define skip lists (via file) to avoid searching on trivial queries like "ok", "got it"
 - **Memory Intake** — explicit `memory(action='add')` entries plus per-turn text screened by the v1 ingest gate (R1–R8); junk/system-injected content is rejected before storage, and the v2 pipeline distills turns into facts
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
-- **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation is no longer wired into the provider (2026-09) but stays available as an ops-invoked engine — see [Storage Backends](#storage-backends-redis--postgresql) and [Consolidation Retirement](#consolidation-retirement-2026-09-09).
-- **Two Storage Backends** — `storage.backend` picks `redis` (default) or `postgres`; both are functionally equivalent for write / BM25+KNN search / consolidation / forgetting. See [Storage Backends](#storage-backends-redis--postgresql).
+- **Auto Maintenance** — selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy. Consolidation is no longer wired into the provider (2026-09) but stays available as an ops-invoked engine — see [Storage Backends](#storage-backends-redis--postgresql--sqlite) and [Consolidation Retirement](#consolidation-retirement-2026-09-09).
+- **Three Storage Backends** — `storage.backend` picks `redis` (default) / `postgres` / `sqlite`; all three are equivalent for write / BM25 search / consolidation / forgetting. Redis and PostgreSQL additionally do KNN vector search; SQLite's `search_knn` is an explicit `NotImplementedError` stub (never a silent empty result). See [Storage Backends](#storage-backends-redis--postgresql--sqlite).
 - **RRF Fusion Ranking (v1.3)** — Reciprocal Rank Fusion combines BM25 full-text and semantic KNN results into a single ranked list for better recall
 - **Local Semantic Search** — optional self-hosted Ollama embedder (e.g. `bge-m3`, 1024-dim) runs fully on-premise via the OpenAI-compatible `/v1/embeddings` endpoint — no external embedding API needed
 - **LLM Query Expansion (2026-09)** — when BM25 recalls fewer than `min_results` hits, a free-tier chat LLM quietly generates synonymous short phrases (2–8 chars) into a Redis cache (24h TTL). Runs on a background thread: **zero added latency on the hot path**; disabled automatically when no `llm` channel is configured
@@ -124,6 +124,10 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   //   "postgres": {"host": "127.0.0.1", "port": 5432, "dbname": "keepsake",
   //                "user": "keepsake", "password": "***", "sslmode": ""}
   // },
+  //
+  // "sqlite" is the third backend: single file, zero third-party deps, no server.
+  //   "backend": "sqlite",
+  //   "sqlite": {"path": "~/.keepsake/keepsake.db", "busy_timeout_ms": 5000}
 
   // Search settings
   "top_k": 5,
@@ -198,7 +202,7 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 
 > Note: Redis password compatibility: leave empty for no authentication, or provide password to automatically send AUTH command.
 >
-> Note: `storage.backend` defaults to `redis`. A missing, empty or unrecognised value always falls back to `redis`, so existing deployments are unaffected. `postgres` is functionally equivalent to `redis` — write, BM25+KNN search, consolidation and forgetting all work; only the implementation differs. See [Storage Backends](#storage-backends-redis--postgresql).
+> Note: `storage.backend` defaults to `redis`. A missing, empty or unrecognised value always falls back to `redis`, so existing deployments are unaffected. `postgres` is functionally equivalent to `redis` — write, BM25+KNN search, consolidation and forgetting all work; only the implementation differs. `sqlite` is the embedded single-file backend for single-machine / single-agent setups — BM25 search, consolidation and forgetting all work, but `search_knn` raises `NotImplementedError`. See [Storage Backends](#storage-backends-redis--postgresql--sqlite).
 
 ### 3. Environment Variables Reference
 
@@ -316,14 +320,16 @@ Then reference it in config.json:
 
 | Config Item | Environment Variable | Default Value | Description |
 |-------------|---------------------|---------------|-------------|
-| `storage.backend` | — | `"redis"` | `redis` or `postgres`. Missing / empty / invalid falls back to `redis`. See [Storage Backends](#storage-backends-redis--postgresql) |
+| `storage.backend` | — | `"redis"` | `redis` / `postgres` / `sqlite`. Missing / empty / invalid falls back to `redis`. See [Storage Backends](#storage-backends-redis--postgresql--sqlite) |
 | `storage.postgres.host` | — | `127.0.0.1` | PostgreSQL host (only read when `backend` is `postgres`) |
 | `storage.postgres.port` | — | `5432` | PostgreSQL port |
 | `storage.postgres.dbname` | — | `keepsake` | PostgreSQL database |
 | `storage.postgres.user` | — | `""` | PostgreSQL user |
 | `storage.postgres.password` | — | `""` | PostgreSQL password |
 | `storage.postgres.sslmode` | — | `""` | PostgreSQL sslmode |
-| `embed_dim` | — | `1536` | Vector width for the PG `embedding vector(N)` column. **Set this explicitly when no embedder is configured** — see [Storage Backends](#storage-backends-redis--postgresql) → `embed_dim` |
+| `storage.sqlite.path` | — | `~/.keepsake/keepsake.db` | SQLite database file (only read when `backend` is `sqlite`) |
+| `storage.sqlite.busy_timeout_ms` | — | `5000` | SQLite `busy_timeout` — how long a writer waits for the write lock before a retry |
+| `embed_dim` | — | `1536` | Vector width for the PG `embedding vector(N)` column. **Set this explicitly when no embedder is configured** — see [Storage Backends](#storage-backends-redis--postgresql--sqlite) → `embed_dim` |
 | `redis_host` | `KEEPSAKE_REDIS_HOST` | `127.0.0.1` | Redis address |
 | `redis_port` | `KEEPSAKE_REDIS_PORT` | `6379` | Redis port |
 | `top_k` | `KEEPSAKE_TOP_K` | `5` | Number of final entries returned |
@@ -342,7 +348,7 @@ Then reference it in config.json:
 | `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1/embeddings` | API endpoint |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `consolidate_min_group` | — | `3` | Minimum entries to trigger consolidation |
-| `consolidate_min_overlap` | — | `3` | Minimum shared keywords for two entries to count as the same topic. Invalid values log a warning and fall back to `3`. See [Storage Backends](#storage-backends-redis--postgresql) → "Consolidation thresholds" |
+| `consolidate_min_overlap` | — | `3` | Minimum shared keywords for two entries to count as the same topic. Invalid values log a warning and fall back to `3`. See [Storage Backends](#storage-backends-redis--postgresql--sqlite) → "Consolidation thresholds" |
 | `consolidate_max_age_hours` | — | `72` | Minimum age (hours) before consolidation. **Not read from config.json** — pass it as `Consolidator(max_age_hours=…)` |
 | `forget_max_age_days` | — | `30` | Max age (days) before deletion |
 | `forget_dry_run` | — | `true` | Safe mode: `true` = count only, `false` = delete |
@@ -363,7 +369,7 @@ Then reference it in config.json:
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
-## Storage Backends (Redis / PostgreSQL)
+## Storage Backends (Redis / PostgreSQL / SQLite)
 
 ### Switching backends
 
@@ -377,7 +383,14 @@ One config line selects the backend — `storage.backend`:
 }
 ```
 
-`redis` (the default) and `postgres` are **functionally equivalent**: write, BM25 + KNN search, consolidation and forgetting all work on both. Only the implementation differs — same `StorageBase` interface, two classes.
+```json
+"storage": {
+  "backend": "sqlite",
+  "sqlite": {"path": "~/.keepsake/keepsake.db", "busy_timeout_ms": 5000}
+}
+```
+
+`redis` (the default) and `postgres` are **functionally equivalent**: write, BM25 + KNN search, consolidation and forgetting all work on both. Only the implementation differs — same `StorageBase` interface, three classes. `sqlite` covers the third tier — see [SQLite](#sqlite) for what it does and does not do.
 
 - A missing, empty, non-string or unrecognised `backend` value **always falls back to `redis`**, so existing deployments are unaffected.
 - Install the optional dependency: `pip install 'keepsake-memory[postgres]'` (pulls `psycopg[binary]`). The database also needs **pgvector** — the KNN column is `embedding vector(N)` with an HNSW cosine index.
@@ -401,21 +414,21 @@ Concretely: an **old database missing columns** gets them back via `ALTER TABLE 
 
 ### Maintenance capabilities and the four backend-agnostic primitives
 
-Consolidation and forgetting reach storage **only** through four primitives on the `StorageBase` interface, which is why they behave identically on both backends:
+Consolidation and forgetting reach storage **only** through four primitives on the `StorageBase` interface, which is why they behave identically on all backends:
 
-| Primitive | Redis | PostgreSQL |
-|-----------|-------|------------|
-| `scan_fragment_keys(cursor, limit, prefix)` | `SCAN` cursor | keyset pagination `WHERE key > :cursor ORDER BY key LIMIT n` (never a large `OFFSET`) |
-| `get_fragments_batch(keys)` | `HMGET` | `WHERE key = ANY(...)` |
-| `write_fragments_batch(rows)` | pipeline upsert | upsert, recomputing `content_tsv` / `embedding` |
-| `update_fragment_fields(key, fields)` | `HSET` | partial `UPDATE` (does not touch `content` / `content_tsv` / `embedding`) |
-| `delete_fragments_batch(keys)` | pipeline `DEL` | `DELETE ... WHERE key = ANY(...)` plus timeline cleanup |
+| Primitive | Redis | PostgreSQL | SQLite |
+|-----------|-------|------------|--------|
+| `scan_fragment_keys(cursor, limit, prefix)` | `SCAN` cursor | keyset pagination `WHERE key > :cursor ORDER BY key LIMIT n` (never a large `OFFSET`) | keyset pagination `WHERE key > ? AND key LIKE ? ORDER BY key LIMIT n` |
+| `get_fragments_batch(keys)` | `HMGET` | `WHERE key = ANY(...)` | `WHERE key IN (...)` |
+| `write_fragments_batch(rows)` | pipeline upsert | upsert, recomputing `content_tsv` / `embedding` | `upsert_fragment` in a write transaction, refreshing FTS5 |
+| `update_fragment_fields(key, fields)` | `HSET` | partial `UPDATE` (does not touch `content` / `content_tsv` / `embedding`) | partial `UPDATE` + reindex `content_tsv` / FTS5 |
+| `delete_fragments_batch(keys)` | pipeline `DEL` | `DELETE ... WHERE key = ANY(...)` plus timeline cleanup | `DELETE ... WHERE key IN (...)` plus timeline **and FTS5** cleanup |
 
 The cursor is an opaque string: `""` starts from the beginning, and an empty `next_cursor` means the scan is done.
 
 PG-side maintenance columns — `level`, `consumed_by`, `consumed_at` — are `TEXT NOT NULL DEFAULT ''`. **Test "not set" with `= ''`, never `IS NULL`**; the default keeps existing rows valid.
 
-Writing is equivalent too: same-content deduplication marks the old version `valid_until` / `is_archived` and files the new one under a `:<epoch>` key suffix, and the R6 rule "a duplicate hit never overwrites `content`" holds on both backends.
+Writing is equivalent too: same-content deduplication marks the old version `valid_until` / `is_archived` and files the new one under a `:<epoch>` key suffix, and the R6 rule "a duplicate hit never overwrites `content`" holds on all backends.
 
 ### Consolidation thresholds
 
@@ -444,14 +457,15 @@ The script is **strictly read-only against Redis** (only `SCAN` / `HGETALL` / `P
 
 ### Known backend differences
 
-Only corpus-maintenance and dead-field methods differ, and they fail loudly rather than silently:
+Corpus maintenance is now implemented on **all three backends**, and the differences that remain fail loudly rather than silently:
 
-| Method | PostgreSQL behaviour | Why |
-|--------|---------------------|-----|
-| `discover_synonyms` | raises `NotImplementedError` | Corpus maintenance, orthogonal to search |
-| `generate_jieba_dict` | raises `NotImplementedError` | Same |
-| `touch_fragment` | returns `False` + logs | `ks_fragment` has no `touch_count` / `updated_at` columns; the fields have no reader anywhere in the repo |
-| `set_supersedes` | returns `False` + logs | No reader either — reverse sealing uses `supersede_fragment`, which works on both backends |
+| Method | Redis / PostgreSQL | SQLite | Why |
+|--------|--------------------|--------|-----|
+| `discover_synonyms` | ✅ supported | ✅ supported | Corpus maintenance, orthogonal to search — all three backends share the same judgement chain in `storage_shared` |
+| `generate_jieba_dict` | ✅ supported | ✅ supported | Same. Given the same corpus, all three produce a **byte-identical** vocabulary and dictionary (`6a31b17`) |
+| `search_knn` | ✅ vector search | raises `NotImplementedError` | Needs the `sqlite-vec` extension (optional lazy-load, not implemented). Fails loudly on purpose — **never a silent empty result**; `search` degrades to BM25-only with a WARNING |
+| `touch_fragment` | PG returns `False` + logs; Redis writes | ✅ writes | `ks_fragment` has no `touch_count` / `updated_at` columns; the fields have no reader anywhere in the repo |
+| `set_supersedes` | PG returns `False` + logs; Redis writes | ✅ writes | No reader either — reverse sealing uses `supersede_fragment`, which works on all backends |
 
 ### Post-switch self-check checklist
 
@@ -530,6 +544,61 @@ PY
 Both dry-runs report `dry_run: True` with `deleted: 0` / `would_merge` counts. Neither touches a row — verify by comparing fragment counts before and after.
 
 > Credentials are read from `config.json` (or `KEEPSAKE_CONFIG`); none of the commands above take a password on the command line, and none of them print one.
+
+### SQLite
+
+The third backend, for the **single-machine / single-agent** tier. Pick by scale:
+
+| Scale | Backend |
+|-------|---------|
+| Large / multi-agent | `postgres` |
+| General | `redis` (default) |
+| Single machine, embedded, single agent | `sqlite` |
+
+The user red line still holds — **`storage.backend` selects exactly one backend**; Redis and PostgreSQL are never run in parallel.
+
+#### Implementation
+
+**Pure standard-library `sqlite3`, zero third-party dependencies.** Switching is the same one config line as the other two:
+
+```json
+"storage": {
+  "backend": "sqlite",
+  "sqlite": {"path": "~/.keepsake/keepsake.db", "busy_timeout_ms": 5000}
+}
+```
+
+The default is still `redis`, and production currently runs `postgres`. Importing `storage_sqlite` needs nothing beyond the standard library.
+
+#### Capabilities
+
+Shipped in three batches:
+
+- **p1 — read/write primitives, schema self-healing, config wiring** (`e8b0398`); plus a write-path guard (`3099609`) that refuses writes when the schema is not ready (`StorageNotReadyError`, no silent no-op) and an in-process write lock covering the whole transaction body (`0fd1b54`).
+- **p2 — search: FTS5 + jieba tokenisation + BM25 + the shared re-ranker** (`8078c6f`); then contract alignment — result limits and ranking weights read from the same config as PG (`c88070d`).
+- **p3 — consolidation, forgetting, synonyms, jieba dictionary** (`38d5816`). On the same corpus, all three backends produce a **byte-identical vocabulary and dictionary** (`6a31b17`).
+
+Tag filtering is shared by all three backends via one `tag_match_sql` helper (`2a9aabd`) — commas delimit tags in the database, so a substring match on `|`-padded tags silently missed every row with a second tag.
+
+#### Boundaries — read this before choosing it
+
+**Vector search `search_knn` is a stub that raises `NotImplementedError` explicitly.** `sqlite-vec` is an optional lazy-load and is not implemented. The convention is deliberate: it **never returns an empty result silently** — a silent empty means "memory can't be found and nothing says why", the worst failure mode in this project. `search` catches the error, logs a WARNING, and degrades to BM25-only, so the degradation is always visible in the log.
+
+Writes *do* persist embeddings (`store()` stores a float32 blob in the same `struct.pack` layout as Redis), so switching to SQLite does not strand history without vectors — only vector *retrieval* is missing.
+
+#### Concurrency
+
+`PRAGMA journal_mode=WAL` ⇒ **many readers, one writer**; reads stay available while a write transaction is in progress. Concurrent writes queue on `busy_timeout` (default 5000 ms) plus write retries (`WRITE_RETRY_ATTEMPTS = 6`, ≈ 34 s total budget). Write transactions always open with `BEGIN IMMEDIATE` — taking the write lock at statement one rather than upgrading at commit time, which is the classic source of `database is locked` deadlocks. Within one process all statements serialise on a single `RLock`, because a `check_same_thread=False` connection is not thread-safe on its own.
+
+#### Chinese text
+
+Tokenisation happens **Python-side with `jieba`** before insert: FTS5 matches on a space-separated token string, never on raw text.
+
+> The `trigram` tokenizer is deliberately **not** used — it has a 3-character minimum, so a 2-character query term such as `证书` inside `证书续签` matches nothing. Two-character words are the bulk of Chinese queries, so **any 2-character query returns 0 hits** under trigram. jieba pre-tokenisation plus the default tokenizer is the supported path.
+
+#### Why not DuckDB
+
+DuckDB was evaluated and **rejected**: it takes an exclusive file lock, so a `read_only` connection cannot read even while a write transaction is in progress elsewhere — which defeats the point of choosing an embedded backend.
 
 ### Embedding Models and Dimensions
 
@@ -691,7 +760,7 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 
 **替代者：** `pipeline.py`（v2 两相管线）。每个 turn 窗口触发提取相 → 更新相，原地 supersede 旧碎片；运行时无独立合并 cron 任务。
 
-**怎么用合并：** 运维脚本 / cron **每轮现构造** —— `Consolidator(storage=storage_from_config(...), config=cfg).consolidate(dry_run=False)`。因为是每轮现读 config，改 `consolidate_min_overlap` / `consolidate_min_group` **下一轮即生效，无需重启**。阈值说明见 [Storage Backends](#storage-backends-redis--postgresql) → "Consolidation thresholds"，dry-run 用法见 [自检清单](#post-switch-self-check-checklist)。
+**怎么用合并：** 运维脚本 / cron **每轮现构造** —— `Consolidator(storage=storage_from_config(...), config=cfg).consolidate(dry_run=False)`。因为是每轮现读 config，改 `consolidate_min_overlap` / `consolidate_min_group` **下一轮即生效，无需重启**。阈值说明见 [Storage Backends](#storage-backends-redis--postgresql--sqlite) → "Consolidation thresholds"，dry-run 用法见 [自检清单](#post-switch-self-check-checklist)。
 
 **运行时观测：** `maintenance()` 返回 stats 仍保留 `consolidator` 字段（`{"status": "retired", "reason": "v2 pipeline takeover"}`），便于 cron 探针 / 健康检查观测退役状态而非误报 missing-key。
 
@@ -740,6 +809,29 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
          └───────────────────┘
 ```
 
+## Frozen Scoring Clock
+
+`scoring_now()` / `scoring_now_ts()` / `frozen_scoring_now()` in `storage_shared.py` give the scoring path one place to read the current time from. **By default they return the real wall clock — behaviour is byte-for-byte identical to before the functions existed, i.e. zero behaviour change.**
+
+Inside a `with frozen_scoring_now():` block the clock is pinned; it restores the real wall clock on exit, and nesting inherits the outer pin rather than silently jumping back:
+
+```python
+from keepsake.storage_shared import frozen_scoring_now
+
+with frozen_scoring_now():
+    ...   # every rerank and hot-topic decay in this block uses the same instant
+```
+
+**Only the scoring side reads it** — the time decay in `rerank_with_decay` and the hot-word decay in `match_hot_topics` (SQLite / PG). 🔴 The **write path does not**: `store()` writing `created`, and timeline timestamps, never read it — freezing write time would corrupt the data.
+
+**Why it exists:** those decays are evaluated at query time, so the same row scores differently on two consecutive queries. Two rows with identical `bm25`/`sim` differing only by a ~1e-7 decay term **cross over within 1.5 seconds** (measured: round 0 led by 5.2e-8, round 1 flipped by 1.3e-8), which made "same query, 3 runs, identical key sequence" fail intermittently. `scripts/recall_eval.py` wraps a whole run in one freeze, so a given question in a given order reproduces exactly (`33727f2`).
+
+## Core Tag — the Resident Memory Tier
+
+Keepsake carries resident memory under the **`core` tag**, making the fragment store the single source of truth for memory. On the Hermes side, `memory.builtin_mode=pointer` means `MEMORY.md` / `USER.md` keep only a pointer — they no longer read, write or inject. Writes go through `on_memory_write()`, which stores the content **verbatim** into `core` (`3a1e43f`).
+
 ## License
 
 MIT
+
+> 最后校准：对齐 HEAD 33727f2（2026-10-12）
