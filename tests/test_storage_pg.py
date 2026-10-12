@@ -537,11 +537,16 @@ def test_bm25_sanitize_splits_path_and_hyphen_terms(pg_search):
     assert {"home", "claude", "user", "trade", "platform"} <= set(parts), parts
     assert "/home/claude_user/trade-platform/" not in parts
 
-    # 集成级：查整条路径不抛语法错，且靠拆出的子词命中到那条含 claude_user 的碎片
-    hit = pg_search.search_bm25(f"/home/claude_user/trade-platform/ {marker}")
-    assert [r["_key"] for r in hit] == [key]
+    # 集成级：查整条路径不抛语法错，且靠拆出的子词命中到那条含 claude_user 的碎片。
+    # 🔴 这是**共享测试库**：别的行合法命中同一批子词（残留/并行写入）不该判红 ——
+    # 原意只要求「自己这条必须命中且唯一 + 结果无重复 key」，不要求库里只有它自己。
+    keys_hit = [r["_key"] for r in
+                pg_search.search_bm25(f"/home/claude_user/trade-platform/ {marker}")]
+    assert keys_hit.count(key) == 1, f"自己那条必须命中且只出现一次: {keys_hit}"
+    assert len(keys_hit) == len(set(keys_hit)), f"结果出现重复 key: {keys_hit}"
     # 只给子词，同样命中
-    assert [r["_key"] for r in pg_search.search_bm25(f"claude_user {marker}")] == [key]
+    keys_sub = [r["_key"] for r in pg_search.search_bm25(f"claude_user {marker}")]
+    assert keys_sub.count(key) == 1, f"子词查询：自己那条必须命中且只出现一次: {keys_sub}"
 
 
 def test_knn_returns_closest_and_reports_cosine_distance(pg_search):
