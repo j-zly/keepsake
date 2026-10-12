@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -165,6 +166,52 @@ SEARCH_FIELDS = (
 # 这些条目是稳定内容、量小，缓存避免重复往返。
 _FRAG_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _FRAG_CACHE_TTL = 60.0
+
+
+# ---------------------------------------------------------------------------
+# 评分时钟（可冻结）—— 只管算分，不管写库
+# ---------------------------------------------------------------------------
+_SCORING_NOW: Optional[datetime] = None
+
+
+def scoring_now() -> datetime:
+    """评分路径统一读这里的时间。**默认 = 真实墙钟，与引入本函数之前逐字一致。**
+
+    为什么要有（2026-10-12 实测）：`rerank_with_decay` 的时衰减、`match_hot_topics`
+    的热词衰减都以「查询那一刻」求值 ⇒ 同一行两次查询分数就不同；两条 `bm25`/`sim`
+    逐位相同、只差 1e-7 级衰减项的行，**1.5 秒内会互相穿过**（诊断实录：round0
+    A 领先 5.2e-8、round1 B 反超 1.3e-8）⇒ 评测「同题连跑 3 轮 key 序列逐字相同」
+    偶发失败。评测器用 `frozen_scoring_now()` 把时钟钉死即可复现；生产不冻结。
+
+    🔴 写路径（`store()` 落 `created`、timeline/时间戳落库）**不许**读本函数 ——
+    冻住写时间会污染数据。只有「按当前时间算权重」的读路径才走这里。
+    """
+    return _SCORING_NOW if _SCORING_NOW is not None else datetime.now(timezone.utc)
+
+
+def scoring_now_ts() -> float:
+    """`scoring_now()` 的 unix 秒 —— 供 `hot_topic_weighted_hits(now_ts=...)` 这类要秒的调用。"""
+    return scoring_now().timestamp()
+
+
+@contextmanager
+def frozen_scoring_now(ts: Optional[datetime] = None):
+    """把评分时钟钉在 `ts`（缺省 = 进入时刻），退出即恢复真实墙钟（线程内生效）。
+
+    用法（评测器 / 确定性测试）::
+
+        with frozen_scoring_now():
+            ...   # 块内每次重排、热词衰减都按同一时刻算 ⇒ 连跑几轮结果逐字相同
+    """
+    global _SCORING_NOW
+    prev = _SCORING_NOW
+    # 不给 ts ⇒ 钉在「进入这一刻的评分时钟」上：外层已冻就沿用外层的值（嵌套冻结
+    # 不该悄悄跳回真实墙钟），否则就是取真实墙钟。
+    _SCORING_NOW = ts if ts is not None else scoring_now()
+    try:
+        yield _SCORING_NOW
+    finally:
+        _SCORING_NOW = prev
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +553,8 @@ def rerank_with_decay(
     if not fragments:
         return fragments
 
-    now = datetime.now(timezone.utc)
+    # 评分时钟：默认真实墙钟；评测器用 frozen_scoring_now() 钉死后这里是常量 ⇒ 跨轮可复现
+    now = scoring_now()
 
     # ---- Step 1: 计算语义相似度 sim ----
     for frag in fragments:

@@ -305,4 +305,7 @@ def test_eval_script_runs_on_synthetic_corpus(corpus, tmp_path, capsys):
     result = json.loads(out.read_text(encoding="utf-8"))
     assert result["metrics"]["Recall@15"] >= 0.9, result["metrics"]
     assert result["meta"]["deterministic"] is True, "连跑 3 轮 key 序列不一致"
+    # 冻结必须真的生效 —— 否则上面那条 deterministic 是靠运气（轮间恰好没赶上分数交叉）
+    # 而不是靠机制，回归了也看不出来。
+    assert result["meta"].get("frozen_now"), "评测没冻结评分时钟（meta.frozen_now 缺失）"
     assert result["meta"]["corpus_size"] >= 300

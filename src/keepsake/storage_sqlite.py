@@ -127,6 +127,7 @@ from .storage_shared import (
     merge_synonym_maps,
     rrf_fuse,
     rerank_with_decay,
+    scoring_now_ts,
     synonym_rows,
     synonym_words,
     tag_match_sql,
@@ -1799,7 +1800,7 @@ class SqliteStorage(StorageBase):
         if not topics:
             return 0.0
         return hot_topic_weighted_hits(
-            topics, last_seen, text, time.time(),
+            topics, last_seen, text, scoring_now_ts(),
             decay_half_days=self._hot_topic_decay_half_days,
         )
 

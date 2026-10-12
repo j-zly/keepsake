@@ -49,6 +49,7 @@ from keepsake.storage import (                                  # noqa: E402
     resolve_backend,
     storage_from_config,
 )
+from keepsake.storage_shared import frozen_scoring_now          # noqa: E402
 
 DEFAULT_CONFIG = os.path.expanduser("~/.config/keepsake/config.json")
 
@@ -193,11 +194,18 @@ def main() -> int:
     ro_notes = _force_readonly(storage, backend)
 
     rounds: List[Dict[str, Any]] = []
+    frozen_at = None
     try:
         corpus_size = _corpus_size(storage)
-        for i in range(max(1, args.repeat)):
-            rounds.append(run_once(storage, probes, ks, args.mode,
-                                   with_keys=(args.repeat > 1 or i == 0)))
+        # 🔴 冻结评分时钟：不冻则每一轮都按「当前墙钟」重算时衰减，同一行的分数跨轮就变，
+        # 只差 1e-7 级的近同行会互相穿过 ⇒ `--repeat>1` 的确定性校验变成掷骰子
+        # （2026-10-12 实测：轮间隔 1.5s 即换位，不隔就全稳）。冻住以后块内每轮用同一
+        # 时刻，同题同序才是可验证承诺；退出 with 立刻恢复真实墙钟，生产路径零影响。
+        with frozen_scoring_now() as _frozen_at:
+            frozen_at = _frozen_at
+            for i in range(max(1, args.repeat)):
+                rounds.append(run_once(storage, probes, ks, args.mode,
+                                       with_keys=(args.repeat > 1 or i == 0)))
     finally:
         try:
             storage.close()
@@ -219,6 +227,8 @@ def main() -> int:
             "backend": backend,
             "config_path": cfg_path,
             "read_only": ro_notes,
+            # 评分时钟被钉在哪一刻（None = 没冻住，说明走了异常路径）
+            "frozen_now": frozen_at.isoformat() if frozen_at else None,
             "params": {k: cfg.get(k) for k in ("top_k", "bm25_limit", "candidate_k")},
             "corpus_size": corpus_size,
             "probes": len(probes),

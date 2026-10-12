@@ -97,6 +97,7 @@ from .storage_shared import (          # 与 Redis 共用的检索后处理（�
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
+    scoring_now_ts,
     tag_match_sql,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
     accumulate_co_occurrence,
@@ -2946,7 +2947,7 @@ class PgStorage(StorageBase):
         # 衰减加权同样是纯计算 → 与 Redis 侧共用 storage_shared 同一份
         return hot_topic_weighted_hits(
             topics, last_seen, text,
-            datetime.now(timezone.utc).timestamp(),
+            scoring_now_ts(),
             decay_half_days=self._hot_topic_decay_half_days,
         )
 
