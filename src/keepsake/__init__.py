@@ -1060,24 +1060,27 @@ class KeepsakeProvider(MemoryProvider):
         """
         if not self._storage:
             return
-        if not content or not content.strip():
+        action = (action or "").strip().lower()
+        # remove 不需要新内容：Hermes 对 remove 传的 content 是空串，在这里早退会让
+        # memory(action=remove) 变成完全无效的操作（2026-10-12 实测：删除从未生效）。
+        if action != "remove" and (not content or not content.strip()):
             return
 
         # R7：入库前凭据打码（与 _v1_store_after_decide 同一入口，同一口径）。
         # 只打码、不改写其余文字 —— 原文入库是硬要求。
         from .ingest_gate import scrub_secrets
         try:
-            scrubbed, _n = scrub_secrets(content)
-            if scrubbed and scrubbed.strip():
-                content = scrubbed
+            if content:
+                scrubbed, _n = scrub_secrets(content)
+                if scrubbed and scrubbed.strip():
+                    content = scrubbed
         except Exception as e:
             logger.debug("keepsake: scrub_secrets failed in _core_write: %s", e)
 
-        action = (action or "").strip().lower()
         tags = f"{_CORE_TAG},{target or 'memory'}"
 
         if action == "remove":
-            self._core_delete(metadata, content)
+            self._core_delete(metadata, content or "")
         elif action in ("replace", "update"):
             # 先删旧再写新。找不到旧条目时退化成「新增」—— 用户重写一条记忆
             # 而 Hermes 没给 old_text/key 时，这是唯一不丢内容的做法。
@@ -1112,15 +1115,59 @@ class KeepsakeProvider(MemoryProvider):
         )
 
     def _core_delete(self, metadata: Dict[str, Any], fallback_text: str) -> None:
-        """删掉 metadata 指向的那条 core 碎片（按 `key` 优先，其次 `old_text` 全文匹配）。"""
+        """删掉 metadata 指向的那条 core 碎片。
+
+        解析顺序（Hermes 侧契约见 agent/memory_manager.notify_memory_tool_write）：
+
+          1. `metadata["key"]` —— 明确指定，直接用；
+          2. `metadata["previous_content"]` —— 镜像带过来的**旧条目全文**，精确匹配；
+          3. `old_text` / fallback —— 先精确全文，再**唯一子串**匹配。
+
+        🔴 第 3 步的子串匹配是必需的：Hermes memory 工具规定 `old_text` 是「一段能唯一定位
+        条目的短子串」而不是全文。只做全文相等 ⇒ replace/remove 时旧条目删不掉、新条目另存
+        一条，同一事实库里两份（2026-10-12 实测 core 里已有这样一对）。
+
+        命中多条时**不猜**：记 warning 并跳过 —— 宁可不删，也不能删错记忆。
+        完全没命中时同样只 warning：replace 会退化成新增（既有语义），remove 则等于没删，
+        由 Hermes 那侧决定重试。
+        """
         key = metadata.get("key")
         if not key:
-            text = metadata.get("old_text") or fallback_text
-            if not text:
+            candidates = [t.strip() for t in (metadata.get("previous_content"),
+                                              metadata.get("old_text"), fallback_text)
+                          if t and t.strip()]
+            if not candidates:
                 return
-            for f in self._core_fragments():
-                if f.get("content") == text:
-                    key = f.get("key")
-                    break
+            frags = self._core_fragments()
+            key = self._resolve_core_key(frags, candidates)
+            if not key:
+                logger.warning(
+                    "keepsake: core 删除未命中（old_text=%r，候选 %d 个，core %d 条）——"
+                    "replace 会退化成新增，remove 等于没删",
+                    candidates[-1][:80], len(candidates), len(frags))
         if key:
             self._storage.delete_fragments_batch([key])
+
+    @staticmethod
+    def _resolve_core_key(frags: List[Dict[str, Any]], candidates: List[str]) -> Optional[str]:
+        """候选文本 → 唯一 core key：逐候选先全文精确，再唯一子串；多命中不猜（返回 None）。"""
+        def _norm(value: Optional[str]) -> str:
+            return (value or "").strip()
+
+        for text in candidates:
+            needle = _norm(text)
+            for frag in frags:
+                if _norm(frag.get("content")) == needle:
+                    return frag.get("key")
+        for text in candidates:
+            needle = _norm(text)
+            if not needle:
+                continue
+            hits = [f for f in frags if needle in (f.get("content") or "")]
+            if len(hits) == 1:
+                return hits[0].get("key")
+            if len(hits) > 1:
+                logger.warning("keepsake: core 删除文本命中 %d 条（%r）——歧义，跳过以免删错",
+                               len(hits), needle[:60])
+                return None
+        return None
