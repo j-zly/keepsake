@@ -852,9 +852,54 @@ def test_concurrent_threads_mixed_read_write_no_exception(tmp_path):
 # 批 2：FTS5 + jieba + BM25 + 共用重排 + 加权信号
 # ---------------------------------------------------------------------------
 
-CORPUS300 = Path("/tmp/ks_corpus300.jsonl")
 VERIFY_QUERIES = ("部署流程", "网关重启", "Redis 连接池", "飞书", "Termux",
                   "Python 依赖", "备份策略", "截图分析", "证书续签", "记忆检索")
+
+# 干扰项词表：与验证查询共用分词单元，让 BM25 有真实的排序信号，但不出现整句逐字串
+_CORPUS_VOCAB = ("部署", "流程", "网关", "重启", "Redis", "连接池", "飞书", "Termux",
+                 "Python", "依赖", "备份", "策略", "截图", "分析", "证书", "续签",
+                 "记忆", "检索", "灰度", "回滚", "熔断", "队列", "索引", "重建",
+                 "配置", "日志", "告警", "隧道", "容器", "镜像", "分词", "权重")
+
+
+def _corpus300() -> list[dict]:
+    """确定性生成 300 条语料 —— **不依赖任何外部文件**。
+
+    🔴 为什么改成生成：原实现读写死的 `/tmp/ks_corpus300.jsonl`，而 /tmp 是 tmpfs
+    （`mount` → `tmpfs size=1788936k`），重启即清空；该文件是 10-10 当天随手生成的一次性
+    产物、仓库里没有生成器 ⇒ 本机 10-11 重启后这条测试必挂 `FileNotFoundError`。
+
+    构造规则：
+    - 每条 VERIFY_QUERIES 各造 3 行逐字命中（共 30 行），保证「语料里有逐字命中 ⇒
+      必须有召回」这条断言真被触发；
+    - 其余 270 行是干扰项，只与验证查询共享分词单元，不出现整句逐字串；
+    - 纯函数、无随机：任何机器、任何时刻生成的内容字节一致。
+    """
+    rows: list[dict] = []
+    for qi, q in enumerate(VERIFY_QUERIES):
+        for k in range(3):
+            n = len(rows)
+            rows.append({
+                "key": f"memory:frag:{n:012x}",
+                "content": f"编号 {n}：{q} 第 {k} 次记录，"
+                           f"{_CORPUS_VOCAB[(qi * 3 + k) % len(_CORPUS_VOCAB)]} 与 "
+                           f"{_CORPUS_VOCAB[(qi * 3 + k + 7) % len(_CORPUS_VOCAB)]} 的处理步骤",
+                "tags": "ops,shared",
+                "created": "2026-10-01T00:00:00+00:00",
+            })
+    while len(rows) < 300:
+        n = len(rows)
+        a = _CORPUS_VOCAB[n % len(_CORPUS_VOCAB)]
+        b = _CORPUS_VOCAB[(n * 7 + 3) % len(_CORPUS_VOCAB)]
+        c = _CORPUS_VOCAB[(n * 13 + 5) % len(_CORPUS_VOCAB)]
+        rows.append({
+            "key": f"memory:frag:{n:012x}",
+            "content": f"编号 {n}：{a} 的记录，涉及 {b}、{c} 与收尾",
+            "tags": "ops,shared",
+            "created": "2026-10-01T00:00:00+00:00",
+        })
+    assert len(rows) == 300, f"语料应 300 条，实际 {len(rows)}"
+    return rows
 
 
 @pytest.fixture()
@@ -864,14 +909,6 @@ def search_store(tmp_path) -> SqliteStorage:
     assert s.ensure_index() is True
     yield s
     s.close()
-
-
-def _load_corpus300(store: SqliteStorage):
-    """用基准语料建库（300 条）—— 与 PG 侧同数据对照用。"""
-    rows = [json.loads(line) for line in
-            CORPUS300.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(rows) == 300, f"基准语料应 300 条，实际 {len(rows)}"
-    return store.write_fragments_batch(rows)
 
 
 def test_store_maintains_fts_index(search_store):
@@ -1062,7 +1099,7 @@ def test_entity_timeline_matches_pg_shape(search_store):
 
 
 def test_corpus300_top10_keys_are_stable(search_store):
-    """300 条基准语料 × 10 条固定查询 —— 断言**不变量**，不断言字面 key 顺序。
+    """300 条确定性语料 × 10 条固定查询 —— 断言**不变量**，不断言字面 key 顺序。
 
     🔴 为什么不能写死 top-10 key：jieba 的切词结果**依赖机器上的用户词典**
     （`~/.config/keepsake/jieba_dict.txt`）。有词典的机器与没有的机器切出不同的词
@@ -1075,12 +1112,10 @@ def test_corpus300_top10_keys_are_stable(search_store):
       4. 更深 N 的结果是更浅 N 的**同序前缀**；
       5. 同一 query 连跑两次结果完全一致（同分 tiebreak 稳定）。
 
-    具体 top-10 key 顺序由 /tmp/ks_sq_align_verify.txt 出证（供与 PG 侧机械比对），
-    不进断言。
+    语料由 _corpus300() 现场确定性生成（纯函数、无随机、不依赖 /tmp 等外部文件）；
+    具体 top-10 key 顺序属实现细节，不进断言。
     """
-    rows = [json.loads(line) for line in
-            CORPUS300.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(rows) == 300
+    rows = _corpus300()
     assert search_store.write_fragments_batch(rows) == 300
 
     blob = " \n".join(f"{r['content']} {r.get('tags','')}" for r in rows).lower()
