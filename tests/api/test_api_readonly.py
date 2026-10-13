@@ -23,6 +23,16 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 CORE_N = 120
 DEMO_N = 40
 
+#: 写面白名单（P2）：非 GET 路由**恰好**是这 6 条，其余一律不许出现。
+ALLOWED_POST_PATHS = {
+    "/api/v1/core/{key}/promote",
+    "/api/v1/core/{key}/demote",
+    "/api/v1/fragments/{key}/update",
+    "/api/v1/fragments/{key}/archive",
+    "/api/v1/ops/merge",
+    "/api/v1/ops/forget",
+}
+
 
 class FakeStorage:
     """最小存储替身：只实现控制台用到的那几个只读原语。"""
@@ -133,14 +143,29 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
+    """🔴 P2 后断言升级：非 GET 路由**恰好**是写面那 6 条 POST，不多不少。
+
+    P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，改成白名单相等 ——
+    多一条（比如漏加 require_token 依赖的临时端点）同样会被这里抓住。
+    """
     app = create_app()
-    bad = [r.path for r in app.routes
-           if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}]
-    assert not bad, bad
+    write = {r.path for r in app.routes
+             if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
+    assert write == ALLOWED_POST_PATHS, sorted(write)
     paths = {getattr(r, "path", "") for r in app.routes}
     assert {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
             "/api/v1/fragments/{key}", "/api/v1/kb/summary", "/api/v1/kb/search",
             "/api/v1/stats", "/api/v1/crons"} <= paths
+    assert len([p for p in paths if p.startswith("/api/v1/")]) >= 8
+
+
+def test_写路由全部需要token():
+    """白名单里的 6 条 POST 一条都不许免认证 —— 少挂一个 require_token 就红。"""
+    app = create_app()
+    for r in app.routes:
+        if getattr(r, "path", "") in ALLOWED_POST_PATHS:
+            names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
+            assert any("require_token" in n for n in names), r.path
 
 
 # ---------------------------------------------------------------- core

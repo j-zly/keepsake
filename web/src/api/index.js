@@ -1,11 +1,15 @@
 import axios from 'axios'
 
 /**
- * 只读控制台的 API 客户端。
+ * Keepsake 控制台的 API 客户端。
  *
  * - token 存 localStorage，随请求头 `Authorization: Bearer <token>` 带出
  * - 401 全局拦截：清 token 并跳「输入 token」页（不是在每个页面各判一次）
  * - 🔴 token 只进请求头，绝不进 URL / 日志 / 页面回显
+ *
+ * P2 新增 6 条写操作（全部要二次确认，confirm 由调用方显式传入）：
+ * 打标 promote/demote、改 update、归档 archive、批量 merge/forget。
+ * merge/forget 默认 dry-run —— 实跑必须再补 `confirm`（当前计数，防手滑）。
  */
 const TOKEN_KEY = 'keepsake.console.token'
 
@@ -54,6 +58,16 @@ export const api = {
   kbSearch: (params) => http.get('/api/v1/kb/search', { params }).then((r) => r.data),
   stats: () => http.get('/api/v1/stats').then((r) => r.data),
   crons: (params) => http.get('/api/v1/crons', { params }).then((r) => r.data),
+
+  // ---- 写操作（后端会写前自动备份 + 审计，这里只是把 confirm 显式带上）----
+  promote: (key) => http.post(`/api/v1/core/${encodeURIComponent(key)}/promote`, { confirm: true }).then((r) => r.data),
+  demote: (key) => http.post(`/api/v1/core/${encodeURIComponent(key)}/demote`, { confirm: true }).then((r) => r.data),
+  updateFragment: (key, payload) =>
+    http.post(`/api/v1/fragments/${encodeURIComponent(key)}/update`, { confirm: true, ...payload }).then((r) => r.data),
+  archive: (key, confirm) =>
+    http.post(`/api/v1/fragments/${encodeURIComponent(key)}/archive`, { confirm }).then((r) => r.data),
+  merge: (payload) => http.post('/api/v1/ops/merge', payload).then((r) => r.data),
+  forget: (payload) => http.post('/api/v1/ops/forget', payload).then((r) => r.data),
 }
 
 export default http

@@ -30,6 +30,22 @@
       </el-col>
     </el-row>
 
+    <h3>记忆维护（合并 / 遗忘）</h3>
+    <el-alert
+      type="warning"
+      show-icon
+      :closable="false"
+      class="alert"
+      title="dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响碎片。"
+    />
+    <el-space wrap class="ops">
+      <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
+      <el-button type="warning" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
+      <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
+      <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
+    </el-space>
+    <pre v-if="opResult" class="opresult">{{ opResult }}</pre>
+
     <h3>知识库</h3>
     <el-descriptions :column="3" border size="small" class="kb">
       <el-descriptions-item label="skill_docs">{{ kbText('skill_docs') }}</el-descriptions-item>
@@ -68,6 +84,7 @@
 import { onMounted, ref } from 'vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { showConfirm, showError, showPrompt, showToast } from '../utils/dialog'
 
 const data = ref(null)
 const crons = ref([])
@@ -75,6 +92,8 @@ const cronSource = ref('')
 const loading = ref(false)
 const error = ref('')
 const cronError = ref('')
+const busy = ref('')
+const opResult = ref('')
 
 /** kb 段不可用时后端给的是 {available:false, error:...} —— 显示成可见的报错，不是 0。 */
 function kbText(field) {
@@ -103,6 +122,50 @@ async function load() {
   }
 }
 
+/**
+ * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
+ * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
+ * 实跑前后都会把受影响碎片全量导出到备份目录，路径回显在结果里。
+ */
+async function runMerge(dryRun) {
+  const n = data.value?.core?.count
+  await runOps('merge', dryRun, String(n), `合并 · 实跑会改写碎片（当前常驻 ${n} 条）`)
+}
+
+async function runForget(dryRun) {
+  const n = data.value?.retrieval?.count
+  await runOps('forget', dryRun, String(n), `遗忘 · 实跑会物理删除过期碎片（当前共 ${n} 条）`)
+}
+
+async function runOps(kind, dryRun, expect, warnText) {
+  let confirm = undefined
+  if (!dryRun) {
+    const ok = await showConfirm(warnText, '二次确认', 'warning')
+    if (!ok) return
+    const got = await showPrompt('请手输当前计数以确认（防手滑）：', '确认实跑', {
+      expect,
+      tip: expect,
+    })
+    if (!got) return
+    confirm = got
+  }
+  busy.value = dryRun ? `${kind}-dry` : kind
+  try {
+    const r = await api[kind]({ dry_run: dryRun, confirm })
+    opResult.value = JSON.stringify(r, null, 2)
+    showToast(
+      dryRun
+        ? `${kind} dry-run 完成：${JSON.stringify(r.stats)}`
+        : `${kind} 实跑完成：${JSON.stringify(r.stats)}`,
+    )
+    load()
+  } catch (e) {
+    showError(`${kind} ${dryRun ? 'dry-run' : '实跑'}失败：${e.message}`)
+  } finally {
+    busy.value = ''
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -115,6 +178,19 @@ onMounted(load)
 }
 .kb {
   margin-bottom: 16px;
+}
+.ops {
+  margin-bottom: 8px;
+}
+.opresult {
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--el-fill-color-light);
+  padding: 12px;
+  border-radius: 4px;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 12px;
 }
 .src {
   margin-top: 8px;

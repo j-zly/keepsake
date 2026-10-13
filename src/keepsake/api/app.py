@@ -1,12 +1,14 @@
-"""Keepsake 只读控制台后端。
+"""Keepsake 控制台后端（P1 只读 + P2 写操作）。
 
     uvicorn keepsake.api.app:app --host 127.0.0.1 --port 8211
 
-🔴 **本单严格只读**：只注册 GET 路由（`/health` 免认证，其余 `/api/*` 走
-Bearer token）。没有 POST/PUT/PATCH/DELETE，闸门 G2 会逐条断言这一点。
+🔴 **写面被闸门圈死**：只有 `routers/ops.py` 里那 6 条 POST（打标 / 改 / 归档
++ merge / forget）能改数据，其余全是 GET。写面每条都要求显式二次确认、
+写前自动备份、事后审计（见 `api/audit.py`），且**一律经 keepsake 存储层原语**
+落库，不自拼 SQL。G4 会断言「非 GET 路由恰好是这 6 条」。
 
 📌 **FastAPI 钉在 0.115.x**：0.116+ 的 `include_router` 改成惰性 `_IncludedRouter`，
-`app.routes` 里就不出现真实路由了 —— G2 那句 `app.routes` 只读断言会**空转通过**
+`app.routes` 里就不出现真实路由了 —— G4 那句 `app.routes` 断言会**空转通过**
 （既没查到写路由，也没查到读路由）。0.115.x 把路由摊平，闸门才有断言价值。
 装法：`.venv/bin/python -m pip install "fastapi==0.115.6" uvicorn httpx pytest`。
 """
@@ -20,7 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
-from .routers import core, crons, fragments, kb, stats
+from .routers import core, crons, fragments, kb, ops, stats
 
 logger = logging.getLogger("keepsake.api")
 
@@ -37,11 +39,11 @@ def _error(status_code: int, error: str, message: str) -> JSONResponse:
 
 
 def create_app() -> FastAPI:
-    """造一个只读 FastAPI 实例：挂路由 → 挂静态文件 → 全局异常处理。"""
+    """造一个 FastAPI 实例：挂只读路由 → 挂写路由 → 挂静态文件 → 全局异常处理。"""
     app = FastAPI(
-        title="Keepsake Console (read-only)",
-        version="1.0.0",
-        description="记忆可视化后台 · 只读：没有写接口",
+        title="Keepsake Console",
+        version="1.1.0",
+        description="记忆可视化后台 · 只读查询 + 带二次确认的写操作（6 条 POST）",
     )
 
     # ---- 健康检查（唯一免认证路由）----
@@ -53,6 +55,9 @@ def create_app() -> FastAPI:
     # ---- 只读业务路由 ----
     for r in (core.router, fragments.router, kb.router, stats.router, crons.router):
         app.include_router(r)
+
+    # ---- 写操作路由（全部 POST / 全部需 token / 全部二次确认+备份+审计）----
+    app.include_router(ops.router)
 
     # ---- 全局异常：任一数据源异常 ⇒ 500 + 结构化 detail，绝不吞成空结果 ----
     @app.exception_handler(Exception)

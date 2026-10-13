@@ -33,6 +33,11 @@
       <el-table-column prop="tags" label="tags" width="140" show-overflow-tooltip />
       <el-table-column prop="content" label="正文（截断）" show-overflow-tooltip />
       <el-table-column prop="updated_at" label="updated_at" width="230" show-overflow-tooltip />
+      <el-table-column label="操作" width="90" fixed="right">
+        <template #default="{ row }">
+          <el-button link type="danger" @click="demote(row)">降常驻</el-button>
+        </template>
+      </el-table-column>
     </el-table>
 
     <el-pagination
@@ -53,6 +58,7 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { showConfirm, showError, showToast } from '../utils/dialog'
 
 const items = ref([])
 const stats = ref(null)
@@ -89,6 +95,22 @@ function onSize(s) {
   pageSize.value = s
   page.value = 1
   load()
+}
+
+/** 降常驻：去掉 core 标签（不再每轮注入）。二次确认 + 成功后刷新 + toast。 */
+async function demote(row) {
+  const ok = await showConfirm(
+    `确认把 ${row.key} 移出常驻层？之后每轮不再注入这条记忆（写前会自动备份，可回滚）。`,
+    '降常驻',
+  )
+  if (!ok) return
+  try {
+    const r = await api.demote(row.key)
+    showToast(`已降常驻：${row.key}（tags=${r.tags || '空'}）`)
+    load()
+  } catch (e) {
+    showError(`降常驻失败：${e.message}`)
+  }
 }
 
 onMounted(load)
