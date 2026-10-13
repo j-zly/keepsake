@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import config
-from ..deps import require_token
+from ..deps import require_session
 from ..schemas import KbHit, KbSearchResult, KbSummary
 
 router = APIRouter(tags=["kb"])
@@ -138,7 +138,7 @@ def _missing(tables: Dict[str, set]) -> List[str]:
 
 
 @router.get("/api/v1/kb/summary", response_model=KbSummary,
-            dependencies=[Depends(require_token)])
+            dependencies=[Depends(require_session)])
 def kb_summary() -> KbSummary:
     """知识库三表计数（一条 SELECT，三个子查询）。"""
     schema = _ident(config.pg_schema())
@@ -166,7 +166,7 @@ def kb_summary() -> KbSummary:
 
 
 @router.get("/api/v1/kb/search", response_model=KbSearchResult,
-            dependencies=[Depends(require_token)])
+            dependencies=[Depends(require_session)])
 def kb_search(
     q: str = Query(..., min_length=1, description="检索词"),
     page: int = Query(1, ge=1),

@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .. import audit, config
-from ..deps import get_storage, require_token
+from ..deps import get_storage, require_session
 from .core import CORE_TAG
 
 router = APIRouter(tags=["ops"])
@@ -188,7 +188,7 @@ def _now_iso() -> str:
 # core 打标
 # --------------------------------------------------------------------------
 
-@router.post("/api/v1/core/{key}/promote", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/core/{key}/promote", dependencies=[Depends(require_session), Depends(write_guard)])
 def promote_core(key: str, body: ConfirmFlag,
                  storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """给碎片打上 `core` 标签（升常驻）。已是常驻 ⇒ 409。"""
@@ -204,7 +204,7 @@ def promote_core(key: str, body: ConfirmFlag,
     return {"ok": True, "action": action, "key": key, "tags": tags, "backup": backup}
 
 
-@router.post("/api/v1/core/{key}/demote", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/core/{key}/demote", dependencies=[Depends(require_session), Depends(write_guard)])
 def demote_core(key: str, body: ConfirmFlag,
                 storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """去掉碎片上的 `core` 标签（降常驻）。不在常驻 ⇒ 409。"""
@@ -224,7 +224,7 @@ def demote_core(key: str, body: ConfirmFlag,
 # 碎片改 / 归档
 # --------------------------------------------------------------------------
 
-@router.post("/api/v1/fragments/{key}/update", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/fragments/{key}/update", dependencies=[Depends(require_session), Depends(write_guard)])
 def update_fragment(key: str, body: UpdateBody,
                     storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """改正文 / 标签。`content` 与 `tags` 同时为空 ⇒ 400。
@@ -252,7 +252,7 @@ def update_fragment(key: str, body: UpdateBody,
             "updated": sorted(fields), "backup": backup}
 
 
-@router.post("/api/v1/fragments/{key}/archive", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/fragments/{key}/archive", dependencies=[Depends(require_session), Depends(write_guard)])
 def archive_fragment(key: str, body: ConfirmText,
                      storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """归档：置 `is_archived=1` + `valid_until=now`（**与既有 store() 版本化
@@ -327,7 +327,7 @@ def _export_before(storage: Any, keys: List[str], ts: str) -> str:
                               [{"key": k, "row": rows.get(k, {})} for k in keys])
 
 
-@router.post("/api/v1/ops/merge", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/ops/merge", dependencies=[Depends(require_session), Depends(write_guard)])
 def ops_merge(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """合并（Consolidator）。**默认 dry-run，零写入**。
 
@@ -361,7 +361,7 @@ def ops_merge(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[st
             "affected_backup": aff_path, "affected_keys": len(keys)}
 
 
-@router.post("/api/v1/ops/forget", dependencies=[Depends(require_token), Depends(write_guard)])
+@router.post("/api/v1/ops/forget", dependencies=[Depends(require_session), Depends(write_guard)])
 def ops_forget(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """选择性遗忘（Forgetter）。**默认 dry-run，零写入**。
 

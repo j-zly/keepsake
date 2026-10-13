@@ -24,7 +24,14 @@ TOKEN = "p2-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 #: 写面白名单（与 test_api_readonly.ALLOWED_POST_PATHS 同一份口径；两处各写一遍
-#: 是故意的 —— 一边改漏了，另一边的相等断言会红）
+#: 是故意的 —— 一边改漏了，另一边的相等断言会红）。P3 起再加 3 条认证 POST
+#: （setup / login 公开、logout 要会话 —— 那部分在 test_auth.py 里逐条打）。
+AUTH_POST_PATHS = {
+    "/api/v1/auth/setup",
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+}
+
 ALLOWED_POST_PATHS = {
     "/api/v1/core/{key}/promote",
     "/api/v1/core/{key}/demote",
@@ -32,7 +39,7 @@ ALLOWED_POST_PATHS = {
     "/api/v1/fragments/{key}/archive",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
-}
+} | AUTH_POST_PATHS
 
 #: fixture 语料：一部分常驻、一部分普通、一条待归档
 SEED: List[Dict[str, Any]] = [
@@ -430,12 +437,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有六条POST_其余全GET():
+def test_写面只有六条业务POST加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 6
+    assert len(ALLOWED_POST_PATHS) == 9
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 6
 
 
 def test_P1只读路由未被写面影响(client):

@@ -23,6 +23,23 @@ TOKEN_ENV = "CONSOLE_TOKEN"
 DEFAULT_TOKEN_FILE = "/root/.hermes/secrets/keepsake_console.token"
 
 # --------------------------------------------------------------------------
+# 管理员凭据 / 会话（P3 登录）
+# --------------------------------------------------------------------------
+
+#: 管理员凭据文件（存 username/salt/hash/iters，**只有哈希，没有明文口令**）
+ADMIN_FILE_ENV = "KEEPSAKE_CONSOLE_ADMIN_FILE"
+DEFAULT_ADMIN_FILE = "/root/.hermes/secrets/keepsake_console_admin.json"
+
+#: 会话文件（存 token 的 sha256、username、expires_at —— **不存 token 原值**）
+SESSION_FILE_ENV = "KEEPSAKE_CONSOLE_SESSION_FILE"
+DEFAULT_SESSION_FILE = "/root/.hermes/secrets/keepsake_console_sessions.json"
+
+#: 会话默认存活秒数；``remember=true`` 时用 REMEMBER_SESSION_TTL（30 天）
+SESSION_TTL_ENV = "KEEPSAKE_CONSOLE_SESSION_TTL"
+DEFAULT_SESSION_TTL = 12 * 3600
+REMEMBER_SESSION_TTL = 30 * 86400
+
+# --------------------------------------------------------------------------
 # 存储 / 知识库 / 定时任务
 # --------------------------------------------------------------------------
 
@@ -89,6 +106,28 @@ def console_token() -> str:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def admin_file() -> Path:
+    """管理员凭据文件路径（测试与 88 环境用环境变量指到临时目录）。"""
+    return Path(_env(ADMIN_FILE_ENV) or DEFAULT_ADMIN_FILE)
+
+
+def session_file() -> Path:
+    """会话文件路径。"""
+    return Path(_env(SESSION_FILE_ENV) or DEFAULT_SESSION_FILE)
+
+
+def session_ttl() -> int:
+    """默认会话存活秒数（`remember=true` 走 30 天那个常量，不受此变量影响）。
+
+    配了非法值（负数 / 非数字）⇒ 回落默认值 —— 配置坏了不该把会话变成永不过期。
+    """
+    try:
+        n = int(_env(SESSION_TTL_ENV) or DEFAULT_SESSION_TTL)
+    except ValueError:
+        return DEFAULT_SESSION_TTL
+    return n if n > 0 else DEFAULT_SESSION_TTL
 
 
 def storage_config_path() -> Optional[str]:

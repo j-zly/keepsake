@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, Query
 
 from .. import config
-from ..deps import get_storage, require_token
+from ..deps import get_storage, require_session
 from ..schemas import CoreItem, CoreList, CoreStats
 
 router = APIRouter(tags=["core"])
@@ -35,7 +35,7 @@ def _core_rows(storage: Any) -> List[Dict[str, Any]]:
     return list(storage.list_by_tag(CORE_TAG))
 
 
-@router.get("/api/v1/core", response_model=CoreList, dependencies=[Depends(require_token)])
+@router.get("/api/v1/core", response_model=CoreList, dependencies=[Depends(require_session)])
 def list_core(
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
@@ -58,7 +58,7 @@ def list_core(
     )
 
 
-@router.get("/api/v1/core/stats", response_model=CoreStats, dependencies=[Depends(require_token)])
+@router.get("/api/v1/core/stats", response_model=CoreStats, dependencies=[Depends(require_session)])
 def core_stats(storage: Any = Depends(get_storage)) -> CoreStats:
     """常驻层统计：条数 / 字符数 / 注入预算占用。
 

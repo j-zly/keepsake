@@ -23,7 +23,14 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 CORE_N = 120
 DEMO_N = 40
 
-#: 写面白名单（P2）：非 GET 路由**恰好**是这 6 条，其余一律不许出现。
+#: 认证 POST（P3）：setup / login 公开，logout 要会话（单独断言，别混进下面的白名单）
+AUTH_POST_PATHS = {
+    "/api/v1/auth/setup",
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+}
+
+#: 写面白名单（P2）：非 GET 路由**恰好**是这 6 条写操作 + 3 条认证，其余一律不许出现。
 ALLOWED_POST_PATHS = {
     "/api/v1/core/{key}/promote",
     "/api/v1/core/{key}/demote",
@@ -31,7 +38,7 @@ ALLOWED_POST_PATHS = {
     "/api/v1/fragments/{key}/archive",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
-}
+} | AUTH_POST_PATHS
 
 
 class FakeStorage:
@@ -143,10 +150,10 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
-    """🔴 P2 后断言升级：非 GET 路由**恰好**是写面那 6 条 POST，不多不少。
+    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 6 条 + 认证 3 条 POST，不多不少。
 
-    P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，改成白名单相等 ——
-    多一条（比如漏加 require_token 依赖的临时端点）同样会被这里抓住。
+    P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点 ——
+    多一条（比如漏加 require_session 依赖的临时端点）同样会被这里抓住。
     """
     app = create_app()
     write = {r.path for r in app.routes
@@ -160,12 +167,16 @@ def test_只读路由断言():
 
 
 def test_写路由全部需要token():
-    """白名单里的 6 条 POST 一条都不许免认证 —— 少挂一个 require_token 就红。"""
+    """写面 6 条 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
+
+    认证的 3 条不在此列：setup / login 本来就公开（P3 硬要求），
+    logout 的会话校验由 tests/api/test_auth.py 单独逐条打。
+    """
     app = create_app()
     for r in app.routes:
-        if getattr(r, "path", "") in ALLOWED_POST_PATHS:
+        if getattr(r, "path", "") in (ALLOWED_POST_PATHS - AUTH_POST_PATHS):
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
-            assert any("require_token" in n for n in names), r.path
+            assert any("require_session" in n for n in names), r.path
 
 
 # ---------------------------------------------------------------- core

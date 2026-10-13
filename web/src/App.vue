@@ -9,7 +9,7 @@
         <el-menu-item index="/stats">看板</el-menu-item>
       </el-menu>
       <div class="foot">
-        <el-button link size="small" @click="signOut">退出（清 token）</el-button>
+        <el-button link size="small" @click="signOut">退出登录</el-button>
       </div>
     </el-aside>
     <el-main>
@@ -22,17 +22,26 @@
 <script setup>
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getToken, setToken } from './api'
+import { api, getToken, setToken } from './api'
+import { showToast } from './utils/dialog'
 
 const route = useRoute()
 const router = useRouter()
 
-// token 页（首屏无 token 时）不套外壳，否则套一个空侧边栏没意义
-const showShell = computed(() => route.name !== 'token' && !!getToken())
+// 登录 / 初始化 / token 三页不套外壳，否则套一个空侧边栏没意义
+const BARE_PAGES = ['token', 'login', 'setup']
+const showShell = computed(() => !BARE_PAGES.includes(route.name) && !!getToken())
 
-function signOut() {
+/** 先让服务端把这个会话作废，再清本地 token —— 只清本地的话 token 还留在服务端文件里。 */
+async function signOut() {
+  try {
+    await api.logout()
+  } catch (e) {
+    // 会话本来就过期/不存在时也要能退出去，失败不挡人
+  }
   setToken('')
-  router.push({ name: 'token' })
+  showToast('已退出登录')
+  router.push({ name: 'login' })
 }
 </script>
 

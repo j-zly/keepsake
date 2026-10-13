@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
-from .routers import core, crons, fragments, kb, ops, stats
+from .routers import auth, core, crons, fragments, kb, ops, stats
 
 logger = logging.getLogger("keepsake.api")
 
@@ -42,8 +42,8 @@ def create_app() -> FastAPI:
     """造一个 FastAPI 实例：挂只读路由 → 挂写路由 → 挂静态文件 → 全局异常处理。"""
     app = FastAPI(
         title="Keepsake Console",
-        version="1.1.0",
-        description="记忆可视化后台 · 只读查询 + 带二次确认的写操作（6 条 POST）",
+        version="1.2.0",
+        description="记忆可视化后台 · 账号登录（会话 token）+ 只读查询 + 带二次确认的写操作",
     )
 
     # ---- 健康检查（唯一免认证路由）----
@@ -51,6 +51,9 @@ def create_app() -> FastAPI:
     def health() -> dict:
         """存活探针。只报「进程活着 + token 是否已配置」，**不报 token 本身**。"""
         return {"status": "ok", "token_configured": bool(config.console_token())}
+
+    # ---- 认证路由（P3：status/setup/login 公开，logout/me 要会话）----
+    app.include_router(auth.router)
 
     # ---- 只读业务路由 ----
     for r in (core.router, fragments.router, kb.router, stats.router, crons.router):

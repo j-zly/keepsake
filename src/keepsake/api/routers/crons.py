@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Set, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import config
-from ..deps import require_token
+from ..deps import require_session
 from ..schemas import CronJob, CronList
 
 router = APIRouter(tags=["crons"])
@@ -56,7 +56,7 @@ def _schedule_text(job: Dict[str, Any]) -> str:
     return str(sch or job.get("schedule_display") or "")
 
 
-@router.get("/api/v1/crons", response_model=CronList, dependencies=[Depends(require_token)])
+@router.get("/api/v1/crons", response_model=CronList, dependencies=[Depends(require_session)])
 def list_crons(
     all_jobs: bool = Query(False, description="true=不过滤，返回 jobs.json 里的全部任务"),
 ) -> CronList:

@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
-from ..deps import get_storage, require_token
+from ..deps import get_storage, require_session
 from ..config import RETRIEVAL_SCAN_CAP
 from ..schemas import Overview
 from . import kb as kb_router
@@ -22,7 +22,7 @@ from .core import core_stats
 router = APIRouter(tags=["stats"])
 
 
-@router.get("/api/v1/stats", response_model=Overview, dependencies=[Depends(require_token)])
+@router.get("/api/v1/stats", response_model=Overview, dependencies=[Depends(require_session)])
 def overview(storage: Any = Depends(get_storage)) -> Overview:
     """两域总览。core/retrieval 失败 ⇒ 500；kb 失败 ⇒ 该段显式标 unavailable。"""
     core = core_stats(storage)

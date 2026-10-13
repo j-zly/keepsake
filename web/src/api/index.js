@@ -4,12 +4,15 @@ import axios from 'axios'
  * Keepsake 控制台的 API 客户端。
  *
  * - token 存 localStorage，随请求头 `Authorization: Bearer <token>` 带出
- * - 401 全局拦截：清 token 并跳「输入 token」页（不是在每个页面各判一次）
+ * - 401 全局拦截：清 token 并跳登录页（不是在每个页面各判一次）
  * - 🔴 token 只进请求头，绝不进 URL / 日志 / 页面回显
  *
  * P2 新增 6 条写操作（全部要二次确认，confirm 由调用方显式传入）：
  * 打标 promote/demote、改 update、归档 archive、批量 merge/forget。
  * merge/forget 默认 dry-run —— 实跑必须再补 `confirm`（当前计数，防手滑）。
+ *
+ * P3：token 是**登录换来的会话 token**（记住我 = 30 天），不再是手贴的静态串。
+ * 登录三连：authStatus（首屏决定去 /setup 还是 /login）、setup、login / logout。
  */
 const TOKEN_KEY = 'keepsake.console.token'
 
@@ -33,16 +36,23 @@ http.interceptors.request.use((cfg) => {
   return cfg
 })
 
-/** 401 = token 缺失/错误/未配置 —— 一律退回 token 页（用 location 而非 router，避开循环依赖）。 */
+/** 登录 / 初始化两页本身不发带鉴权的请求 —— 别在这儿把用户踢出去。 */
+const NO_AUTH_PAGES = ['#/login', '#/setup', '#/token']
+
+/**
+ * 401 = 会话失效/过期/没配 token —— 一律清 token 退回登录页。
+ * 429（限速）与 400/409 直接把后端文案抛给调用方，不做跳转。
+ * 用 location 而非 router，避开 api ↔ router 的循环依赖。
+ */
 http.interceptors.response.use(
   (res) => res,
   (err) => {
     const status = err?.response?.status
     const detail = err?.response?.data?.detail
     const message = (detail && (detail.message || detail.error)) || err?.message || '请求失败'
-    if (status === 401) {
+    if (status === 401 && !NO_AUTH_PAGES.some((p) => location.hash.startsWith(p))) {
       setToken('')
-      if (!location.hash.startsWith('#/token')) location.hash = '#/token'
+      location.hash = '#/login'
     }
     return Promise.reject(new Error(message))
   },
@@ -50,6 +60,13 @@ http.interceptors.response.use(
 
 export const api = {
   health: () => http.get('/health').then((r) => r.data),
+  authStatus: () => http.get('/api/v1/auth/status').then((r) => r.data),
+  setup: (username, password) =>
+    http.post('/api/v1/auth/setup', { username, password }).then((r) => r.data),
+  login: (username, password, remember) =>
+    http.post('/api/v1/auth/login', { username, password, remember }).then((r) => r.data),
+  logout: () => http.post('/api/v1/auth/logout').then((r) => r.data),
+  me: () => http.get('/api/v1/auth/me').then((r) => r.data),
   coreList: (params) => http.get('/api/v1/core', { params }).then((r) => r.data),
   coreStats: () => http.get('/api/v1/core/stats').then((r) => r.data),
   fragments: (params) => http.get('/api/v1/fragments', { params }).then((r) => r.data),

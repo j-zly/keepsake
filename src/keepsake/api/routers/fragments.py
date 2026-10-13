@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import config
-from ..deps import get_storage, require_token
+from ..deps import get_storage, require_session
 from ..schemas import FragmentDetail, FragmentItem, FragmentList
 
 router = APIRouter(tags=["fragments"])
@@ -95,7 +95,7 @@ def _collect(storage: Any, q: str, tag: str, page: int,
 
 
 @router.get("/api/v1/fragments", response_model=FragmentList,
-            dependencies=[Depends(require_token)])
+            dependencies=[Depends(require_session)])
 def list_fragments(
     q: str = Query("", description="检索词；为空则退化为按 tag 浏览"),
     tag: str = Query("", description="标签精确过滤（逗号边界匹配，与存储层同判据）"),
@@ -125,7 +125,7 @@ def _jsonable(value: Any) -> Any:
 
 
 @router.get("/api/v1/fragments/{key}", response_model=FragmentDetail,
-            dependencies=[Depends(require_token)])
+            dependencies=[Depends(require_session)])
 def get_fragment(key: str, storage: Any = Depends(get_storage)) -> FragmentDetail:
     """单条碎片全文（全字段）。不存在 ⇒ 404。"""
     row = storage.get_fragment(key)
