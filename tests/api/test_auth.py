@@ -376,8 +376,12 @@ def test_畸形Authorization头_401不是500(client):
         assert r.status_code == 401, header
 
 
-def test_未初始化且无静态token_报未配置(env, monkeypatch):
+def test_未初始化且无静态token_报未配置(env, monkeypatch, tmp_path):
     monkeypatch.setenv("CONSOLE_TOKEN", "")
+    # 🔴 文件回退也要切断：本机（主脑）存在 /root/.hermes/secrets/keepsake_console.token，
+    # 只清 CONSOLE_TOKEN 时本用例在主脑恒失败、在 88 恒通过 ⇒ 环境敏感用例。
+    # 指到一个确定不存在的路径，让「未配置」这件事与环境无关。
+    monkeypatch.setenv("KEEPSAKE_CONSOLE_TOKEN_FILE", str(tmp_path / "不存在.token"))
     r = TestClient(create_app()).get("/api/v1/core",
                                      headers={"Authorization": "Bearer whatever"})
     assert r.status_code == 401 and r.json()["detail"]["error"] == "token_not_configured"

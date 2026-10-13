@@ -34,6 +34,9 @@ dependencies = [
 # PostgreSQL 后端（可选）。默认后端是 Redis —— 不用 PG 就别装，装了也不影响。
 # 用法: pip install 'keepsake-memory[postgres]' + 配置 storage.backend = "postgres"
 postgres = ["psycopg[binary]>=3.1"]
+# 通用 MCP 服务（可选）。只有 `keepsake.mcp_server` / examples/mcp_client_demo.py 需要，
+# 其余功能不装也能用（`mcp_server` 是 import 时才要 SDK）。
+mcp = ["mcp>=1.2,<2"]
 
 [tool.setuptools]
 packages.find = {where = ["src"]}

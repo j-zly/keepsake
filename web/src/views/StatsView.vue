@@ -22,7 +22,7 @@
       </el-col>
       <el-col :span="6">
         <StatCard
-          label="检索层碎片"
+          label="检索层记忆条目"
           :value="data?.retrieval?.count ?? '-'"
           unit="条"
           :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : 'keyset 扫描'"
@@ -36,7 +36,7 @@
       show-icon
       :closable="false"
       class="alert"
-      title="dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响碎片。"
+      title="dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。"
     />
     <el-space wrap class="ops">
       <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
@@ -125,16 +125,16 @@ async function load() {
 /**
  * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
  * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
- * 实跑前后都会把受影响碎片全量导出到备份目录，路径回显在结果里。
+ * 实跑前后都会把受影响记忆条目全量导出到备份目录，路径回显在结果里。
  */
 async function runMerge(dryRun) {
   const n = data.value?.core?.count
-  await runOps('merge', dryRun, String(n), `合并 · 实跑会改写碎片（当前常驻 ${n} 条）`)
+  await runOps('merge', dryRun, String(n), `合并 · 实跑会改写记忆条目（当前常驻 ${n} 条）`)
 }
 
 async function runForget(dryRun) {
   const n = data.value?.retrieval?.count
-  await runOps('forget', dryRun, String(n), `遗忘 · 实跑会物理删除过期碎片（当前共 ${n} 条）`)
+  await runOps('forget', dryRun, String(n), `遗忘 · 实跑会物理删除过期记忆条目（当前共 ${n} 条）`)
 }
 
 async function runOps(kind, dryRun, expect, warnText) {

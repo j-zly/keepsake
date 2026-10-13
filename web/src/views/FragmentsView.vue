@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h2>检索层（碎片）</h2>
+    <h2>检索层（记忆条目）</h2>
     <el-form :inline="true" class="bar" @submit.prevent="search">
       <el-form-item label="检索词">
         <el-input
@@ -69,7 +69,7 @@
       @size-change="onSize"
     />
 
-    <el-drawer v-model="drawer" title="碎片全文 / 编辑" size="50%">
+    <el-drawer v-model="drawer" title="记忆条目全文 / 编辑" size="50%">
       <div v-if="detail">
         <el-descriptions :column="1" border size="small">
           <el-descriptions-item label="key">{{ detail.key }}</el-descriptions-item>
@@ -144,7 +144,7 @@ async function load() {
     count.value = data.count
     hasMore.value = data.has_more
   } catch (e) {
-    error.value = `读取碎片失败：${e.message}`
+    error.value = `读取记忆条目失败：${e.message}`
     ElMessage.error(error.value)
   } finally {
     loading.value = false

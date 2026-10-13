@@ -129,9 +129,19 @@ def test_错token_401(client):
     assert TOKEN not in r.text
 
 
-def test_token未配置一律401(client, monkeypatch):
+def test_token未配置一律401(client, monkeypatch, tmp_path):
+    """token 未配置 ⇒ 一律 401 `token_not_configured`，与宿主环境无关。
+
+    🔴 隔离必须写全三处：token 环境变量、token 文件**、管理员/会话文件**。
+    少隔离管理员文件时，生产上（管理员已初始化 ⇒ `admin_exists()=True`）
+    会走成 `invalid_token`，本用例必挂 —— 那不是用例的错，是隔离漏了。
+    这里全部指到 `tmp_path` 下**不存在**的路径（另见 G4：外层环境指向真实
+    存在的管理员文件也得过）。
+    """
     monkeypatch.setenv("CONSOLE_TOKEN", "")
-    monkeypatch.setenv("KEEPSAKE_CONSOLE_TOKEN_FILE", "/tmp/keepsake-not-exist.token")
+    monkeypatch.setenv("KEEPSAKE_CONSOLE_TOKEN_FILE", str(tmp_path / "不存在.token"))
+    monkeypatch.setenv("KEEPSAKE_CONSOLE_ADMIN_FILE", str(tmp_path / "不存在-admin.json"))
+    monkeypatch.setenv("KEEPSAKE_CONSOLE_SESSION_FILE", str(tmp_path / "不存在-sessions.json"))
     r = client.get("/api/v1/core", headers=AUTH)
     assert r.status_code == 401
     assert r.json()["detail"]["error"] == "token_not_configured"

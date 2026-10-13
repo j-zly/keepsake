@@ -1,4 +1,4 @@
-"""检索层（碎片）只读接口：分页列表 + 单条全文。
+"""检索层（记忆条目）只读接口：分页列表 + 单条全文。
 
 一律经 `keepsake.storage` 的现成原语取数（`search` / `list_by_tag` /
 `scan_fragment_keys` + `get_fragments_batch`），**不拼 SQL、不碰后端专属连接**。
@@ -103,7 +103,7 @@ def list_fragments(
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
     storage: Any = Depends(get_storage),
 ) -> FragmentList:
-    """碎片列表（服务端分页；BM25 走 `storage.search`）。"""
+    """记忆条目列表（服务端分页；BM25 走 `storage.search`）。"""
     rows, total, has_more, reason = _collect(storage, q.strip(), tag.strip(), page, page_size)
     return FragmentList(
         items=[_to_item(r) for r in rows],
@@ -127,11 +127,11 @@ def _jsonable(value: Any) -> Any:
 @router.get("/api/v1/fragments/{key}", response_model=FragmentDetail,
             dependencies=[Depends(require_session)])
 def get_fragment(key: str, storage: Any = Depends(get_storage)) -> FragmentDetail:
-    """单条碎片全文（全字段）。不存在 ⇒ 404。"""
+    """单条记忆条目全文（全字段）。不存在 ⇒ 404。"""
     row = storage.get_fragment(key)
     if not row:
         raise HTTPException(status_code=404,
-                            detail={"error": "not_found", "message": f"碎片不存在：{key}"})
+                            detail={"error": "not_found", "message": f"记忆条目不存在：{key}"})
     return FragmentDetail(
         key=key,
         content=str(row.get("content", "")),
