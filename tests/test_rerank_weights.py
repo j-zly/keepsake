@@ -22,7 +22,9 @@ import pytest
 
 from keepsake import storage, storage_pg, storage_shared
 
-ROOT = Path(storage.__file__).resolve().parent.parent.parent
+# storage 的实现搬到 core/redis.py 后深了一层（2026-10 keepsake_p0_layout_v1）：
+# <repo>/src/keepsake/core/redis.py ⇒ parents[3] 才是仓库根。
+ROOT = Path(storage.__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import eval_compare_backends as ecb  # noqa: E402

@@ -296,7 +296,7 @@ def test_pg_and_sqlite_bind_the_same_shared_corpus_maintenance_functions():
     for func_name in ("synonym_words", "jieba_dict_words", "discover_synonym_pairs",
                       "merge_synonym_maps", "synonym_rows", "jieba_dict_entries"):
         impl = getattr(storage_shared, func_name)
-        assert impl.__module__ == "keepsake.storage_shared", func_name
+        assert impl.__module__ == "keepsake.core.shared", func_name
         assert Path(impl.__code__.co_filename).resolve() == Path(storage_shared.__file__).resolve()
     # 阈值默认值三处同源（PG / SQLite / Redis 各自 __init__ 的形参）
     import inspect

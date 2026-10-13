@@ -57,7 +57,7 @@ def test_shared_functions_live_only_in_storage_shared_module():
     for func_name in SHARED_METHODS:
         func = getattr(storage_shared, func_name)
         assert Path(func.__code__.co_filename).resolve() == Path(storage_shared.__file__).resolve()
-        assert func.__module__ == "keepsake.storage_shared"
+        assert func.__module__ == "keepsake.core.shared"
 
 
 def test_storage_shared_does_not_import_either_backend():
@@ -71,7 +71,9 @@ def test_storage_shared_does_not_import_either_backend():
             imported.update(a.name for a in node.names)
     assert "keepsake.storage" not in imported
     assert "keepsake.storage_pg" not in imported
-    assert not any(m.endswith(".storage") or m.endswith(".storage_pg") for m in imported)
+    # 2026-10 分层后后端实现叫 core.redis / core.pg / core.sqlite
+    assert not any(m.split(".")[-1] in ("redis", "pg", "sqlite", "storage", "storage_pg")
+                   for m in imported), imported
 
 
 # ---------------------------------------------------------------- 三、行为等价
@@ -189,8 +191,8 @@ def test_rerank_with_decay_knn_distance_semantics():
 # ---------------------------------------------------------------- 加权公式唯一实现
 
 @pytest.mark.parametrize("func_name, users", [
-    ("attention_boost_from_topics", ["keepsake.storage", "keepsake.storage_pg"]),
-    ("hot_topic_weighted_hits", ["keepsake.storage", "keepsake.storage_pg"]),
+    ("attention_boost_from_topics", ["keepsake.core.redis", "keepsake.core.pg"]),
+    ("hot_topic_weighted_hits", ["keepsake.core.redis", "keepsake.core.pg"]),
 ])
 def test_weight_formula_has_one_definition_and_is_used_by_both_backends(func_name, users):
     """注意力/热词加权：只有一处定义，且两个后端的调用点都引用它。
@@ -210,10 +212,10 @@ def test_weight_formula_has_one_definition_and_is_used_by_both_backends(func_nam
 
 def test_both_backends_reference_shared_weight_helpers():
     """两个后端都必须引用两个共用加权函数（双向都查，不漏一边）。"""
-    for path in (SRC / "storage_pg.py", SRC / "storage.py"):
+    for path in (SRC / "pg.py", SRC / "redis.py"):
         src = path.read_text(encoding="utf-8")
         assert "attention_boost_from_topics" in src, f"{path.name} 未引用共用注意力公式"
-    for path in (SRC / "storage_pg.py", SRC / "storage.py"):
+    for path in (SRC / "pg.py", SRC / "redis.py"):
         src = path.read_text(encoding="utf-8")
         assert "hot_topic_weighted_hits" in src, f"{path.name} 未引用共用热词衰减公式"
 
@@ -232,7 +234,7 @@ def test_upstream_query_helpers_still_defined_in_storage(name):
 
 def test_pg_backend_reuses_sanitize_terms_instead_of_copying():
     """PG 侧必须 import `_sanitize_terms` / `_expand_terms`，不能自己再写一套。"""
-    tree = ast.parse((SRC / "storage_pg.py").read_text(encoding="utf-8"))
+    tree = ast.parse((SRC / "pg.py").read_text(encoding="utf-8"))
     imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
                 for a in n.names}
     assert {"_sanitize_terms", "_expand_terms"} <= imported
@@ -243,7 +245,7 @@ def test_pg_backend_reuses_sanitize_terms_instead_of_copying():
 
 def test_storage_pg_is_actually_using_the_module():
     """storage_pg 真的用上了 storage_shared（不是 import 了却不用）。"""
-    src = (SRC / "storage_pg.py").read_text(encoding="utf-8")
+    src = (SRC / "pg.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     for name in ("apply_v2_filters", "rerank_with_decay", "rrf_fuse",
@@ -392,8 +394,8 @@ CORPUS_MAINTENANCE_FUNCS = (
 )
 #: 两个后端各自的语料维护入口（方法名，用于查「引用了共用函数」）
 CORPUS_MAINTENANCE_ENTRYPOINTS = {
-    "storage_pg.py": ("discover_synonyms", "generate_jieba_dict"),
-    "storage_sqlite.py": ("discover_synonyms", "generate_jieba_dict"),
+    "pg.py": ("discover_synonyms", "generate_jieba_dict"),
+    "sqlite.py": ("discover_synonyms", "generate_jieba_dict"),
 }
 
 
@@ -409,8 +411,8 @@ def test_corpus_maintenance_chain_has_one_definition(func_name):
         if any(isinstance(n, ast.FunctionDef) and n.name == func_name
                for n in ast.walk(tree)):
             seen.append(path.name)
-    assert seen == ["storage_shared.py"], (
-        f"{func_name} 必须只在 storage_shared.py 里定义一次，实测定义于 {seen}"
+    assert seen == ["shared.py"], (
+        f"{func_name} 必须只在 core/shared.py 里定义一次，实测定义于 {seen}"
     )
 
 

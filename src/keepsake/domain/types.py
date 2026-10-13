@@ -1,0 +1,104 @@
+"""domain 层纯数据类型：Fragment / Hit / Capabilities 与错误类型。
+
+本模块**零 IO、零依赖**（只用标准库 typing）：它是 `adapters/generic/protocol.py`
+的数据侧地基，任何适配器都可以在不碰 core 的前提下引用。
+
+Fragment / Hit 刻意用 `TypedDict` 而不是 dataclass：
+存储层三个后端（Redis / PG / SQLite）返回的本来就是 `Dict[str, Any]`，
+TypedDict 只在类型检查层面描述形状，**运行时仍是那个 dict 本身** ——
+不引入一次多余的对象转换，也就不会有「取回来变成另一种类型」的行为漂移。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, TypedDict
+
+
+# ---------------------------------------------------------------------------
+# 检索命中 / 碎片本体
+# ---------------------------------------------------------------------------
+
+class Fragment(TypedDict, total=False):
+    """一条记忆碎片（存储层原样返回的 dict，不做转换）。
+
+    `total=False`：字段随后端与写入路径不同而增减，缺字段是常态，
+    调用方一律走 `.get()` + 默认值，不许直接下标。
+    """
+
+    key: str
+    content: str
+    tags: str
+    category: str
+    source: str
+    fragment_type: str
+    created: str
+    updated_at: str
+    sentiment_score: str
+    sentiment_label: str
+    feedback_score: str
+    touch_count: str
+
+
+class Hit(TypedDict, total=False):
+    """一条检索命中：在 Fragment 之上叠了排序信号。
+
+    `_` 前缀字段是检索期算出来的**临时**信号（不入库），
+    与 `storage_shared` 的重排函数输出一一对应。
+    """
+
+    key: str
+    content: str
+    tags: str
+    # 排序信号
+    _combined_score: float
+    _sim: float
+    _weights: Dict[str, Any]
+    _knn_score: Optional[float]
+
+
+# ---------------------------------------------------------------------------
+# 能力声明
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Capabilities:
+    """适配器对外的能力声明（`MemoryProvider.capabilities()` 的返回值）。
+
+    调用方据此决定「能不能问后端要 KNN」这类问题，而不是 try/except 猜。
+    `version` 是**契约版本**（"v1"），与 keepsake 包版本无关 ——
+    升级契约要升它，升级实现不许动它。
+    """
+
+    core_tier: bool = False
+    """是否有常驻核心层（core tag 每轮全量注入上下文）。"""
+
+    knn: bool = False
+    """检索是否含向量（KNN）通道；False = 只有 BM25 全文。"""
+
+    dry_run_merge: bool = False
+    """merge() 是否支持 dry_run（只统计不写）；False = 调用方不许传 dry_run。"""
+
+    version: str = "v1"
+    """契约版本号。"""
+
+
+# ---------------------------------------------------------------------------
+# 错误类型
+# ---------------------------------------------------------------------------
+
+class KeepsakeContractError(Exception):
+    """契约层错误基类：实现违反 `adapters/generic/protocol.py` 的失败语义时抛出。"""
+
+
+class CapabilityNotSupported(KeepsakeContractError):
+    """调用方要了实现方 `Capabilities` 里没声明的能力（如对 BM25-only 后端要 KNN）。"""
+
+
+__all__ = [
+    "Fragment",
+    "Hit",
+    "Capabilities",
+    "KeepsakeContractError",
+    "CapabilityNotSupported",
+]

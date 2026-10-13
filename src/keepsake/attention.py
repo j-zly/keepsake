@@ -1,167 +1,19 @@
-"""注意力追踪 — 统计用户对各个话题的关注频率。
+"""兼容层：`keepsake.attention` → 真实实现已搬到 `keepsake.core.attention`。
 
-用户反复提起某个话题 -> 该话题关注度上升 -> 相关碎片在搜索中权重更高。
+注意力追踪与加权。搬家是为了分层，本文件保证旧导入路径**逐字不变**。
 
-存储: Redis Sorted Set `keepsake:attention`
-  - member: 话题词（由 jieba/关键词提取来）
-  - score: 关注度累计值（每次提及 +2，情绪烈度加权）
+用 sys.modules 模块别名而不是 `from .core.attention import *`：别名与实现是**同一个
+module 对象**，所以模块级私有名（`_SNAPSHOTS` / `_expand_terms` 之类）与
+monkeypatch 落点都还在原处；`import *` 会拷一份快照，patch 就会打空 ——
+那才是真正的行为变化。
 
-三套时间窗口（同 hot_topics 模式）:
-  - 全局: keepsake:attention (7天)
-  - 日榜: keepsake:attention:daily (2天)
-  - 周榜: keepsake:attention:weekly (14天)
+⚠️ 只搬文件、零行为变化：本文件不含任何实现代码。
 """
 
 from __future__ import annotations
 
-import logging
-import time
-from typing import Any, Dict, List, Optional
+import sys as _sys
+import importlib as _importlib
 
-import redis
-
-logger = logging.getLogger(__name__)
-
-# Redis key 前缀
-ATTENTION_SET = "keepsake:attention"
-ATTENTION_DAILY = "keepsake:attention:daily"
-ATTENTION_WEEKLY = "keepsake:attention:weekly"
-
-# 过期时间
-_ATTENTION_TTL = {
-    ATTENTION_SET: 86400 * 7,        # 全局：7天
-    ATTENTION_DAILY: 86400 * 2,      # 日榜：2天
-    ATTENTION_WEEKLY: 86400 * 14,    # 周榜：14天
-}
-
-# ---- 2026-09-14 延迟修复：注意力榜单进程级 TTL 缓存 ----
-# rerank 对**每条候选**都调 match_attention_boost，而它取的是全局榜单
-# （与候选内容无关）⇒ 单次检索数十次 Redis 往返（实测链路 ~170 ms/次）。
-# 榜单是滚动聚合，秒级陈旧无影响，故缓存 60 s。
-_ATTN_SNAPSHOT_TTL = 60.0
-_ATTN_SNAPSHOT: Dict[str, Any] = {"raw": None, "top_n": 0, "ts": 0.0}
-
-
-def _attention_snapshot(client: redis.Redis, top_n: int):
-    """取全局注意力榜单 top-N（60 秒进程级缓存，避免逐候选重复拉取）。"""
-    now = time.time()
-    if (_ATTN_SNAPSHOT["raw"] is not None
-            and (now - float(_ATTN_SNAPSHOT["ts"] or 0.0)) < _ATTN_SNAPSHOT_TTL
-            and int(_ATTN_SNAPSHOT["top_n"] or 0) >= int(top_n)):
-        return _ATTN_SNAPSHOT["raw"][:top_n]
-    fetch_n = max(int(top_n), 50)
-    raw = client.zrevrange(ATTENTION_SET, 0, fetch_n - 1, withscores=True)
-    _ATTN_SNAPSHOT.update({"raw": raw, "top_n": fetch_n, "ts": now})
-    return raw[:top_n]
-
-
-def record_attention(
-    client: redis.Redis,
-    text: str,
-    emotion_intensity: float = 0.0,
-    keywords: Optional[List[str]] = None,
-    base_increment: float = 2.0,
-    emotion_factor: float = 1.5,
-) -> None:
-    """记录用户对一段文本中话题的关注。"""
-    if not client or not text:
-        return
-
-    try:
-        # 没有关键词时跳过（正常路径由 store() 传入，不会走到这里）
-        if not keywords:
-            return
-
-        increment = base_increment + emotion_intensity * emotion_factor
-
-        for kw in keywords:
-            kw_lower = kw.lower().strip()
-            if len(kw_lower) < 2:
-                continue
-            for topic_set in (ATTENTION_SET, ATTENTION_DAILY, ATTENTION_WEEKLY):
-                client.zincrby(topic_set, increment, kw_lower)
-                client.expire(topic_set, _ATTENTION_TTL.get(topic_set, 86400))
-
-    except Exception as e:
-        logger.debug("attention: record_attention error: %s", e)
-
-
-def get_attention_score(client: redis.Redis, keyword: str) -> float:
-    """查某个词在当前注意力分数中的排名分。"""
-    if not client or not keyword:
-        return 0.0
-    try:
-        score = client.zscore(ATTENTION_SET, keyword.lower().strip())
-        return score if score is not None else 0.0
-    except Exception:
-        return 0.0
-
-
-def get_top_attention(client: redis.Redis, limit: int = 10,
-                      period: str = "all") -> List[Dict[str, Any]]:
-    """获取关注度最高的词。"""
-    key = {
-        "all": ATTENTION_SET,
-        "daily": ATTENTION_DAILY,
-        "weekly": ATTENTION_WEEKLY,
-    }.get(period, ATTENTION_SET)
-
-    if not client:
-        return []
-    try:
-        raw = client.zrevrange(key, 0, limit - 1, withscores=True)
-        results = []
-        for t, s_raw in raw:
-            topic = t.decode("utf-8") if isinstance(t, bytes) else t
-            if isinstance(s_raw, bytes):
-                s_raw = s_raw.decode("utf-8")
-            results.append({"topic": topic, "score": round(float(s_raw), 1)})
-        return results
-    except Exception as e:
-        logger.debug("attention: get_top_attention error: %s", e)
-        return []
-
-
-def match_attention_boost(
-    client: redis.Redis,
-    content: str,
-    top_n: int = 10,
-    boost_max: float = 1.5,
-) -> float:
-    """检查碎片内容的注意力关注度加权值。
-
-    从全局注意力取 top N 话题，看碎片内容命中几个。
-    命中越多权重越高，最高 boost_max。
-    """
-    if not client or not content:
-        return 1.0
-
-    try:
-        raw = _attention_snapshot(client, top_n)
-        if not raw:
-            return 1.0
-
-        content_lower = content.lower()
-        total_score = 0.0
-        max_score = 0.0
-
-        for topic_b, score_raw in raw:
-            topic = topic_b.decode("utf-8") if isinstance(topic_b, bytes) else topic_b
-            if isinstance(score_raw, bytes):
-                score_raw = score_raw.decode("utf-8")
-            sc = float(score_raw)  # noqa: F841
-            if isinstance(sc, (int, float)):
-                if len(topic) >= 2 and topic in content_lower:
-                    total_score += sc
-                max_score += sc
-
-        if max_score <= 0:
-            return 1.0
-
-        # 归一化到 1.0~boost_max，命中越高越接近 boost_max
-        ratio = min(total_score / max_score, 1.0)
-        return 1.0 + (boost_max - 1.0) * ratio
-
-    except Exception as e:
-        logger.debug("attention: match_attention_boost error: %s", e)
-        return 1.0
+_impl = _importlib.import_module("keepsake.core.attention")
+_sys.modules[__name__] = _impl

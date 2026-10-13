@@ -1048,7 +1048,7 @@ def test_search_uses_shared_rerank_object(search_store):
     """🔴 排序逻辑**不得重写**：必须复用 `storage_shared` 的同一个函数对象。"""
     from keepsake.storage_shared import rerank_with_decay as shared_rerank
     assert SqliteStorage._rerank_with_decay is shared_rerank
-    assert SqliteStorage._apply_v2_filters.__module__ == "keepsake.storage_shared"
+    assert SqliteStorage._apply_v2_filters.__module__ == "keepsake.core.shared"
 
 
 def test_search_degrades_to_bm25_loudly(search_store, caplog):
@@ -1776,7 +1776,9 @@ def test_maintenance_modules_are_backend_neutral_ast():
     """
     import ast
 
-    for mod in ("consolidator", "forgetter"):
+    # 2026-10 keepsake_p0_layout_v1：维护算子搬到 core/ops/（src/keepsake/ 根下
+    # 只剩同名兼容层别名，扫它会把这道铁律变成空判）。
+    for mod in ("core/ops/consolidator", "core/ops/forgetter"):
         path = Path(__file__).resolve().parents[1] / "src" / "keepsake" / f"{mod}.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
         imported = set()
