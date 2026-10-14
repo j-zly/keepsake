@@ -123,9 +123,14 @@ const ICON = {
     '<path d="M6.4 2.9H3.6a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.8"/><path d="M10.2 5.5 13.1 8l-2.9 2.5"/><path d="M13.1 8H6.6"/>',
 }
 
-// 侧栏分组：记忆（常驻层 / 记忆条目）· 知识库与运维（知识库 / 看板）
-// 面包屑也从这份结构取，所以两处永远说同一句话。
+// 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目）· 知识库（知识库）
+// 看板是总览入口，业界惯例 Overview 置顶，所以它单独成组排第一。
+// 面包屑也从这份结构取，所以两处永远说同一句话（看板页：总览 › 看板）。
 const GROUPS = [
+  {
+    title: '总览',
+    items: [{ path: '/stats', label: '看板', icon: ICON.chart }],
+  },
   {
     title: '记忆',
     items: [
@@ -134,11 +139,8 @@ const GROUPS = [
     ],
   },
   {
-    title: '知识库与运维',
-    items: [
-      { path: '/kb', label: '知识库', icon: ICON.book },
-      { path: '/stats', label: '看板', icon: ICON.chart },
-    ],
+    title: '知识库',
+    items: [{ path: '/kb', label: '知识库', icon: ICON.book }],
   },
 ]
 
