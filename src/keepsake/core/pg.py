@@ -2655,6 +2655,11 @@ class PgStorage(StorageBase):
         同一份 SQL 片段），排序在 SQL 里做 —— PG 侧没有 `updated_at` 列
         （见 `touch_fragment` 的说明），排序键回落到 `created`，
         对齐 Redis 侧「`updated_at` 缺失时回落 created」的同一语义。
+
+        🔴 排除已归档条目（`is_archived='1'`，见 `archive_fragment`）：
+        归档 = 版本化失效的同款语义，列表视图只给**活的那一份**。
+        判据 `COALESCE(is_archived,'') <> '1'` 兼容历史行：列值 `'1'` 才算归档，
+        空串 / NULL / 从未写过这根列的行都算未归档。
         """
         clean = self._clean_tag(tag)
         if not clean:
@@ -2663,7 +2668,8 @@ class PgStorage(StorageBase):
         with self._ro() as cur:
             cur.execute(
                 f"SELECT key, content, tags, created FROM ks_fragment "
-                f"WHERE {clause} ORDER BY created ASC, key ASC",
+                f"WHERE {clause} AND COALESCE(is_archived, '') <> '1' "
+                f"ORDER BY created ASC, key ASC",
                 tuple(args),
             )
             return [

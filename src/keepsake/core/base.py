@@ -251,6 +251,11 @@ class StorageBase(ABC):
         `storage_shared.tag_match_sql` 同一判据）：`core` 不许命中 `core-x`。
         Redis 侧 `tags` 落库形态是逗号串，按逗号切分比对。
 
+        🔴 **只返回未归档条目**：已归档（`is_archived='1'` + `valid_until=now`，
+        见 `archive_fragment`）的一律不返回 —— 归档是版本化失效的同款语义，
+        列表视图只给活的那一份。除归档外的行为（排序 / 分页 / 标签判据）
+        都不许变；判据按 `'1'` 精确相等，历史上从未写过该列的行照常返回。
+
         🔴 **未实现的后端必须抛 NotImplementedError，绝不静默返回空列表** ——
         静默空 = 核心层悄悄变空、agent 丢掉全部常驻记忆且无任何告警，
         与 `search_*` 的同一约定（见类 docstring）。

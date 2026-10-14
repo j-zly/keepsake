@@ -1264,6 +1264,10 @@ class RedisStorage(StorageBase):
         `updated_at` 是 Redis 侧的「最近命中」时间戳（R6 `touch_fragment` 刷的），
         老碎片可能压根没这根字段 —— 回落到 `created`，保证排序键恒存在
         （否则混排时 None 与 str 比较会抛 TypeError）。
+
+        🔴 排除已归档条目（`is_archived='1'`，归档写入见 `store` 的版本化分支
+        与 `archive_fragment`）：归档 = 版本化失效的同款语义，列表视图只给
+        **活的那一份**。未归档的老碎片压根没这根字段 ⇒ None ⇒ 放行。
         """
         needle = f",{tag},"
         rows: List[Dict[str, Any]] = []
@@ -1279,11 +1283,14 @@ class RedisStorage(StorageBase):
             if keys:
                 pipe = client.pipeline()
                 for k in keys:
-                    pipe.hmget(k, "content", "tags", "updated_at", "created")
+                    pipe.hmget(k, "content", "tags", "updated_at", "created",
+                               "is_archived")
                 for key, vals in zip(keys, pipe.execute()):
-                    content, tags, updated_at, created = (
+                    content, tags, updated_at, created, archived = (
                         _decode_hash_value(v) for v in vals
                     )
+                    if archived == "1":
+                        continue
                     if not tags or needle not in _tags_padded(tags):
                         continue
                     rows.append({

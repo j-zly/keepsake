@@ -1209,6 +1209,11 @@ class SqliteStorage(StorageBase):
         与 PG 侧同款：匹配判据复用 `storage_shared.tag_match_sql`（`instr` 两参形，
         占位符 `?`），排序键用本后端**真有的** `updated` 列（R6 刷的最近命中时间），
         空串回落 `created` —— 与 Redis 侧同一语义。
+
+        🔴 排除已归档条目（`is_archived='1'`，见 `archive_fragment`）：归档 =
+        版本化失效的同款语义，列表视图只给**活的那一份**。判据
+        `COALESCE(is_archived,'') != '1'` 兼容历史行：空串 / NULL / 从未写过
+        这根列的行都算未归档（别写 `is_archived = ''`，会误杀它们）。
         """
         clean = self._clean_tag(tag)
         if not clean:
@@ -1218,7 +1223,7 @@ class SqliteStorage(StorageBase):
         with self._lock:
             rows = self._db().execute(
                 "SELECT key, content, tags, updated, created FROM ks_fragment "
-                f"WHERE {clause} "
+                f"WHERE {clause} AND COALESCE(is_archived, '') != '1' "
                 "ORDER BY COALESCE(NULLIF(updated, ''), created) ASC, key ASC",
                 tuple(args),
             ).fetchall()
