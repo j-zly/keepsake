@@ -119,6 +119,8 @@ const ICON = {
   sun: '<circle cx="8" cy="8" r="3.1"/><path d="M8 1.4v1.5M8 13.1v1.5M1.4 8h1.5M13.1 8h1.5M3.4 3.4l1 1M11.6 11.6l1 1M12.6 3.4l-1 1M4.4 11.6l-1 1"/>',
   moon: '<path d="M13.4 9.5A5.6 5.6 0 0 1 6.5 2.6a5.9 5.9 0 1 0 6.9 6.9Z"/>',
   shield: '<path d="M8 1.9 2.9 3.9v3.7c0 3 2.1 5.4 5.1 6.5 3-1.1 5.1-3.5 5.1-6.5V3.9Z"/><path d="m6.1 7.9 1.4 1.4 2.6-2.7"/>',
+  broom:
+    '<path d="M10.4 2.9 13.1 5.6 8.6 10.1 5.9 7.4Z"/><path d="m6.7 8.2-3.4 3.4 2.4 2.4 3.4-3.4"/><path d="M4.6 13.4h6.8"/>',
   logout:
     '<path d="M6.4 2.9H3.6a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.8"/><path d="M10.2 5.5 13.1 8l-2.9 2.5"/><path d="M13.1 8H6.6"/>',
 }
@@ -136,6 +138,7 @@ const GROUPS = [
     items: [
       { path: '/core', label: '常驻层', icon: ICON.layers },
       { path: '/fragments', label: '记忆条目', icon: ICON.search },
+      { path: '/maintenance', label: '记忆维护', icon: ICON.broom },
     ],
   },
   {

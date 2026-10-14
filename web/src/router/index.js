@@ -5,6 +5,7 @@ import CoreView from '../views/CoreView.vue'
 import FragmentsView from '../views/FragmentsView.vue'
 import KbView from '../views/KbView.vue'
 import LoginView from '../views/LoginView.vue'
+import MaintenanceView from '../views/MaintenanceView.vue'
 import SetupView from '../views/SetupView.vue'
 import StatsView from '../views/StatsView.vue'
 import TokenView from '../views/TokenView.vue'
@@ -17,6 +18,7 @@ const routes = [
   { path: '/', redirect: '/core' },
   { path: '/core', name: 'core', component: CoreView, meta: { title: '常驻层' } },
   { path: '/fragments', name: 'fragments', component: FragmentsView, meta: { title: '检索层' } },
+  { path: '/maintenance', name: 'maintenance', component: MaintenanceView, meta: { title: '记忆维护' } },
   { path: '/kb', name: 'kb', component: KbView, meta: { title: '知识库' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]

@@ -2,7 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">看板</h1>
-      <p class="page-sub">三个域的存量与预算，加上记忆维护（合并 / 遗忘）与定时任务。</p>
+      <p class="page-sub">三个域的存量与预算，加上定时任务。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -31,19 +31,6 @@
       <StatCard label="documents" :value="kb.documents.value" :hint="kb.documents.hint" />
       <StatCard label="chunks" :value="kb.chunks.value" :hint="kb.chunks.hint" />
     </div>
-
-    <h3 class="section-title">记忆维护（合并 / 遗忘）</h3>
-    <div class="banner">
-      dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
-    </div>
-    <div class="ops">
-      <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
-      <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
-      <span class="ops-gap"></span>
-      <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
-      <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
-    </div>
-    <pre v-if="opResult" class="pre">{{ opResult }}</pre>
 
     <h3 class="section-title">记忆类定时任务</h3>
     <div v-if="cronError" class="banner banner--danger">{{ cronError }}</div>
@@ -93,22 +80,11 @@
       </ItemCard>
     </div>
     <div class="src">来源：{{ cronSource }}</div>
-
-    <ConfirmDialog
-      v-model="confirmOpen"
-      :title="confirmTitle"
-      :consequences="confirmConsequences"
-      :expect="confirmExpect"
-      confirm-text="确认实跑"
-      :busy="busy === confirmKind"
-      @confirm="doOps"
-    />
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
@@ -122,15 +98,6 @@ const cronSource = ref('')
 const loading = ref(false)
 const error = ref('')
 const cronError = ref('')
-const busy = ref('')
-const opResult = ref('')
-
-/** 危险实跑（合并 / 遗忘）的确认态 */
-const confirmOpen = ref(false)
-const confirmKind = ref('')
-const confirmExpect = ref('')
-const confirmTitle = ref('')
-const confirmConsequences = ref([])
 
 const budgetTone = computed(() => {
   const p = data.value?.core?.percent
@@ -182,80 +149,10 @@ async function doCopy(text) {
   ok ? showToast('已复制') : showError('复制失败，请手动选中复制')
 }
 
-/**
- * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
- * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
- * 实跑前后都会把受影响记忆条目全量导出到备份目录，路径回显在结果里。
- */
-function runMerge(dryRun) {
-  const n = data.value?.core?.count
-  if (dryRun) return runOps('merge', true)
-  confirmKind.value = 'merge'
-  confirmExpect.value = String(n)
-  confirmTitle.value = '合并 · 实跑'
-  confirmConsequences.value = [
-    `会按相似度合并重叠的记忆条目，当前常驻层共 ${n} 条。`,
-    '被合并掉的条目正文会被改写，原始全文先导出到备份目录。',
-    '手输的计数会作为 confirm 串发给后端，对不上直接被拒。',
-  ]
-  confirmOpen.value = true
-}
-
-function runForget(dryRun) {
-  const n = data.value?.retrieval?.count
-  if (dryRun) return runOps('forget', true)
-  confirmKind.value = 'forget'
-  confirmExpect.value = String(n)
-  confirmTitle.value = '遗忘 · 实跑'
-  confirmConsequences.value = [
-    `会物理删除过期记忆条目，当前记忆条目共 ${n} 条。`,
-    '这一步是真删：备份目录里留有全文，但控制台没有恢复入口。',
-    '手输的计数会作为 confirm 串发给后端，对不上直接被拒。',
-  ]
-  confirmOpen.value = true
-}
-
-/** ConfirmDialog 确认回调：把用户手输的串原样当 confirm 发给后端。 */
-async function doOps(typed) {
-  confirmOpen.value = false
-  await runOps(confirmKind.value, false, typed)
-}
-
-async function runOps(kind, dryRun, confirm) {
-  busy.value = dryRun ? `${kind}-dry` : kind
-  try {
-    const r = await api[kind]({ dry_run: dryRun, confirm })
-    opResult.value = JSON.stringify(r, null, 2)
-    showToast(
-      `${kind} ${dryRun ? 'dry-run' : '实跑'}完成：${JSON.stringify(r.stats)}`,
-    )
-    load()
-  } catch (e) {
-    showError(`${kind} ${dryRun ? 'dry-run' : '实跑'}失败：${e.message}`)
-  } finally {
-    busy.value = ''
-  }
-}
-
 onMounted(load)
 </script>
 
 <style scoped>
-.ops {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-.ops-gap {
-  width: 1px;
-  height: 20px;
-  margin: 0 4px;
-  background: var(--border-2);
-}
-.pre {
-  margin-top: 20px;
-}
 .pad {
   padding: 20px;
 }

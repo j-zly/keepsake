@@ -16,15 +16,15 @@ const groups = [...APP.matchAll(/title: '([^']+)',\s*\n\s*items: \[([\s\S]*?)\]\
   (m) => ({ title: m[1], items: [...m[2].matchAll(/label: '([^']+)'/g)].map((x) => x[1]) }),
 )
 
-test('侧栏：看板在第一组「总览」，共三组，四个入口不变', () => {
+test('侧栏：看板在第一组「总览」，共三组，五个入口', () => {
   assert.deepEqual(
     groups.map((g) => g.title),
     ['总览', '记忆', '知识库'],
   )
   assert.deepEqual(groups[0].items, ['看板'])
-  assert.deepEqual(groups[1].items, ['常驻层', '记忆条目'])
+  assert.deepEqual(groups[1].items, ['常驻层', '记忆条目', '记忆维护'])
   assert.deepEqual(groups[2].items, ['知识库'])
-  assert.equal(groups.flatMap((g) => g.items).length, 4)
+  assert.equal(groups.flatMap((g) => g.items).length, 5)
 })
 
 test('面包屑：随分组走（看板页 总览 › 看板），旧的「知识库与运维」措辞已消失', () => {
