@@ -2,8 +2,9 @@
   分页条：左「共 N 条 + 每页条数」，右「页码窗口 + 跳至 __ 页」，紧凑一排。
 
   不用 el-pagination —— 它把 total/sizes/pager 摊成三块、留白很大，
-  这里自己排一行，信息密度对标 Linear 的表格底栏。
+  这里自己排一行。样式是 tokens.css 里的全局 .pager 原子类，本组件只出结构。
   页码窗口由 utils/format.js 的 pageWindow 给，最多 5 个数字 + 2 个省略号。
+  每页 20/50/100 与「共 N 条」的口径都来自接口，这里不另算。
 -->
 <template>
   <div class="pager">
@@ -80,92 +81,3 @@ function onSize(v) {
   emit('update:pageSize', Number(v))
 }
 </script>
-
-<style scoped>
-.pager {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  margin-top: 12px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  box-shadow: var(--inset);
-  color: var(--text-faint);
-  font-size: 12px;
-}
-.left {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.right {
-  display: flex;
-  gap: 4px;
-  align-items: center;
-}
-.dot {
-  color: var(--border-strong);
-}
-.size select,
-.jump input {
-  height: 24px;
-  margin: 0 4px;
-  padding: 0 6px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 12px;
-}
-.jump input {
-  width: 52px;
-}
-.size select:focus,
-.jump input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.pg {
-  min-width: 26px;
-  height: 26px;
-  padding: 0 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-.pg:hover:not(:disabled) {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-.pg:disabled {
-  color: var(--border-strong);
-  cursor: not-allowed;
-}
-.pg.on {
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  color: var(--text);
-  font-weight: 600;
-}
-.pg.gap {
-  color: var(--text-faint);
-  cursor: default;
-}
-.pg.gap:hover {
-  background: transparent;
-}
-@media (max-width: 900px) {
-  .pager {
-    justify-content: flex-start;
-  }
-}
-</style>

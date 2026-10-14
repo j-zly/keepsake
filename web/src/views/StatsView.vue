@@ -1,15 +1,13 @@
 <template>
   <div>
     <div class="page-head">
-      <div>
-        <h1 class="page-title">看板</h1>
-        <p class="page-sub">三个域的存量与预算，加上记忆维护（合并 / 遗忘）与定时任务。</p>
-      </div>
+      <h1 class="page-title">看板</h1>
+      <p class="page-sub">三个域的存量与预算，加上记忆维护（合并 / 遗忘）与定时任务。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
-    <div class="cards">
+    <div class="stat-grid">
       <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" />
       <StatCard label="常驻层字符" :value="data?.core?.chars ?? '-'" unit="字符" />
       <StatCard
@@ -20,7 +18,7 @@
         :hint="`预算 ${data?.core?.budget ?? '-'} 字符`"
       />
       <StatCard
-        label="检索层记忆条目"
+        label="记忆条目"
         :value="data?.retrieval?.count ?? '-'"
         unit="条"
         :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : 'keyset 扫描'"
@@ -28,20 +26,14 @@
     </div>
 
     <h3 class="section-title">知识库</h3>
-    <div class="kb panel">
-      <div class="kb-item">
-        <span class="kb-k">skill_docs</span><span class="kb-v num">{{ kbText('skill_docs') }}</span>
-      </div>
-      <div class="kb-item">
-        <span class="kb-k">documents</span><span class="kb-v num">{{ kbText('documents') }}</span>
-      </div>
-      <div class="kb-item">
-        <span class="kb-k">chunks</span><span class="kb-v num">{{ kbText('chunks') }}</span>
-      </div>
+    <div class="stat-grid">
+      <StatCard label="skill_docs" :value="kb.skill_docs.value" :hint="kb.skill_docs.hint" />
+      <StatCard label="documents" :value="kb.documents.value" :hint="kb.documents.hint" />
+      <StatCard label="chunks" :value="kb.chunks.value" :hint="kb.chunks.hint" />
     </div>
 
     <h3 class="section-title">记忆维护（合并 / 遗忘）</h3>
-    <div class="banner banner--warn">
+    <div class="banner">
       dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
     </div>
     <div class="ops">
@@ -51,60 +43,55 @@
       <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
       <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
     </div>
-    <pre v-if="opResult" class="opresult">{{ opResult }}</pre>
+    <pre v-if="opResult" class="pre">{{ opResult }}</pre>
 
     <h3 class="section-title">记忆类定时任务</h3>
     <div v-if="cronError" class="banner banner--danger">{{ cronError }}</div>
 
-    <div v-if="loading && !crons.length" class="panel skeleton-wrap">
+    <div v-if="loading && !crons.length" class="panel pad">
       <el-skeleton :rows="4" animated />
     </div>
 
-    <el-table v-else :data="crons" max-height="560" class="table">
-      <el-table-column prop="name" label="name" width="190">
-        <template #default="{ row }"><span class="mono dim">{{ row.name }}</span></template>
-      </el-table-column>
-      <el-table-column prop="script" label="script" width="220">
-        <template #default="{ row }">
-          <span class="cell-key">
-            <span class="k mono faint" :title="row.script">{{ row.script }}</span>
-            <button class="copy-btn" title="复制脚本路径" @click="doCopy(row.script)">
-              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-                stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
-                <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
-              </svg>
-            </button>
-          </span>
-        </template>
-      </el-table-column>
-      <el-table-column label="schedule" width="150">
-        <template #default="{ row }"><span class="mono dim">{{ row.schedule }}</span></template>
-      </el-table-column>
-      <el-table-column label="enabled" width="90">
-        <template #default="{ row }">
-          <span class="pill" :class="row.enabled ? 'on' : 'off'">{{ row.enabled ? '开' : '关' }}</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="上次运行" width="160">
-        <template #default="{ row }">
-          <span class="mono dim" :title="row.last_run_at">{{ toLocal(row.last_run_at) }}</span>
-        </template>
-      </el-table-column>
-      <el-table-column prop="last_status" label="last_status" width="140">
-        <template #default="{ row }"><span class="mono faint">{{ row.last_status || '—' }}</span></template>
-      </el-table-column>
+    <div v-else-if="!crons.length" class="panel">
+      <div class="empty">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
+          <circle cx="12" cy="12" r="8" />
+          <path d="M12 7.4V12l3 1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <p><b>没有匹配到记忆类任务</b>它们来自 cron 的 jobs.json，不在这个文件里就查不到。</p>
+      </div>
+    </div>
 
-      <template #empty>
-        <div class="empty">
-          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
-            <circle cx="12" cy="12" r="8" />
-            <path d="M12 7.4V12l3 1.8" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <p><b>没有匹配到记忆类任务</b>它们来自 cron 的 jobs.json，不在这个文件里就查不到。</p>
-        </div>
-      </template>
-    </el-table>
+    <div v-else class="card-grid">
+      <ItemCard
+        v-for="row in crons"
+        :key="row.name"
+        :chip-tone="row.enabled ? 'accent' : ''"
+        @lead="doCopy(row.script)"
+      >
+        <template #tag>{{ row.enabled ? '已启用' : '已停用' }}</template>
+        <template #time>{{ toLocal(row.last_run_at) }}</template>
+
+        <p class="card-title">{{ row.name }}</p>
+        <span class="cell-key">
+          <span class="k mono" :title="row.script">{{ row.script }}</span>
+          <button class="copy-btn" title="复制脚本路径" @click.stop="doCopy(row.script)">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
+              <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
+            </svg>
+          </button>
+        </span>
+
+        <template #tags>
+          <span class="tag mono">{{ row.schedule }}</span>
+          <span v-if="row.last_status" class="tag mono">{{ row.last_status }}</span>
+        </template>
+
+        <template #lead>复制脚本路径 ↗</template>
+      </ItemCard>
+    </div>
     <div class="src">来源：{{ cronSource }}</div>
 
     <ConfirmDialog
@@ -122,6 +109,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import ItemCard from '../components/ItemCard.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
@@ -148,16 +136,26 @@ const budgetTone = computed(() => {
   const p = data.value?.core?.percent
   if (p === undefined || p === null) return ''
   if (p >= 100) return 'danger'
-  if (p >= 80) return 'warn'
+  if (p >= 80) return 'accent'
   return 'ok'
 })
 
-/** kb 段不可用时后端给的是 {available:false, error:...} —— 显示成可见的报错，不是 0。 */
-function kbText(field) {
+/**
+ * kb 段不可用时后端给的是 {available:false, error:...} —— 显示成可见的报错，不是 0。
+ * 报错文案太长，放不进 32px 的数字位，所以数字位写「不可用」、原文进 hint。
+ */
+function kbCard(field) {
   const kb = data.value?.kb
-  if (!kb || kb.available === false) return `不可用：${kb?.message || kb?.error || '未知'}`
-  return kb[field] ?? '-'
+  if (!kb || kb.available === false) {
+    return { value: '不可用', hint: kb?.message || kb?.error || '未知' }
+  }
+  return { value: kb[field] ?? '-', hint: '' }
 }
+const kb = computed(() => ({
+  skill_docs: kbCard('skill_docs'),
+  documents: kbCard('documents'),
+  chunks: kbCard('chunks'),
+}))
 
 async function load() {
   loading.value = true
@@ -210,7 +208,7 @@ function runForget(dryRun) {
   confirmExpect.value = String(n)
   confirmTitle.value = '遗忘 · 实跑'
   confirmConsequences.value = [
-    `会物理删除过期记忆条目，当前检索层共 ${n} 条。`,
+    `会物理删除过期记忆条目，当前记忆条目共 ${n} 条。`,
     '这一步是真删：备份目录里留有全文，但控制台没有恢复入口。',
     '手输的计数会作为 confirm 串发给后端，对不上直接被拒。',
   ]
@@ -243,34 +241,6 @@ onMounted(load)
 </script>
 
 <style scoped>
-.cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 12px;
-}
-.kb {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  overflow: hidden;
-}
-.kb-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px 16px;
-  border-right: 1px solid var(--border);
-}
-.kb-item:last-child {
-  border-right: 0;
-}
-.kb-k {
-  color: var(--text-faint);
-  font-size: 11.5px;
-}
-.kb-v {
-  font-size: 16px;
-  font-weight: 600;
-}
 .ops {
   display: flex;
   flex-wrap: wrap;
@@ -281,48 +251,16 @@ onMounted(load)
   width: 1px;
   height: 20px;
   margin: 0 4px;
-  background: var(--border-strong);
+  background: var(--border-2);
 }
-.opresult {
-  margin: 12px 0 0;
-  padding: 12px 14px;
-  max-height: 320px;
-  overflow: auto;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-size: 11.5px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-all;
+.pre {
+  margin-top: 20px;
 }
-.table {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  box-shadow: var(--inset);
-}
-.skeleton-wrap {
-  padding: 16px;
-}
-.pill {
-  display: inline-block;
-  padding: 1px 8px;
-  border-radius: 5px;
-  font-size: 11.5px;
-}
-.pill.on {
-  background: color-mix(in srgb, var(--ok) 18%, transparent);
-  color: var(--ok);
-}
-.pill.off {
-  background: var(--bg-hover);
-  color: var(--text-faint);
+.pad {
+  padding: 20px;
 }
 .src {
-  margin-top: 8px;
+  margin-top: 12px;
   color: var(--text-faint);
   font-size: 12px;
 }
