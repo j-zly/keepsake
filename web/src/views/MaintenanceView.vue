@@ -80,6 +80,17 @@
           </template>
         </ItemCard>
       </div>
+
+      <!-- 分页：组件与「记忆条目」页同一个，props 口径也照抄那边（总数由接口给，不写死） -->
+      <PagerBar
+        v-if="cands.length"
+        :total="candPagerTotal"
+        :page="candPage"
+        :page-size="candPageSize"
+        :unknown="candCount === null"
+        @update:page="onCandPage"
+        @update:page-size="onCandSize"
+      />
     </section>
 
     <ConfirmDialog
@@ -109,6 +120,7 @@
 import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
+import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
@@ -246,8 +258,20 @@ function agentOf(s) {
 const cands = ref([])
 /** 来自接口 count，不写死；扫描触顶时后端给 null（显示 '—'） */
 const candCount = ref(null)
+const candHasMore = ref(false)
+const candPage = ref(1)
+const candPageSize = ref(20)
 const candLoading = ref(false)
 const candError = ref('')
+
+/**
+ * 分页条总数，口径与「记忆条目」页（FragmentsView）完全一致：
+ * 接口给了 count 就用它；没给（count=null）时按 has_more 撑出「下一页」——
+ * 有下一页才报 page*page_size+1，翻到那儿再由 has_more=false 收口。
+ */
+const candPagerTotal = computed(() =>
+  candCount.value ?? (candHasMore.value ? candPage.value * candPageSize.value + 1 : cands.value.length),
+)
 
 // 防串：请求序号（同 KbView 的 seq 写法）。批准后立刻重拉，旧响应不许覆盖新列表。
 let candSeq = 0
@@ -281,24 +305,47 @@ const candConsequences = computed(() => {
   ]
 })
 
-/** 候选列表：`tag=core_candidate` 走存储层的按标签列（不是 BM25 检索）。 */
+/** 候选列表：`tag=core_candidate` 走存储层的按标签列（不是 BM25 检索）。服务端分页。 */
 async function loadCandidates() {
   const seq = ++candSeq
   candLoading.value = true
   try {
-    const data = await api.fragments({ tag: CANDIDATE_TAG, page: 1, page_size: 50 })
+    const data = await api.fragments({
+      tag: CANDIDATE_TAG,
+      page: candPage.value,
+      page_size: candPageSize.value,
+    })
     if (seq !== candSeq) return
+    // 把末页最后一条审完后本页会空掉 —— 空态文案是「没有待审候选」，留着就是撒谎。
+    // 退一页重拉，页码单调递减所以不会递归不止。
+    if (!data.items.length && candPage.value > 1 && !data.has_more) {
+      candPage.value -= 1
+      return loadCandidates()
+    }
     cands.value = data.items
     candCount.value = data.count
+    candHasMore.value = data.has_more
     candError.value = ''
   } catch (e) {
     if (seq !== candSeq) return
     cands.value = []
     candCount.value = null
+    candHasMore.value = false
     candError.value = `读取常驻候选失败：${e.message}`
   } finally {
     if (seq === candSeq) candLoading.value = false
   }
+}
+
+function onCandPage(p) {
+  candPage.value = p
+  loadCandidates()
+}
+
+function onCandSize(s) {
+  candPageSize.value = s
+  candPage.value = 1
+  loadCandidates()
 }
 
 function askApprove(row) {

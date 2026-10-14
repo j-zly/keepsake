@@ -42,6 +42,36 @@ test('审核区接的是三个既有接口，没有自造第四个', () => {
   assert.ok(VIEW.includes('常驻候选'), '区块标题文案不见了')
 })
 
+test('候选列表走分页：PagerBar 接线 + 写死的那一拉到底已经拆掉', () => {
+  assert.match(VIEW, /import PagerBar from '\.\.\/components\/PagerBar\.vue'/, '没引 PagerBar')
+  assert.match(VIEW, /<PagerBar[\s\S]*?:total="candPagerTotal"/, 'PagerBar 没接候选的 total')
+  assert.match(VIEW, /@update:page="onCandPage"/, '翻页事件没接线')
+  assert.match(VIEW, /@update:page-size="onCandSize"/, '每页条数事件没接线')
+  // 写死页的判据：page: 1, page_size: 50 曾经是一把梭 50 条，必须拆掉
+  assert.doesNotMatch(VIEW, /page:\s*1,\s*page_size:\s*50/, '还在写死第一页 50 条')
+  // 页码/每页条数是响应式的，默认与 PagerBar 的 SIZES 选项对齐（20）
+  assert.match(VIEW, /const candPage = ref\(1\)/)
+  assert.match(VIEW, /const candPageSize = ref\(20\)/)
+  assert.match(VIEW, /page:\s*candPage\.value,\s*page_size:\s*candPageSize\.value/)
+  // total 口径与 FragmentsView 同源：有 count 用 count，has_more 时撑出下一页
+  assert.match(
+    VIEW,
+    /const candPagerTotal = computed\(\(\) =>\s*candCount\.value \?\? \(candHasMore\.value \? candPage\.value \* candPageSize\.value \+ 1 : cands\.value\.length\)/,
+  )
+  // 翻页重拉必须走既有的 candSeq 防串，否则慢的旧页响应会盖掉新页
+  const load = VIEW.slice(VIEW.indexOf('async function loadCandidates()'), VIEW.indexOf('function askApprove'))
+  assert.match(load, /const seq = \+\+candSeq/)
+  assert.match(load, /if \(seq !== candSeq\) return/)
+  // 改每页条数回到第 1 页（否则会停在一个不存在的页码上）
+  assert.match(VIEW, /function onCandSize\(s\) \{\s*candPageSize\.value = s\s*candPage\.value = 1\s*loadCandidates\(\)/)
+  // 末页审空后必须退一页，否则落进「没有待审候选」空态（谎报，前面还有页）
+  assert.match(
+    load,
+    /if \(!data\.items\.length && candPage\.value > 1 && !data\.has_more\) \{\s*candPage\.value -= 1\s*return loadCandidates\(\)/,
+    '末页审空后没退页，会落进空态谎报「没有待审候选」',
+  )
+})
+
 test('摘标签只摘完整标签：core_candidate 不误伤 core_candidate_v2 / xcore_candidate', () => {
   assert.equal(splitTags(' a , ,b ').join('|'), 'a|b')
   // 边界剔除：同类前缀的标签必须原样留下
