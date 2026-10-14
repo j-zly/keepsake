@@ -311,10 +311,11 @@ async function signOut() {
 }
 
 /* -------------------------------------------------------------- 内容区 --- */
+/* 内容区铺满导航右侧的可用宽度（不居中：左对齐贴导航，右侧只留自身 padding） */
 .main {
   margin-left: calc(var(--nav-w) + 36px);
   padding: 24px 24px 40px;
-  max-width: 1400px;
+  max-width: none;
 }
 .crumb-acts {
   display: flex;

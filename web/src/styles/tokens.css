@@ -531,24 +531,31 @@ html.dark {
   cursor: not-allowed;
 }
 
-/* 卡片网格：≥1200 三列 / 900–1200 两列 / <900 单列，间距 20
+/* 卡片网格：列数由可用宽度自适应（auto-fill + 300px 下限），不写死 N 列，
+ * 否则宽屏右边会空一大块。断点只往下收下限/收列，窄屏不会横向滚动。
  * align-items: stretch 是等高的地基：同排卡片一律拉到行高，摘要长短不同也不会
  * 让底下的操作行错开一截。卡内任何区块都不许写 align-self:start 去救场，
  * 那会把 stretch 又关掉。 */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   align-items: stretch;
   gap: 20px;
 }
 @media (max-width: 1200px) {
   .card-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   }
 }
 @media (max-width: 900px) {
   .card-grid {
     grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+}
+@media (max-width: 600px) {
+  .card-grid {
+    gap: 12px;
   }
 }
 
