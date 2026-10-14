@@ -1279,10 +1279,12 @@ class PgStorage(StorageBase):
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        # 非主脑：只能搜 agent 自己的 或 shared 的碎片
+        # 非主脑：只能搜 agent 自己的 / shared / core 的碎片
+        # （多代理治理：子代理对常驻层**只读**——检索要能召回 core 条目，
+        #  与 Redis/SQLite 同口径；写侧的降级闸在 provider.add()）
         if not effective_is_primary:
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
-                          if effective_agent_id else []) + ["shared"]
+                          if effective_agent_id else []) + ["shared", "core"]
             sql, args = tag_match_sql("tags", agent_tags, "%s", pos_fn="strpos")
             clauses.append(sql)
             params.extend(args)

@@ -1709,15 +1709,17 @@ class RedisStorage(StorageBase):
 
             filter_clause = ""
             if not effective_is_primary and effective_agent_id:
-                # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
+                # 只能搜索 agent 指定的碎片 / shared / core 标签的碎片
+                # （多代理治理：子代理对常驻层只读 ⇒ 检索侧放开 core，与 PG/SQLite 同口径）
                 # 2026-09-14: agent id 可能含 `-`/`:`，TAG 花括号内裸 `-` 会报语法错 → 过 _tag_safe
                 agent_filter = f"@tags:{{agent:{_tag_safe(effective_agent_id)}}}"
                 shared_filter = f"@tags:{{shared}}"
-                # 两者之一即可
-                filter_clause = f"({agent_filter} || {shared_filter}) AND "
+                core_filter = "@tags:{core}"
+                # 三者之一即可
+                filter_clause = f"({agent_filter} || {shared_filter} || {core_filter}) AND "
             elif not effective_is_primary and not effective_agent_id:
-                # 如果没有 agent_id，只搜索 shared 标签
-                filter_clause = "@tags:{shared} AND "
+                # 没有 agent_id：shared 或 core
+                filter_clause = "(@tags:{shared} || @tags:{core}) AND "
             query_expr = f"{filter_clause}{body_expr}"
 
             q = (

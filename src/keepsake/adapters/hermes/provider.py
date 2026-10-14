@@ -24,7 +24,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -118,6 +118,11 @@ _DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 
 #: 核心层标记 tag。检索层见到它就跳过（`prefetch`），写入层见它就原文入库。
 _CORE_TAG = "core"
+
+#: **非 primary 写 core 的降级目标**（多代理治理）：子代理对常驻层只读，
+#: 它写 `core` 只能落成候选（`core_candidate`），经审核后才由主脑转正。
+#: 同时是主脑检索出口 `retrieval.exclude_tags` 的缺省排除标签。
+CORE_CANDIDATE_TAG = "core_candidate"
 
 #: 核心层缓存 TTL（秒）。每轮都查库没有意义 —— core 层是低频变的常驻记忆。
 _CORE_CACHE_TTL = 60.0
@@ -230,6 +235,10 @@ class KeepsakeProvider(MemoryProvider):
     _initialized: bool = False
     _storage: Optional[RedisStorage] = None
     _tag_filter: str = ""
+    _is_primary: bool = False
+    #: 主脑检索出口要剔除的噪音标签（`retrieval.exclude_tags`，初始化时读入）。
+    #: 类属性兜底 = 未 initialize 的实例（如测试直接挂 storage）不排除任何东西。
+    _exclude_tags: Tuple[str, ...] = ()
     _forgetter: Optional[Forgetter] = None
     _last_maintenance: float = 0.0
     _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
@@ -333,6 +342,14 @@ class KeepsakeProvider(MemoryProvider):
             is_primary = is_primary.lower() in ("true", "1", "yes", "on")
         cfg["is_primary"] = bool(is_primary)
 
+        # 6.1 解析 `retrieval.exclude_tags`（主脑检索出口的噪音排除，逗号分隔标签串）
+        # 缺省 = CORE_CANDIDATE_TAG（子代理写 core 降级出来的候选层不进主脑检索）；
+        # 显式空串 = 不排除。None（键存在但没值）按缺省处理，容错写法照抄 is_primary。
+        raw_exclude = cfg.get("retrieval", {}).get("exclude_tags", CORE_CANDIDATE_TAG)
+        if raw_exclude is None:
+            raw_exclude = CORE_CANDIDATE_TAG
+        cfg["exclude_tags"] = [t.strip() for t in str(raw_exclude).split(",") if t.strip()]
+
         # 7. 加载 skip patterns 配置
         # skip_min_length: int，默认 2，从 config.json 的 skip_min_length 读取
         skip_min_length = cfg.get("skip_min_length", 2)
@@ -415,6 +432,9 @@ class KeepsakeProvider(MemoryProvider):
         top_k = int(cfg.get("top_k", 5))
         candidate_k = int(cfg.get("candidate_k", 10))
         self._tag_filter = cfg.get("tag_filter", "")
+        # 多代理治理：非 primary 写 core 的降级闸；主脑检索出口的噪音排除
+        self._is_primary = bool(cfg.get("is_primary", False))
+        self._exclude_tags = tuple(cfg.get("exclude_tags", (CORE_CANDIDATE_TAG,)))
 
         embed_cfg = cfg.get("embedder", {})
         embed_provider = embed_cfg.get("provider", "").strip().lower()
@@ -758,6 +778,7 @@ class KeepsakeProvider(MemoryProvider):
         # core 碎片由 system_prompt_block 无条件全量注入，这里必须排除 ——
         # 否则同一条记忆每轮出现两次（一次全量、一次检索），且两份可能不同版本。
         fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
+        fragments = self._filter_excluded(fragments)
 
         if not fragments:
             return ""
@@ -1214,6 +1235,20 @@ class KeepsakeProvider(MemoryProvider):
 
     # ---- 检索层（显式抛错）----
 
+    def _filter_excluded(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """剔除带 `retrieval.exclude_tags` 噪音标签的命中（多代理治理的第三条规则）。
+
+        `search()` / `prefetch()` 两个检索出口统一走这里 —— 命中形态是
+        `{"content":…, "tags": "逗号串", …}`，标签判据复用 `_has_tag`
+        （逗号边界的完整标签相等，与存储层 SQL/Python 判据同口径）。
+        排除发生在截断**之前**：不让噪音挤掉本该进上下文的名额。
+        """
+        tags = self._exclude_tags
+        if not tags:
+            return hits
+        return [h for h in hits
+                if not any(_has_tag(h.get("tags", ""), t) for t in tags)]
+
     def search(self, query: str, *, limit: int = 10) -> List[Dict[str, Any]]:
         """按查询检索，返回最多 `limit` 条命中。
 
@@ -1221,7 +1256,9 @@ class KeepsakeProvider(MemoryProvider):
         空列表在契约里只有一个含义「确实没有匹配」。
         """
         storage = self._require_storage()
-        return list(storage.search(query.strip(), tag_filter=self._tag_filter))[:limit]
+        hits = self._filter_excluded(
+            list(storage.search(query.strip(), tag_filter=self._tag_filter)))
+        return hits[:limit]
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """按 key 取单条碎片；**确实不存在**返回 None，后端故障抛错。"""
@@ -1229,6 +1266,23 @@ class KeepsakeProvider(MemoryProvider):
         return storage.get_fragment(key)
 
     # ---- 写层（fail-closed）----
+
+    def _apply_write_gate(self, tags: str) -> str:
+        """写闸：非 primary 写 `core` 一律降级为 `core_candidate`（多代理治理第二条）。
+
+        子代理对常驻层**只读** —— 它写 `core` 不能直接进常驻层，只能落候选，
+        经审核后由主脑转正。标签判据是**逗号边界的完整标签相等**（复用 `_has_tag`，
+        `core_x` / `xcore` 不算命中），其余标签原样保留、顺序不变。
+        primary 原样放行；返回 key 语义不受影响。
+        """
+        if self._is_primary or not _has_tag(tags, _CORE_TAG):
+            return tags
+        parts = [t.strip() for t in str(tags).split(",") if t.strip()]
+        kept = [CORE_CANDIDATE_TAG if t == _CORE_TAG else t for t in parts]
+        logger.warning(
+            "keepsake: 非 primary 写 core 降级为 %s（tags: %r → %r）",
+            CORE_CANDIDATE_TAG, tags, ",".join(kept))
+        return ",".join(kept)
 
     def add(
         self,
@@ -1247,7 +1301,7 @@ class KeepsakeProvider(MemoryProvider):
             storage = self._require_storage()
             ok = storage.store(
                 text,
-                tags=tags,
+                tags=self._apply_write_gate(tags),
                 category=str(meta.get("category", "")),
                 source=str(meta.get("source", "")),
                 fragment_type=str(meta.get("fragment_type", "")),

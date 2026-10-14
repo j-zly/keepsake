@@ -1468,8 +1468,9 @@ class SqliteStorage(StorageBase):
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
         if not effective_is_primary:
+            # 多代理治理：子代理对常驻层只读 ⇒ 检索侧放开 core（PG/Redis 同口径）
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
-                          if effective_agent_id else []) + ["shared"]
+                          if effective_agent_id else []) + ["shared", "core"]
             sql, args = tag_match_sql("tags", agent_tags, "?")
             clauses.append(sql)
             params.extend(args)
