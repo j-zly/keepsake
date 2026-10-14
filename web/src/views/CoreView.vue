@@ -1,64 +1,101 @@
 <template>
   <div>
-    <h2>常驻层（core）</h2>
-    <el-alert
-      v-if="error"
-      :title="error"
-      type="error"
-      show-icon
-      :closable="false"
-      class="alert"
-    />
-    <el-row :gutter="12" class="cards">
-      <el-col :span="6"><StatCard label="条数" :value="stats?.count ?? '-'" unit="条" /></el-col>
-      <el-col :span="6"><StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" /></el-col>
-      <el-col :span="6"><StatCard label="注入预算" :value="stats?.budget ?? '-'" unit="字符" /></el-col>
-      <el-col :span="6">
-        <StatCard
-          label="预算占用"
-          :value="stats ? `${stats.percent}%` : '-'"
-          :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
-        />
-      </el-col>
-    </el-row>
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">常驻层</h1>
+        <p class="page-sub">带 core 标签的记忆条目，每轮 system_prompt 全量注入，占用注入预算。</p>
+      </div>
+    </div>
 
-    <el-progress
-      v-if="stats"
-      :percentage="Math.min(stats.percent, 100)"
-      :status="stats.percent >= 100 ? 'exception' : stats.percent >= 80 ? 'warning' : 'success'"
-    />
+    <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
-    <el-table :data="items" v-loading="loading" border size="small" class="table">
-      <el-table-column prop="key" label="key" width="220" show-overflow-tooltip />
-      <el-table-column prop="tags" label="tags" width="140" show-overflow-tooltip />
-      <el-table-column prop="content" label="正文（截断）" show-overflow-tooltip />
-      <el-table-column prop="updated_at" label="updated_at" width="230" show-overflow-tooltip />
-      <el-table-column label="操作" width="90" fixed="right">
+    <div class="cards">
+      <StatCard label="条数" :value="stats?.count ?? '-'" unit="条" />
+      <StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" />
+      <StatCard label="注入预算" :value="stats?.budget ?? '-'" unit="字符" />
+      <StatCard
+        label="预算占用"
+        :value="stats ? `${stats.percent}%` : '-'"
+        :percent="stats ? stats.percent : null"
+        :tone="budgetTone"
+        :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
+      />
+    </div>
+
+    <div class="toolbar">
+      <span class="faint">共 {{ count }} 条常驻记忆；正文为单行截断，鼠标悬停看全文，点 key 旁的图标复制。</span>
+    </div>
+
+    <div v-if="loading && !items.length" class="panel skeleton-wrap">
+      <el-skeleton :rows="5" animated />
+    </div>
+
+    <el-table v-else :data="items" max-height="560" class="table">
+      <el-table-column label="key" width="240">
+        <template #default="{ row }">
+          <span class="cell-key">
+            <span class="k" :title="row.key">{{ row.key }}</span>
+            <button class="copy-btn" title="复制 key" @click.stop="doCopy(row.key)">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
+                <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
+              </svg>
+            </button>
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column label="tags" width="150">
+        <template #default="{ row }">
+          <span class="mono faint cell-clip" :title="row.tags">{{ row.tags || '—' }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="正文（截断）">
+        <template #default="{ row }">
+          <span class="cell-clip" :title="row.content">{{ row.content }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="更新时间" width="150">
+        <template #default="{ row }">
+          <span class="mono dim" :title="row.updated_at">{{ toLocal(row.updated_at) }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="90">
         <template #default="{ row }">
           <el-button link type="danger" @click="demote(row)">降常驻</el-button>
         </template>
       </el-table-column>
+
+      <template #empty>
+        <div class="empty">
+          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
+            <path d="M12 3.5 3.5 7.5 12 11.5l8.5-4-8.5-4Z" stroke-linejoin="round" />
+            <path d="M4.6 12 12 15.6 19.4 12M4.6 16.5 12 20l7.4-3.5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <p><b>常驻层还是空的</b>到「检索层」把要每轮注入的记忆点「升常驻」，它们就会出现在这里。</p>
+        </div>
+      </template>
     </el-table>
 
-    <el-pagination
-      class="pager"
-      layout="total, sizes, prev, pager, next"
+    <PagerBar
       :total="count"
+      :page="page"
       :page-size="pageSize"
-      :current-page="page"
-      :page-sizes="[20, 50, 100]"
-      @current-change="onPage"
-      @size-change="onSize"
+      @update:page="onPage"
+      @update:page-size="onSize"
     />
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
+import { toLocal } from '../utils/format'
 
 const items = ref([])
 const stats = ref(null)
@@ -67,6 +104,15 @@ const page = ref(1)
 const pageSize = ref(20)
 const loading = ref(false)
 const error = ref('')
+
+/** 占用越高越红：80% 起黄，过 100% 红（超预算注入会截断）。 */
+const budgetTone = computed(() => {
+  const p = stats.value?.percent
+  if (p === undefined || p === null) return ''
+  if (p >= 100) return 'danger'
+  if (p >= 80) return 'warn'
+  return 'ok'
+})
 
 async function load() {
   loading.value = true
@@ -97,6 +143,11 @@ function onSize(s) {
   load()
 }
 
+async function doCopy(key) {
+  const ok = await copyText(key)
+  ok ? showToast(`已复制 key：${key}`) : showError('复制失败，请手动选中复制')
+}
+
 /** 降常驻：去掉 core 标签（不再每轮注入）。二次确认 + 成功后刷新 + toast。 */
 async function demote(row) {
   const ok = await showConfirm(
@@ -117,17 +168,22 @@ onMounted(load)
 </script>
 
 <style scoped>
-.alert {
-  margin-bottom: 12px;
-}
 .cards {
-  margin-bottom: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.toolbar .faint {
+  font-size: 12px;
 }
 .table {
-  margin-top: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  box-shadow: var(--inset);
 }
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+.skeleton-wrap {
+  padding: 16px;
 }
 </style>
