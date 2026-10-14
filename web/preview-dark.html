@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keepsake 控制台 · 设计令牌目录（暗色）</title>
+<!--
+  自包含静态示意：内联样式、不依赖构建、不联网、不引外部字体/CDN，双击即可打开。
+  数值取自 web/src/styles/tokens.css，以它为准。本页不参与构建，规范文本见 web/DESIGN.md。
+-->
+<style>
+/* ===================================================== 令牌（暗色，抄自 tokens.css 的 [data-theme="dark"] 块）=== */
+:root {
+  --bg:#0b0d10; --bg-elev:#12151a; --panel:#12151a; --panel-hover:#1b1f27; --chip:#1b1f27;
+  --border:rgba(255,255,255,.08); --border-2:rgba(255,255,255,.11); --line-3:rgba(255,255,255,.05);
+  --text:#eef1f6; --text-dim:#a7b0be; --text-faint:#7c8697; --text-ghost:#6b7280;
+  --accent:#5b8cff; --accent-soft:#16233d; --on-accent:#ffffff;
+  --ok:#22c55e; --danger:#f05252; --danger-soft:#2a1618;
+  --r-panel:20px; --r-card:16px; --r-inset:12px; --r-ctl:10px; --r-sm:8px; --r-chip:6px;
+  --font: Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --nav-w:232px;
+  --shadow-card:0 1px 2px rgba(0,0,0,.4);
+  --shadow-hover:0 4px 12px rgba(0,0,0,.5);
+  --shadow-pop:0 16px 40px rgba(0,0,0,.55);
+  --shadow-nav-on:0 2px 6px rgba(91,140,255,.3);
+  --mask:rgba(11,13,16,.72);
+  --skeleton-from:#1a1f27; --skeleton-to:#232932;
+  --fill-dark:#1b2029; --danger-hi:#f47070;
+  --accent-3:#4062b3; --accent-5:#2e4680; --accent-7:#1b2a4d; --accent-9:#121c33; --accent-d2:#7ba3ff;
+}
+
+/* ============================================================== 示意页自身骨架 === */
+* { box-sizing:border-box; }
+body {
+  margin:0; padding:32px 24px 72px;
+  background:var(--bg); color:var(--text);
+  font-family:var(--font); font-size:14px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap { max-width:1120px; margin:0 auto; }
+.top {
+  padding:16px 20px; margin-bottom:28px;
+  background:var(--panel); border-radius:var(--r-panel);
+}
+.top h1 { margin:0 0 4px; font-size:22px; font-weight:700; letter-spacing:-.4px; }
+.top .src { margin:0; color:var(--text-faint); font-size:13px; }
+.top .src code { font-family:var(--mono); font-size:12px; padding:1px 5px; border-radius:var(--r-chip); background:var(--chip); color:var(--text); }
+.top .go { margin:8px 0 0; font-size:13px; }
+.top .go a { color:var(--accent); text-decoration:none; }
+.top .go a:hover { text-decoration:underline; }
+
+section { margin-bottom:40px; }
+section > h2 {
+  margin:0 0 4px; font-size:16px; font-weight:600;
+  display:flex; align-items:center; gap:8px;
+}
+section > h2::before { content:''; width:3px; height:16px; border-radius:2px; background:var(--accent); }
+section > .note { margin:0 0 16px; color:var(--text-faint); font-size:12px; }
+h3 { margin:20px 0 8px; font-size:13px; font-weight:600; color:var(--text-dim); }
+
+/* ------------------------------------------------------------------- 色板 --- */
+.sw-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(232px,1fr)); gap:12px; }
+.sw {
+  border:1px solid var(--border); border-radius:var(--r-card);
+  background:var(--bg-elev); box-shadow:var(--shadow-card); overflow:hidden;
+}
+.sw .block { height:56px; border-bottom:1px solid var(--border-2); }
+.sw .meta { padding:10px 12px; }
+.sw .nm { font-size:13px; font-weight:600; font-family:var(--mono); }
+.sw .val { font-size:12px; color:var(--text-dim); font-family:var(--mono); }
+.sw .use { margin-top:4px; font-size:12px; line-height:1.5; color:var(--text-faint); }
+.sw .cr {
+  display:inline-block; margin-top:6px; padding:1px 6px; font-size:11px; font-family:var(--mono);
+  border-radius:var(--r-chip); background:var(--chip); color:var(--text-dim);
+}
+.sw .cr.bad { background:var(--danger-soft); color:var(--danger); }
+.sw .cr.decor { background:var(--accent-soft); color:var(--accent); }
+
+/* ---------------------------------------------------------------- 对比度 --- */
+table.cv { width:100%; border-collapse:collapse; font-size:13px; }
+table.cv th, table.cv td { padding:9px 12px; text-align:left; border-bottom:1px solid var(--border); }
+table.cv th { color:var(--text-dim); font-weight:600; font-size:12px; }
+table.cv td.n { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+.pass { color:var(--ok); font-weight:600; }
+.fail { color:var(--danger); font-weight:600; }
+
+/* ------------------------------------------------------------ 字号阶梯 --- */
+.fs-row {
+  display:flex; align-items:baseline; gap:16px;
+  padding:10px 14px; margin-bottom:6px;
+  border:1px solid var(--border); border-radius:var(--r-inset); background:var(--bg-elev);
+}
+.fs-row .lab { flex:none; width:104px; font-family:var(--mono); font-size:12px; color:var(--text-faint); }
+.fs-row .demo { color:var(--text); }
+
+/* ------------------------------------------------------------ 圆角阶梯 --- */
+.rd-grid { display:flex; flex-wrap:wrap; gap:12px; }
+.rd {
+  flex:1 1 150px; min-width:150px; padding:16px;
+  background:var(--bg-elev); border:1px solid var(--border);
+  box-shadow:var(--shadow-card);
+}
+.rd .box { height:56px; background:var(--accent-soft); border:1px solid var(--accent-7); }
+.rd .nm { margin-top:10px; font-family:var(--mono); font-size:12px; font-weight:600; }
+.rd .use { font-size:12px; color:var(--text-faint); line-height:1.5; }
+
+/* ---------------------------------------------------------------- 按钮 --- */
+.btn-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+.btn {
+  display:inline-flex; align-items:center; justify-content:center;
+  height:40px; padding:0 16px;
+  font-family:inherit; font-size:13px; font-weight:500;
+  border-radius:var(--r-sm); cursor:pointer; box-shadow:none;
+}
+.btn--primary { background:var(--accent); border:1px solid var(--accent); color:var(--on-accent); }
+.btn--primary:hover { background:var(--accent-d2); border-color:var(--accent-d2); }
+.btn--default { background:var(--bg-elev); border:1px solid var(--border-2); color:var(--text-dim); }
+.btn--default:hover { background:var(--chip); border-color:var(--text-ghost); color:var(--text); }
+.btn--soft { height:32px; padding:0 14px; background:var(--accent-soft); border:1px solid transparent; color:var(--accent); }
+.btn--soft:hover { border-color:var(--accent); }
+.btn--danger { background:var(--danger-soft); border:1px solid transparent; color:var(--danger); }
+.btn--danger:hover { border-color:var(--danger); }
+.btn--ghost { height:32px; padding:0 14px; background:var(--bg-elev); border:1px solid var(--border-2); color:var(--text-dim); }
+.btn--ghost:hover { border-color:var(--text-ghost); color:var(--text); }
+.btn--link { height:auto; padding:0; background:none; border:0; color:var(--accent); font-weight:500; }
+.btn--link:hover { text-decoration:underline; }
+.btn.sm { height:28px; padding:0 12px; }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
+.btn:disabled:hover { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+.btn--default:disabled:hover { background:var(--bg-elev); border-color:var(--border-2); color:var(--text-dim); }
+.btn--danger:disabled:hover { background:var(--danger-soft); border-color:1px solid transparent; color:var(--danger); }
+
+/* ------------------------------------------------------ 输入与下拉 --- */
+.fld-row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+.fld { display:flex; flex-direction:column; gap:6px; }
+.fld > label { font-size:12px; color:var(--text-faint); }
+.inp {
+  display:flex; align-items:center; gap:8px;
+  height:40px; padding:0 12px;
+  background:var(--bg-elev); color:var(--text);
+  border-radius:var(--r-ctl);
+  box-shadow:0 0 0 1px var(--border-2) inset;
+  font-size:14px; min-width:220px;
+}
+.inp .ph { color:var(--text-ghost); }
+.inp .ico { color:var(--text-ghost); display:inline-flex; }
+.inp--hover { box-shadow:0 0 0 1px var(--text-ghost) inset; }
+.inp--focus { box-shadow:0 0 0 1px var(--accent) inset; }
+.inp--focus .ph { color:var(--text-dim); }
+.sel { justify-content:space-between; min-width:180px; }
+.sel .caret { color:var(--text-ghost); }
+.fld-hint { font-size:11px; color:var(--text-faint); }
+
+/* ----------------------------------------------------- chip / tag --- */
+.chip {
+  display:inline-block; padding:1px 8px;
+  background:var(--chip); color:var(--text-dim);
+  border-radius:var(--r-chip); font-size:12px; line-height:1.7; white-space:nowrap;
+}
+.chip--accent { background:var(--accent-soft); color:var(--accent); }
+.chip--danger { background:var(--danger-soft); color:var(--danger); }
+.tag {
+  display:inline-block; max-width:100%; padding:1px 8px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  background:var(--bg-elev); border:1px solid var(--border-2);
+  border-radius:var(--r-chip); color:var(--text-faint);
+  font-size:12px; line-height:1.7;
+}
+
+/* ---------------------------------------------------------- 卡片 --- */
+.card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); align-items:stretch; gap:20px; }
+.card {
+  display:flex; flex-direction:column; height:100%; gap:12px; padding:20px;
+  background:var(--bg-elev); border:1px solid var(--border);
+  border-radius:var(--r-card); box-shadow:var(--shadow-card);
+}
+.card-top { display:flex; gap:12px; align-items:center; justify-content:space-between; }
+.card-time { flex:none; color:var(--text-faint); font-size:12px; }
+.card-title { color:var(--text); font-size:16px; font-weight:600; line-height:1.45; }
+.card-body {
+  color:var(--text-dim); font-size:14px; line-height:1.6;
+  display:-webkit-box; -webkit-line-clamp:3; line-clamp:3;
+  -webkit-box-orient:vertical; overflow:hidden; word-break:break-word;
+}
+.card-tags { display:flex; flex-wrap:wrap; gap:6px; }
+.card-foot {
+  display:flex; gap:8px; align-items:center; justify-content:space-between;
+  margin-top:auto; padding-top:4px; border-top:1px solid var(--line-3);
+}
+.card-link { background:none; border:0; padding:0; font-family:inherit; color:var(--accent); font-size:13px; font-weight:500; cursor:pointer; }
+.card-acts { display:flex; gap:8px; }
+
+/* ---------------------------------------------------------- 分页条 --- */
+.pager {
+  display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;
+  padding:12px 16px; background:var(--bg-elev);
+  border:1px solid var(--border); border-radius:var(--r-card);
+  box-shadow:var(--shadow-card); color:var(--text-faint); font-size:13px;
+}
+.pager .left, .pager .right { display:flex; gap:6px; align-items:center; }
+.pager .num, .num { font-variant-numeric:tabular-nums; }
+.pg {
+  min-width:28px; height:28px; padding:0 8px;
+  background:transparent; border:1px solid transparent; border-radius:var(--r-chip);
+  color:var(--text-dim); font-family:inherit; font-size:13px; cursor:pointer;
+}
+.pg.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+.pg:disabled { color:var(--text-faint); cursor:not-allowed; }
+.pg.gap { color:var(--text-ghost); cursor:default; }
+.pager .dot { color:var(--text-ghost); }
+.pager select, .pager input {
+  height:28px; margin:0 4px; padding:0 6px;
+  background:var(--bg-elev); border:1px solid var(--border-2); border-radius:var(--r-chip);
+  color:var(--text-dim); font-family:inherit; font-size:13px;
+}
+.pager input { width:56px; }
+
+/* ---------------------------------------------------- 危险确认弹框 --- */
+.dlg-mask {
+  display:flex; align-items:center; justify-content:center;
+  padding:24px; border-radius:var(--r-card);
+  background:var(--mask);
+}
+.dlg {
+  width:440px; max-width:100%;
+  background:var(--bg-elev); border:1px solid var(--border);
+  border-radius:var(--r-card); box-shadow:var(--shadow-pop); overflow:hidden;
+}
+.dlg-hd {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:16px 20px 12px; border-bottom:1px solid var(--border);
+}
+.dlg-hd .t { margin-left:-14px; padding-left:11px; border-left:3px solid var(--accent);
+  font-size:14px; font-weight:600; color:var(--text); }
+.dlg-hd .t.danger { border-left-color:var(--danger); }
+.dlg-hd .x { color:var(--text-faint); font-size:16px; }
+.dlg-bd { padding:16px 20px; }
+.conseq { margin:0; padding-left:18px; color:var(--text-dim); font-size:12.5px; line-height:1.75; }
+.conseq li + li { margin-top:4px; }
+.ask { margin-top:16px; padding-top:14px; border-top:1px solid var(--border); }
+.ask > span { display:block; margin-bottom:7px; color:var(--text-faint); font-size:12px; }
+code { font-family:var(--mono); font-size:12px; padding:1px 5px; border-radius:var(--r-chip); background:var(--chip); color:var(--text); }
+.dlg-ft {
+  display:flex; gap:10px; justify-content:flex-end;
+  padding:12px 20px; border-top:1px solid var(--border); background:var(--panel);
+}
+
+/* --------------------------------------------------- 骨架屏 / 空态 --- */
+.panel { background:var(--bg-elev); border:1px solid var(--border); border-radius:var(--r-card); box-shadow:var(--shadow-card); }
+.panel.pad { padding:20px; }
+.sk-row { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+.sk {
+  height:14px; border-radius:var(--r-chip);
+  background:linear-gradient(90deg,var(--skeleton-from) 25%,var(--skeleton-to) 37%,var(--skeleton-from) 63%);
+  background-size:400% 100%; animation:shimmer 1.4s ease infinite;
+}
+.sk.title { height:18px; width:38%; }
+.sk.line { flex:1; }
+.sk.line.short { flex:none; width:56%; }
+@keyframes shimmer { 0% { background-position:100% 50%; } 100% { background-position:0 50%; } }
+@media (prefers-reduced-motion: reduce) { .sk { animation:none; } }
+.empty {
+  display:flex; flex-direction:column; align-items:center; gap:12px;
+  padding:44px 16px; color:var(--text-faint); text-align:center; font-size:13px; line-height:1.7;
+}
+.empty .ic { color:var(--text-ghost); display:block; }
+.empty p { margin:0; max-width:420px; }
+.empty b { display:block; color:var(--text-dim); font-weight:500; font-size:14px; }
+
+/* ------------------------------------------------------ 侧栏示意 --- */
+.nav-demo {
+  width:var(--nav-w); padding:20px 12px 12px;
+  background:var(--panel); border-radius:var(--r-panel);
+}
+.nav-demo .grp {
+  margin:24px 0 8px; padding:0 8px;
+  color:var(--text-ghost); font-size:12px; font-weight:500;
+}
+.nav-demo .grp:first-child { margin-top:0; }
+.nav-demo .item {
+  display:flex; align-items:center; height:40px; padding:0 10px; margin-bottom:2px;
+  border-radius:var(--r-ctl); color:var(--text-dim); font-size:14px; font-weight:500;
+}
+.nav-demo .item.on { background:var(--accent); color:var(--on-accent); box-shadow:var(--shadow-nav-on); }
+.nav-demo .seg { display:flex; gap:2px; padding:3px; margin-top:12px; background:var(--panel-hover); border-radius:var(--r-ctl); }
+.nav-demo .seg span {
+  flex:1; text-align:center; height:30px; line-height:30px;
+  border-radius:var(--r-sm); color:var(--text-faint); font-size:13px;
+}
+.nav-demo .seg span.on { background:var(--bg-elev); color:var(--text); font-weight:500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1>Keepsake 控制台 · 设计令牌目录（暗色）</h1>
+    <p class="src">数值取自 <code>web/src/styles/tokens.css</code>，以它为准。规范文本见 <code>web/DESIGN.md</code>；浅色同款见 <span class="go"><a href="preview.html">preview.html</a></span>。</p>
+  </header>
+
+  <!-- ========================================================= 1. 色板 === -->
+  <section>
+    <h2>颜色令牌 · 色板</h2>
+    <p class="note">每个色块 = 一个令牌。原样摘自 <code>tokens.css</code>，标注为对比度的项只对「可读文字」有意义。</p>
+
+    <h3>底色与描边</h3>
+    <div class="sw-grid">
+      <div class="sw"><div class="block" style="background:var(--bg)"></div><div class="meta">
+        <div class="nm">--bg</div><div class="val">#ffffff</div><div class="use">页面主底（.main / body）</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--bg-elev)"></div><div class="meta">
+        <div class="nm">--bg-elev</div><div class="val">#ffffff</div><div class="use">抬起层：卡片 / 面板 / 弹层 / 输入框</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--panel)"></div><div class="meta">
+        <div class="nm">--panel</div><div class="val">#f5f5f6</div><div class="use">浅灰面板：侧栏 / 筛选面板 / 预格式块</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--panel-hover)"></div><div class="meta">
+        <div class="nm">--panel-hover</div><div class="val">#ececee</div><div class="use">灰面板上的 hover / 分段控件轨道</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--chip)"></div><div class="meta">
+        <div class="nm">--chip</div><div class="val">#f1f1f2</div><div class="use">chip 底 / 行内代码 / 进度条轨道</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--border)"></div><div class="meta">
+        <div class="nm">--border</div><div class="val">#ececee</div><div class="use">描边 1 档：卡片 / 面板 / 弹层 / .kv / .banner</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--border-2)"></div><div class="meta">
+        <div class="nm">--border-2</div><div class="val">#e8e8ea</div><div class="use">描边 2 档：输入框 / 按钮 / .tag</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--line-3)"></div><div class="meta">
+        <div class="nm">--line-3</div><div class="val">#f0f0f0</div><div class="use">描边 3 档：卡内分隔线（.card-foot 上边线）</div></div></div>
+    </div>
+
+    <h3>文字四档</h3>
+    <div class="sw-grid">
+      <div class="sw"><div class="block" style="background:var(--bg-elev);display:flex;align-items:center;padding:0 12px;color:var(--text);font-size:16px;font-weight:600">Aa 主文字</div><div class="meta">
+        <div class="nm">--text</div><div class="val">#1a1a1a</div><div class="use">标题 / 正文强调 / .kv 的值</div>
+        <span class="cr">深底 17.19:1 · 暗面板 16.16:1</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--bg-elev);display:flex;align-items:center;padding:0 12px;color:var(--text-dim);font-size:15px">Aa 次文字</div><div class="meta">
+        <div class="nm">--text-dim</div><div class="val">#555555</div><div class="use">正文 / .card-body 摘要 / 弹框正文</div>
+        <span class="cr">深底 8.89:1 · 暗面板 8.36:1</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--bg-elev);display:flex;align-items:center;padding:0 12px;color:var(--text-faint);font-size:15px">Aa 弱文字（要读）</div><div class="meta">
+        <div class="nm">--text-faint</div><div class="val">#666d78</div><div class="use">时间 / 标签 / 提示 —— 要读的信息，最差底色仍须 ≥4.5:1</div>
+        <span class="cr">深底 5.29:1 · 暗面板 4.98:1</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--bg-elev);display:flex;align-items:center;padding:0 12px;color:var(--text-ghost);font-size:15px">Aa 装饰专用</div><div class="meta">
+        <div class="nm">--text-ghost</div><div class="val">#9a9a9e</div><div class="use"><b>只许</b>用于 placeholder / 分隔符 / 图标 / 禁用描边 / 分组标题，永不承载可读信息</div>
+        <span class="cr decor">深底 4.02:1 · 暗面板 3.78:1 —— 不做对比度承诺</span></div></div>
+    </div>
+
+    <h3>强调色与状态色</h3>
+    <div class="sw-grid">
+      <div class="sw"><div class="block" style="background:var(--accent)"></div><div class="meta">
+        <div class="nm">--accent</div><div class="val">#2f6bff</div><div class="use">全站唯一强调色：链接 / 选中胶囊 / 主按钮 / 焦点</div>
+        <span class="cr">深底 6.15:1（文字）</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--accent-soft)"></div><div class="meta">
+        <div class="nm">--accent-soft</div><div class="val">#eaf1ff</div><div class="use">强调浅底：.chip--accent / .pager .pg.on / .soft-btn</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--on-accent);border-bottom-color:var(--border-2);display:flex;align-items:center;padding:0 12px;color:var(--text-faint);font-size:12px">--on-accent（压在 --accent 上）</div><div class="meta">
+        <div class="nm">--on-accent</div><div class="val">#ffffff</div><div class="use">强调色上的文字（选中侧栏项、实心主按钮）</div>
+        <span class="cr bad">蓝底 3.16:1 ⚠️</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--ok)"></div><div class="meta">
+        <div class="nm">--ok</div><div class="val">#22c55e</div><div class="use">第二个颜色，仅用于「活着」的指示：.dot-ok / .stat-bar</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--danger)"></div><div class="meta">
+        <div class="nm">--danger</div><div class="val">#dc2626</div><div class="use">危险：确认弹框红竖条 / 危险按钮字 / 报错条</div>
+        <span class="cr">深底 5.59:1（文字）</span></div></div>
+      <div class="sw"><div class="block" style="background:var(--danger-soft)"></div><div class="meta">
+        <div class="nm">--danger-soft</div><div class="val">#fdeeee</div><div class="use">危险浅底：.act-btn--danger / .chip--danger</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--fill-dark)"></div><div class="meta">
+        <div class="nm">--fill-dark</div><div class="val">#ececee</div><div class="use">element-plus 深填充（次级区底色）</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--danger-hi)"></div><div class="meta">
+        <div class="nm">--danger-hi</div><div class="val">#ef4444</div><div class="use">危险按钮 hover 加深</div></div></div>
+    </div>
+
+    <h3>element-plus primary 阶梯（由 --accent 派生，勿手改）</h3>
+    <div class="sw-grid">
+      <div class="sw"><div class="block" style="background:var(--accent-3)"></div><div class="meta"><div class="nm">--accent-3</div><div class="val">#c1d3ff</div><div class="use">primary light-3</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--accent-5)"></div><div class="meta"><div class="nm">--accent-5</div><div class="val">#97b5ff</div><div class="use">primary light-5</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--accent-7)"></div><div class="meta"><div class="nm">--accent-7</div><div class="val">#6d97ff</div><div class="use">primary light-7 / light-8</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--accent-9)"></div><div class="meta"><div class="nm">--accent-9</div><div class="val">#eaf1ff</div><div class="use">primary light-9（选中行底）</div></div></div>
+      <div class="sw"><div class="block" style="background:var(--accent-d2)"></div><div class="meta"><div class="nm">--accent-d2</div><div class="val">#2656cc</div><div class="use">primary dark-2 = 主按钮 hover</div></div></div>
+    </div>
+  </section>
+
+  <!-- ======================================================= 2. 对比度 === -->
+  <section>
+    <h2>对比度硬指标</h2>
+    <p class="note">硬指标：<b>--text / --text-dim / --text-faint 在各自主题最差底色上 ≥ 4.5:1</b>（浅色看浅灰面板 #f5f5f6，暗色看面板 #12151a）。--text-ghost 例外，因为它是装饰色。</p>
+    <table class="cv">
+      <thead><tr><th>文字令牌</th><th>白底</th><th>浅灰面板</th><th>深底</th><th>暗色面板</th><th>判定</th></tr></thead>
+      <tbody>
+        <tr><td><code>--text</code> #1a1a1a / #eef1f6</td><td class="n">17.40:1</td><td class="n">15.97:1</td><td class="n">17.19:1</td><td class="n">16.16:1</td><td class="pass">✅ 全部达标</td></tr>
+        <tr><td><code>--text-dim</code> #555555 / #a7b0be</td><td class="n">7.46:1</td><td class="n">6.84:1</td><td class="n">8.89:1</td><td class="n">8.36:1</td><td class="pass">✅ 全部达标</td></tr>
+        <tr><td><code>--text-faint</code> #666d78 / #7c8697</td><td class="n">5.22:1</td><td class="n">4.79:1</td><td class="n">5.29:1</td><td class="n">4.98:1</td><td class="pass">✅ 全部达标</td></tr>
+        <tr><td><code>--text-ghost</code> #9a9a9e / #6b7280</td><td class="n">2.80:1</td><td class="n">2.57:1</td><td class="n">4.02:1</td><td class="n">3.78:1</td><td class="fail">⚠️ 装饰专用，不做对比度承诺</td></tr>
+      </tbody>
+    </table>
+    <h3>已知的低于 4.5:1 配对（现存实现，本轮未改）</h3>
+    <table class="cv">
+      <thead><tr><th>组合</th><th>浅色</th><th>暗色</th></tr></thead>
+      <tbody>
+        <tr><td><code>--on-accent</code> 白字 / <code>--accent</code> 底（选中侧栏项、实心主按钮）</td><td class="fail n">3.16:1</td><td class="n">4.50:1</td></tr>
+        <tr><td><code>--accent</code> 字 / <code>--accent-soft</code> 底（.chip--accent、.pg.on）</td><td class="fail n">3.97:1</td><td class="n">4.95:1</td></tr>
+        <tr><td><code>--danger</code> 字 / <code>--danger-soft</code> 底（.act-btn--danger）</td><td class="fail n">4.29:1</td><td class="n">4.92:1</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ======================================================= 3. 字号 === -->
+  <section>
+    <h2>字号阶梯</h2>
+    <p class="note">五档 + 展示档，最小 11px。每行同一句中文。</p>
+    <div class="fs-row"><span class="lab">11px 微型</span><span class="demo" style="font-size:11px;color:var(--text-faint)">统计卡脚注是这个最小档，再小一律升到 12px</span></div>
+    <div class="fs-row"><span class="lab">12px 小</span><span class="demo" style="font-size:12px;color:var(--text-faint)">卡片时间、chip、状态说明、键值表行、等宽文本</span></div>
+    <div class="fs-row"><span class="lab">13px 次</span><span class="demo" style="font-size:13px;color:var(--text-dim)">面包屑、次要说明、筛选区、按钮文字、统计标签</span></div>
+    <div class="fs-row"><span class="lab">14px 正文</span><span class="demo" style="font-size:14px">正文基准字号：卡片摘要、按钮、输入文字、弹框正文</span></div>
+    <div class="fs-row"><span class="lab">16px 标题</span><span class="demo" style="font-size:16px;font-weight:600">卡片标题、区块标题、弹框标题、抽屉标题</span></div>
+    <div class="fs-row"><span class="lab">27px / 22px</span><span class="demo" style="font-size:27px;font-weight:700;letter-spacing:-.4px">页面大标题</span></div>
+    <div class="fs-row"><span class="lab">32px 展示</span><span class="demo" style="font-size:32px;font-weight:700;letter-spacing:-.8px">1,284</span></div>
+  </section>
+
+  <!-- ======================================================= 4. 圆角 === -->
+  <section>
+    <h2>圆角阶梯</h2>
+    <p class="note">六级，内层圆角 &lt; 外层圆角：20 → 16 → 12 → 10 → 8 → 6。禁止裸 px 圆角。</p>
+    <div class="rd-grid">
+      <div class="rd" style="border-radius:var(--r-panel)"><div class="box"></div><div class="nm">--r-panel · 20px</div><div class="use">最大独立容器：侧栏、抽屉</div></div>
+      <div class="rd" style="border-radius:var(--r-card)"><div class="box"></div><div class="nm">--r-card · 16px</div><div class="use">卡片 / 统计卡 / 面板 / 分页条 / 弹框</div></div>
+      <div class="rd" style="border-radius:var(--r-inset)"><div class="box"></div><div class="nm">--r-inset · 12px</div><div class="use">卡内内嵌块：键值表 / 预格式 / 提示条</div></div>
+      <div class="rd" style="border-radius:var(--r-ctl)"><div class="box"></div><div class="nm">--r-ctl · 10px</div><div class="use">控件外壳：导航行 / 输入框 / 分段控件 / 浮层</div></div>
+      <div class="rd" style="border-radius:var(--r-sm)"><div class="box"></div><div class="nm">--r-sm · 8px</div><div class="use">按钮</div></div>
+      <div class="rd" style="border-radius:var(--r-chip)"><div class="box"></div><div class="nm">--r-chip · 6px</div><div class="use">小粒：chip / tag / 页码 / 复制键 / code</div></div>
+    </div>
+  </section>
+
+  <!-- ======================================================= 5. 按钮 === -->
+  <section>
+    <h2>按钮</h2>
+    <p class="note">统一圆角 8px、13px/500、<b>无阴影</b>。禁用态统一 <code>opacity:.5</code> + <code>not-allowed</code>，不要只改颜色。</p>
+
+    <h3>正常态</h3>
+    <div class="btn-row">
+      <button class="btn btn--primary">主按钮</button>
+      <button class="btn btn--default">次按钮</button>
+      <button class="btn btn--danger">危险</button>
+      <button class="btn btn--soft">软强调</button>
+      <button class="btn btn--ghost">幽灵</button>
+      <button class="btn btn--link">文字链接 →</button>
+    </div>
+    <h3>小尺寸（卡片操作行 28px / 筛选区 32px）</h3>
+    <div class="btn-row">
+      <button class="btn btn--default sm">编辑</button>
+      <button class="btn btn--danger sm">归档</button>
+      <button class="btn btn--soft">存草稿</button>
+      <button class="btn btn--ghost">重置</button>
+    </div>
+    <h3>禁用态（对比 hover 看差异）</h3>
+    <div class="btn-row">
+      <button class="btn btn--primary" disabled>主按钮</button>
+      <button class="btn btn--default" disabled>次按钮</button>
+      <button class="btn btn--danger" disabled>危险</button>
+      <button class="btn btn--soft" disabled>软强调</button>
+      <button class="btn btn--link" disabled>文字链接</button>
+    </div>
+  </section>
+
+  <!-- =============================================== 6. 输入与下拉 === -->
+  <section>
+    <h2>输入框与下拉</h2>
+    <p class="note">高 40px、圆角 10px、白底、<b>1px #e8e8ea</b> 描边；hover 描边转 --text-ghost，focus 描边转 --accent。</p>
+    <div class="fld-row">
+      <div class="fld">
+        <label>默认</label>
+        <div class="inp"><span class="ico">⌕</span><span class="ph">搜核心词、短语</span></div>
+      </div>
+      <div class="fld">
+        <label>hover</label>
+        <div class="inp inp--hover"><span class="ico">⌕</span><span class="ph">搜核心词、短语</span></div>
+      </div>
+      <div class="fld">
+        <label>focus</label>
+        <div class="inp inp--focus"><span class="ico">⌕</span><span>语义记忆去重</span></div>
+      </div>
+      <div class="fld">
+        <label>下拉（宽 180px）</label>
+        <div class="inp sel"><span>全部类型</span><span class="caret">▾</span></div>
+      </div>
+      <div class="fld">
+        <label>禁用</label>
+        <div class="inp" style="box-shadow:0 0 0 1px var(--line-3) inset;opacity:.5;cursor:not-allowed"><span class="ph">不可编辑</span></div>
+        <span class="fld-hint">占位符走 --text-ghost（装饰色，合规）</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================== 7. chip === -->
+  <section>
+    <h2>chip 与 tag</h2>
+    <p class="note">一律 12px / 圆角 6px / 内距 1px 8px。<b>.chip</b> 实心小粒，<b>.tag</b> 描边小粒。</p>
+    <h3>.chip（中性 / 强调 / 危险）</h3>
+    <div class="btn-row">
+      <span class="chip">常驻层</span>
+      <span class="chip chip--accent">已生效</span>
+      <span class="chip chip--danger">冲突</span>
+      <span class="chip">知识库命中</span>
+      <span class="chip chip--accent">定时任务</span>
+    </div>
+    <h3>.tag（描边式，可换行）</h3>
+    <div class="btn-row" style="max-width:640px">
+      <span class="tag">语义去重</span>
+      <span class="tag">长期偏好</span>
+      <span class="tag">按项目隔离</span>
+      <span class="tag">一个很长的标签名会被省略号截断而不是换行</span>
+    </div>
+  </section>
+
+  <!-- ==================================================== 8. 卡片 === -->
+  <section>
+    <h2>卡片（ItemCard 四段固定顺序）</h2>
+    <p class="note">
+      顺序：顶行(chip+时间) → 标题 → 3 行摘要 → 标签组 → 底部操作行。
+      等高三件套：<code>.card-grid{align-items:stretch}</code> + <code>.card{height:100%}</code> + <code>.card-foot{margin-top:auto}</code>。下面两张卡摘要长短不同，底部操作行仍在同一水平线。
+    </p>
+    <div class="card-grid">
+      <article class="card">
+        <div class="card-top"><span class="chip chip--accent">已生效</span><span class="card-time">2 小时前</span></div>
+        <div>
+          <div class="card-title">用户偏好：回答用中文，先结论后展开</div>
+          <div class="card-body">长摘要示例：这一条记忆条目记录了用户对回答语言的固定偏好，命中后每轮都会被注入到上下文里，用来约束输出的语言与结构。这一段特意写长一些，用来演示最多三行截断的效果，超出的部分会被裁掉而不是把卡片撑高。</div>
+        </div>
+        <div class="card-tags"><span class="tag">长期偏好</span><span class="tag">输出风格</span><span class="tag">常驻注入</span></div>
+        <div class="card-foot">
+          <button class="card-link">升常驻</button>
+          <div class="card-acts"><button class="btn btn--default sm">编辑</button><button class="btn btn--danger sm">遗忘</button></div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card-top"><span class="chip">知识库命中</span><span class="card-time">昨天 21:14</span></div>
+        <div>
+          <div class="card-title">部署约定</div>
+          <div class="card-body">短摘要示例：只写一句，演示两卡等高时卡片底部仍对齐。</div>
+        </div>
+        <div class="card-tags"><span class="tag">运维</span></div>
+        <div class="card-foot">
+          <button class="card-link">查看全文</button>
+          <div class="card-acts"><button class="btn btn--default sm">编辑</button><button class="btn btn--danger sm">遗忘</button></div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card-top"><span class="chip chip--danger">冲突</span><span class="card-time">3 天前</span></div>
+        <div>
+          <div class="card-title">项目路径</div>
+          <div class="card-body">中等长度摘要，用来验证第三张卡在同排时的高度表现。</div>
+        </div>
+        <div class="card-tags"></div>
+        <div class="card-foot">
+          <button class="card-link">处理</button>
+          <div class="card-acts"><button class="btn btn--danger sm">遗忘</button></div>
+        </div>
+      </article>
+    </div>
+    <p class="note" style="margin-top:12px">网格列数由可用宽度自适应（<code>repeat(auto-fill, minmax(300px,1fr))</code>），断点 1200 / 900 / 600 只往下收，不出现横向滚动。</p>
+  </section>
+
+  <!-- ==================================================== 9. 分页 === -->
+  <section>
+    <h2>标准分页</h2>
+    <p class="note">不用 <code>el-pagination</code>（留白太大），自己排一排。左「共 N 条 + 每页条数」，右「页码窗口 + 跳转」。</p>
+    <div class="pager">
+      <div class="left">
+        <span class="num">共 1,284 条</span>
+        <span class="dot">·</span>
+        <label>每页 <select class="num"><option>20</option><option selected>50</option><option>100</option></select></label>
+      </div>
+      <div class="right">
+        <button class="pg" disabled>上一页</button>
+        <button class="pg num">1</button>
+        <button class="pg num">2</button>
+        <button class="pg num">3</button>
+        <span class="pg gap">…</span>
+        <button class="pg num on">5</button>
+        <span class="pg gap">…</span>
+        <button class="pg num">26</button>
+        <button class="pg num">下一页</button>
+        <label>跳至 <input class="num" type="text" value="5" aria-label="跳至页码"> 页</label>
+      </div>
+    </div>
+    <p class="note" style="margin-top:8px">页码窗口最多 5 个数字 + 2 个省略号（来自 <code>utils/format.js</code> 的 <code>pageWindow</code>）；「共 N 条」口径来自接口，总数未知时改说「至少 N 条（总数未知）」，前端不另算。</p>
+  </section>
+
+  <!-- ============================================== 10. 危险确认弹框 === -->
+  <section>
+    <h2>危险确认弹框</h2>
+    <p class="note">
+      三层防手滑：① 标题左侧 <b>3px 红竖条</b>；② 正文逐条列后果，不是「确定吗」；
+      ③ 必须<b>照抄确认串</b>才解除主按钮禁用。弹框 <code>close-on-click-modal:false</code>，主按钮是红实心 + 动词文案。
+    </p>
+    <div class="dlg-mask">
+      <div class="dlg">
+        <div class="dlg-hd">
+          <span class="t danger">遗忘这条记忆条目</span>
+          <span class="x">✕</span>
+        </div>
+        <div class="dlg-bd">
+          <ul class="conseq">
+            <li>这条记忆条目会从常驻层与检索索引里同时移除。</li>
+            <li>引用它的历史会话不受影响，但之后不会再被召回。</li>
+            <li>此操作不可撤销。</li>
+          </ul>
+          <div class="ask">
+            <span>键入 <code>3f9a21c7</code> 以确认</span>
+            <div class="inp inp--focus"><span>3f9a21c7</span></div>
+          </div>
+        </div>
+        <div class="dlg-ft">
+          <button class="btn btn--default">取消</button>
+          <button class="btn btn--primary" style="background:var(--danger);border-color:var(--danger);color:var(--on-accent)">确认执行</button>
+        </div>
+      </div>
+    </div>
+    <h3>未键入时的禁用态</h3>
+    <div class="dlg-mask">
+      <div class="dlg">
+        <div class="dlg-hd"><span class="t danger">遗忘这条记忆条目</span><span class="x">✕</span></div>
+        <div class="dlg-bd">
+          <ul class="conseq"><li>这条记忆条目会从常驻层与检索索引里同时移除。</li><li>此操作不可撤销。</li></ul>
+          <div class="ask">
+            <span>键入 <code>3f9a21c7</code> 以确认</span>
+            <div class="inp"><span class="ph">3f9a21c7</span></div>
+          </div>
+        </div>
+        <div class="dlg-ft">
+          <button class="btn btn--default">取消</button>
+          <button class="btn" style="background:var(--danger);border-color:var(--danger);color:var(--on-accent)" disabled>确认执行</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================ 11. 骨架屏 / 空态 === -->
+  <section>
+    <h2>骨架屏与空态</h2>
+    <p class="note">骨架屏只在「加载中且当前无旧数据」时出现，避免闪烁；空态要写清「为什么空 + 接下来点哪里」，禁止「暂无数据」。</p>
+    <h3>骨架屏（shimmer）</h3>
+    <div class="panel pad">
+      <div class="sk-row"><div class="sk title"></div></div>
+      <div class="sk-row"><div class="sk line"></div></div>
+      <div class="sk-row"><div class="sk line short"></div></div>
+      <div class="sk-row"><div class="sk line"></div></div>
+    </div>
+    <h3>空态</h3>
+    <div class="panel">
+      <div class="empty">
+        <span class="ic"><svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M12 3.5 3.5 7.5 12 11.5l8.5-4-8.5-4Z" stroke-linejoin="round"/><path d="M4.6 12 12 15.6 19.4 12M4.6 16.5 12 20l7.4-3.5" stroke-linecap="round"/></svg></span>
+        <p><b>常驻层还是空的</b>到「记忆条目」把要每轮注入的记忆点「升常驻」，它们就会出现在这里。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================== 12. 侧栏 === -->
+  <section>
+    <h2>侧栏（独立圆角面板）</h2>
+    <p class="note">固定定位，四周留 12px 白边不通栏；宽 <code>--nav-w: 232px</code>；底色 <code>--panel</code>；圆角 20px。选中态是整行蓝胶囊。主题切换在侧栏底部。</p>
+    <div class="nav-demo">
+      <div class="grp">记忆</div>
+      <div class="item">◎ 常驻层</div>
+      <div class="item on">⌕ 记忆条目</div>
+      <div class="grp">知识库与运维</div>
+      <div class="item">▤ 知识库</div>
+      <div class="item">▥ 看板</div>
+      <div class="seg"><span>浅色</span><span class="on">深色</span></div>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>
