@@ -39,7 +39,7 @@ def register_resources(server: Any, provider: Any) -> Any:
     def fragment(key: str) -> str:
         frag = provider.get(key)
         if not frag:
-            raise ToolError(f"碎片不存在：{key}")
+            raise ToolError(f"记忆条目不存在：{key}")
         return json.dumps(
             {"key": str(frag.get("key") or key), **dict(frag)},
             ensure_ascii=False,

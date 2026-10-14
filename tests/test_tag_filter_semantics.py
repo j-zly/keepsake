@@ -101,7 +101,7 @@ def lite(tmp_path):
 
 @pytest.fixture()
 def lite_seeded(tmp_path):
-    """一份含 4 条多标签碎片的库（其中一条用 worker 实例写 ⇒ 带 agent:worker）。"""
+    """一份含 4 条多标签记忆条目的库（其中一条用 worker 实例写 ⇒ 带 agent:worker）。"""
     path = str(tmp_path / "seed.db")
     main = SqliteStorage(path=path, is_primary=True)
     worker = SqliteStorage(path=path, agent_id="worker", is_primary=True)

@@ -2,10 +2,10 @@
 
 🔴 **本文件锁死的是「记忆不许被悄悄改坏或悄悄消失」**，不是某个格式细节：
   1. `on_memory_write` **原文**入库（不过 LLM 提炼），且幂等
-  2. `system_prompt_block` 每轮把 core 碎片**原文**注入
+  2. `system_prompt_block` 每轮把 core 记忆条目**原文**注入
   3. 读库失败 / 超时 ⇒ **fail-open**（返回静态文案，绝不抛、绝不阻塞对话）
   4. 超预算截断时**必须留一行可见说明**，不许静默丢
-  5. `prefetch` 排除 core 碎片（核心层已无条件注入，重复注入是故障）
+  5. `prefetch` 排除 core 记忆条目（核心层已无条件注入，重复注入是故障）
   6. 三后端 `list_by_tag` 都是**逗号边界的完整标签相等**（`core` ≠ `core-x`）
 
 除 SQLite 真库用例外全部 hermetic（内存 fake storage，零网络零数据库）。
@@ -288,7 +288,7 @@ def test_slow_read_is_fail_open(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_prefetch_excludes_core_fragments():
-    """🔴 core 碎片已由 system_prompt_block 无条件全量注入，prefetch 不得再吐一遍。"""
+    """🔴 core 记忆条目已由 system_prompt_block 无条件全量注入，prefetch 不得再吐一遍。"""
     st = FakeStorage([
         {"key": "c1", "content": "核心层专属记忆", "tags": "core,memory",
          "updated_at": "1", "_search_hit": True},
@@ -424,7 +424,7 @@ def test_redis_list_by_tag_scans_all_pages(tmp_path, monkeypatch):
     assert [r["content"] for r in rows] == ["core-F", "core-B", "core-A"]
     assert "xcore-D" not in [r["content"] for r in rows]
     assert "core-x-E" not in [r["content"] for r in rows]
-    # 缺 updated_at 的老碎片回落到 created ⇒ 排序键恒存在（None/str 混排会抛 TypeError）
+    # 缺 updated_at 的老记忆条目回落到 created ⇒ 排序键恒存在（None/str 混排会抛 TypeError）
     assert rows[1]["updated_at"] == "2026-01-01"
 
 
@@ -445,7 +445,7 @@ def test_sqlite_list_by_tag_is_comma_bounded_and_sorted(tmp_path):
         got = s.list_by_tag("core")
         contents = [f["content"] for f in got]
         assert "丙" not in contents, "core-x 不该命中 core"
-        assert "丁" not in contents, "无 core 标签的碎片不该出现"
+        assert "丁" not in contents, "无 core 标签的记忆条目不该出现"
         assert set(contents) == {"甲", "乙"}
         # 排序键恒存在（PG 无 updated_at 列、Redis 无这根字段时都回落 created）
         assert all(f["updated_at"] for f in got)

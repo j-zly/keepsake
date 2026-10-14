@@ -1,4 +1,4 @@
-"""带二进制字段（embed_bin）的碎片 hash 也能被批量读出 —— 红绿闭环。
+"""带二进制字段（embed_bin）的记忆条目 hash 也能被批量读出 —— 红绿闭环。
 
 🔴 2026-10-10 真 Redis（180）实测 bug：`get_fragments_batch` 对每个字段一律
 `v.decode("utf-8")`，遇到 `embed_bin`（float32 blob）抛 UnicodeDecodeError →
@@ -143,7 +143,7 @@ def _add_fragment(client: _Client, key: str, content: str, with_embed: bool = Tr
     h = _BytesHash()
     h.data = {
         b"content": content.encode(),
-        b"created": "2020-01-01T00:00:00+00:00",  # 老碎片，保证不被 max_age 过滤
+        b"created": "2020-01-01T00:00:00+00:00",  # 老记忆条目，保证不被 max_age 过滤
         b"source": source,
         b"fragment_type": b"",
         b"level": b"1",

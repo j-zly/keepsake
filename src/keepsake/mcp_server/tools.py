@@ -9,14 +9,14 @@ capabilities/system_prompt_block`。
 --------------------------------------------------------------------------
 🔴 `dry_run` 是一等公民：`merge` / `forget` 默认 `dry_run=True`，只统计不写。
 🔴 删除必须 `confirm=True`，否则**抛 ToolError 拒绝**，绝不静默返回 ok。
-🔴 merge/forget 实跑必须回填 `confirm` = 当前 core 条数 / 当前碎片总数
+🔴 merge/forget 实跑必须回填 `confirm` = 当前 core 条数 / 当前记忆条目总数
    （字符串比较）—— 防「以为自己在跑 A 库」与「以为自己在跑 dry-run」。
 🔴 失败抛 `ToolError`（结构化错误），**绝不静默 ok**。
 
 --------------------------------------------------------------------------
 可选扩展：core 层枚举
 --------------------------------------------------------------------------
-`MemoryProvider` 契约里没有「列 core 层」与「数碎片总数」这两个原语
+`MemoryProvider` 契约里没有「列 core 层」与「数记忆条目总数」这两个原语
 （它是给注入/检索/写设计的，不该为某一个宿主加成员 —— 加了会连带把
 `tests/contract/test_provider_protocol.py` 的契约清单改掉）。
 所以这里约定一个**可选**扩展 `StorageIntrospection`：provider 有就提供，
@@ -53,7 +53,7 @@ class StorageIntrospection(Protocol):
         ...
 
     def count_fragments(self) -> int:
-        """当前碎片总数 —— `memory_forget` 的 confirm 凭据。"""
+        """当前记忆条目总数 —— `memory_forget` 的 confirm 凭据。"""
         ...
 
 
@@ -79,7 +79,7 @@ def _count_fragments(provider: Any) -> int:
     n = int(_introspect(provider).count_fragments())
     if n >= _FRAGMENT_CONFIRM_CAP:
         raise ToolError(
-            f"碎片数已达取数上限 {_FRAGMENT_CONFIRM_CAP}，confirm 不可信 —— 拒绝实跑"
+            f"记忆条目数已达取数上限 {_FRAGMENT_CONFIRM_CAP}，confirm 不可信 —— 拒绝实跑"
         )
     return n
 
@@ -112,7 +112,7 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
 
 
 def memory_search(provider: Any, query: str, limit: int = 10) -> Dict[str, Any]:
-    """按查询检索碎片。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。"""
+    """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。"""
     if not query or not query.strip():
         raise ToolError("query 不能为空")
     limit = max(1, min(int(limit), 100))
@@ -136,7 +136,7 @@ def memory_get(provider: Any, key: str) -> Dict[str, Any]:
     """按 key 取单条全文。key 不存在 ⇒ 抛 ToolError（不是「空 ok」）。"""
     frag = provider.get(key)
     if not frag:
-        raise ToolError(f"碎片不存在：{key}")
+        raise ToolError(f"记忆条目不存在：{key}")
     return {
         "key": str(frag.get("key") or key),
         "content": str(frag.get("content", "")),
@@ -174,7 +174,7 @@ def memory_add(provider: Any, text: str, tags: str = "") -> Dict[str, Any]:
 
 
 def memory_remove(provider: Any, key: str, confirm: bool = False) -> Dict[str, Any]:
-    """删除一条碎片。`confirm=False` ⇒ **拒绝并说明**，绝不动数据。"""
+    """删除一条记忆条目。`confirm=False` ⇒ **拒绝并说明**，绝不动数据。"""
     if not key:
         raise ToolError("key 不能为空")
     if not confirm:
@@ -188,7 +188,7 @@ def memory_remove(provider: Any, key: str, confirm: bool = False) -> Dict[str, A
 
 
 def memory_merge(provider: Any, dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
-    """合并碎片。默认 dry-run；实跑必须 `confirm` = 调用瞬间的 core 条数（字符串）。"""
+    """合并记忆条目。默认 dry-run；实跑必须 `confirm` = 调用瞬间的 core 条数（字符串）。"""
     core_before = len(_list_core(provider))
     if not dry_run:
         if confirm != str(core_before):
@@ -203,12 +203,12 @@ def memory_merge(provider: Any, dry_run: bool = True, confirm: str = "") -> Dict
 
 
 def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
-    """遗忘（按时间衰减筛过期条目）。默认 dry-run；实跑必须 `confirm` = 当前碎片总数。"""
+    """遗忘（按时间衰减筛过期条目）。默认 dry-run；实跑必须 `confirm` = 当前记忆条目总数。"""
     total_before = _count_fragments(provider)
     if not dry_run:
         if confirm != str(total_before):
             raise ToolError(
-                f"实跑遗忘需要 confirm = 当前碎片总数（{total_before}）；收到 {confirm!r}"
+                f"实跑遗忘需要 confirm = 当前记忆条目总数（{total_before}）；收到 {confirm!r}"
             )
     stats = dict(provider.forget(dry_run=dry_run))
     stats["dry_run"] = bool(dry_run)
@@ -233,7 +233,7 @@ def register_tools(server: Any, provider: Any) -> Any:
 
     @server.tool(
         name="memory_search",
-        description="按查询检索记忆碎片，返回 key / tags / score / 正文预览（截断 300 字）。",
+        description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）。",
     )
     def _search(query: str, limit: int = 10) -> Dict[str, Any]:
         return memory_search(provider, query, limit)
@@ -268,14 +268,14 @@ def register_tools(server: Any, provider: Any) -> Any:
 
     @server.tool(
         name="memory_merge",
-        description="合并碎片。默认 dry_run=True 只统计；实跑需 confirm = 当前 core 条数。",
+        description="合并记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前 core 条数。",
     )
     def _merge(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
         return memory_merge(provider, dry_run, confirm)
 
     @server.tool(
         name="memory_forget",
-        description="遗忘过期碎片。默认 dry_run=True 只统计；实跑需 confirm = 当前碎片总数。",
+        description="遗忘过期记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前记忆条目总数。",
     )
     def _forget(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
         return memory_forget(provider, dry_run, confirm)

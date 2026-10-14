@@ -45,12 +45,12 @@ class CoreStats(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# 碎片（检索层）
+# 记忆条目（检索层）
 # --------------------------------------------------------------------------
 
 
 class FragmentItem(BaseModel):
-    """碎片列表项（含检索打分，q 为空时 score 为 None）。"""
+    """记忆条目列表项（含检索打分，q 为空时 score 为 None）。"""
 
     key: str
     tags: str = ""
@@ -74,7 +74,7 @@ class FragmentList(BaseModel):
 
 
 class FragmentDetail(BaseModel):
-    """碎片详情：全字段、全文。"""
+    """记忆条目详情：全字段、全文。"""
 
     key: str
     content: str = ""

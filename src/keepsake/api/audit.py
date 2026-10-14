@@ -135,7 +135,7 @@ def _fallback(value: Any) -> Any:
 
 
 def backup_fragment(key: str, row: Optional[Dict[str, Any]]) -> str:
-    """落一条碎片的**改前原文**：`<backup_root>/<YYYYMMDD>/<key>.before.json`。
+    """落一条记忆条目的**改前原文**：`<backup_root>/<YYYYMMDD>/<key>.before.json`。
 
     必须在写存储层**之前**调用；抛异常 ⇒ 整个写操作中止（数据还没动）。
     返回落盘路径，供回包与审计引用。

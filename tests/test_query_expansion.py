@@ -571,7 +571,7 @@ class TestDiscoverSynonymsDenoise:
                                     min_word_freq: int = 1,
                                     min_co_occurrence: int = 1,
                                     jaccard_threshold: float = 0.0):
-        """构造带碎片语料的 storage（无真实 Redis，纯 mock 客户端）。"""
+        """构造带记忆条目语料的 storage（无真实 Redis，纯 mock 客户端）。"""
         client = _FakeClient()
         for i, frag in enumerate(fragments):
             key = f"memory:frag:{i:03d}"

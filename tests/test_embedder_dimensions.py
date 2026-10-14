@@ -379,9 +379,9 @@ class TestBM25UnaffectedByEmbedderState:
 
         # 哨兵：让 search_bm25 直接返一些固定结果
         bm25_results = [
-            {"content": "碎片A", "_bm25_score": 1.0, "_sim": 1.0,
+            {"content": "记忆条目A", "_bm25_score": 1.0, "_sim": 1.0,
              "_key": "memory:frag:a"},
-            {"content": "碎片B", "_bm25_score": 0.8, "_sim": 0.8,
+            {"content": "记忆条目B", "_bm25_score": 0.8, "_sim": 0.8,
              "_key": "memory:frag:b"},
         ]
         with patch.object(storage, "search_bm25", return_value=list(bm25_results)), \
@@ -394,7 +394,7 @@ class TestBM25UnaffectedByEmbedderState:
         )
         # BM25 结果原样返回
         assert len(out) == 2
-        assert {f["content"] for f in out} == {"碎片A", "碎片B"}
+        assert {f["content"] for f in out} == {"记忆条目A", "记忆条目B"}
 
 
 # ===========================================================================

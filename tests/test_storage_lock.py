@@ -269,7 +269,7 @@ def test_concurrent_ensure_index_and_writes_never_deadlock(warm):
             for idx, (_, _, key) in sorted(out.items()):
                 cur.execute("SELECT content FROM ks_fragment WHERE key = %s", (key,))
                 row = cur.fetchone()
-                assert row is not None, f"round{rnd} worker{idx} 写入的碎片查不到：{key}"
+                assert row is not None, f"round{rnd} worker{idx} 写入的记忆条目查不到：{key}"
                 assert marker in row[0]
 
     deadlock = sum(1 for e in errors if "DeadlockDetected" in e or "deadlock" in e.lower())
@@ -534,7 +534,7 @@ def test_concurrent_store_with_reversed_input_never_deadlocks(warm, monkeypatch)
                 assert ok is True, f"round{rnd} worker{idx} 的写入未成功"
                 cur.execute("SELECT content FROM ks_fragment WHERE key = %s", (key,))
                 row = cur.fetchone()
-                assert row is not None, f"round{rnd} worker{idx} 写入的碎片查不到：{key}"
+                assert row is not None, f"round{rnd} worker{idx} 写入的记忆条目查不到：{key}"
                 assert marker in row[0]
                 _written_keys.append(key)
 
@@ -699,7 +699,7 @@ def test_deadlock_retry_is_bounded_and_fails_loudly(warm):
         f"期望上限 {storage_pg.DEADLOCK_RETRY_ATTEMPTS} 次事务，实际 {st.tx_count}"
     # 退避确实走了（0.2 与 0.4 各带 0.5~1.5 倍抖动 ⇒ 合计 ∈ [0.3, 0.9]s）
     assert 0.25 <= elapsed < 15, f"退避序列不对或挂死：{elapsed:.2f}s"
-    # 超限不许静默成功：库里绝不能有这条碎片
+    # 超限不许静默成功：库里绝不能有这条记忆条目
     with warm._ro() as cur:                       # noqa: SLF001
         cur.execute("SELECT 1 FROM ks_fragment WHERE key = %s", (key,))
         assert cur.fetchone() is None, "超限后却静默写入了 —— 吞异常等于假装成功"

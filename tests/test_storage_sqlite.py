@@ -1011,7 +1011,7 @@ def test_update_and_delete_keep_fts_in_sync(search_store):
 
     # 删 ⇒ 不再召回
     assert search_store.delete_fragments_batch([key]) == 1
-    assert search_store.search_bm25("A") == [], "删掉的碎片仍被召回（FTS 僵尸行）"
+    assert search_store.search_bm25("A") == [], "删掉的记忆条目仍被召回（FTS 僵尸行）"
 
     # 改 ⇒ 新词能召回、旧词召不回
     assert search_store.store("原始内容讲的是 A 主题", tags="shared") is True
@@ -1342,20 +1342,20 @@ def maint_store(tmp_path) -> SqliteStorage:
 # ---------------------------------------------------------------------------
 
 def test_consolidator_scans_unconsolidated_on_sqlite(maint_store):
-    """`_scan_unconsolidated` 在 SQLite 上要真扫得出待合并碎片（不是恒 0）。"""
+    """`_scan_unconsolidated` 在 SQLite 上要真扫得出待合并记忆条目（不是恒 0）。"""
     rows = [{"key": f"memory:frag:{i:04d}",
              "content": f"部署流程 第{i}步 网关 重启 连接池 重建 检查 证书 续签",
              "created": "2020-01-01T00:00:00+00:00"} for i in range(6)]
     rows.append({"key": "memory:frag:fresh",
-                 "content": "新碎片 网关 重启 连接池 重建 检查 证书 续签",
+                 "content": "新记忆条目 网关 重启 连接池 重建 检查 证书 续签",
                  "created": "2999-01-01T00:00:00+00:00"})   # 太新 ⇒ 不该被扫进来
     assert maint_store.write_fragments_batch(rows) == len(rows)
 
     c = Consolidator(maint_store, min_group_size=3, max_age_hours=72)
     frags = c._scan_unconsolidated()
     keys = {f["_key"] for f in frags}
-    assert len(keys) == 6, f"应扫出 6 条老碎片，实际 {len(keys)}: {sorted(keys)}"
-    assert "memory:frag:fresh" not in keys, "太新的碎片不该进合并候选"
+    assert len(keys) == 6, f"应扫出 6 条老记忆条目，实际 {len(keys)}: {sorted(keys)}"
+    assert "memory:frag:fresh" not in keys, "太新的记忆条目不该进合并候选"
     # 已 consumed 的不参与（多级提炼时原料才不会被反复合并）
     assert all(f.get("fragment_type") != "consumed" for f in frags)
 
@@ -1379,7 +1379,7 @@ def test_consolidator_dry_run_reports_three_numbers_and_writes_nothing(maint_sto
 
 
 def test_consolidator_merges_and_marks_consumed_via_primitives(maint_store, monkeypatch):
-    """真合并：新碎片写入（level=2/category=consolidated）+ 旧碎片标 consumed_by/consumed_at。
+    """真合并：新记忆条目写入（level=2/category=consolidated）+ 旧记忆条目标 consumed_by/consumed_at。
 
     🔴 走的是 `consolidator.py` 里**后端无关**的那份逻辑（`_merge_group` →
     `write_fragments_batch` / `update_fragment_fields`）—— 本测试同时是
@@ -1424,7 +1424,7 @@ def test_maintenance_columns_judged_with_eq_empty_not_is_null(maint_store):
     任何 `IS NULL` 判据在这套 schema 上永远不成立 ⇒ 静默判错。
     """
     maint_store.write_fragments_batch(
-        [{"key": "memory:frag:a", "content": "一条普通碎片 网关 重启"}])
+        [{"key": "memory:frag:a", "content": "一条普通记忆条目 网关 重启"}])
     with maint_store._lock:
         cur = maint_store._db().cursor()
         for col in ("level", "consumed_by", "consumed_at"):
@@ -1470,7 +1470,7 @@ def test_forgetter_dry_run_reports_four_numbers_and_deletes_nothing(maint_store)
              "created": "2020-01-01T00:00:00+00:00",
              "sentiment_score": "0.0", "feedback_score": "0"}
             for i in range(5)]
-    rows.append({"key": "memory:frag:keep", "content": "正反馈碎片",
+    rows.append({"key": "memory:frag:keep", "content": "正反馈记忆条目",
                  "created": "2020-01-01T00:00:00+00:00", "feedback_score": "3"})
     rows.append({"key": "memory:frag:cons", "content": "已合并的高层条目",
                  "created": "2020-01-01T00:00:00+00:00", "fragment_type": "consolidated"})
@@ -1504,9 +1504,9 @@ def test_forgetter_protection_rules_match_backend_neutral_code(maint_store):
 
 
 def test_forgetter_feedback_weight_participates(maint_store):
-    """反馈权重参与判定：`min_feedback_score` 抬高 ⇒ 原本可遗忘的碎片转入受保护。"""
+    """反馈权重参与判定：`min_feedback_score` 抬高 ⇒ 原本可遗忘的记忆条目转入受保护。"""
     maint_store.write_fragments_batch(
-        [{"key": "memory:frag:zero", "content": "零反馈碎片",
+        [{"key": "memory:frag:zero", "content": "零反馈记忆条目",
           "created": "2020-01-01T00:00:00+00:00", "feedback_score": "0"}])
     loose = Forgetter(maint_store, max_age_days=1, min_feedback_score=0, dry_run=True).forget()
     assert loose["candidates"] == 1, loose
@@ -1530,7 +1530,7 @@ def test_forgetter_real_delete_goes_through_delete_primitives(maint_store):
     assert _rows(maint_store) == before - 4
     assert len(_frags(maint_store,
                       "SELECT key FROM ks_fragment WHERE key LIKE 'memory:frag:d%'")) == 0
-    # 🔴 FTS 僵尸行：主表删了索引没删 ⇒ 检索仍能召回一条取不回正文的碎片
+    # 🔴 FTS 僵尸行：主表删了索引没删 ⇒ 检索仍能召回一条取不回正文的记忆条目
     assert len(_frags(maint_store,
                       "SELECT frag_key FROM ks_fragment_fts WHERE frag_key LIKE 'memory:frag:d%'")) == 0
     assert len(_frags(maint_store,
@@ -1699,7 +1699,7 @@ def test_discover_synonyms_denoises_short_ascii_and_stopwords(maint_store):
     # 该滤的：被降噪判据滤掉的 token（含纯 ASCII 短词/内置虚词）一个都不许进表
     assert not (noise & terms), f"碎渣词混进了同义词表: {sorted(noise & terms)}"
     assert terms <= survivors, f"表里有没走降噪判据的词: {sorted(terms - survivors)}"
-    # 该进的：每条碎片都出现的候选词两两共现 >= min_co_occurrence ⇒ 必成对进表
+    # 该进的：每条记忆条目都出现的候选词两两共现 >= min_co_occurrence ⇒ 必成对进表
     assert survivors <= terms, f"该进的候选词没进表: {sorted(survivors - terms)}"
     # stats 自洽：表里几行就报几个词条
     assert stats["degraded"] == [], stats["degraded"]

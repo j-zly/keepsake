@@ -56,7 +56,7 @@ class FakeStorage:
         for i in range(DEMO_N):
             self.rows.append({
                 "key": f"memory:frag:demo{i:03d}",
-                "content": f"检索碎片第 {i} 条",
+                "content": f"检索记忆条目第 {i} 条",
                 "tags": "demo,shared",
                 "updated_at": f"2026-10-12T00:00:{i % 60:02d}+00:00",
             })

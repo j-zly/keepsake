@@ -49,7 +49,7 @@ def pg():
     """建表 + 实例；凭据写进实例但绝不打印。
 
     `is_primary=True`：默认 False 时检索的 WHERE 会带上「只搜 agent/shared」的
-    标签过滤，而本模块写入的碎片不带 agent 标签 ⇒ 必然零结果（与快照无关）。
+    标签过滤，而本模块写入的记忆条目不带 agent 标签 ⇒ 必然零结果（与快照无关）。
     """
     st = PgStorage(dsn=DSN, connect_timeout=30, is_primary=True)
     st.ensure_index()
@@ -129,7 +129,7 @@ def test_new_fragment_is_searchable_immediately(pg):
     text = "端到端可见性校验 栀子花标记 未来函数 回测 bar"
     key = _remember(pg, text)
     keys = [f["_key"] for f in pg.search_bm25("栀子花标记")]
-    assert key in keys, "刚写入的碎片在紧接着的 BM25 里查不到（快照陈旧或未生效）"
+    assert key in keys, "刚写入的记忆条目在紧接着的 BM25 里查不到（快照陈旧或未生效）"
 
 
 def test_supersede_and_correct_drop_corpus_snapshot(pg):

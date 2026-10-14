@@ -2,7 +2,7 @@
 
 覆盖 B 部分：
   a) 「可以的」窗口 → facts 空 → 零写入
-  b) 需求→pending 入库，后续「完成」fact → UPDATE 封旧、旧碎片不再被检索命中
+  b) 需求→pending 入库，后续「完成」fact → UPDATE 封旧、旧记忆条目不再被检索命中
   c) LLM 抛异常 → 窗口回落 v1 原文入库
   d) 超 max_calls → 回落
   e) 队列不丢对（shutdown 前排空）
@@ -66,7 +66,7 @@ class FakeStorage:
         self.stored: List[Dict[str, Any]] = []      # store() 调用记录
         self.search_calls: List[str] = []            # search_bm25 调用记录
         self.supersede_calls: List[Tuple[str, str]] = []  # (old, new) 记录
-        # 模拟碎片库（按 key 索引）
+        # 模拟记忆条目库（按 key 索引）
         self.fragments: Dict[str, Dict[str, Any]] = {}
         # 模拟 search 索引（按 content 关键词返回）
         self.search_index: Dict[str, List[str]] = {}  # token -> [frag_keys]
@@ -74,7 +74,7 @@ class FakeStorage:
         self.hset_calls: List[Tuple[str, str, Any]] = []
         self._client = _FakeRedisClient(self)
 
-    # --- 模拟 store(): 写一个碎片，记录 key + 内容 ---
+    # --- 模拟 store(): 写一个记忆条目，记录 key + 内容 ---
     def store(self, text: str, tags: str = "", category: str = "",
               source: str = "", fragment_type: str = "", **kwargs) -> bool:
         import hashlib
@@ -117,7 +117,7 @@ class FakeStorage:
                     agent_id: str = "", is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
         self.search_calls.append(query)
         tokens = self._tokenize(query)
-        # 统计每条碎片被命中次数（粗略 BM25）
+        # 统计每条记忆条目被命中次数（粗略 BM25）
         scores: Dict[str, int] = {}
         for tok in tokens:
             for k in self.search_index.get(tok, []):
@@ -129,7 +129,7 @@ class FakeStorage:
             frag = self.fragments.get(k)
             if frag is None:
                 continue
-            # 模拟「封边碎片不返回」
+            # 模拟「封边记忆条目不返回」
             if frag.get("superseded_by"):
                 continue
             # 模拟「consumed 不返回」
@@ -172,7 +172,7 @@ class FakeStorage:
 # ===========================================================================
 
 class TestExtractPhaseEmpty:
-    """纯确认短句窗口：提取相返回空数组 → pipeline 不写任何碎片。"""
+    """纯确认短句窗口：提取相返回空数组 → pipeline 不写任何记忆条目。"""
 
     def test_pure_confirmation_returns_no_facts(self):
         """「可以的」/「好」/「OK」等纯确认 → LLM 应返回空数组。"""
@@ -190,7 +190,7 @@ class TestExtractPhaseEmpty:
         assert result.facts_extracted == 0
         assert result.llm_calls == 1  # 提取相 1 次，更新相 0 次
         # 关键断言：零写入
-        assert len(st.stored) == 0, "纯确认窗口不应写任何碎片"
+        assert len(st.stored) == 0, "纯确认窗口不应写任何记忆条目"
         assert len(st.supersede_calls) == 0
 
     def test_mixed_short_and_meaningful_only_writes_meaningful(self):
@@ -230,7 +230,7 @@ class TestUpdateSupersedeFlow:
     """端到端：先存 pending 需求，再触发完成 fact → UPDATE 路径封旧。"""
 
     def _build_pipeline_with_existing(self, st: FakeStorage) -> Pipeline:
-        """构造一个已经存了「分页需求」碎片的 pipeline。"""
+        """构造一个已经存了「分页需求」记忆条目的 pipeline。"""
         st.store(
             text="用户要求做资金总览分页",
             tags="kind:pending,conversation",
@@ -240,7 +240,7 @@ class TestUpdateSupersedeFlow:
         return Pipeline(storage=st, llm_fn=lambda msgs, model: '{"action":"NOOP","target_key":""}')
 
     def test_update_phase_seals_old_fragment(self):
-        """完成 fact → UPDATE → 旧碎片被 supersede_fragment 标记，新碎片被 store。"""
+        """完成 fact → UPDATE → 旧记忆条目被 supersede_fragment 标记，新记忆条目被 store。"""
         st = FakeStorage()
         call_count = [0]
 
@@ -305,7 +305,7 @@ class TestUpdateSupersedeFlow:
         assert "已完成" in st.fragments.get(new_key, {}).get("text", "") or new_key.startswith("memory:frag:")
 
     def test_sealed_old_fragment_no_longer_in_search(self):
-        """UPDATE 后：旧碎片被封 → FakeStorage.search_bm25 自动剔除（模拟 v2 过滤）。"""
+        """UPDATE 后：旧记忆条目被封 → FakeStorage.search_bm25 自动剔除（模拟 v2 过滤）。"""
         st = FakeStorage()
         st.store(
             text="用户要求做资金总览分页",
@@ -327,13 +327,13 @@ class TestUpdateSupersedeFlow:
         p = Pipeline(storage=st, llm_fn=fake_llm)
         p._process_window([Turn("分页做完了", "OK", 0.0)], [])
 
-        # 现在再 search「分页」：旧碎片已被 supersede_by → search_bm25 不应返回它
+        # 现在再 search「分页」：旧记忆条目已被 supersede_by → search_bm25 不应返回它
         after = st.search_bm25("分页")
         keys = [c["_key"] for c in after]
-        assert old_key not in keys, "封边后的旧碎片不应再出现在检索结果"
+        assert old_key not in keys, "封边后的旧记忆条目不应再出现在检索结果"
 
     def test_delete_phase_seals_with_void(self):
-        """DELETE 路径：旧碎片 superseded_by='__void__'。"""
+        """DELETE 路径：旧记忆条目 superseded_by='__void__'。"""
         st = FakeStorage()
         st.store(
             text="矛盾的旧记忆",
@@ -358,9 +358,9 @@ class TestUpdateSupersedeFlow:
             [],
         )
         assert result.deletes == 1
-        # 旧碎片被 supersede_fragment(old, __void__)
+        # 旧记忆条目被 supersede_fragment(old, __void__)
         assert (old_key, VOID_KEY) in st.supersede_calls
-        # 验证旧碎片标了 superseded_by=__void__
+        # 验证旧记忆条目标了 superseded_by=__void__
         assert st.fragments[old_key]["superseded_by"] == VOID_KEY
 
 
@@ -688,12 +688,12 @@ class TestDefaults:
 # ===========================================================================
 
 class TestSaneTargetRejectsHallucinatedKey:
-    """_sane_target 校验：白名单 + exists 双保险。LLM 幻觉 key 不能 supersede 真碎片。"""
+    """_sane_target 校验：白名单 + exists 双保险。LLM 幻觉 key 不能 supersede 真记忆条目。"""
 
     def test_hallucinated_key_does_not_supersede_real_fragment(self):
-        """幻觉 key（不在候选 + exists=False）→ LLM 路径拒用，_find 兜底封真碎片属正常。"""
+        """幻觉 key（不在候选 + exists=False）→ LLM 路径拒用，_find 兜底封真记忆条目属正常。"""
         st = FakeStorage()
-        # 库里已有真碎片（不能被幻觉 key 误封）
+        # 库里已有真记忆条目（不能被幻觉 key 误封）
         st.store(
             text="用户要求做资金总览分页",
             tags="kind:pending,conversation",
@@ -701,7 +701,7 @@ class TestSaneTargetRejectsHallucinatedKey:
             source="pipeline_v2",
         )
         real_key = list(st.fragments.keys())[0]
-        assert st._client.exists(real_key) == 1  # 真碎片存在
+        assert st._client.exists(real_key) == 1  # 真记忆条目存在
 
         # 验证：模拟 LLM 幻觉一个不存在的 key
         hallucinated_key = "memory:frag:deadbeef9999"
@@ -733,14 +733,14 @@ class TestSaneTargetRejectsHallucinatedKey:
             f"幻觉 key 不应被 hset 触及：{st.hset_calls}"
         )
         # 退化行为：UPDATE 找不到合法 target_key（_find 可能找到 real_key 属正常路径）
-        # 但本测试要求 _find 也找不到（库外碎片不在 _find 的搜索路径上 → 退化 ADD）
+        # 但本测试要求 _find 也找不到（库外记忆条目不在 _find 的搜索路径上 → 退化 ADD）
         # 这里 _find 仍可能命中 real_key；测试只断言幻觉 key 未被用 + 新事实入库
         assert any("已完成" in s["text"] for s in st.stored), (
             f"应入库新事实，实际 {st.stored}"
         )
 
     def test_hallucinated_key_with_empty_storage_degrades_to_add(self):
-        """空库 + 幻觉 key → 既不封任何碎片，也不产生半壳键，退化 ADD。"""
+        """空库 + 幻觉 key → 既不封任何记忆条目，也不产生半壳键，退化 ADD。"""
         st = FakeStorage()
         hallucinated_key = "memory:frag:deadbeef9999"
 
@@ -769,7 +769,7 @@ class TestSaneTargetRejectsHallucinatedKey:
     def test_key_outside_candidates_even_if_exists_is_rejected(self):
         """库里真实存在但不在本次候选的 key → 同样拒（白名单硬约束）。"""
         st = FakeStorage()
-        # 两个真碎片，但只把其中一个展示给 LLM
+        # 两个真记忆条目，但只把其中一个展示给 LLM
         st.store(text="用户要求做资金总览分页", category="fact_v2")
         st.store(text="完全不相关的另一主题", category="fact_v2")
         all_keys = list(st.fragments.keys())
@@ -809,7 +809,7 @@ class TestSaneTargetRejectsHallucinatedKey:
         assert unrelated_key not in supersede_keys, (
             f"白名单外 key 不应被 supersede，实际 {st.supersede_calls}"
         )
-        # 退化 ADD（找不到白名单内的合法 target；_find 可能命中真碎片属正常）
+        # 退化 ADD（找不到白名单内的合法 target；_find 可能命中真记忆条目属正常）
         assert any("已完成" in s["text"] for s in st.stored)
 
     def test_sane_target_unit_pure(self):
@@ -885,7 +885,7 @@ class TestBlindFallbackRemoved:
         assert old_key in supersede_keys, (
             f"_find 兜底应封 old_key，实际 supersede_keys={supersede_keys}"
         )
-        # 真碎片被 supersede
+        # 真记忆条目被 supersede
         assert st.fragments[old_key].get("superseded_by") is not None
 
     def test_find_returns_none_when_top_result_missing_degrades_to_add(self):
@@ -935,7 +935,7 @@ class TestBlindFallbackRemoved:
     def test_no_candidates_and_empty_target_degrades_to_add(self):
         """无候选 + target_key 空 → ADD（避免静默丢）。"""
         st = FakeStorage()
-        # 不预存任何碎片 → candidates 为空
+        # 不预存任何记忆条目 → candidates 为空
 
         call_count = [0]
 
@@ -1042,14 +1042,14 @@ class TestEndToEndWithFixes:
         assert result.noops == 1
         assert result.adds == 0
         assert result.updates == 0
-        # 关键：真碎片未被 supersede
+        # 关键：真记忆条目未被 supersede
         assert "superseded_by" not in st.fragments[real_key]
         assert len(st.supersede_calls) == 0
 
     def test_hallucinated_key_does_not_create_half_shell(self):
         """LLM 幻觉 key → 不得对幻觉 key 产生任何 hset（半壳键的核心防御）。"""
         st = FakeStorage()
-        # 库里**没有**任何候选碎片（保证 candidates 为空 → _find 也 None → ADD）
+        # 库里**没有**任何候选记忆条目（保证 candidates 为空 → _find 也 None → ADD）
         hallucinated_key = "memory:frag:deadbeef9999"
 
         call_count = [0]

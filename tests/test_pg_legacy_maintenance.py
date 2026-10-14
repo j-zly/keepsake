@@ -159,7 +159,7 @@ def _no_leftover_probe_schemas():
 
 
 def _seed(dsn: str, n: int = 4) -> None:
-    """写入 n 条**够老**、同话题的碎片（合并/遗忘两条路径都要能被扫到）。"""
+    """写入 n 条**够老**、同话题的记忆条目（合并/遗忘两条路径都要能被扫到）。"""
     from datetime import datetime, timedelta, timezone
     old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
     with psycopg.connect(dsn, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
@@ -309,5 +309,5 @@ def test_legacy_db_forget_real_run_deletes_only_rows(probe):
 
     stats = Forgetter(storage, max_age_days=30, dry_run=True).forget(force=True)
 
-    assert stats["deleted"] == before, "自造的碎片全都够老够低价值 ⇒ 应全删"
+    assert stats["deleted"] == before, "自造的记忆条目全都够老够低价值 ⇒ 应全删"
     assert _rowcount(dsn) == 0

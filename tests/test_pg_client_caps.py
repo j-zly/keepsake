@@ -38,7 +38,7 @@ if not (dsn and ALLOWED_HOST in dsn and ALLOWED_DBNAME in dsn):
 
 _WROTE_KEYS: List[str] = []
 # 每轮唯一：残留数据来自上一轮时不会撞 key（撞了会触发 store() 的版本化，
-# 把碎片写成 `key:<epoch>`，让 rank1 的 key 断言看起来像失败）。
+# 把记忆条目写成 `key:<epoch>`，让 rank1 的 key 断言看起来像失败）。
 _TOKEN = f"kspclicheck{uuid.uuid4().hex[:10]}"
 
 
@@ -87,7 +87,7 @@ def _key_for(text: str) -> str:
 # --------------------------------------------------------------------------
 
 def test_r6_dedup_probe_works_on_pg(pg):
-    """同一内容连写两次：第二次必须被判为「既有碎片」并走 update_state。"""
+    """同一内容连写两次：第二次必须被判为「既有记忆条目」并走 update_state。"""
     from keepsake.ingest_gate import decide, update_state_only
 
     text = f"用户偏好用 PostgreSQL 存记忆 {_TOKEN} 第一条"

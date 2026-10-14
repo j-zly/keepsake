@@ -210,10 +210,10 @@ def _make_storage(initial_hashes: Dict[str, Dict[str, str]] = None,
 # ===========================================================================
 
 class TestConsumedSupersededFilter:
-    """search() 路径统一排除 consumed 与 superseded 碎片。"""
+    """search() 路径统一排除 consumed 与 superseded 记忆条目。"""
 
     def test_active_fragment_is_returned(self):
-        """未被消耗/封边的正常碎片应被返回。"""
+        """未被消耗/封边的正常记忆条目应被返回。"""
         s, client = _make_storage(initial_search=[
             {"_key": "memory:frag:abc", "content": "用户决定部署A方案",
              "_score": 1.5},
@@ -223,7 +223,7 @@ class TestConsumedSupersededFilter:
         assert out[0]["content"] == "用户决定部署A方案"
 
     def test_consumed_fragment_is_filtered(self):
-        """fragment_type=consumed 的碎片（被 consolidator 蒸馏吞掉的）应被剔除。"""
+        """fragment_type=consumed 的记忆条目（被 consolidator 蒸馏吞掉的）应被剔除。"""
         s, client = _make_storage(initial_search=[
             {"_key": "memory:frag:abc", "content": "用户决定部署A方案",
              "fragment_type": "consumed", "_score": 1.5},
@@ -232,8 +232,8 @@ class TestConsumedSupersededFilter:
         assert out == []
 
     def test_superseded_fragment_is_filtered(self):
-        """superseded_by 非空的碎片（pipeline 封边的）应被剔除。"""
-        # 关键：search_bm25 已经返回这个碎片，但 search() 的 _apply_v2_filters
+        """superseded_by 非空的记忆条目（pipeline 封边的）应被剔除。"""
+        # 关键：search_bm25 已经返回这个记忆条目，但 search() 的 _apply_v2_filters
         # 应该通过 _key 读 superseded_by 字段并排除
         s, client = _make_storage(
             initial_search=[
@@ -305,7 +305,7 @@ class TestConsumedSupersededFilter:
 # ===========================================================================
 
 class TestMinScoreFloor:
-    """v2_min_score 阈值：低于此值的碎片不注入。"""
+    """v2_min_score 阈值：低于此值的记忆条目不注入。"""
 
     def test_default_min_score_is_0p05(self):
         """默认 v2_min_score = 0.05（经验值）。"""
@@ -313,7 +313,7 @@ class TestMinScoreFloor:
         assert s._v2_min_score == 0.05
 
     def test_low_sim_fragment_filtered_out(self):
-        """sim < 地板值的碎片应被剔除。
+        """sim < 地板值的记忆条目应被剔除。
 
         设计：两个结果，BM25 归一化后 _sim 分别 1.0（高分）和 0.05（低分），
         floor=0.1 时低分应被剔除。
@@ -333,7 +333,7 @@ class TestMinScoreFloor:
         assert out[0]["_key"] == "memory:frag:top"
 
     def test_high_sim_fragment_kept(self):
-        """sim >= 地板值的碎片应保留。"""
+        """sim >= 地板值的记忆条目应保留。"""
         s, client = _make_storage(
             initial_search=[
                 {"_key": "memory:frag:abc", "content": "相关记忆",

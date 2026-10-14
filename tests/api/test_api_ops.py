@@ -47,9 +47,9 @@ SEED: List[Dict[str, Any]] = [
      "tags": "core,ops", "created": "2026-01-01T00:00:00+00:00"},
     {"key": "memory:frag:bbb", "content": "常驻记忆 B：值班联系人",
      "tags": "core,ops", "created": "2026-01-01T00:00:00+00:00"},
-    {"key": "memory:frag:ccc", "content": "检索碎片 C：临时笔记",
+    {"key": "memory:frag:ccc", "content": "检索记忆条目 C：临时笔记",
      "tags": "demo", "created": "2026-01-01T00:00:00+00:00"},
-    {"key": "memory:frag:ddd", "content": "检索碎片 D：旧版本排查",
+    {"key": "memory:frag:ddd", "content": "检索记忆条目 D：旧版本排查",
      "tags": "demo,stale", "created": "2026-01-01T00:00:00+00:00"},
 ]
 
@@ -188,7 +188,7 @@ def test_update_改正文与标签(client, storage, backup_dir):
     assert row["content"] == "改过的正文" and row["tags"] == "demo,edited"
     # 备份是**改前**原文
     bak = json.loads(next(backup_dir.rglob("*.before.json")).read_text(encoding="utf-8"))
-    assert bak["row"]["content"] == "检索碎片 C：临时笔记"
+    assert bak["row"]["content"] == "检索记忆条目 C：临时笔记"
 
 
 def test_update_只改正文_标签不动(client, storage):
@@ -203,7 +203,7 @@ def test_update_正文tags都空_400(client, storage, audit_dir):
     r = client.post("/api/v1/fragments/memory:frag:ccc/update",
                     json={"confirm": True}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "nothing_to_update"
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
     assert audit_lines(audit_dir)[-1]["reason"] == "nothing_to_update"
 
 
@@ -212,14 +212,14 @@ def test_update_空白正文按没填处理_不清空记忆(client, storage):
     r = client.post("/api/v1/fragments/memory:frag:ccc/update",
                     json={"confirm": True, "content": "   ", "tags": "  "}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "nothing_to_update"
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
 
 
 def test_update_缺confirm_400(client, storage):
     r = client.post("/api/v1/fragments/memory:frag:ccc/update",
                     json={"content": "偷偷改"}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
 
 
 def test_update_不存在的key_404(client):
@@ -239,7 +239,7 @@ def test_update_存储层拒绝_500且明确报错(monkeypatch, storage, audit_d
                    json={"confirm": True, "content": "x"}, headers=AUTH)
     app.dependency_overrides.clear()
     assert r.status_code == 500 and r.json()["detail"]["error"] == "update_failed"
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
 
 
 # ---------------------------------------------------------------- archive
@@ -398,7 +398,7 @@ def test_备份目录按日期分区(client, backup_dir):
     assert day_dir.is_dir()
     bak = json.loads((day_dir / "memory:frag:ddd.before.json").read_text("utf-8"))
     assert bak["key"] == "memory:frag:ddd"
-    assert bak["row"]["content"] == "检索碎片 D：旧版本排查"
+    assert bak["row"]["content"] == "检索记忆条目 D：旧版本排查"
     assert bak["row"]["tags"] == "demo,stale"          # 归档**前**的标签
 
 
@@ -416,7 +416,7 @@ def test_备份失败_写操作中止(storage, audit_dir, backup_dir, monkeypatc
                    json={"confirm": True, "content": "改了"}, headers=AUTH)
     app.dependency_overrides.clear()
     assert r.status_code == 500
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
 
 
 def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backup_dir, monkeypatch):
@@ -432,7 +432,7 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
                    json={"confirm": True, "content": "改了"}, headers=AUTH)
     app.dependency_overrides.clear()
     assert r.status_code == 500
-    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索碎片 C：临时笔记"
+    assert storage.get_fragment("memory:frag:ccc")["content"] == "检索记忆条目 C：临时笔记"
 
 
 # ---------------------------------------------------------------- 只读不回退

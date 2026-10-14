@@ -140,7 +140,7 @@ def test_scan_respects_limit_and_returns_keys():
 
 def test_scan_prefix_memory_full_is_empty_on_both_backends():
     """`memory:full:*` 无写方（A 门取证）⇒ 扫描恒空，Redis/PG 都一样。"""
-    s = FakeStorage(_rows("碎片A", "碎片B"))
+    s = FakeStorage(_rows("记忆条目A", "记忆条目B"))
     cursor, keys = s.scan_fragment_keys(prefix="memory:full:")
     assert keys == [] and cursor == ""
 
@@ -179,7 +179,7 @@ def test_consolidate_dry_run_writes_nothing(monkeypatch):
 
 
 def test_consolidate_marks_sources_consumed(monkeypatch):
-    """真跑：新碎片落库 + 原料三字段（consumed_by/at/fragment_type）都写。"""
+    """真跑：新记忆条目落库 + 原料三字段（consumed_by/at/fragment_type）都写。"""
     rows = _rows(
         "PostgreSQL 索引 优化 数据库",
         "PostgreSQL 索引 优化 数据库 性能",
@@ -204,10 +204,10 @@ def test_consolidate_marks_sources_consumed(monkeypatch):
 
 
 def test_consolidate_skips_recent_fragments(monkeypatch):
-    """太新的碎片不参与（本轮不动它们）。"""
+    """太新的记忆条目不参与（本轮不动它们）。"""
     rows = _rows(
-        "新 碎片 内容 关键词",
-        "新 碎片 内容 关键词 第二个",
+        "新 记忆条目 内容 关键词",
+        "新 记忆条目 内容 关键词 第二个",
     )
     for r in rows.values():
         r["created"] = _old(0.001)      # 1 分钟前，远小于 max_age_hours
@@ -221,8 +221,8 @@ def test_consolidate_skips_recent_fragments(monkeypatch):
 
 def test_consolidate_skips_already_consumed(monkeypatch):
     rows = _rows(
-        "已经 被 吞掉 的 碎片 内容",
-        "已经 被 吞掉 的 碎片 内容 两条",
+        "已经 被 吞掉 的 记忆条目 内容",
+        "已经 被 吞掉 的 记忆条目 内容 两条",
     )
     for r in rows.values():
         r["fragment_type"] = "consumed"

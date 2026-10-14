@@ -30,7 +30,7 @@ ENV_PATH = Path.home() / ".keepsake_pg_test.env"
 ALLOWED_HOST = "8.140.192.91"
 ALLOWED_DBNAME = "keepsake_test"
 
-# 本次运行写入的所有碎片 key（teardown 按 key 清；整表不 TRUNCATE —— 那是别人的库）
+# 本次运行写入的所有记忆条目 key（teardown 按 key 清；整表不 TRUNCATE —— 那是别人的库）
 _WROTE_KEYS: list[str] = []
 _TOPICS: list[str] = []
 
@@ -74,14 +74,14 @@ def _cleanup(pg):
     语料里的 `无关` 会**永久留在热词榜**里，下一轮跑
     `test_hot_topics_and_match` 的 `match_hot_topics("完全无关的句子 xyzzy") == 0.0`
     必然红 —— 而且与被测代码无关，是上一轮遗留的数据把这一轮判死的。
-    所以这里在删碎片**之前**先按 key 取回正文，把它们的关键词一并清掉。
+    所以这里在删记忆条目**之前**先按 key 取回正文，把它们的关键词一并清掉。
 
     🔴 2026-10 ks_testiso 补的四处漏网（取证见 /tmp/ks_testiso_rootcause.txt）：
       1. `ks_entity_cooc` —— **从来没被任何 fixture 删过**，只增不减（实测涨到 3052 行）。
          `store()` 的 `_record_entity_cooc` 会把正文抽出的实体两两配对永久写进去。
       2. `ks_entity_timeline` 孤儿 —— 只删 `frag_key = ANY(_WROTE_KEYS)`，
          但 store() 写的 timeline 行在版本化场景下会对不上，实测攒下 **515 行孤儿**
-         （frag_key 指向早已删除的碎片，100% 孤儿率）。
+         （frag_key 指向早已删除的记忆条目，100% 孤儿率）。
       3. **大小写**：`_record_attention` 存的是 `kw.lower().strip()`，而这里按
          **原样 kw** 删 ⇒ 含大写字母的英文关键词（`PostgreSQL` → `postgresql`）删不掉。
       4. `_TOPICS` / `_WROTE_KEYS` 是模块级 list：某个用例中途失败时不会被清，
@@ -135,7 +135,7 @@ def _cleanup(pg):
             """, (keys, keys, [f"{k}:%" for k in keys],
                   all_topics or [""], all_topics or [""], all_topics or [""]))
             frag_res, topic_res = cur.fetchone()
-            assert frag_res == 0, f"碎片/时间线残留 {frag_res} 行，teardown 没清干净"
+            assert frag_res == 0, f"记忆条目/时间线残留 {frag_res} 行，teardown 没清干净"
             assert topic_res == 0, f"榜单残留 {topic_res} 行，teardown 没清干净"
         if pairs:
             cur.execute("SELECT count(*) FROM ks_entity_cooc WHERE pair = ANY(%s)", (pairs,))
@@ -564,7 +564,7 @@ def test_bm25_hits_the_relevant_fragment(pg_search):
     _TOPICS.append(marker)
 
     res = pg_search.search_bm25(f"数据库迁移 {marker}")
-    assert res, f"BM25 应当命中本轮写入的碎片（marker={marker}）"
+    assert res, f"BM25 应当命中本轮写入的记忆条目（marker={marker}）"
     # 🔴 只在**自己 seed 的那批**里判第一（排名依赖全库是设计如此，
     #    库里别人的行排前面不代表 BM25 有错 —— 同 ks_testiso hybrid 用例）
     assert _bm25_top_of(res, keys) == "数据库迁移方案"
@@ -593,7 +593,7 @@ def test_bm25_sanitize_splits_path_and_hyphen_terms(pg_search):
     assert {"home", "claude", "user", "trade", "platform"} <= set(parts), parts
     assert "/home/claude_user/trade-platform/" not in parts
 
-    # 集成级：查整条路径不抛语法错，且靠拆出的子词命中到那条含 claude_user 的碎片。
+    # 集成级：查整条路径不抛语法错，且靠拆出的子词命中到那条含 claude_user 的记忆条目。
     # 🔴 这是**共享测试库**：别的行合法命中同一批子词（残留/并行写入）不该判红 ——
     # 原意只要求「自己这条必须命中且唯一 + 结果无重复 key」，不要求库里只有它自己。
     keys_hit = [r["_key"] for r in
@@ -713,7 +713,7 @@ def test_search_agent_isolation(pg_search):
     seen = {r["content"] for r in pg_search.search(f"私密记忆 {marker}",
                                                    agent_id="alpha", is_primary=False)}
     assert mine in seen
-    assert other not in seen, "别的 agent 的碎片不该被看到"
+    assert other not in seen, "别的 agent 的记忆条目不该被看到"
 
 
 def test_empty_query_is_explicit_not_silent(pg_search, caplog):

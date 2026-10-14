@@ -46,7 +46,7 @@ class KeepsakeMCPProvider(KeepsakeProvider):
         return list(self._require_storage().list_by_tag("core"))
 
     def count_fragments(self) -> int:
-        """当前碎片总数（`memory_forget` 的 confirm 凭据）。
+        """当前记忆条目总数（`memory_forget` 的 confirm 凭据）。
 
         `ponytail:` 存储层没有 count 原语，只能 keyset 扫描 —— 本库几千行，
         一次工具调用扫一遍完全可接受。上限 `_count_fragments` 侧会显式拒绝，

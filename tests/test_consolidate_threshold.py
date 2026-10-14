@@ -1,6 +1,6 @@
 """合并聚类阈值（`consolidate_min_overlap` / `consolidate_min_group`）行为固化（2026-10 ks_cth）。
 
-背景：`_cluster_by_topic` 的判据原为裸字面量「重叠 >= 2 即同组」，生产同批 2819 条碎片
+背景：`_cluster_by_topic` 的判据原为裸字面量「重叠 >= 2 即同组」，生产同批 2819 条记忆条目
 实测真并占比 53.1%（阈值 2）→ 13.2%（阈值 3）→ 2.1%（阈值 4）。本文件把
 **默认阈值 3** 固化成必测，并锁住非法配置的回落语义。
 
@@ -18,7 +18,7 @@
 ================================================================================
 🔴 为什么本文件的测试数据是「哑词」而不是自然语言（2026-10 ks_ctt 修订）
 ================================================================================
-上一版用中文自然句当碎片，并把「族内相对族首的重叠 = 2/3/4」写死成断言。
+上一版用中文自然句当记忆条目，并把「族内相对族首的重叠 = 2/3/4」写死成断言。
 那在**主脑机器上 6 条红**（本机全绿）。根因已定位并留证（/tmp/ks_ctt_audit.txt）：
 
     src/keepsake/splitter.py:24-25 的 `init_domain_dict()` 在 **import 时**无条件执行
@@ -94,7 +94,7 @@ ALL_FAMILIES = [FAMILY_OVERLAP2, FAMILY_OVERLAP3, FAMILY_OVERLAP4]
 
 
 def _make_storage(families) -> FakeStorage:
-    """把若干族铺成碎片行（created 取 200 天前 ⇒ 必过任何 max_age_hours 门槛）。"""
+    """把若干族铺成记忆条目行（created 取 200 天前 ⇒ 必过任何 max_age_hours 门槛）。"""
     return FakeStorage(_rows(*[c for fam in families for c in fam]))
 
 
@@ -399,7 +399,7 @@ class TestDryRunZeroWrite:
         st = _make_storage(ALL_FAMILIES)
         before = {k: dict(v) for k, v in st.rows.items()}
         Consolidator(st).consolidate(dry_run=True)
-        assert st.writes == [], f"dry-run 不许写新碎片，实际写了 {st.writes}"
+        assert st.writes == [], f"dry-run 不许写新记忆条目，实际写了 {st.writes}"
         assert st.updates == [], f"dry-run 不许改原料字段，实际改了 {st.updates}"
         assert st.deletes == [], f"dry-run 不许删，实际删了 {st.deletes}"
         assert st.rows == before, "dry-run 后行内容必须逐字不变"

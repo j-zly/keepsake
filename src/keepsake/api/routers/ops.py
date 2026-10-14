@@ -151,7 +151,7 @@ def _load(storage: Any, key: str, action: str) -> Dict[str, Any]:
     """取改前原文；不存在 ⇒ 404（并留痕）。"""
     row = storage.get_fragment(key)
     if not row:
-        _reject(404, "not_found", f"碎片不存在：{key}", action, key)
+        _reject(404, "not_found", f"记忆条目不存在：{key}", action, key)
     return row
 
 
@@ -191,7 +191,7 @@ def _now_iso() -> str:
 @router.post("/api/v1/core/{key}/promote", dependencies=[Depends(require_session), Depends(write_guard)])
 def promote_core(key: str, body: ConfirmFlag,
                  storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """给碎片打上 `core` 标签（升常驻）。已是常驻 ⇒ 409。"""
+    """给记忆条目打上 `core` 标签（升常驻）。已是常驻 ⇒ 409。"""
     action = "core.promote"
     _need_flag(body.confirm, action, key, '升常驻必须显式传 {"confirm": true}')
     row = _load(storage, key, action)
@@ -207,7 +207,7 @@ def promote_core(key: str, body: ConfirmFlag,
 @router.post("/api/v1/core/{key}/demote", dependencies=[Depends(require_session), Depends(write_guard)])
 def demote_core(key: str, body: ConfirmFlag,
                 storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """去掉碎片上的 `core` 标签（降常驻）。不在常驻 ⇒ 409。"""
+    """去掉记忆条目上的 `core` 标签（降常驻）。不在常驻 ⇒ 409。"""
     action = "core.demote"
     _need_flag(body.confirm, action, key, '降常驻必须显式传 {"confirm": true}')
     row = _load(storage, key, action)
@@ -221,7 +221,7 @@ def demote_core(key: str, body: ConfirmFlag,
 
 
 # --------------------------------------------------------------------------
-# 碎片改 / 归档
+# 记忆条目改 / 归档
 # --------------------------------------------------------------------------
 
 @router.post("/api/v1/fragments/{key}/update", dependencies=[Depends(require_session), Depends(write_guard)])
@@ -233,7 +233,7 @@ def update_fragment(key: str, body: UpdateBody,
     且没法从语义上区分「想清空」与「忘了填」）。真要清空走归档。
     """
     action = "fragment.update"
-    _need_flag(body.confirm, action, key, '改碎片必须显式传 {"confirm": true}')
+    _need_flag(body.confirm, action, key, '改记忆条目必须显式传 {"confirm": true}')
     row = _load(storage, key, action)
     fields: Dict[str, Any] = {}
     if (body.content or "").strip():
@@ -315,7 +315,7 @@ def _core_count(storage: Any) -> int:
 
 
 def _total_count(storage: Any) -> int:
-    """当前碎片总数（`GET /api/v1/stats` 的 retrieval.count 同一口径）。"""
+    """当前记忆条目总数（`GET /api/v1/stats` 的 retrieval.count 同一口径）。"""
     _, keys = storage.scan_fragment_keys("", config.RETRIEVAL_SCAN_CAP)
     return len(keys)
 
@@ -365,7 +365,7 @@ def ops_merge(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[st
 def ops_forget(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """选择性遗忘（Forgetter）。**默认 dry-run，零写入**。
 
-    实跑必须带 `confirm="<当前碎片总数>"`（取 `GET /api/v1/stats` 的
+    实跑必须带 `confirm="<当前记忆条目总数>"`（取 `GET /api/v1/stats` 的
     `retrieval.count`）。实跑前同样先落 dry-run 报告 + 受影响 keys 全量导出。
     物理删除由 Forgetter 经 `storage.delete_fragments_batch` 完成。
     """
@@ -373,7 +373,7 @@ def ops_forget(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[s
 
     action, target = "ops.forget", "all"
     expect = _need_count_confirm(body, lambda: _total_count(storage), action, target,
-                                 "当前碎片总数", "GET /api/v1/stats 的 retrieval.count")
+                                 "当前记忆条目总数", "GET /api/v1/stats 的 retrieval.count")
 
     # Forgetter 构造默认 dry_run=True ⇒ forget() 不删；force=True 才真删
     engine = Forgetter(storage)

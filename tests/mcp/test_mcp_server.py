@@ -320,7 +320,7 @@ def test_单条资源返回全文(server):
     key = call(server, "memory_add", text="单条资源 探针")["key"]
     assert json.loads(read_resource(server, f"memory://fragment/{key}"))["content"] == "单条资源 探针"
     # 模板资源取不到时 SDK 会把内部异常包一层 ValueError —— 语义仍是「报错，不是空 ok」
-    with pytest.raises((ToolError, ValueError), match="碎片不存在"):
+    with pytest.raises((ToolError, ValueError), match="记忆条目不存在"):
         read_resource(server, "memory://fragment/memory:frag:不存在")
 
 

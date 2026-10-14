@@ -34,7 +34,7 @@ SHORT_PWD = "short"
 SEED: list = [
     {"key": "memory:frag:aaa", "content": "常驻记忆 A", "tags": "core",
      "created": "2026-01-01T00:00:00+00:00"},
-    {"key": "memory:frag:bbb", "content": "检索碎片 B", "tags": "demo",
+    {"key": "memory:frag:bbb", "content": "检索记忆条目 B", "tags": "demo",
      "created": "2026-01-01T00:00:00+00:00"},
 ]
 
