@@ -56,3 +56,25 @@ test('列表走卡片网格：.card-grid 在 tokens.css 且三档断点都在', 
   assert.match(CSS, /@media \(max-width: 1200px\)[\s\S]{0,120}card-grid/)
   assert.match(CSS, /@media \(max-width: 900px\)[\s\S]{0,120}card-grid/)
 })
+
+test('要读的元素不用装饰色：.card-time 挂 --text-faint 而不是 --text-ghost', () => {
+  // --text-ghost 白底只有 2.80:1，是纯装饰/占位色。时间是要读的，掉了就看不清。
+  const rule = CSS.match(/\.card-time\s*\{([^}]*)\}/)
+  assert.ok(rule, '.card-time 规则不见了')
+  const color = rule[1].match(/color:\s*var\((--[\w-]+)\)/)
+  assert.ok(color, '.card-time 的 color 必须走令牌')
+  assert.notEqual(color[1], '--text-ghost', `.card-time 是要读的时间，不能用装饰色 ${color[1]}`)
+  assert.equal(color[1], '--text-faint')
+})
+
+test('同排卡片等高：grid stretch + .card height:100% + .card-foot 压底三件套都在', () => {
+  assert.match(CSS, /\.card-grid\s*\{[^}]*align-items:\s*stretch/, '.card-grid 必须 stretch')
+  assert.match(CSS, /\.card\s*\{[^}]*height:\s*100%/, '.card 必须 height:100% 撑满行高')
+  assert.match(CSS, /\.card\s*\{[^}]*flex-direction:\s*column/, '.card 仍是 flex column')
+  assert.match(CSS, /\.card-foot\s*\{[^}]*margin-top:\s*auto/, '.card-foot 必须靠 margin-top:auto 压底')
+  // 卡内不许 align-self:start —— 那等于把 stretch 又关掉，等高会静默退化
+  assert.ok(
+    !/align-self:\s*start/.test(CSS.match(/\.card\s*\{([^}]*)\}/)[1]),
+    '.card 内不许 align-self:start，会破坏等高'
+  )
+})

@@ -119,16 +119,45 @@ test('tokens.css：暗色只在 [data-theme="dark"] 下生效', () => {
   assert.equal(bgOf(DARK_SEL), '#0b0d10')
 })
 
-test('对比度：浅色正文/次要文字 ≥4.5:1（WCAG AA）', () => {
+/** 某个主题块里「要读的文字」令牌（--text-ghost 是装饰色，不进这个名单） */
+const TEXT_TOKENS = ['text', 'text-dim', 'text-faint']
+/** 文字实际会落到的两种底：主底（--bg-elev）与面板底（--panel），面板更难达标 */
+const SURFACES = ['bg-elev', 'panel']
+
+test('对比度：浅色正文/次要/最弱文字 ≥4.5:1（WCAG AA）', (t) => {
   const light = CSS.slice(CSS.indexOf(':root {'), CSS.indexOf(DARK_SEL + ' {'))
   const g = (name) => new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`).exec(light)[1]
-  assert.ok(contrast(g('text'), g('bg-elev')) >= 4.5)
-  assert.ok(contrast(g('text-dim'), g('bg-elev')) >= 4.5)
+  for (const name of TEXT_TOKENS) {
+    for (const surf of SURFACES) {
+      const r = contrast(g(name), g(surf))
+      t.diagnostic(`浅色 --${name} ${g(name)} on --${surf} ${g(surf)} = ${r.toFixed(2)}:1`)
+      assert.ok(r >= 4.5, `浅色 --${name} 在 --${surf} 上只有 ${r.toFixed(2)}:1`)
+    }
+  }
 })
 
-test('对比度：暗色正文/次要文字 ≥4.5:1（WCAG AA）', () => {
+test('对比度：暗色正文/次要/最弱文字 ≥4.5:1（WCAG AA）', (t) => {
   const dark = CSS.slice(CSS.indexOf(DARK_SEL + ' {'))
   const g = (name) => new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`).exec(dark)[1]
-  assert.ok(contrast(g('text'), g('bg-elev')) >= 4.5)
-  assert.ok(contrast(g('text-dim'), g('bg-elev')) >= 4.5)
+  for (const name of TEXT_TOKENS) {
+    for (const surf of SURFACES) {
+      const r = contrast(g(name), g(surf))
+      t.diagnostic(`暗色 --${name} ${g(name)} on --${surf} ${g(surf)} = ${r.toFixed(2)}:1`)
+      assert.ok(r >= 4.5, `暗色 --${name} 在 --${surf} 上只有 ${r.toFixed(2)}:1`)
+    }
+  }
+})
+
+test('对比度：--text-ghost 只作装饰用，两个主题里都存在（故意不比值）', (t) => {
+  // 装饰色（element-plus placeholder、分隔符、图标、禁用描边），白底仅 2.80:1，
+  // 规则是「不许承载可读信息」，而不是「不许比值低」—— 靠 ui-style 里那条
+  // .card-time 断言 + 用眼过一遍剩余引用来保证。
+  for (const [theme, src] of [
+    ['浅色', CSS.slice(CSS.indexOf(':root {'), CSS.indexOf(DARK_SEL + ' {'))],
+    ['暗色', CSS.slice(CSS.indexOf(DARK_SEL + ' {'))],
+  ]) {
+    const v = new RegExp(`--text-ghost:\\s*(#[0-9a-f]{6})`).exec(src)
+    assert.ok(v, `${theme} 块里少了 --text-ghost`)
+    t.diagnostic(`${theme} --text-ghost = ${v[1]}（装饰色，不做比值要求）`)
+  }
 })

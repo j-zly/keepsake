@@ -22,11 +22,15 @@
   --border-2: #e8e8ea;
   --line-3: #f0f0f0;
 
-  /* ---- 文字四档 ---- */
+  /* ---- 文字四档 ----
+   * 分工是硬约定，不是「深浅好看」：text / text-dim / text-faint 三档都是**要读的文字**，
+   * 在最差底色（--panel 浅灰）上仍须 ≥4.5:1；--text-ghost 只许给纯装饰与占位符
+   * （element-plus placeholder、分隔符、图标、禁用态描边），永远不许承载可读信息。
+   * tests/theme.test.mjs 会把这条当断言跑。 */
   --text: #1a1a1a;
   --text-dim: #555555;
-  --text-faint: #7a7a7e;
-  --text-ghost: #9a9a9e;
+  --text-faint: #666d78; /* 5.22:1 白底 / 4.79:1 浅灰底 */
+  --text-ghost: #9a9a9e; /* 装饰专用，不做对比度承诺 */
 
   /* ---- 强调色（唯一彩色）与状态 ---- */
   --accent: #2f6bff;
@@ -84,8 +88,8 @@
 
   --text: #eef1f6;
   --text-dim: #a7b0be;
-  --text-faint: #7c8697;
-  --text-ghost: #6b7280;
+  --text-faint: #7c8697; /* 4.98:1 暗底 #12151a */
+  --text-ghost: #6b7280; /* 装饰专用 */
 
   --accent: #5b8cff;
   --accent-soft: #16233d;
@@ -527,10 +531,14 @@ html.dark {
   cursor: not-allowed;
 }
 
-/* 卡片网格：≥1200 三列 / 900–1200 两列 / <900 单列，间距 20 */
+/* 卡片网格：≥1200 三列 / 900–1200 两列 / <900 单列，间距 20
+ * align-items: stretch 是等高的地基：同排卡片一律拉到行高，摘要长短不同也不会
+ * 让底下的操作行错开一截。卡内任何区块都不许写 align-self:start 去救场，
+ * 那会把 stretch 又关掉。 */
 .card-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
   gap: 20px;
 }
 @media (max-width: 1200px) {
@@ -544,10 +552,14 @@ html.dark {
   }
 }
 
-/* 卡片：白底 16px 圆角 + 1px 描边，hover 只升阴影 */
+/* 卡片：白底 16px 圆角 + 1px 描边，hover 只升阴影
+ * height:100% 接住 grid 的 stretch（stretch 会拉伸 grid item 的行高，
+ * 显式钉死免得哪天有人把 item 改成别的布局方式时静默退化）；
+ * 配 .card-foot{margin-top:auto} 把操作行压到卡片底部，同排就在同一水平线。 */
 .card {
   display: flex;
   flex-direction: column;
+  height: 100%;
   gap: 12px;
   padding: 20px;
   background: var(--bg-elev);
@@ -569,7 +581,7 @@ html.dark {
 }
 .card-time {
   flex: none;
-  color: var(--text-ghost);
+  color: var(--text-faint);
   font-size: 12px;
 }
 /* 正文摘要：14px、行高 1.6、最多 3 行 */
@@ -714,7 +726,7 @@ html.dark {
 }
 .stat-value .unit {
   margin-left: 4px;
-  color: var(--text-ghost);
+  color: var(--text-faint);
   font-size: 13px;
   font-weight: 400;
   letter-spacing: 0;
@@ -921,7 +933,7 @@ code {
   color: var(--text);
 }
 .pager .pg:disabled {
-  color: var(--text-ghost);
+  color: var(--text-faint);
   cursor: not-allowed;
 }
 .pager .pg.on {
