@@ -20,10 +20,12 @@ test('知识库页：打开就加载摘要 + 文档列表（不靠输入检索�
   assert.match(KB, /onMounted\([\s\S]{0,200}loadSummary\(\)[\s\S]{0,120}loadDocs\(\)/)
 })
 
-test('知识库页：检索框可选 —— q 为空时不发检索，回到文档列表', () => {
+test('知识库页：检索框可选 —— q 为空时不发检索，清空回到文档列表', () => {
   assert.match(KB, /const searching = computed\(\(\) => !!q\.value\.trim\(\)\)/)
-  assert.match(KB, /if \(!searching\.value\) \{[\s\S]{0,160}loadDocs\(\)/)
-  assert.match(KB, /@clear="search"/)
+  // P10：空输入直接回车 ⇒ 不发请求（清空 ✕ 走 onClear，回默认列表）
+  assert.match(KB, /if \(!term\) return/)
+  assert.match(KB, /@clear="onClear"/)
+  assert.match(KB, /function onClear\(\)/)
 })
 
 test('知识库页：点文档看切片走新接口，且带分页', () => {

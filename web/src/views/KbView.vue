@@ -1,15 +1,17 @@
 <!--
-  知识库：默认视图是**文档列表**（不输词就有数据，P9 起）；
-  检索框改为可选 —— 输了词走既有 /kb/search 展示切片命中，清空即回到列表。
-  点某个文档 → 右侧抽屉拉该文档的切片（走 /kb/documents/{doc_id}/chunks，带分页）。
+  知识库：默认视图是**文档列表**（不输词就有数据，P9 起）；P10 起检索是**两路并行** ——
+  同一个词同时打 /kb/documents（按标题过滤下面的文档列表）和 /kb/search（切片正文命中）。
+  两路各带各的分页与计数，结果行合成「文档 N 条 · 切片 M 条」；**任一有结果就算找得到**。
+  清空 ✕ 两路都清、回到默认文档列表（不是空态）；点文档 → 抽屉拉它的切片。
 
   口径全部来自接口，页面不另算：count / page / page_size 都是后端给的。
+  防串用请求序号（utils/kb.js 的 isStale）：快速改词时旧响应只丢弃、不覆盖新结果。
 -->
 <template>
   <div>
     <div class="page-head">
       <h1 class="page-title">知识库</h1>
-      <p class="page-sub">PG 里的文档与切片；默认按文档浏览，输了词则检索切片正文。</p>
+      <p class="page-sub">PG 里的文档与切片；默认按文档浏览，输了词则文档标题与切片正文一起查。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -21,22 +23,18 @@
     </div>
 
     <div class="filter-panel">
-      <div class="filter-title">{{ searching ? '检索文档切片' : '文档列表' }}</div>
+      <div class="filter-title">检索</div>
       <p class="filter-desc">
-        {{
-          searching
-            ? '命中的切片以卡片铺开：左边标题、右边命中片段，chunk_id 一键复制。'
-            : '不输词也能看：下面是文档列表，点开任一文档可以看到它的切片。'
-        }}
+        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。
       </p>
       <div class="filter-ctl">
         <el-input
           v-model="q"
           class="grow"
-          placeholder="输入检索词查切片；清空回到文档列表"
+          placeholder="输入检索词：文档标题与切片正文同时查"
           clearable
           @keyup.enter="search"
-          @clear="search"
+          @clear="onClear"
         >
           <template #prefix>
             <span class="search-ico">
@@ -50,45 +48,30 @@
         </el-input>
         <el-button type="primary" :loading="loading" @click="search">搜索</el-button>
       </div>
-      <div v-if="searching && result" class="filter-result">
-        <span>共 {{ result.count }} 条命中 · 第 {{ result.page }} 页 · 每页 {{ pageSize }}</span>
+      <!-- 两路计数合并：N/M 来自各自接口的 count，不写死 -->
+      <div v-if="searching && !loading" class="filter-result">
+        <span>{{ mergeCounts(docCount, hitCount) }}</span>
       </div>
     </div>
 
-    <!-- 检索态：切片命中卡片 -->
     <div v-if="loading" class="panel pad">
       <el-skeleton :rows="4" animated />
     </div>
 
-    <template v-else-if="searching">
-      <div v-if="result && result.items.length" class="card-grid">
-        <ItemCard v-for="row in result.items" :key="row.chunk_id" chip-tone="accent" @lead="doCopy(row.chunk_id)">
-          <template #tag>rank {{ row.rank }}</template>
-
-          <p class="card-title" :title="row.title">{{ row.title || '（无标题）' }}</p>
-          <p class="card-body" :title="row.snippet">{{ row.snippet }}</p>
-
-          <template #tags>
-            <span class="tag mono">{{ row.chunk_id }}</span>
-          </template>
-
-          <template #lead>复制 chunk_id ↗</template>
-        </ItemCard>
+    <!-- 两路都为 0 才算没找到（anyHit）；任一有结果往下走 -->
+    <div v-else-if="searching && !anyHit" class="panel">
+      <div class="empty">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
+          <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
+          <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
+        </svg>
+        <p><b>没找到「{{ q.trim() }}」</b>文档标题和切片正文都没命中 —— 换个更短的核心词试试。</p>
       </div>
+    </div>
 
-      <div v-else class="panel">
-        <div class="empty">
-          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
-            <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
-            <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
-          </svg>
-          <p><b>知识库里没有命中这条检索</b>换个更短的核心词试试 —— 切片检索比整篇全文更容易漏召回。</p>
-        </div>
-      </div>
-    </template>
-
-    <!-- 浏览器：文档列表（默认视图） -->
     <template v-else>
+      <!-- 第一路：文档列表（检索态下按标题过滤，原地更新 doc-grid） -->
+      <div v-if="searching && docs.length" class="section-title">文档</div>
       <div v-if="docs.length" class="card-grid">
         <ItemCard v-for="doc in docs" :key="doc.doc_id" @lead="openDoc(doc)">
           <template #tag>切片 {{ doc.chunk_count }}</template>
@@ -105,7 +88,7 @@
         </ItemCard>
       </div>
 
-      <div v-else class="panel">
+      <div v-if="!docs.length && !searching" class="panel">
         <div class="empty">
           <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
@@ -116,12 +99,41 @@
       </div>
 
       <PagerBar
+        v-if="docCount"
         :total="docCount"
         :page="page"
         :page-size="pageSize"
         @update:page="onPage"
         @update:page-size="onSize"
       />
+
+      <!-- 第二路：切片命中区（分页独立，走 /kb/search 的 page） -->
+      <template v-if="searching">
+        <div v-if="hits.length" class="section-title">切片</div>
+        <div v-if="hits.length" class="card-grid">
+          <ItemCard v-for="row in hits" :key="row.chunk_id" chip-tone="accent" @lead="doCopy(row.chunk_id)">
+            <template #tag>rank {{ row.rank }}</template>
+
+            <p class="card-title" :title="row.title">{{ row.title || '（无标题）' }}</p>
+            <p class="card-body" :title="row.snippet">{{ row.snippet }}</p>
+
+            <template #tags>
+              <span class="tag mono">{{ row.chunk_id }}</span>
+            </template>
+
+            <template #lead>复制 chunk_id ↗</template>
+          </ItemCard>
+        </div>
+
+        <PagerBar
+          v-if="hitCount"
+          :total="hitCount"
+          :page="hitPage"
+          :page-size="hitSize"
+          @update:page="onHitPage"
+          @update:page-size="onHitSize"
+        />
+      </template>
     </template>
 
     <!-- 某个文档的切片 -->
@@ -169,16 +181,20 @@ import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { hasAnyHit, isStale, mergeCounts } from '../utils/kb'
 
-// 每页条数跟着 PagerBar 的下拉走，所以是 ref（两个独立状态：文档列表 / 文档切片）
+// 每页条数跟着各自 PagerBar 的下拉走 —— 两路各自独立：文档列表 / 切片命中 / 文档内切片
 const pageSize = ref(20)
+const hitSize = ref(20)
 const chunkSize = ref(20)
 
 const summary = ref(null)
 const docs = ref([])
 const docCount = ref(0)
 const page = ref(1)
-const result = ref(null)
+const hits = ref([])
+const hitCount = ref(0)
+const hitPage = ref(1)
 const q = ref('')
 const loading = ref(false)
 const error = ref('')
@@ -190,8 +206,14 @@ const chunkCount = ref(0)
 const chunkPage = ref(1)
 const chunkLoading = ref(false)
 
+// 防串：请求序号。发请求前 ++，回来时序号对不上 ⇒ 过期响应直接丢弃（utils/kb.js 的 isStale）。
+// 不用 AbortController 是因为 axios 层不接 signal（api 客户端本轮只增不改），序号已足够防覆盖。
+let reqSeq = 0
+
 /** 检索框有词 ⇒ 检索态；没词 ⇒ 浏览文档列表（默认视图） */
 const searching = computed(() => !!q.value.trim())
+/** 「任一有结果就算找得到」：文档命中或切片命中任一不为 0 就算数（两路都 0 才显示空态） */
+const anyHit = computed(() => hasAnyHit(docCount.value, hitCount.value))
 
 async function loadSummary() {
   try {
@@ -203,54 +225,92 @@ async function loadSummary() {
   }
 }
 
-/** 文档列表：q 丢了就不带（后端 q 可选，不带就是全量浏览） */
+/** 浏览态：全量文档列表（不带 q）—— 默认视图 / 清空后 / 未输词翻页都走这里 */
 async function loadDocs() {
+  const seq = ++reqSeq
   loading.value = true
   try {
-    const data = await api.kbDocuments({
-      q: q.value.trim() || undefined,
-      page: page.value,
-      page_size: pageSize.value,
-    })
+    const data = await api.kbDocuments({ page: page.value, page_size: pageSize.value })
+    if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
     error.value = ''
   } catch (e) {
+    if (isStale(seq, reqSeq)) return
     docs.value = []
     docCount.value = 0
     error.value = `读取文档列表失败：${e.message}`
   } finally {
-    loading.value = false
+    if (!isStale(seq, reqSeq)) loading.value = false
   }
 }
 
-async function search() {
-  page.value = 1
-  result.value = null
-  if (!searching.value) {
-    // 清空检索词 ⇒ 回到文档列表（不再是空态）
-    await loadDocs()
+/**
+ * 检索态：一个词两路并行 —— /kb/documents 按标题过滤下面的文档列表，
+ * /kb/search 命切片正文。两路各拿各的 page/page_size，结果行再合成计数。
+ * 序号不匹配（用户已经改词/清空了）⇒ 整个响应丢弃，绝不覆盖新结果。
+ */
+async function loadBoth(term) {
+  const seq = ++reqSeq
+  loading.value = true
+  let docRes, hitRes
+  try {
+    [docRes, hitRes] = await Promise.all([
+      api.kbDocuments({ q: term, page: page.value, page_size: pageSize.value }),
+      api.kbSearch({ q: term, page: hitPage.value, page_size: hitSize.value }),
+    ])
+  } catch (e) {
+    if (isStale(seq, reqSeq)) return
+    error.value = `知识库检索失败：${e.message}`
+    loading.value = false
     return
   }
-  loading.value = true
-  try {
-    result.value = await api.kbSearch({ q: q.value.trim(), page: 1, page_size: pageSize.value })
-    error.value = ''
-  } catch (e) {
-    error.value = `知识库检索失败：${e.message}`
-  } finally {
-    loading.value = false
-  }
+  if (isStale(seq, reqSeq)) return
+  docs.value = docRes.items
+  docCount.value = docRes.count
+  hits.value = hitRes.items
+  hitCount.value = hitRes.count
+  error.value = ''
+  loading.value = false
+}
+
+/** 回车与点「搜索」按钮同一条路：两路都重查，页码各回第 1 页 */
+async function search() {
+  const term = q.value.trim()
+  // 空输入直接回车 ⇒ 不发请求、保持当前列表
+  if (!term) return
+  page.value = 1
+  hitPage.value = 1
+  await loadBoth(term)
+}
+
+/** 清空 ✕：两路都清（切片清零），回到默认文档列表而不是空态 */
+function onClear() {
+  q.value = ''
+  hits.value = []
+  hitCount.value = 0
+  hitPage.value = 1
+  page.value = 1
+  loadDocs()
 }
 
 function onPage(p) {
   page.value = p
-  loadDocs()
+  searching.value ? loadBoth(q.value.trim()) : loadDocs()
 }
 function onSize(s) {
   pageSize.value = Number(s)
   page.value = 1
-  loadDocs()
+  searching.value ? loadBoth(q.value.trim()) : loadDocs()
+}
+function onHitPage(p) {
+  hitPage.value = p
+  loadBoth(q.value.trim())
+}
+function onHitSize(s) {
+  hitSize.value = Number(s)
+  hitPage.value = 1
+  loadBoth(q.value.trim())
 }
 
 async function openDoc(doc) {
