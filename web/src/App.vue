@@ -19,7 +19,18 @@
         </li>
       </ul>
 
-      <button class="signout nav-foot" @click="signOut">退出登录</button>
+      <div class="nav-foot">
+        <!-- 主题切换：纯内联 SVG（不引图标库），选择落在 keepsake.console.theme -->
+        <button class="theme-btn" :aria-label="themeLabel" :title="themeLabel" @click="toggle">
+          <span class="ico" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"
+              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"
+              :innerHTML="theme === 'dark' ? ICON.moon : ICON.sun" />
+          </span>
+          <span class="txt">{{ theme === 'dark' ? '浅色' : '深色' }}</span>
+        </button>
+        <button class="signout" @click="signOut">退出登录</button>
+      </div>
     </nav>
 
     <!-- 顶栏：面包屑 + 右侧退出。整条 sticky，表格粘性表头正好贴在它下面 -->
@@ -42,10 +53,11 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, getToken, setToken } from './api'
 import { showToast } from './utils/dialog'
+import { readTheme, toggleTheme } from './utils/theme'
 
 const route = useRoute()
 const router = useRouter()
@@ -58,6 +70,8 @@ const ICON = {
   book: '<path d="M2.6 2.9h3.6a2 2 0 0 1 2 2v8.3a1.7 1.7 0 0 0-1.7-1.7H2.6Z"/><path d="M13.4 2.9H9.8a2 2 0 0 0-2 2v8.3a1.7 1.7 0 0 1 1.7-1.7h3.9Z"/>',
   chart:
     '<path d="M2.4 13.6h11.2"/><path d="M4.1 13.6V8.9"/><path d="M8 13.6V4.6"/><path d="M11.9 13.6V6.9"/>',
+  sun: '<circle cx="8" cy="8" r="3.1"/><path d="M8 1.4v1.5M8 13.1v1.5M1.4 8h1.5M13.1 8h1.5M3.4 3.4l1 1M11.6 11.6l1 1M12.6 3.4l-1 1M4.4 11.6l-1 1"/>',
+  moon: '<path d="M13.4 9.5A5.6 5.6 0 0 1 6.5 2.6a5.9 5.9 0 1 0 6.9 6.9Z"/>',
 }
 const MENU = [
   { path: '/core', label: '常驻层', icon: ICON.layers },
@@ -69,6 +83,13 @@ const MENU = [
 // 登录 / 初始化 / token 三页不套外壳，否则套一个空侧边栏没意义
 const BARE_PAGES = ['token', 'login', 'setup']
 const showShell = computed(() => !BARE_PAGES.includes(route.name) && !!getToken())
+
+// 主题：首屏已由 main.js 写好 html，这里只需要一份响应式副本给按钮的图标/文案用
+const theme = ref(readTheme())
+const themeLabel = computed(() => (theme.value === 'dark' ? '切换到浅色' : '切换到深色'))
+function toggle() {
+  theme.value = toggleTheme()
+}
 
 /** 先让服务端把这个会话作废，再清本地 token —— 只清本地的话 token 还留在服务端文件里。 */
 async function signOut() {
@@ -156,7 +177,12 @@ async function signOut() {
   display: inline-flex;
   flex: none;
 }
-.signout {
+.signout,
+.theme-btn {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  justify-content: center;
   height: 26px;
   padding: 0 9px;
   background: transparent;
@@ -168,12 +194,16 @@ async function signOut() {
   cursor: pointer;
   white-space: nowrap;
 }
-.signout:hover {
+.signout:hover,
+.theme-btn:hover {
   background: var(--bg-hover);
   border-color: var(--border-strong);
   color: var(--text);
 }
 .nav-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   margin: 10px 6px 14px;
 }
 
@@ -221,8 +251,15 @@ async function signOut() {
 @media (max-width: 900px) {
   .brand-name,
   .item .txt,
-  .nav-foot {
+  .nav-foot .txt {
     display: none;
+  }
+  /* 窄条放不下「退出登录」，主题按钮留下图标就够了 */
+  .nav-foot .signout {
+    display: none;
+  }
+  .theme-btn {
+    padding: 0;
   }
   .item {
     justify-content: center;

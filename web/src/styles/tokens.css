@@ -2,23 +2,26 @@
  * Keepsake 控制台 · 设计令牌
  *
  * 全局唯一色值来源：组件里只许用 var(--*)，禁止再散落硬编码颜色。
- * 基调对标 Linear / Vercel / Supabase：克制的暗色 + 高信息密度 + 细腻层次。
- * 层次只靠 1px 描边 + 极轻内阴影，不做大渐变 / 玻璃拟态 / 发光。
+ * 基调对标 Vercel / Notion / Linear 浅色 + 高信息密度 + 细腻层次。
+ * 层次只靠 1px 描边 + 极轻阴影，不做大渐变 / 玻璃拟态 / 发光。
+ *
+ * 双主题：`:root` 就是浅色（默认），`[data-theme="dark"]` 是暗色。
+ * 所以无 JS、html 上还没有 data-theme 时，首屏也一定是浅色。
  * ========================================================================== */
 
 :root {
-  --bg: #0b0d10;
-  --bg-elev: #12151a;
-  --bg-hover: #171b22;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.14);
-  --text: #e6e9ef;
-  --text-dim: #9aa3b2;
-  --text-faint: #6b7280;
-  --accent: #4f8cff;
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --danger: #ef4444;
+  --bg: #f6f7f9;
+  --bg-elev: #ffffff;
+  --bg-hover: #f1f3f7;
+  --border: #e6e8ec;
+  --border-strong: #d3d7de;
+  --text: #1a1d23;
+  --text-dim: #5b6472;
+  --text-faint: #8a94a6;
+  --accent: #2563eb;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --danger: #dc2626;
 
   --r-card: 10px;
   --r-ctl: 8px;
@@ -29,8 +32,57 @@
   --nav-w: 220px;
   --top-h: 48px;
 
+  /* 表头 / 斑马纹 / 阴影 / 微光：这些也是「颜色」，一并进令牌表换肤 */
+  --th-bg: #f6f7f7;
+  --th-veil: 82%; /* 表头半透明不透明度，配合 backdrop-filter */
+  --row-even: #fafbfc;
+  --inset: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-pop: 0 12px 32px rgba(16, 24, 40, 0.12);
+  --mask: rgba(16, 24, 40, 0.45);
+  --fill-dark: #ebedf0;
+  --danger-hi: #ef4444;
+  --skeleton-from: #eceff3;
+  --skeleton-to: #f6f7f9;
+  /* element-plus 的 primary 深浅阶梯，手算 = accent 分别混 30/50/70/80% 白、20% 黑 */
+  --accent-3: #6694f1;
+  --accent-5: #92b1f5;
+  --accent-7: #bdcef9;
+  --accent-9: #d2defb;
+  --accent-d2: #1d4fbc;
+}
+
+/* 暗色：只调对比度，结构与浅色完全一致 */
+:root[data-theme="dark"] {
+  --bg: #0b0d10;
+  --bg-elev: #12151a;
+  --bg-hover: #171b22;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text: #eef1f6;
+  --text-dim: #a7b0be;
+  --text-faint: #6b7280;
+  --accent: #4f8cff;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+
+  --th-bg: #12151a;
+  --th-veil: 88%;
+  --row-even: transparent;
   --inset: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.55);
+  --mask: rgba(11, 13, 16, 0.72);
+  --fill-dark: #1b2029;
+  --danger-hi: #f05252;
+  --skeleton-from: #1a1f27;
+  --skeleton-to: #232932;
+  --accent-3: #3d76e6;
+  --accent-5: #2c5cb6;
+  --accent-7: #1f4085;
+  --accent-9: #14264a;
+  --accent-d2: #74a4ff;
 }
 
 /* ---------------------------------------------------------------- 基础 --- */
@@ -93,15 +145,18 @@ a {
 }
 
 /* --------------------------------------------- Element Plus 品牌色接管 --- */
-/* 只改令牌不改组件结构：element-plus 的深色变量挂在 html.dark 上，这里再压一层品牌色。 */
+/* 只改令牌不改组件结构。
+ * 选择器写 `:root, html.dark` 两个都带上：element-plus 自带的暗色变量挂在 html.dark 上，
+ * 特异性比 :root 高一档；只写 :root 的话暗色下会输给它，所以并列写、靠本文件在后面覆盖。 */
+:root,
 html.dark {
   --el-color-primary: var(--accent);
-  --el-color-primary-light-3: #3d76e6;
-  --el-color-primary-light-5: #2c5cb6;
-  --el-color-primary-light-7: #1f4085;
-  --el-color-primary-light-8: #1a356a;
-  --el-color-primary-light-9: #14264a;
-  --el-color-primary-dark-2: #74a4ff;
+  --el-color-primary-light-3: var(--accent-3);
+  --el-color-primary-light-5: var(--accent-5);
+  --el-color-primary-light-7: var(--accent-7);
+  --el-color-primary-light-8: var(--accent-7);
+  --el-color-primary-light-9: var(--accent-9);
+  --el-color-primary-dark-2: var(--accent-d2);
   --el-color-success: var(--ok);
   --el-color-warning: var(--warn);
   --el-color-danger: var(--danger);
@@ -112,7 +167,7 @@ html.dark {
   --el-fill-color-blank: var(--bg-elev);
   --el-fill-color-light: var(--bg-hover);
   --el-fill-color-lighter: var(--bg-elev);
-  --el-fill-color-dark: #1b2029;
+  --el-fill-color-dark: var(--fill-dark);
   --el-text-color-primary: var(--text);
   --el-text-color-regular: var(--text-dim);
   --el-text-color-secondary: var(--text-faint);
@@ -122,12 +177,15 @@ html.dark {
   --el-border-color-lighter: var(--border);
   --el-border-color-extra-light: var(--border);
   --el-border-radius-base: var(--r-ctl);
-  --el-mask-color: rgba(11, 13, 16, 0.72);
+  --el-mask-color: var(--mask);
   --el-font-size-base: 13px;
   --el-input-focus-border-color: var(--accent);
+  /* 骨架屏微光：两套主题各自的起止色 */
+  --el-skeleton-color: var(--skeleton-from);
+  --el-skeleton-to-color: var(--skeleton-to);
 }
 
-/* 控件：暗底、8px 圆角、聚焦描边走 --accent */
+/* 控件：浅底、8px 圆角、聚焦描边走 --accent */
 .el-input__wrapper,
 .el-select__wrapper,
 .el-textarea__inner {
@@ -162,8 +220,8 @@ html.dark {
   --el-button-hover-border-color: var(--el-color-primary-light-3);
 }
 .el-button--danger {
-  --el-button-hover-bg-color: color-mix(in srgb, var(--danger) 85%, #fff);
-  --el-button-hover-border-color: color-mix(in srgb, var(--danger) 85%, #fff);
+  --el-button-hover-bg-color: var(--danger-hi);
+  --el-button-hover-border-color: var(--danger-hi);
 }
 .el-button--default {
   background: var(--bg-elev);
@@ -193,18 +251,25 @@ html.dark {
   font-size: 13px;
   --el-table-bg-color: transparent;
   --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: var(--bg-elev);
+  --el-table-header-bg-color: var(--th-bg);
   --el-table-border-color: var(--border);
   --el-table-text-color: var(--text-dim);
   --el-table-header-text-color: var(--text-faint);
   --el-table-row-hover-bg-color: var(--bg-hover);
   --el-table-current-row-bg-color: var(--bg-hover);
 }
+/* 表头：半透明 + blur，横向滚动/内容穿透时不会露出难看的硬边；底边 1px 兜住分隔 */
 .el-table th.el-table__cell {
-  background: var(--bg-elev);
+  background: color-mix(in srgb, var(--th-bg) var(--th-veil), transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border-strong);
   box-shadow: var(--inset);
   font-weight: 500;
   font-size: 12px;
+}
+/* 斑马纹：极淡的一层。:not(:hover) 把特异性抬高一档，行 hover 时让回 element-plus 的规则。 */
+.el-table__body tr:nth-child(even):not(:hover) td.el-table__cell {
+  background: var(--row-even);
 }
 .el-table .el-table__cell {
   padding: 7px 0;
@@ -311,7 +376,7 @@ html.dark {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  box-shadow: var(--inset);
+  box-shadow: var(--shadow-card);
 }
 .page-head {
   display: flex;
