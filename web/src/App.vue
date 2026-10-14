@@ -82,6 +82,17 @@
       </div>
       <router-view />
     </main>
+
+    <!-- 登出确认：红色竖条 + 逐条后果，红色实心按钮（沿用统一确认组件，不新造弹框） -->
+    <ConfirmDialog
+      v-model="confirmSignOut"
+      title="退出登录？"
+      :consequences="signOutConsequences"
+      confirm-text="退出"
+      tone="danger"
+      :busy="signingOut"
+      @confirm="onSignOutConfirm"
+    />
   </div>
   <router-view v-else />
 </template>
@@ -89,6 +100,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import { api, getToken, setToken } from './api'
 import { showToast } from './utils/dialog'
 import { readTheme, setTheme } from './utils/theme'
@@ -148,13 +160,29 @@ function pick(t) {
   theme.value = setTheme(t)
 }
 
-/** 先让服务端把这个会话作废，再清本地 token —— 只清本地的话 token 还留在服务端文件里。 */
+/** 退出登录是误点代价最高的一下（直接退到登录页），所以先弹 ConfirmDialog。 */
+const confirmSignOut = ref(false)
+const signingOut = ref(false)
+const signOutConsequences = [
+  '退出后需重新登录才能管理记忆。',
+  '会话 token 会在服务端作废，本地也会清掉；未保存的输入会丢。',
+]
+
+/** 点了登出按钮只开确认框，确认回调 onSignOutConfirm 才真的退。 */
 async function signOut() {
+  confirmSignOut.value = true
+}
+
+async function onSignOutConfirm() {
+  signingOut.value = true
+  // 先让服务端把这个会话作废，再清本地 token —— 只清本地的话 token 还留在服务端文件里
   try {
     await api.logout()
   } catch (e) {
     // 会话本来就过期/不存在时也要能退出去，失败不挡人
   }
+  signingOut.value = false
+  confirmSignOut.value = false
   setToken('')
   showToast('已退出登录')
   router.push({ name: 'login' })

@@ -16,10 +16,12 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import）
 
 from .. import config
 from ..deps import require_session
 from ..schemas import KbHit, KbSearchResult, KbSummary
+from ..schemas import KbChunkList, KbDocument, KbDocumentList
 
 router = APIRouter(tags=["kb"])
 
@@ -32,6 +34,8 @@ _CAND_ID = ("id", "chunk_id", "key", "uuid")
 _CAND_DOC = ("doc_id", "document_id", "doc", "knowledge_id")
 _CAND_TITLE = ("title", "name", "doc_title", "document_title")
 _CAND_TSV = ("content_tsv", "tsv", "search_vector", "content_vector_ts")
+#: documents 表的时间列（可选）：探到就用，探不到就留空串 —— 时间列不是识别表结构的硬要求
+_CAND_TIME = ("updated_at", "modified_at", "last_modified_at", "updated", "created_at", "date")
 
 _COLS_CACHE: Dict[str, Dict[str, set]] = {}
 _COLS_LOCK = threading.Lock()
@@ -221,6 +225,123 @@ def kb_search(
     ]
     return KbSearchResult(q=q, items=items, count=len(items), page=page,
                           page_size=page_size, mode=mode)
+
+
+@router.get("/api/v1/kb/documents", response_model=KbDocumentList,
+            dependencies=[Depends(require_session)])
+def kb_documents(
+    q: Optional[str] = Query(None, description="标题模糊词，可选；不给就全量浏览"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
+) -> KbDocumentList:
+    """文档列表（只读）：不输词也能看到数据 —— 这就是知识库页的默认视图。
+
+    切片条数用相关子查询按 doc_id 计数；q 复用检索那套手法（documents 表有 tsvector
+    列走 tsquery，否则退标题 ILIKE）。表名/列名仍只认白名单探出来的名字。
+    """
+    schema = _ident(config.pg_schema())
+    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
+    gone = _missing(tabs)
+    if gone:
+        raise HTTPException(status_code=500,
+                            detail={"error": "kb_table_missing",
+                                    "message": f"知识库表不存在：{', '.join(gone)}"})
+    docs = tabs[config.KB_TABLE_DOCUMENTS]
+    chunks = tabs[config.KB_TABLE_CHUNKS]
+
+    d_id = _pick(docs, _CAND_ID, config.KB_TABLE_DOCUMENTS, "主键")
+    c_doc = _pick(chunks, _CAND_DOC, config.KB_TABLE_CHUNKS, "外键(文档)")
+    d_title = next((_ident(t) for t in _CAND_TITLE if t in docs), None)
+    d_time = next((_ident(t) for t in _CAND_TIME if t in docs), None)
+    d_tsv = next((_ident(c) for c in _CAND_TSV if c in docs), None)
+
+    keyword = (q or "").strip()
+    if keyword and d_tsv:
+        # 中文语料同检索：simple 分词
+        where, params = f"d.{d_tsv} @@ plainto_tsquery('simple', %s)", [keyword]
+    elif keyword and d_title:
+        where, params = f"d.{d_title} ILIKE %s", [f"%{keyword}%"]
+    else:
+        # 没词、或表里既没标题列也没索引列 ⇒ 不过滤（宁可多给，不假装筛过）
+        where, params = "TRUE", []
+
+    src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
+    chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
+                f"WHERE c.{c_doc} = d.{d_id}) AS chunk_count")
+    order = "chunk_count DESC, " + (f"d.{d_time} DESC, " if d_time else "") + "doc_id ASC"
+    # 标题/时间列探不到就 SELECT '' —— 出参留空串，不假装有值
+    sel_title = f"d.{d_title}" if d_title else "''"
+    sel_time = f"d.{d_time}" if d_time else "''"
+
+    sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
+           f"{sel_time} AS updated_at, "
+           f"{chunk_ct} {src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [*params, page_size, (page - 1) * page_size])
+            rows = cur.fetchall()
+            cur.execute(f"SELECT COUNT(*) AS n {src} WHERE {where}", list(params))
+            total = int((cur.fetchone() or {"n": 0})["n"])
+
+    items = [
+        KbDocument(doc_id=str(r["doc_id"] or ""), title=str(r["title"] or ""),
+                   updated_at=str(r["updated_at"] or ""), chunk_count=int(r["chunk_count"] or 0))
+        for r in rows
+    ]
+    return KbDocumentList(items=items, count=total, page=page, page_size=page_size)
+
+
+@router.get("/api/v1/kb/documents/{doc_id}/chunks", response_model=KbChunkList,
+            dependencies=[Depends(require_session)])
+def kb_document_chunks(
+    doc_id: str = Path(..., min_length=1, description="文档 id"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
+) -> KbChunkList:
+    """单个文档的切片列表（只读）。文档不存在 ⇒ 404 kb_doc_missing。
+
+    这里不给切片打分：ts_rank 要有检索词才有意义，浏览单个文档没有词，
+    所以 rank 恒 0、按 chunk_id 稳定排序（任务书里的 rank 是可选字段）。
+    """
+    schema = _ident(config.pg_schema())
+    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
+    gone = _missing(tabs)
+    if gone:
+        raise HTTPException(status_code=500,
+                            detail={"error": "kb_table_missing",
+                                    "message": f"知识库表不存在：{', '.join(gone)}"})
+    docs = tabs[config.KB_TABLE_DOCUMENTS]
+    chunks = tabs[config.KB_TABLE_CHUNKS]
+
+    d_id = _pick(docs, _CAND_ID, config.KB_TABLE_DOCUMENTS, "主键")
+    c_id = _pick(chunks, _CAND_ID, config.KB_TABLE_CHUNKS, "主键")
+    c_doc = _pick(chunks, _CAND_DOC, config.KB_TABLE_CHUNKS, "外键(文档)")
+    c_text = _pick(chunks, _CAND_TEXT, config.KB_TABLE_CHUNKS, "正文")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT 1 FROM {schema}.{config.KB_TABLE_DOCUMENTS} d "
+                        f"WHERE d.{d_id} = %s LIMIT 1", [doc_id])
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404,
+                                    detail={"error": "kb_doc_missing",
+                                            "message": f"知识库文档不存在：{doc_id}"})
+            sql = (f"SELECT CAST(c.{c_id} AS text) AS chunk_id, LEFT(c.{c_text}, 300) AS snippet, "
+                   f"0.0::float8 AS score FROM {schema}.{config.KB_TABLE_CHUNKS} c "
+                   f"WHERE c.{c_doc} = %s ORDER BY chunk_id ASC LIMIT %s OFFSET %s")
+            cur.execute(sql, [doc_id, page_size, (page - 1) * page_size])
+            rows = cur.fetchall()
+            cur.execute(f"SELECT COUNT(*) AS n FROM {schema}.{config.KB_TABLE_CHUNKS} c "
+                        f"WHERE c.{c_doc} = %s", [doc_id])
+            total = int((cur.fetchone() or {"n": 0})["n"])
+
+    items = [
+        KbHit(chunk_id=str(r["chunk_id"] or ""), doc_id=doc_id,
+              snippet=str(r["snippet"] or ""),
+              rank=round(float(r["score"] or 0.0), 6))
+        for r in rows
+    ]
+    return KbChunkList(doc_id=doc_id, items=items, count=total, page=page, page_size=page_size)
 
 
 def probe() -> Optional[Dict[str, Any]]:

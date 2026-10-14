@@ -73,6 +73,10 @@ export const api = {
   fragment: (key) => http.get(`/api/v1/fragments/${encodeURIComponent(key)}`).then((r) => r.data),
   kbSummary: () => http.get('/api/v1/kb/summary').then((r) => r.data),
   kbSearch: (params) => http.get('/api/v1/kb/search', { params }).then((r) => r.data),
+  // P9 知识库列表：不输词也能看到文档（q 可选，带了才按标题/全文过滤）
+  kbDocuments: (params) => http.get('/api/v1/kb/documents', { params }).then((r) => r.data),
+  kbDocumentChunks: (docId, params) =>
+    http.get(`/api/v1/kb/documents/${encodeURIComponent(docId)}/chunks`, { params }).then((r) => r.data),
   stats: () => http.get('/api/v1/stats').then((r) => r.data),
   crons: (params) => http.get('/api/v1/crons', { params }).then((r) => r.data),
 

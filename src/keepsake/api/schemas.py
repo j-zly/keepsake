@@ -114,6 +114,32 @@ class KbSearchResult(BaseModel):
     mode: str = Field(..., description="tsvector 或 ilike —— 命中路径，便于定位索引状态")
 
 
+class KbDocument(BaseModel):
+    """知识库文档列表项（chunk_count = 该文档的切片条数）。"""
+
+    doc_id: str
+    title: str = ""
+    updated_at: str = Field("", description="表内可用的更新时间列；没有时间列时为空串")
+    chunk_count: int = 0
+
+
+class KbDocumentList(BaseModel):
+    items: List[KbDocument]
+    count: int = Field(..., description="过滤后的文档总数（非本页条数）")
+    page: int
+    page_size: int
+
+
+class KbChunkList(BaseModel):
+    """单个文档的切片列表；切片项复用 KbHit（浏览单个文档没有检索词，rank 恒 0、title 空串）。"""
+
+    doc_id: str
+    items: List[KbHit]
+    count: int
+    page: int
+    page_size: int
+
+
 # --------------------------------------------------------------------------
 # 总览
 # --------------------------------------------------------------------------
