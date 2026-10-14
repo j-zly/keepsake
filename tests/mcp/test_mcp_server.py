@@ -42,7 +42,13 @@ def server(tmp_path, monkeypatch):
     `provider._CORE_CACHE` 是**进程级** 60s 缓存，用例间不共享（否则上一例的
     core 快照会污染下一例的 `memory://core`）。
     """
-    cfg = {"storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "mcp.db")}}}
+    # is_primary=true：MCP 是**主脑**的记忆入口，生产 config 顶层键就是 true。
+    # 2026-10 写闸（sqlite.py + provider.py）按它判身份 —— 缺省 false ⇒ 非 primary
+    # 写 core 被降成 core_candidate，下面那条同源用例就会看到 0 条常驻。
+    cfg = {
+        "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "mcp.db")}},
+        "is_primary": True,
+    }
     cfg_file = tmp_path / "config.json"
     cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
     monkeypatch.setenv("KEEPSAKE_CONFIG", str(cfg_file))
@@ -314,6 +320,34 @@ def test_常驻层列表与core资源同源(server):
     assert rows["count"] == 1 and len(rows["items"]) == 1
     assert "常驻记忆 甲" in rows["items"][0]["content"]
     assert "常驻记忆 甲" in read_resource(server, "memory://core")
+
+
+def test_mcp_非primary写core降候选(tmp_path, monkeypatch):
+    """🔴 写闸的 MCP 路径同样生效：非 primary 写 `core` 落库必须变成 `core_candidate`。
+
+    与上面那条同源用例互为正反两面：那边 `is_primary=true` 放行，这边缺省（false）
+    拦下。两边都用同一套 `memory_add(tags="core")`，所以经 MCP 走的写请求
+    也在闸门管辖之内 —— 不能只靠 provider 单测、漏掉 MCP 入口。
+
+    断言看 `memory_get` 的**落库后** tags：`memory_add` 返回的是请求里的 tags
+    （写入前的原值），拿它断言等于什么都没验。
+    """
+    cfg = {"storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "nonprimary.db")}}}
+    cfg_file = tmp_path / "config_nonprimary.json"
+    cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setenv("KEEPSAKE_CONFIG", str(cfg_file))
+
+    from keepsake.adapters.hermes import provider as prov_mod
+
+    prov_mod._CORE_CACHE.update({"ts": 0.0, "frags": None})
+    try:
+        s = build_server()
+        key = call(s, "memory_add", text="子代理想写常驻", tags="core")["key"]
+        assert "core_candidate" in call(s, "memory_get", key=key)["tags"]
+        # 降下来的候选不进常驻层 —— 每轮注入里看不到它
+        assert call(s, "memory_core_list")["count"] == 0
+    finally:
+        prov_mod._CORE_CACHE.update({"ts": 0.0, "frags": None})
 
 
 def test_单条资源返回全文(server):
