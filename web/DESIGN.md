@@ -2,10 +2,11 @@
 version: 1.0
 name: Keepsake 控制台设计规范
 description: 这是 Keepsake 控制台（web/）的唯一权威设计规范 —— 改动任何 UI 前必读，数值与 tokens.css 冲突时一律以 tokens.css 为准。
-适用范围: web/ 下所有页面与组件（列表、看板、检索、常驻层、弹框、抽屉、登录/初始化页）
+适用范围: web/ 下所有页面与组件（列表、看板、检索、常驻层、记忆维护、弹框、抽屉、登录/初始化页）
 唯一配置源: web/src/styles/tokens.css
 可视化目录: web/preview.html（浅色） / web/preview-dark.html（暗色）
-术语: 常驻层 / 记忆条目 / 知识库 / 看板
+术语: 常驻层 / 记忆条目 / 记忆维护 / 知识库 / 看板
+最后校准: 2026-10-14（记忆维护独立页 + 侧栏五入口）
 ---
 
 # Keepsake 控制台 · 设计规范
@@ -355,7 +356,7 @@ description: 这是 Keepsake 控制台（web/）的唯一权威设计规范 —�
 8. **禁止写死业务数字** —— 总条数、命中率、预算占比等一律来自接口/配置，样式与布局里不许出现业务常量。
 9. **禁止改接口层与路由层** —— 纯 UI 改动不得碰 `web/src/api/index.js` 与 `web/src/router/index.js`（diff 必须为 0），也不许在 `.vue` 里加/改业务逻辑。
 10. **禁止原生 `alert` / `confirm`** —— 一律用 `utils/dialog.js` 的 `showToast` / `showConfirm`；弹框 `close-on-click-modal=false`。
-11. **界面文案禁止再出现「碎片」** —— 术语只有**常驻层 / 记忆条目 / 知识库 / 看板**。`tests/ui-style.test.mjs` 会扫 `src/` 断言这一点。
+11. **界面文案禁止再出现「碎片」** —— 术语只有**常驻层 / 记忆条目 / 记忆维护 / 知识库 / 看板**。`tests/ui-style.test.mjs` 会扫 `src/` 断言这一点。
 12. **禁止引入外部字体/CDN** —— `web/preview*.html` 必须自包含、双击能开、不联网。
 
 ---
