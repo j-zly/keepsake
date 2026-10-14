@@ -2,7 +2,7 @@
   知识库：默认视图是**文档列表**（不输词就有数据，P9 起）；P10 起检索是**两路并行** ——
   同一个词同时打 /kb/documents（按标题过滤下面的文档列表）和 /kb/search（切片正文命中）。
   两路各带各的分页与计数，结果行合成「文档 N 条 · 切片 M 条」；**任一有结果就算找得到**。
-  清空 ✕ 两路都清、回到默认文档列表（不是空态）；点文档 → 抽屉拉它的切片。
+  清空 ✕（或删光后回车）两路都清、无条件回全量文档列表（不是空态）；点文档 → 抽屉拉它的切片。
 
   口径全部来自接口，页面不另算：count / page / page_size 都是后端给的。
   防串用请求序号（utils/kb.js 的 isStale）：快速改词时旧响应只丢弃、不覆盖新结果。
@@ -58,8 +58,8 @@
       <el-skeleton :rows="4" animated />
     </div>
 
-    <!-- 两路都为 0 才算没找到（anyHit）；任一有结果往下走 -->
-    <div v-else-if="searching && !anyHit" class="panel">
+    <!-- 两路都为 0 才算没找到（anyHit）；任一有结果往下走；出错时只留上方横幅，不冒充「没找到」 -->
+    <div v-else-if="searching && !anyHit && !error" class="panel">
       <div class="empty">
         <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
           <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
@@ -88,7 +88,8 @@
         </ItemCard>
       </div>
 
-      <div v-if="!docs.length && !searching" class="panel">
+      <!-- 「知识库里还没有文档」只在**请求成功且返回 0 条**时出现：加载中有骨架屏、出错有上方横幅 -->
+      <div v-if="!docs.length && !searching && docLoaded && !error" class="panel">
         <div class="empty">
           <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.2">
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
@@ -198,6 +199,8 @@ const hitPage = ref(1)
 const q = ref('')
 const loading = ref(false)
 const error = ref('')
+/** 三分状态用：请求中（骨架屏）/ 成功且真的 0 条（空态）/ 失败（错误横幅）——「零文档」只在成功后出现 */
+const docLoaded = ref(false)
 
 const drawer = ref(false)
 const curDoc = ref(null)
@@ -210,7 +213,7 @@ const chunkLoading = ref(false)
 // 不用 AbortController 是因为 axios 层不接 signal（api 客户端本轮只增不改），序号已足够防覆盖。
 let reqSeq = 0
 
-/** 检索框有词 ⇒ 检索态；没词 ⇒ 浏览文档列表（默认视图） */
+/** 检索框有词 ⇒ 检索态；没词 ⇒ 浏览文档列表（默认视图）。空词判定与 search() 里那处同义：都要 trim */
 const searching = computed(() => !!q.value.trim())
 /** 「任一有结果就算找得到」：文档命中或切片命中任一不为 0 就算数（两路都 0 才显示空态） */
 const anyHit = computed(() => hasAnyHit(docCount.value, hitCount.value))
@@ -234,6 +237,7 @@ async function loadDocs() {
     if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
+    docLoaded.value = true
     error.value = ''
   } catch (e) {
     if (isStale(seq, reqSeq)) return
@@ -270,28 +274,27 @@ async function loadBoth(term) {
   docCount.value = docRes.count
   hits.value = hitRes.items
   hitCount.value = hitRes.count
+  docLoaded.value = true
   error.value = ''
   loading.value = false
 }
 
-/** 回车与点「搜索」按钮同一条路：两路都重查，页码各回第 1 页 */
+/** 回车与点「搜索」按钮同一条路：有词两路重查、页码各回第 1 页；空词只回全量文档列表 */
 async function search() {
   const term = q.value.trim()
-  // 空输入直接回车 ⇒ 不发请求、保持当前列表
-  if (!term) return
   page.value = 1
   hitPage.value = 1
+  // 空输入回车 ⇒ 只发 /kb/documents（不带 q、page=1）回全量列表，且**不发 /kb/search**（没词可搜）
+  if (!term) return loadDocs()
   await loadBoth(term)
 }
 
-/** 清空 ✕：两路都清（切片清零），回到默认文档列表而不是空态 */
+/** 清空 ✕：两路都清（切片清零），回到默认文档列表而不是空态 —— 与空输入回车同一条路 */
 function onClear() {
   q.value = ''
   hits.value = []
   hitCount.value = 0
-  hitPage.value = 1
-  page.value = 1
-  loadDocs()
+  return search()
 }
 
 function onPage(p) {

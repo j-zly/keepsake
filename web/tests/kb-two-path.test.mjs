@@ -29,7 +29,8 @@ test('两路计数合并成一行动显示：N/M 来自各自 count，任一为 
   // 页面用的是这个合并函数 + 这个判定，空态才只在两路都为 0 时出现
   assert.match(KB, /\{\{ mergeCounts\(docCount, hitCount\) \}\}/)
   assert.match(KB, /const anyHit = computed\(\(\) => hasAnyHit\(docCount\.value, hitCount\.value\)\)/)
-  assert.match(KB, /v-else-if="searching && !anyHit"/)
+  // 空态还要排除 error：请求失败时出横幅，不冒充「没找到」（三分支：加载中/真的 0 条/失败）
+  assert.match(KB, /v-else-if="searching && !anyHit && !error"/)
 })
 
 test('过期响应被丢弃：请求序号落后的一律不落到界面上', () => {
@@ -61,10 +62,10 @@ test('检索：一次输入两路并行，回车与搜索按钮等价，清空�
   // 回车与按钮同一条路
   assert.match(KB, /@keyup\.enter="search"/)
   assert.match(KB, /@click="search"/)
-  // 空输入回车不发请求；清空 ✕ 两路都清、回默认列表（不是空态）
-  assert.match(KB, /const term = q\.value\.trim\(\)\s*\n\s*\/\/ 空输入直接回车 ⇒ 不发请求、保持当前列表\s*\n\s*if \(!term\) return/)
+  // 空输入回车 ⇒ 不发 /kb/search，只回全量文档列表；清空 ✕ 两路都清、走同一条路（不是空态）
+  assert.match(KB, /const term = q\.value\.trim\(\)\s*\n\s*page\.value = 1\s*\n\s*hitPage\.value = 1\s*\n\s*\/\/ 空输入回车[\s\S]{0,120}?if \(!term\) return loadDocs\(\)/)
   assert.match(KB, /@clear="onClear"/)
-  assert.match(KB, /function onClear\(\) \{[\s\S]{0,300}?hits\.value = \[\][\s\S]{0,120}?loadDocs\(\)/)
+  assert.match(KB, /function onClear\(\) \{[\s\S]{0,300}?hits\.value = \[\][\s\S]{0,160}?return search\(\)/)
   // 两路分页各自独立
   assert.match(KB, /:page="page"[\s\S]{0,120}?@update:page="onPage"/)
   assert.match(KB, /:page="hitPage"[\s\S]{0,120}?@update:page="onHitPage"/)
