@@ -293,8 +293,9 @@ def _resolve_knobs(cfg: Dict[str, Any], kwargs: Dict[str, Any]) -> Dict[str, Any
 def storage_from_config(config_path: Optional[str] = None, *, config: Optional[Dict[str, Any]] = None, redis_cls: Optional[type] = None, **kwargs: Any) -> StorageBase:
     """按 config.json 构造存储后端（**含 embedder**）——cron/脚本统一入口。
 
-    2026-09-15 实锤：`cron/memory_distill.py`（线上 /root/scripts/ 同款）与
-    `scripts/memory_distill.py` 各自手搓 `RedisStorage(host=..., port=..., password=...)`
+    2026-09-15 实锤：`cron/memory_distill.py`（线上 /root/scripts/ 同款；当时另有
+    一个仓库 scripts/ 下的老代孤儿同款，已删）各自手搓
+    `RedisStorage(host=..., port=..., password=...)`
     **漏传 embedder** ⇒ 每小时提炼写入的记忆没有 embed_bin（库内 439/3057 无向量，
     且全部是提炼产物）。统一走本函数，避免「东补西补」式的重复接线。
 

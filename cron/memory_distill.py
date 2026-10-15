@@ -175,6 +175,25 @@ def get_redis_password():
         return "", "127.0.0.1", 6379
 
 
+def _sanitize_llm_tags(raw: str) -> str:
+    """剥掉 LLM 自造的保留/治理标签（2026-10-14 拍板）。
+
+    实测事故：提炼 LLM 聊「候选审核」话题时给记忆自打 `core_candidate`，
+    假申请混进控制台审核队列。`core`/`shared`/`agent:*` 同属治理保留字——
+    自动提炼无权声明常驻、共享或代理归属，出现即剥除并记日志。
+    """
+    reserved_exact = {"core", "core_candidate", "shared"}
+    kept = []
+    for t in (x.strip() for x in (raw or "").split(",")):
+        if not t:
+            continue
+        if t in reserved_exact or t.startswith("agent:"):
+            print(f"[distill] 剥除 LLM 自造保留标签: {t!r}")
+            continue
+        kept.append(t)
+    return ",".join(kept)
+
+
 def store_to_keepsake(items, dry_run):
     """写入 Keepsake (RedisStorage 直连)"""
     sys.path.insert(0, "/opt/fragmented-memory/src")
@@ -188,8 +207,9 @@ def store_to_keepsake(items, dry_run):
     for it in items:
         cat = it.get("category", "fact")
         tags = f"auto-distill,{cat}"
-        if it.get("tags"):
-            tags += "," + it["tags"]
+        llm_tags = _sanitize_llm_tags(it.get("tags", ""))
+        if llm_tags:
+            tags += "," + llm_tags
         if dry_run:
             print(f"[DRY] [{cat}] {it['content']}")
             continue

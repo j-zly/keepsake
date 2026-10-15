@@ -596,3 +596,55 @@ class TestApiKeyNotInLogs:
             assert needle not in content, (
                 f"cron/memory_distill.py 含禁字面 {needle!r}（任务书红线）"
             )
+
+# ===========================================================================
+# _sanitize_llm_tags —— LLM 自造保留/治理标签剥离（2026-10-14 拍板）
+# ===========================================================================
+
+class TestSanitizeLlmTags:
+    """黑名单：自动提炼无权声明 core / core_candidate / shared / agent:*。"""
+
+    def test_strips_reserved_exact(self):
+        """正剥：core_candidate 剥掉，正常标签保序。"""
+        assert (
+            memory_distill._sanitize_llm_tags("core_candidate,看板,审核")
+            == "看板,审核"
+        )
+
+    def test_strips_mixed_reserved(self):
+        """正剥：保留字与普通标签混排时只留普通标签。"""
+        assert (
+            memory_distill._sanitize_llm_tags("core,看板,shared,agent:x1,fact")
+            == "看板,fact"
+        )
+
+    def test_does_not_over_strip(self):
+        """不误伤：精确相等判据 —— core_x / ycore / kind:fact 不是保留字。"""
+        raw = "core_x,ycore,kind:fact"
+        assert memory_distill._sanitize_llm_tags(raw) == raw
+
+    @pytest.mark.parametrize("raw", ["", None, ",,,", " , , "])
+    def test_empty_tolerant(self, raw):
+        """容错：空串 / None / 纯逗号串 → ""。"""
+        assert memory_distill._sanitize_llm_tags(raw) == ""
+
+    def test_wired_into_store_to_keepsake(self, monkeypatch):
+        """接线：store_to_keepsake 写库前过黑名单，前缀与普通标签不受影响。"""
+        import keepsake.storage as ks_storage
+
+        stor = MagicMock()
+        stor.store.return_value = True
+        monkeypatch.setattr(ks_storage, "storage_from_config", lambda *a, **kw: stor)
+        monkeypatch.setattr(
+            memory_distill, "get_redis_password", lambda: ("", "127.0.0.1", 6379)
+        )
+
+        items = [{"category": "fact", "content": "x", "tags": "core_candidate,foo"}]
+        saved = memory_distill.store_to_keepsake(items, dry_run=False)
+
+        assert saved == 1
+        _, kwargs = stor.store.call_args
+        tags = kwargs["tags"]
+        assert tags.startswith("auto-distill,fact"), tags
+        assert "core_candidate" not in tags, tags
+        assert "foo" in tags, tags

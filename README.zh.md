@@ -44,7 +44,7 @@
 | 💻 **本地语义检索** | 可选自托管 Ollama 嵌入模型（如 `bge-m3`，1024 维）走 OpenAI 兼容 `/v1/embeddings` 端点，完全本地运行 |
 | 🪄 **LLM 查询扩展（2026-09）** | BM25 命中不足 `min_results` 条时，后台用免费档 chat LLM 悄悄生成 2-8 字同义短词写入 Redis 缓存（24h TTL）。**热路径零延迟增加**；未配置 `llm` 通道时自动停用 |
 | ⏱️ **时间感知召回（v1.5）** | 实体时间线（`keepsake:entity_timeline`）+ 事实版本化——搜索不仅看「说了什么」还看「什么时候发生」 |
-| 🧪 **本地记忆提炼** | `scripts/memory_distill.py` 用本地模型（qwen3:8b）把陈旧条目蒸馏为精简摘要，watermark 增量更新（可开关、ComfyUI 错峰） |
+| 🧪 **自动记忆提炼** | `cron/memory_distill.py`（线上部署在 `/root/scripts/`）走 keepsake LLM 通道（config `llm` 节热生效）把近期对话提炼为一句结论入库，watermark 增量更新，LLM 自造治理标签由保留字黑名单剥除（可开关） |
 | 📊 **检索质量抽查集** | `scripts/eval_spotcheck.py` 30 条真实查询回归测试持续追踪检索质量（v1.4 BM25-only：60% → 67%；+向量 KNN 融合 2026-09：73%） |
 | 🧩 **Hermes 插件壳** | 内含 `hermes-plugin/` 目录（plugin.yaml + __init__.py），即拷即用 |
 
