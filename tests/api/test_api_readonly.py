@@ -30,9 +30,10 @@ AUTH_POST_PATHS = {
     "/api/v1/auth/logout",
 }
 
-#: 写面白名单（P2 + keepsake_memory_crud_be）：非 GET 路由**恰好**是这 9 条
-#: 写操作（增 / 真删 / 导入 为 crud 单新增，其余 6 条为 P2）+ 3 条认证，其余一律
-#: 不许出现。新增 3 条时**只许往这份白名单里加，不许改成子集断言** ——
+#: 写面白名单（P2 + keepsake_memory_crud_be + keepsake_kb_crud_be）：非 GET 路由
+#: **恰好**是这 13 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
+#: kb_crud 单新增，其余 6 条为 P2）+ 3 条认证，其余一律不许出现。
+#: 新增写端点时**只许往这份白名单里加，不许改成子集断言** ——
 #: 白名单是「写面没有悄悄长出第四条入口」的唯一凭据，宽松一分它就废了。
 ALLOWED_POST_PATHS = {
     "/api/v1/core/{key}/promote",
@@ -44,6 +45,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/import",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
+    "/api/v1/kb/documents",
+    "/api/v1/kb/documents/{id}/update",
+    "/api/v1/kb/documents/{id}/delete",
+    "/api/v1/kb/import",
 } | AUTH_POST_PATHS
 
 

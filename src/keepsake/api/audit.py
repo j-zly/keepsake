@@ -5,6 +5,7 @@
 
 * 备份 `CONSOLE_BACKUP_DIR` → `<root>/<YYYYMMDD>/`
     - 单条操作：`<key>.before.json`（改前整条 fragment 原文）
+    - 知识库文档真删：`document.<id>.before.json`（整篇 + 全部切片原文）
     - 合并/遗忘实跑：`merge.<ts>.dryrun.json` + `affected.<ts>.before.jsonl`
 * 审计 `CONSOLE_AUDIT_DIR` → `audit-YYYYMMDD.jsonl`，每次写追加一行
 
@@ -145,6 +146,21 @@ def backup_fragment(key: str, row: Optional[Dict[str, Any]]) -> str:
     path = d / f"{_safe(key)}.before.json"
     path.write_text(_dumps({"key": key, "backed_up_at": _now().isoformat(),
                              "row": row or {}}), encoding="utf-8")
+    return str(path)
+
+
+def backup_document(doc_id: Any, snapshot: Dict[str, Any]) -> str:
+    """落一篇知识库文档**删除前的快照**：`document.<id>.before.json`。
+
+    与 `backup_fragment` 同款纪律：必须在删数据**之前**调用，写不成 ⇒ 整个删除中止
+    （数据一秒都没动）。`snapshot` 是调用方给的一整份（文档行 + 全部切片正文），
+    这里只负责落盘与安全化文件名，不解释内容 —— 知识库的正文也可能带口令。
+    """
+    d = backup_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"document.{_safe(str(doc_id))}.before.json"
+    path.write_text(_dumps({"doc_id": str(doc_id), "backed_up_at": _now().isoformat(),
+                             "document": snapshot or {}}), encoding="utf-8")
     return str(path)
 
 
