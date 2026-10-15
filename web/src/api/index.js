@@ -99,6 +99,19 @@ export const api = {
     http.post(`/api/v1/fragments/${encodeURIComponent(key)}/delete`, { confirm }).then((r) => r.data),
   // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
   importFragments: (payload) => http.post('/api/v1/import', payload).then((r) => r.data),
+
+  // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
+  // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
+  kbCreateDocument: (payload) =>
+    http.post('/api/v1/kb/documents', { confirm: true, ...payload }).then((r) => r.data),
+  // 改文档：title/content 至少给一个；改正文时后端同事务重切切片（只改 documents 行会召回旧片段）。
+  kbUpdateDocument: (id, payload) =>
+    http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/update`, { confirm: true, ...payload }).then((r) => r.data),
+  // 真删：confirm 传文档标题全文（手输防手滑），删前备份由后端做；skill 域后端 409。
+  kbDeleteDocument: (id, confirm) =>
+    http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/delete`, { confirm }).then((r) => r.data),
+  // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
+  kbImportDocuments: (payload) => http.post('/api/v1/kb/import', payload).then((r) => r.data),
 }
 
 export default http
