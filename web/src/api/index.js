@@ -89,6 +89,16 @@ export const api = {
     http.post(`/api/v1/fragments/${encodeURIComponent(key)}/archive`, { confirm }).then((r) => r.data),
   merge: (payload) => http.post('/api/v1/ops/merge', payload).then((r) => r.data),
   forget: (payload) => http.post('/api/v1/ops/forget', payload).then((r) => r.data),
+
+  // ---- 记忆 CRUD（控制台批1 后端）：纯透传，语义与护栏都在后端 ----
+  // 新增必须显式带 confirm（与其它写操作同一口径）；打 core 标签后端直 400。
+  createFragment: (payload) =>
+    http.post('/api/v1/fragments', { confirm: true, ...payload }).then((r) => r.data),
+  // 真删：confirm 传 key 末 8 位（手输防手滑），删前备份由后端做。
+  deleteFragment: (key, confirm) =>
+    http.post(`/api/v1/fragments/${encodeURIComponent(key)}/delete`, { confirm }).then((r) => r.data),
+  // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
+  importFragments: (payload) => http.post('/api/v1/import', payload).then((r) => r.data),
 }
 
 export default http

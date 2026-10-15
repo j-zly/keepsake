@@ -25,9 +25,31 @@
       <p class="filter-desc">
         卡片给 3 行摘要，悬停看完整正文；点 key 旁的图标复制，「查看全文 ↗」进抽屉看全文与编辑。
       </p>
+      <div class="filter-ctl">
+        <el-input
+          v-model="q"
+          class="grow"
+          placeholder="搜索常驻正文或标签（清空回全量）"
+          clearable
+          @keyup.enter="search"
+          @clear="onClear"
+        >
+          <template #prefix>
+            <span class="search-ico">
+              <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="7" cy="7" r="4.3" />
+                <path d="m10.3 10.3 3.4 3.4" />
+              </svg>
+            </span>
+          </template>
+        </el-input>
+        <el-button type="primary" :loading="loading" @click="search">查询</el-button>
+      </div>
       <div class="filter-result">
         <span>共 {{ count }} 条匹配 · 每页 {{ pageSize }}</span>
         <div class="acts">
+          <button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选</button>
           <button class="ghost-btn" :disabled="loading" @click="load">刷新</button>
         </div>
       </div>
@@ -43,7 +65,8 @@
           <path d="M12 3.5 3.5 7.5 12 11.5l8.5-4-8.5-4Z" stroke-linejoin="round" />
           <path d="M4.6 12 12 15.6 19.4 12M4.6 16.5 12 20l7.4-3.5" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
-        <p><b>常驻层还是空的</b>到「记忆条目」把要每轮注入的记忆点「升常驻」，它们就会出现在这里。</p>
+        <p v-if="dirty"><b>没匹配到常驻记忆</b>换个更短的核心词试试，或点「清除筛选」回全量常驻层。</p>
+        <p v-else><b>常驻层还是空的</b>到「记忆条目」把要每轮注入的记忆点「升常驻」，它们就会出现在这里。</p>
       </div>
     </div>
 
@@ -103,7 +126,9 @@ import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { isStale } from '../utils/kb'
 
+const q = ref('')
 const items = ref([])
 const stats = ref(null)
 const count = ref(0)
@@ -113,6 +138,9 @@ const loading = ref(false)
 const error = ref('')
 const drawer = ref(false)
 const detail = ref(null)
+
+/** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它 */
+const dirty = computed(() => !!(q.value || '').trim())
 
 /** 占用越高越红：80% 起转蓝（与主色同一套），过 100% 红 —— 超预算注入会截断。 */
 const budgetTone = computed(() => {
@@ -131,23 +159,44 @@ function splitTags(s) {
     .filter(Boolean)
 }
 
+// 请求序号：连续改词时旧响应只丢弃，不覆盖新结果（照抄 KbView 的收口口径）
+let reqSeq = 0
+
 async function load() {
+  const seq = ++reqSeq
   loading.value = true
   error.value = ''
   try {
     const [list, st] = await Promise.all([
-      api.coreList({ page: page.value, page_size: pageSize.value }),
+      // q 只透传，匹配语义在服务端（正文+标签子串，大小写不敏感）
+      api.coreList({
+        q: (q.value || '').trim() || undefined,
+        page: page.value,
+        page_size: pageSize.value,
+      }),
       api.coreStats(),
     ])
+    if (isStale(seq, reqSeq)) return
     items.value = list.items
     count.value = list.count
     stats.value = st
   } catch (e) {
+    if (isStale(seq, reqSeq)) return
     error.value = `读取常驻层失败：${e.message}`
     ElMessage.error(error.value)
   } finally {
-    loading.value = false
+    if (!isStale(seq, reqSeq)) loading.value = false
   }
+}
+
+function search() {
+  page.value = 1
+  load()
+}
+/** 清空 ✕ / 「清除筛选」：无条件回全量常驻层（不是空态），与 KbView 的清空口径一致 */
+function onClear() {
+  q.value = ''
+  search()
 }
 
 function onPage(p) {

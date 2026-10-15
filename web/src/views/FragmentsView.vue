@@ -45,6 +45,14 @@
           <!-- 清除筛选 = 清空 q/tag 再查；重置 = 保留条件、回到第 1 页重查 -->
           <button class="soft-btn" :disabled="!dirty" @click="reset">清除筛选</button>
           <button class="ghost-btn" :disabled="loading" @click="search">重置</button>
+          <!-- 导出沿用当前 q/tag 筛选；格式只影响文件后缀与内容 -->
+          <el-select v-model="exportFormat" class="fmt" title="导出格式">
+            <el-option label="JSONL" value="jsonl" />
+            <el-option label="CSV" value="csv" />
+          </el-select>
+          <el-button :loading="busyExport" @click="doExport">导出</el-button>
+          <el-button @click="openImport">导入</el-button>
+          <el-button type="primary" @click="openCreate">新增条目</el-button>
         </div>
       </div>
     </div>
@@ -93,6 +101,7 @@
         <template #actions>
           <button class="act-btn" @click="promote(row)">升常驻</button>
           <button class="act-btn act-btn--danger" @click="archive(row)">归档</button>
+          <button class="act-btn act-btn--danger" @click="askDelete(row)">删除</button>
         </template>
       </ItemCard>
     </div>
@@ -118,20 +127,129 @@
       :busy="busyArchive"
       @confirm="doArchive"
     />
+
+    <!-- 真删确认：比归档更重（物理删除），所以后果里点名备份路径与手输要求 -->
+    <ConfirmDialog
+      v-model="deleting"
+      title="彻底删除这条记忆条目？"
+      :consequences="deleteConsequences"
+      :expect="deleteExpect"
+      confirm-text="确认删除"
+      :busy="busyDelete"
+      @confirm="doDelete"
+    />
+
+    <!-- 导入实跑确认：expect = 预演给出的「将新增 N 条」，与 merge/forget 同一口径 -->
+    <ConfirmDialog
+      v-model="importRunAsk"
+      title="按预演结果实跑导入？"
+      :consequences="importConsequences"
+      :expect="importExpect"
+      confirm-text="确认导入"
+      :busy="busyRun"
+      tone="primary"
+      @confirm="doImportRun"
+    />
+
+    <!-- 新增：正文必填 + 标签可选（治理保留标签由后端拒/剥，错误文案原样透出） -->
+    <el-dialog
+      v-model="creating"
+      title="新增记忆条目"
+      width="440px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyCreate"
+      :show-close="!busyCreate"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="正文（必填）">
+          <el-input
+            v-model="draftContent"
+            type="textarea"
+            :rows="6"
+            placeholder="一句话写清这条记忆是什么、能用来做什么"
+          />
+        </el-form-item>
+        <el-form-item label="标签（可选，逗号分隔）">
+          <el-input v-model="draftTags" placeholder="如 ops,deploy；core / agent:* 等治理标签不许手填" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="busyCreate" @click="creating = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="busyCreate"
+          :disabled="!draftContent.trim()"
+          @click="doCreate"
+        >
+          新增
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 导入：先 JSONL 解析 → 预演（零写入）回显计数 → 手输 N 才实跑 -->
+    <el-dialog
+      v-model="importing"
+      title="导入记忆条目（JSONL）"
+      width="560px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyPlan && !busyRun"
+      :show-close="!busyPlan && !busyRun"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="每行一条 {content, tags?}">
+          <el-input
+            v-model="importText"
+            type="textarea"
+            :rows="7"
+            placeholder='{"content": "这条记忆是什么", "tags": "ops"}'
+          />
+        </el-form-item>
+      </el-form>
+      <p v-if="importParse.broken" class="banner banner--danger">
+        有 {{ importParse.broken }} 行不是合法的 {"content": ...}，未计入下方条目 —— 不静默丢行，请修正后重试。
+      </p>
+      <p v-else-if="importParse.items.length" class="tip">
+        已解析 {{ importParse.items.length }} 条，点「预演」后端会按内容去重、剥治理标签，并回显将新增多少条。
+      </p>
+      <p v-if="importPlan" class="tip">
+        预演结果：将新增 {{ importPlan.would_add }} 条 · 跳过重复 {{ importPlan.skipped_duplicate }} 条 ·
+        拒收治理标签 {{ importPlan.rejected_reserved }} 条 · 空正文 {{ importPlan.rejected_empty }} 条
+        （共 {{ importPlan.total }} 条）。
+      </p>
+      <template #footer>
+        <el-button :disabled="busyPlan || busyRun" @click="importing = false">取消</el-button>
+        <el-button :loading="busyPlan" :disabled="busyRun || !importParse.items.length" @click="planImport">
+          预演（不写入）
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="busyRun"
+          :disabled="busyPlan || !importPlan || !importPlan.would_add"
+          @click="askImportRun"
+        >
+          实跑导入
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import DetailDrawer from '../components/DetailDrawer.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
-import { api } from '../api'
+import http, { api, getToken } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { isStale } from '../utils/kb'
 
 // count 未知（全库浏览）时按 has_more 撑出「下一页」：给一个假的下一页总数，
 // 有下一页才显示 total=page*page_size+1，翻到那儿再由 has_more=false 收口。
@@ -166,6 +284,50 @@ const archiveConsequences = computed(() =>
     : [],
 )
 
+// ---- 真删（危险操作，同 ConfirmDialog 三层防手滑）----
+const deleting = ref(false)
+const deleteRow = ref(null)
+const busyDelete = ref(false)
+const deleteExpect = computed(() => (deleteRow.value ? deleteRow.value.key.slice(-8) : ''))
+const deleteConsequences = computed(() =>
+  deleteRow.value
+    ? [
+        `真删 ${deleteRow.value.key}：从存储层物理移除，检索与常驻层立刻不再返回它，不可恢复。`,
+        '与归档不同 —— 归档只是失效可回溯，这里是这条记忆不该再存在（误打、含敏感信息）。',
+        '删前会自动备份到 /root/.hermes/backup/console_ops/（唯一的回退路径）；请照抄上面的 key 末 8 位确认。',
+      ]
+    : [],
+)
+
+// ---- 新增 ----
+const creating = ref(false)
+const busyCreate = ref(false)
+const draftContent = ref('')
+const draftTags = ref('')
+
+// ---- 导入：解析 → 预演 → 手输 N 实跑 ----
+const importing = ref(false)
+const importText = ref('')
+const importParse = reactive({ items: [], broken: 0 })
+const importPlan = ref(null)
+const busyPlan = ref(false)
+const busyRun = ref(false)
+const importRunAsk = ref(false)
+const importExpect = computed(() => (importPlan.value ? String(importPlan.value.would_add) : ''))
+const importConsequences = computed(() =>
+  importPlan.value
+    ? [
+        `将写入 ${importPlan.value.would_add} 条新记忆（重复 ${importPlan.value.skipped_duplicate} 条会被跳过，不覆盖旧条目）。`,
+        '打 core 等治理标签的条目会被拒收（不进常驻层），常驻请走候选审核。',
+        `请照抄「${importExpect.value}」确认 —— 这个数就是预演出来的将新增条数，写进去一条都不会多。`,
+      ]
+    : [],
+)
+
+// ---- 导出 ----
+const exportFormat = ref('jsonl')
+const busyExport = ref(false)
+
 /** 有筛选条件在生效吗：空态文案与「清除筛选」按钮都看它 */
 const dirty = computed(() => !!(q.value || tag.value))
 
@@ -182,7 +344,11 @@ function fmtScore(v) {
   return typeof v === 'number' ? v.toFixed(4) : (v ?? '—')
 }
 
+// 请求序号：写操作成功后接着刷新、用户同时又改词时，旧响应只丢弃不覆盖新结果
+let reqSeq = 0
+
 async function load() {
+  const seq = ++reqSeq
   loading.value = true
   error.value = ''
   try {
@@ -193,14 +359,16 @@ async function load() {
       page: page.value,
       page_size: pageSize.value,
     })
+    if (isStale(seq, reqSeq)) return
     items.value = data.items
     count.value = data.count
     hasMore.value = data.has_more
   } catch (e) {
+    if (isStale(seq, reqSeq)) return
     error.value = `读取记忆条目失败：${e.message}`
     ElMessage.error(error.value)
   } finally {
-    loading.value = false
+    if (!isStale(seq, reqSeq)) loading.value = false
   }
 }
 
@@ -274,11 +442,181 @@ async function doArchive(typed) {
   }
 }
 
+/** 真删：物理删除，不可恢复。要求手输 key 末 8 位 —— 与归档同款防手滑。 */
+function askDelete(row) {
+  deleteRow.value = row
+  deleting.value = true
+}
+
+async function doDelete(typed) {
+  const row = deleteRow.value
+  if (!row) return
+  busyDelete.value = true
+  try {
+    await api.deleteFragment(row.key, typed)
+    deleting.value = false
+    showToast(`已删除：${row.key}`)
+    load()
+  } catch (e) {
+    showError(`删除失败：${e.message}`)
+  } finally {
+    busyDelete.value = false
+  }
+}
+
+// ---- 新增 ----
+function openCreate() {
+  draftContent.value = ''
+  draftTags.value = ''
+  creating.value = true
+}
+
+async function doCreate() {
+  const content = draftContent.value.trim()
+  if (!content) return
+  busyCreate.value = true
+  try {
+    // 后端 400（打 core 等保留标签）时 e.message 就是 detail.message，不吞
+    const r = await api.createFragment({ content, tags: draftTags.value.trim() })
+    creating.value = false
+    showToast(`已新增：${r.key}`)
+    load()
+  } catch (e) {
+    showError(`新增失败：${e.message}`)
+  } finally {
+    busyCreate.value = false
+  }
+}
+
+// ---- 导入 ----
+/** JSONL 逐行解析成 items；坏行**计数返回**，绝不静默丢 */
+function parseJsonl(text) {
+  const items = []
+  let broken = 0
+  for (const line of (text || '').split('\n')) {
+    const s = line.trim()
+    if (!s) continue
+    try {
+      const o = JSON.parse(s)
+      if (o && typeof o.content === 'string') items.push({ content: o.content, tags: o.tags || '' })
+      else broken += 1
+    } catch {
+      broken += 1
+    }
+  }
+  return { items, broken }
+}
+
+function openImport() {
+  importText.value = ''
+  importParse.items = []
+  importParse.broken = 0
+  importPlan.value = null
+  importing.value = true
+}
+
+function currentItems() {
+  const p = parseJsonl(importText.value)
+  importParse.items = p.items
+  importParse.broken = p.broken
+  return p.items
+}
+
+/** 预演：后端零写入，只回显「将新增 / 跳过重复 / 拒收」三个数 */
+async function planImport() {
+  busyPlan.value = true
+  try {
+    importPlan.value = await api.importFragments({ items: currentItems(), dry_run: true })
+  } catch (e) {
+    showError(`导入预演失败：${e.message}`)
+  } finally {
+    busyPlan.value = false
+  }
+}
+
+function askImportRun() {
+  if (!importPlan.value || !importPlan.value.would_add) return
+  importRunAsk.value = true
+}
+
+async function doImportRun(typed) {
+  busyRun.value = true
+  try {
+    const r = await api.importFragments({ items: importParse.items, dry_run: false, confirm: typed })
+    importRunAsk.value = false
+    importing.value = false
+    showToast(`导入完成：新增 ${r.would_add} 条 · 跳过重复 ${r.skipped_duplicate} 条`)
+    load()
+  } catch (e) {
+    showError(`导入失败：${e.message}`)
+  } finally {
+    busyRun.value = false
+  }
+}
+
+// ---- 导出 ----
+/** 失败时把后端的 JSON 文案取出来（否则只能看到「status 400」） */
+async function exportError(res) {
+  try {
+    const d = JSON.parse(await res.text())
+    return d?.detail?.message || d?.detail?.error || `后端返回 ${res.status}`
+  } catch {
+    return `后端返回 ${res.status}`
+  }
+}
+
+/**
+ * 导出：走 fetch 而不是裸 `<a href>` —— 端点要 Authorization 头，裸链子带不了
+ * （token 只进请求头，绝不进 URL）。baseURL 取自 http 实例，不另写一份环境变量。
+ * q/tag 沿用页面当前筛选：导出的就是屏幕上这一批，不是「全库」。
+ */
+async function doExport() {
+  busyExport.value = true
+  try {
+    const qs = new URLSearchParams()
+    const kw = (q.value || '').trim()
+    const tg = (tag.value || '').trim()
+    if (kw) qs.set('q', kw)
+    if (tg) qs.set('tag', tg)
+    qs.set('format', exportFormat.value)
+    const token = getToken()
+    const res = await fetch(`${http.defaults.baseURL || ''}/api/v1/export?${qs}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) throw new Error(await exportError(res))
+    const url = URL.createObjectURL(await res.blob())
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `keepsake-export.${exportFormat.value}`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+    showToast(`导出已开始下载：${a.download}`)
+  } catch (e) {
+    showError(`导出失败：${e.message}`)
+  } finally {
+    busyExport.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
 <style scoped>
 .pad {
   padding: 20px;
+}
+/* 导出格式下拉：只跟 .sel 一样是筛选区控件的宽度档，窄一点不抢按钮的视线 */
+.fmt {
+  width: 110px;
+}
+/* 弹框里的说明行：与 DetailDrawer 的 .tip 同一份配方（12px/1.7 --text-faint）——
+   scoped 样式跨组件不生效，只能各写一份，数值不许自创 */
+.tip {
+  margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>
