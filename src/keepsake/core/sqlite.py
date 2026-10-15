@@ -96,13 +96,13 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
-from .base import StorageBase
+from .base import StorageBase, fire_hits
 from . import shared as storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
 from .shared import (
@@ -296,6 +296,16 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
     """),
     # 批 2：FTS5 虚表（与上表同源，ensure_index 的「先查后补」循环一并建）
     (FTS_TABLE, _CREATE_FTS),
+    # 2026-10 ks_hit_tracking：检索命中事件（纯追加，无外键 —— 碎片归档后事件仍在）。
+    # ts 存 ISO 字符串（本库既有时间列都是 TEXT，如 ks_fragment.updated）：
+    # 一律 `datetime.now(timezone.utc).isoformat()` ⇒ 同一 UTC 形态、字典序 == 时序，
+    # 窗口比较（`ts >= ?`）与 PG 侧 timestamptz 的语义等价，且不用引依赖。
+    ("ks_hit_event", """
+    CREATE TABLE IF NOT EXISTS ks_hit_event (
+        key TEXT NOT NULL,
+        ts  TEXT NOT NULL
+    )
+    """),
 )
 
 _DDL_INDEXES: Tuple[Tuple[str, str], ...] = (
@@ -305,6 +315,10 @@ _DDL_INDEXES: Tuple[Tuple[str, str], ...] = (
     ("idx_ks_fragment_consumed_by",
      "CREATE INDEX IF NOT EXISTS idx_ks_fragment_consumed_by "
      "ON ks_fragment (consumed_by)"),
+    # ponytail: prune 按 ts 删走顺序扫（每 key 300 秒去抖，行量小），不另建 ts 索引。
+    ("idx_ks_hit_event_key_ts",
+     "CREATE INDEX IF NOT EXISTS idx_ks_hit_event_key_ts "
+     "ON ks_hit_event (key, ts)"),
 )
 
 
@@ -1438,6 +1452,74 @@ class SqliteStorage(StorageBase):
             return False
 
     # ------------------------------------------------------------------
+    # 检索命中打点（2026-10 ks_hit_tracking）
+    #
+    # 落库形态：**ks_hit_event 追加行表**（与 PG 侧同款；本库是单文件嵌入式，
+    # 事件量随去抖后很小，行表比任何「计数列挂在主表上」的形态都更省写放大）。
+    # 与 Redis 侧 zset+hash 的差别只在落库语句，对外形状完全一致。
+    # ------------------------------------------------------------------
+
+    def _fire_hits(self, fragments: List[Dict[str, Any]]) -> None:
+        """检索返回前的命中打点（**侧写，绝不影响检索结果**）。
+
+        限频 + 后台线程 + fail-open 三件事都在 `storage_shared.fire_hits` 里
+        （三后端共用一份实现）；这里只摘 `_key`，并在最外层再兜一道 try/except。
+        """
+        try:
+            fire_hits(self, [f.get("_key") for f in fragments if f.get("_key")])
+        except Exception as e:      # noqa: BLE001
+            logger.debug("storage_sqlite: 命中打点失败（fail-open）: %s: %s",
+                         type(e).__name__, e)
+
+    def record_hits(self, keys: List[str]) -> int:
+        """一批命中事件追加成行（纯 INSERT，不碰 ks_fragment ⇒ 写放大零）。"""
+        rows = [(k, datetime.now(timezone.utc).isoformat())
+                for k in dict.fromkeys(keys) if k]
+        if not rows:
+            return 0
+        with self._write() as cur:
+            cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (?, ?)", rows)
+        return len(rows)
+
+    def hits_stats(
+        self,
+        window_days: int = 7,
+        min_hits: int = 5,
+        keys: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。"""
+        since = (datetime.now(timezone.utc)
+                 - timedelta(days=int(window_days))).isoformat()
+        sql = "SELECT key, count(*) AS hits, max(ts) FROM ks_hit_event WHERE ts >= ?"
+        params: List[Any] = [since]
+        # 同 PG 侧：给了 keys 就只算这些 key，且**不再套 min_hits 门槛**
+        # （调用方已知候选集，热度阈值是它自己的判断）
+        wanted = list(dict.fromkeys(k for k in keys if k)) if keys else []
+        if wanted:
+            sql += " AND key IN (%s)" % ",".join("?" for _ in wanted)
+            params.extend(wanted)
+        sql += " GROUP BY key"
+        if not wanted:
+            sql += " HAVING count(*) >= ?"
+            params.append(int(min_hits))
+        sql += " ORDER BY hits DESC, key LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._db().execute(sql, params).fetchall()
+        return [
+            {"key": key, "hits": int(hits), "last_hit": last_hit or ""}
+            for key, hits, last_hit in rows
+        ]
+
+    def prune_hit_events(self, days: int = 90) -> int:
+        """删掉 `days` 天前的命中事件行，返回删除条数。"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
+        with self._write() as cur:
+            cur.execute("DELETE FROM ks_hit_event WHERE ts < ?", (cutoff,))
+            return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
     # 检索（批 2：jieba + FTS5 + bm25 + 共用重排）
     # ------------------------------------------------------------------
 
@@ -1621,8 +1703,11 @@ class SqliteStorage(StorageBase):
             knn_results = []
         if knn_results:
             fused = self._tiebreak(self._rrf_fuse(bm25_results, knn_results))
-            return self._apply_v2_filters(fused)
-        return self._apply_v2_filters(bm25_results)
+            final = self._apply_v2_filters(fused)
+        else:
+            final = self._apply_v2_filters(bm25_results)
+        self._fire_hits(final)      # 侧写打点：命中 keys，后台 + fail-open
+        return final
 
     def _bm25_stats(self, where_sql: str, params: List[Any],
                     terms: List[str]) -> Tuple[float, float, Dict[str, float]]:
@@ -1760,7 +1845,9 @@ class SqliteStorage(StorageBase):
         # 2. 共用重排（时间衰减 × 情绪 × 反馈 × 热门 × 注意力）+ tiebreak + 截断。
         #    与 PG `search_bm25` 逐步同序：重排 → tiebreak → [:final_limit]。
         ranked = self._rerank_with_decay(fragments, score_key="_bm25_score")
-        return self._tiebreak(ranked)[: self._final_limit]
+        final = self._tiebreak(ranked)[: self._final_limit]
+        self._fire_hits(final)      # 侧写打点：命中 keys，后台 + fail-open
+        return final
 
     # ------------------------------------------------------------------
     # 加权信号（批 2）

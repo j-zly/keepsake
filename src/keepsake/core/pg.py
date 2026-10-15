@@ -82,7 +82,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
-from .base import StorageBase
+from .base import StorageBase, fire_hits
 from .shared import (          # 与 Redis 共用的检索后处理（同一批函数对象）
     FRAGMENT_FIELDS,
     SEARCH_FIELDS,
@@ -293,12 +293,28 @@ _DDL_TABLES = (
         synonyms jsonb NOT NULL DEFAULT '[]'::jsonb
     )
     """),
+    # 2026-10 ks_hit_tracking：检索命中事件（**纯追加**，与 ks_fragment 无外键 ——
+    # 碎片被删/归档后事件行仍要留着，否则「曾经热过」这个信号会随归档消失）。
+    # ts 用 timestamptz（不是本库惯用的 text ISO）：窗口统计要按时间范围聚合/比较，
+    # timestamptz 由 PG 自己算时区，不会因为某天机器时区变了就把窗口切歪。
+    ("ks_hit_event", """
+    CREATE TABLE IF NOT EXISTS ks_hit_event (
+        key text        NOT NULL,
+        ts  timestamptz NOT NULL DEFAULT now()
+    )
+    """),
 )
 
 _DDL_INDEXES = (
     ("idx_ks_entity_timeline_ts",
      "CREATE INDEX IF NOT EXISTS idx_ks_entity_timeline_ts "
      "ON ks_entity_timeline (entity, ts DESC)"),
+    # 窗口统计的主查询形态就是「按 key 取窗口内事件数」，(key, ts) 一条索引覆盖。
+    # ponytail: prune_hit_events 按 ts 删是顺序扫 —— 90 天窗口 + 每 key 300 秒
+    # 去抖，行量本来就不大；真嫌慢再加一条 (ts) 索引（代价是每次打点多写一条索引）。
+    ("idx_ks_hit_event_key_ts",
+     "CREATE INDEX IF NOT EXISTS idx_ks_hit_event_key_ts "
+     "ON ks_hit_event (key, ts)"),
 )
 
 # 🔴 content_tsv / embedding 两列**不能**写进上面这段 DDL：
@@ -945,6 +961,23 @@ class PgStorage(StorageBase):
         except Exception:
             pass
 
+    def _search_pool(self) -> ThreadPoolExecutor:
+        """后台活（BM25/KNN 并行两路 + 检索命中打点）共用的线程池，惰性建、复用。
+
+        🔴 **打点为什么不自己起线程**（2026-10 ks_hit_tracking）：起线程会让每次
+        检索多一条 PG 连接（`_worker_conn()` 是**按线程**存的，直到 `close()`
+        才回收）—— 聊几轮就攒出几十条僵尸连接。自建线程池的 worker 数固定，
+        连接数上界恒定，且 `close()` 里已经 shutdown 了这条路径。
+        """
+        pool = self._pool
+        if pool is None:
+            with self._conn_lock:
+                if self._pool is None:
+                    self._pool = ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="ks-pg-search")
+                pool = self._pool
+        return pool
+
     @contextmanager
     def _ro(self) -> Iterator[Any]:
         """只读游标。读完显式 commit 关掉 psycopg 的隐式事务。
@@ -981,15 +1014,26 @@ class PgStorage(StorageBase):
         只会建 SAVEPOINT，退出时释放保存点、外层隐式事务**仍未提交**，
         而 `Connection.close()` 会把它回滚 ⇒ 「先查后写」时写入全部丢失。
         本函数是本模块唯一的写入口，所以在这里兜死。
+
+        🔴 **后台线程里的写也走这里，但换成本线程那条连接**（2026-10 ks_hit_tracking
+        撞出来的真故障）：psycopg 的 Connection 非线程安全，主连接正被调用线程
+        的事务占着时，打点线程再拿它开事务 ⇒ `ProgrammingError: Explicit commit()
+        forbidden within a Transaction context`，**并把调用线程那条连接搞成
+        [BAD]**（主线程下一次读直接炸）。判据沿用 `_ro()` 那套 `in_worker` 标志，
+        两条路径于是同源：worker 线程各持一条连接（`close()` 里统一关）。
         """
-        conn = self._connect()
+        in_worker = getattr(self._tls, "in_worker", False)
+        conn = self._worker_conn() if in_worker else self._connect()
         try:
             with conn.transaction():
                 with conn.cursor() as cur:
                     yield cur
             conn.commit()
         except Exception:
-            self._drop_conn()
+            if in_worker:
+                self._drop_worker_conn()
+            else:
+                self._drop_conn()
             raise
 
     def health_check(self) -> bool:
@@ -1420,7 +1464,9 @@ class PgStorage(StorageBase):
         is_primary: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索（对外入口：内部薄候选 + 一次取回正文，形状逐字不变）。"""
-        return self._hydrate_thin(self._bm25_thin(query, tag_filter, agent_id, is_primary))
+        results = self._hydrate_thin(self._bm25_thin(query, tag_filter, agent_id, is_primary))
+        self._fire_hits(results)        # 侧写打点：命中 keys，后台 + fail-open
+        return results
 
     def _bm25_thin(
         self,
@@ -1783,14 +1829,19 @@ class PgStorage(StorageBase):
         if not self._has_embedder():
             bm25_results = self._bm25_thin(query, tag_filter, effective_agent_id,
                                             effective_is_primary)
-            return self._hydrate_thin(self._apply_v2_filters(bm25_results))
+            final = self._hydrate_thin(self._apply_v2_filters(bm25_results))
+            self._fire_hits(final)     # 侧写打点：命中 keys，后台 + fail-open
+            return final
 
         knn_results, bm25_results = self._search_parallel(
             query, tag_filter, effective_agent_id, effective_is_primary)
         if knn_results:
             fused = self._rrf_fuse(bm25_results, knn_results)
-            return self._hydrate_thin(self._apply_v2_filters(self._tiebreak(fused)))
-        return self._hydrate_thin(self._apply_v2_filters(bm25_results))
+            final = self._hydrate_thin(self._apply_v2_filters(self._tiebreak(fused)))
+        else:
+            final = self._hydrate_thin(self._apply_v2_filters(bm25_results))
+        self._fire_hits(final)
+        return final
 
     def _search_parallel(
         self,
@@ -1809,13 +1860,7 @@ class PgStorage(StorageBase):
         shutdown）—— 每次 search 新建线程池会让 worker 连接反复重建，
         而建连到远端库要 2~4s，比省下的那点时间贵得多。
         """
-        pool = self._pool
-        if pool is None:
-            with self._conn_lock:
-                if self._pool is None:
-                    self._pool = ThreadPoolExecutor(
-                        max_workers=2, thread_name_prefix="ks-pg-search")
-                pool = self._pool
+        pool = self._search_pool()
 
         def run(fn, *args):
             # 标记本线程走独立连接（`_ro()` 据此分流到 `_worker_conn`）
@@ -2903,6 +2948,109 @@ class PgStorage(StorageBase):
             new_key, old_key,
         )
         return False
+
+    # ------------------------------------------------------------------
+    # 检索命中打点（2026-10 ks_hit_tracking）
+    #
+    # 落库形态：**ks_hit_event 追加行表**（PG 选表不选 zset 的理由见该表 DDL 注释
+    # —— 命中是流水，要按天窗 `count(*)`，表一次 GROUP BY 就够；PG 侧没有
+    # 「sorted set + hash 计数」那种为读放大设计的结构，硬凑只会多一层转换）。
+    # 与 Redis 侧的差别只在落库语句，对外形状（hits_stats 的返回）完全一致。
+    # ------------------------------------------------------------------
+
+    def _submit_hit_work(self, fn: Any) -> bool:
+        """PG 侧执行器：把打点丢进检索那条复用线程池（不打新线程 ⇒ 连接数有上界）。
+
+        worker 带 `in_worker` 标记 ⇒ 落库走**本线程那条独立连接**，绝不与调用
+        线程的主连接抢事务（psycopg Connection 非线程安全，见 `_tx` 的注释）。
+        """
+        def run() -> None:
+            self._tls.in_worker = True
+            try:
+                fn()
+            finally:
+                self._tls.in_worker = False
+        self._search_pool().submit(run)
+        return True
+
+    def _fire_hits(self, fragments: List[Dict[str, Any]]) -> None:
+        """检索返回前的命中打点：纯侧写，绝不影响检索结果（限频 / 异步 / fail-open
+        三件事都在共用的 `fire_hits` 里）；PG 侧只多传一个自己的执行器。
+        """
+        try:
+            fire_hits(self, [f.get("_key") for f in fragments if f.get("_key")],
+                      submit=self._submit_hit_work)
+        except Exception as e:      # noqa: BLE001
+            logger.debug("storage_pg: 命中打点失败（fail-open）: %s: %s",
+                         type(e).__name__, e)
+
+    def record_hits(self, keys: List[str]) -> int:
+        """一批命中事件追加成行（纯 INSERT，不碰 ks_fragment ⇒ 写放大零）。
+
+        同一批里的重复 key 只写一行（一次检索每个 key 至多出现一次；同 key 的
+        **跨批**重复命中由 `fire_hits` 的 300 秒限频挡掉）。
+        """
+        rows = [(k, datetime.now(timezone.utc)) for k in dict.fromkeys(keys) if k]
+        if not rows:
+            return 0
+        in_worker = threading.current_thread() is not threading.main_thread()
+        self._tls.in_worker = in_worker
+        try:
+            with self._tx() as cur:
+                cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (%s, %s)", rows)
+        finally:
+            self._tls.in_worker = False
+        return len(rows)
+
+    def hits_stats(
+        self,
+        window_days: int = 7,
+        min_hits: int = 5,
+        keys: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。"""
+        sql = (
+            "SELECT key, count(*) AS hits, max(ts) AS last_hit FROM ks_hit_event "
+            "WHERE ts >= now() - (%s * interval '1 day')"
+        )
+        params: List[Any] = [int(window_days)]
+        if keys:
+            # 给了 keys 就只算这些 key，且**不再套 min_hits 门槛** ——
+            # 调用方（下一单 core_tiering）已知候选集，要的是「各多少热度」，
+            # 门槛是它自己的判断（7 天内 ≥5 次提名），不是这里该悄悄筛掉的。
+            sql += " AND key = ANY(%s)"
+            params.append(list(dict.fromkeys(keys)))
+        sql += " GROUP BY key"
+        if not keys:
+            sql += " HAVING count(*) >= %s"
+            params.append(int(min_hits))
+        sql += " ORDER BY hits DESC, key LIMIT %s"
+        params.append(int(limit))
+        with self._ro() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {
+                "key": key,
+                "hits": int(hits),
+                # 统一归一到 UTC 再出参：timestamptz 取回时带的是**会话时区**
+                # （线上是 +08:00），而另两个后端出参恒为 UTC —— 同一份东西
+                # 三种时区形态，下游按字符串比就错了。
+                "last_hit": last_hit.astimezone(timezone.utc).isoformat()
+                            if last_hit is not None else "",
+            }
+            for key, hits, last_hit in rows
+        ]
+
+    def prune_hit_events(self, days: int = 90) -> int:
+        """删掉 `days` 天前的命中事件行，返回删除条数。"""
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM ks_hit_event WHERE ts < now() - (%s * interval '1 day')",
+                (int(days),),
+            )
+            return cur.rowcount or 0
 
     def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
         """按时间倒序返回某实体的记忆时间线。"""

@@ -43,6 +43,37 @@ export async function downloadFile(path, filename) {
 }
 
 /**
+ * 勾选导出：只导**选中的那几条**（`POST /api/v1/ops/bulk-export`）。
+ *
+ * 🔴 为什么走 POST 而不是给 `GET /api/v1/export` 加 `keys=`：500 个 key 拼进
+ * query 约 11KB，nginx/uvicorn 的请求行上限（默认 8K）会直接 431 —— 「勾选导出」
+ * 在最大的勾选规模上必然失败。后端按 body 收 keys，超限报 400 不截断。
+ *
+ * blob 下载那段与 `downloadFile` 同款（各写一份：前者是既有函数，行为不许动）。
+ */
+export async function exportKeys(keys, format = 'jsonl') {
+  const token = getToken()
+  const res = await fetch(`${http.defaults.baseURL || ''}/api/v1/ops/bulk-export`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ keys, format }),
+  })
+  if (!res.ok) throw new Error(await errorText(res))
+  const url = URL.createObjectURL(await res.blob())
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `keepsake-selected.${format === 'csv' ? 'csv' : 'jsonl'}`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+  return a.download
+}
+
+/**
  * 下载导入模板（`kind` = memory | kb | core）。字段名三域各不相同
  * （记忆条目 content / 知识库 title+content），猜错的表现是「导入 N 条全是 0」。
  */

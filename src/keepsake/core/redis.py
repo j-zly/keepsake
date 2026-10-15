@@ -24,7 +24,7 @@ import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder, create_embedder
-from .base import StorageBase
+from .base import StorageBase, fire_hits
 # 2026-10 ks_pg_b2：检索后处理与排序权重抽到 storage_shared —— Redis / PG 共用同一份。
 # 下面这几个名字从 storage_shared 转出，是给既有调用方（cleanup_hot_topics 等）的转出口。
 from .shared import (          # noqa: F401 — 常量与函数均为有意 re-export
@@ -92,6 +92,17 @@ HOT_TOPIC_SET = "keepsake:hot_topics"
 HOT_TOPIC_DAILY = "keepsake:hot_topics:daily"  # 日榜
 HOT_TOPIC_WEEKLY = "keepsake:hot_topics:weekly"  # 周榜
 HOT_TOPIC_LAST_SEEN = "keepsake:hot_topics:last_seen"  # 最后提及时间
+
+# ---- 2026-10 ks_hit_tracking：检索命中打点 ----
+# 为什么 Redis 侧是「zset + hash 计数」而 PG/SQLite 是行表（任务书拍板的选型）：
+#   * Redis 侧没有表，事件是流水 ⇒ 用 sorted set 存「每 key 的最近一次命中时刻」
+#     （score=unix 秒、member=key，`zadd GT` 只前移不后退 ⇒ 每 key 至多一条，
+#     天然幂等、占内存恒定，不像流水那样只涨）；
+#   * 但窗口统计要的是**次数**，zset 只有时刻 ⇒ 另配一个 hash 计累计次数
+#     （`hincrby` O(1)，同 key 300 秒去抖已在上游 `fire_hits` 里做掉了）。
+#   * 对外形状（`hits_stats` 的返回）与另两个后端**完全一致**，只有实现不同。
+HITS_ZSET = "keepsake:hits"          # member=碎片 key，score=最近命中 unix 秒
+HITS_COUNT_HASH = "keepsake:hits:count"  # field=碎片 key，value=累计命中次数
 
 
 def _decode_hash_value(v: Any) -> Any:
@@ -1191,6 +1202,108 @@ class RedisStorage(StorageBase):
         client.hset(new_key, "supersedes", old_key)
         return True
 
+    # ------------------------------------------------------------------
+    # 检索命中打点（2026-10 ks_hit_tracking）
+    #
+    # 落库形态：`keepsake:hits` zset（每 key 最近一次命中时刻）+ `keepsake:hits:count`
+    # hash（累计次数）—— 选型理由见上面两个 key 常量的注释。
+    # 与 PG/SQLite 行表的**对外形状完全一致**，差别只在实现。
+    # ------------------------------------------------------------------
+
+    def _fire_hits(self, fragments: List[Dict[str, Any]]) -> None:
+        """检索返回前的命中打点（**侧写，绝不影响检索结果**）。
+
+        限频 + 后台线程 + fail-open 三件事都在 `storage_shared.fire_hits` 里
+        （三后端共用一份实现）；这里只摘 `_key`，并在最外层再兜一道 try/except ——
+        Redis 不可达时 `_get_client()` 返回 None，fire_hits 里 record_hits 返回 0。
+        """
+        try:
+            fire_hits(self, [f.get("_key") for f in fragments if f.get("_key")])
+        except Exception as e:      # noqa: BLE001
+            logger.debug("storage: 命中打点失败（fail-open）: %s: %s",
+                         type(e).__name__, e)
+
+    def record_hits(self, keys: List[str]) -> int:
+        """记一批命中：zset 刷新最近时刻（`zadd GT`）+ hash 计数 +1。"""
+        uniq = list(dict.fromkeys(k for k in keys if k))
+        if not uniq:
+            return 0
+        client = self._get_client()
+        if not client:
+            return 0
+        now = time.time()
+        pipe = client.pipeline()
+        # GT：只在时刻真的前移时才更新（同一秒内的重复命中不会覆盖回旧值）
+        pipe.zadd(HITS_ZSET, {k: now for k in uniq}, gt=True)
+        for k in uniq:
+            pipe.hincrby(HITS_COUNT_HASH, k, 1)
+        pipe.execute()
+        return len(uniq)
+
+    def hits_stats(
+        self,
+        window_days: int = 7,
+        min_hits: int = 5,
+        keys: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """窗口内命中统计（形状见 StorageBase.hits_stats）。
+
+        🔴 与 PG/SQLite 的一处**已知口径差**：计数取自 hash 的**累计**次数，
+        而「窗口内」只由 zset 的最近时刻筛（zset 每 key 只有最近一次）——
+        与行表口径相比，跨窗口的累计会略高。因为上游已按 300 秒去抖、
+        且本单只作「热不热」的粗信号，够用不追求精确（任务书口径）。
+        """
+        client = self._get_client()
+        if not client:
+            return []
+        since = time.time() - int(window_days) * 86400
+        raw = client.zrangebyscore(HITS_ZSET, since, "+inf", withscores=True)
+        scores = {
+            (m.decode("utf-8") if isinstance(m, bytes) else str(m)): float(s)
+            for m, s in (raw or [])
+        }
+        if keys:
+            wanted = {k for k in keys if k}
+            scores = {k: v for k, v in scores.items() if k in wanted}
+        if not scores:
+            return []
+        names = sorted(scores)
+        pipe = client.pipeline()
+        for k in names:
+            pipe.hget(HITS_COUNT_HASH, k)
+        counts = pipe.execute()
+        items = [
+            {
+                "key": k,
+                "hits": int((c.decode("utf-8") if isinstance(c, bytes) else c) or 0),
+                "last_hit": datetime.fromtimestamp(
+                    scores[k], tz=timezone.utc).isoformat(),
+            }
+            for k, c in zip(names, counts)
+        ]
+        if not keys:
+            items = [it for it in items if it["hits"] >= int(min_hits)]
+        items.sort(key=lambda it: (-it["hits"], it["key"]))
+        return items[:int(limit)]
+
+    def prune_hit_events(self, days: int = 90) -> int:
+        """删掉 `days` 天前命中过的 key（zset 成员 + 计数 hash 字段一起清）。"""
+        client = self._get_client()
+        if not client:
+            return 0
+        cutoff = time.time() - int(days) * 86400
+        stale = client.zrangebyscore(HITS_ZSET, "-inf", f"({cutoff}")
+        if not stale:
+            return 0
+        names = [m.decode("utf-8") if isinstance(m, bytes) else str(m) for m in stale]
+        pipe = client.pipeline()
+        pipe.zremrangebyscore(HITS_ZSET, "-inf", f"({cutoff}")
+        for i in range(0, len(names), 500):        # 一次 HMAXDEL 不多，拆批防超长参数
+            pipe.hdel(HITS_COUNT_HASH, *names[i:i + 500])
+        pipe.execute()
+        return len(names)
+
     def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
         """读一个碎片的完整 hash（v2 pipeline UPDATE 阶段需要看旧事实全文）。
 
@@ -1842,6 +1955,7 @@ class RedisStorage(StorageBase):
                     ttl=self._qexp_ttl,
                 )
 
+            self._fire_hits(final_fragments)     # 侧写打点：命中 keys，后台 + fail-open
             return final_fragments
 
         except Exception as e:
@@ -2013,9 +2127,13 @@ class RedisStorage(StorageBase):
             knn_results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
             if knn_results:
                 fused = self._rrf_fuse(bm25_results, knn_results)
-                return self._apply_v2_filters(fused)
+                final = self._apply_v2_filters(fused)
+                self._fire_hits(final)          # 侧写打点：命中 keys，后台 + fail-open
+                return final
 
-        return self._apply_v2_filters(bm25_results)
+        final = self._apply_v2_filters(bm25_results)
+        self._fire_hits(final)
+        return final
 
     # ------------------------------------------------------------------
     # Redis 专属取数钩子（storage_shared 的两个后端接口，各只有几行）

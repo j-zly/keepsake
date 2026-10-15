@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
-from .routers import auth, core, crons, fragments, kb, ops, stats
+from .routers import auth, core, crons, fragments, hits, kb, ops, stats
 
 logger = logging.getLogger("keepsake.api")
 
@@ -56,7 +56,8 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
 
     # ---- 只读业务路由 ----
-    for r in (core.router, fragments.router, kb.router, stats.router, crons.router):
+    for r in (core.router, fragments.router, hits.router, kb.router,
+              stats.router, crons.router):
         app.include_router(r)
 
     # ---- 写操作路由（全部 POST / 全部需 token / 全部二次确认+备份+审计）----

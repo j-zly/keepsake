@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from keepsake.core.shared import fragment_key_for, sanitize_reserved_tags
 
@@ -126,6 +126,26 @@ class BulkOpsBody(BaseModel):
 
     dry_run: bool = True
     confirm: Optional[str] = None
+
+
+class BulkActionBody(BaseModel):
+    """`{"action": "promote", "keys": [...], "confirm": "<勾选数>"}`。
+
+    `confirm` 是**去重后的选中条数**（防手滑口径与 merge/forget 同款），
+    不是布尔 —— 批量删 37 条时「按回车就删」是不可接受的。
+    """
+
+    action: str = ""
+    keys: List[str] = []
+    confirm: str = ""
+
+
+class BulkExportBody(BaseModel):
+    """`{"keys": [...], "format": "jsonl|csv"}` —— 勾选导出（走 POST 是因为
+    500 个 key 拼进 query 会撞 8K 请求行上限，见 `bulk_export`）。"""
+
+    keys: List[str] = []
+    format: str = Field("jsonl", pattern="^(jsonl|csv)$")
 
 
 # --------------------------------------------------------------------------
@@ -818,6 +838,146 @@ def set_core_budget(body: CoreBudgetBody) -> Dict[str, Any]:
                  reason=f"{current} -> {body.budget}; backup={backup}; path={path}")
     return {"ok": True, "action": action, "budget": int(body.budget),
             "path": str(path), "backup": backup}
+
+
+# --------------------------------------------------------------------------
+# 勾选批量：改数据（ops/bulk）与纯读（ops/bulk-export）
+# --------------------------------------------------------------------------
+
+#: 一次勾选操作的上限。500 条既是交互上限，也压住了单次请求体；超了报 400
+#: 而不是截断成「前 500 条」（被截断的批量写 = 用户以为都做了、实际没做）。
+BULK_MAX_KEYS = 500
+
+#: 批量动作白名单 —— 每一条都必须有对应的**单条**端点与同一存储路径
+BULK_ACTIONS = ("promote", "demote", "archive", "delete")
+
+
+def _dedup_keys(raw: List[str], action: str, target: str) -> List[str]:
+    """勾选的 keys 去重 + 区间校验（保序：与用户勾选顺序一致，回包好对账）。"""
+    keys: List[str] = []
+    seen = set()
+    for k in raw or []:
+        s = str(k).strip()
+        if s and s not in seen:
+            seen.add(s)
+            keys.append(s)
+    if not keys:
+        _reject(400, "bulk_no_keys", "keys 不能为空（请先勾选条目）", action, target)
+    if len(keys) > BULK_MAX_KEYS:
+        _reject(400, "bulk_too_large",
+                f"一次最多 {BULK_MAX_KEYS} 条，本次 {len(keys)} 条：请分批操作（超限不截断）",
+                action, target)
+    return keys
+
+
+def _err_code(e: HTTPException) -> str:
+    """把 `_apply` 抛出的 HTTPException 收回成可读原因码（批量语义：逐条记，不中断）。"""
+    detail = e.detail
+    if isinstance(detail, dict):
+        return str(detail.get("error") or f"http_{e.status_code}")
+    return f"http_{e.status_code}"
+
+
+@router.post("/api/v1/ops/bulk",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def bulk_ops(body: BulkActionBody, storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**勾选批量**写：promote / demote / archive / delete。
+
+    🔴 **逐条走单条端点的同一存储函数**（`_with_core` + `_apply` 打标签、
+    `_apply` 归档、`audit.backup_fragment` + `delete_fragments_batch` 真删），
+    不是另写一份 SQL：单条端点是这条路线的唯一语义来源，复制一份迟早漂移。
+
+    确认串 = **去重后的选中条数**（与 merge/forget 的「当前计数」同一防手滑口径）：
+    勾了 37 条却手输 38 个都不会放行 ⇒ 「我要删的这一批」和「我点确认的那一批」
+    必须是同一个数。
+
+    **单条失败不中断整批**：不存在 / 已是常驻 / 不在常驻 / 后端拒写，各自在
+    `failed` 里带原因码返回，其余照常执行 —— 批量里 499 条成功不该被第 500 条
+    拖成整批 0 成功。审计另记一条批次汇总（成败数 + 备份目录）。
+
+    真删仍是**先逐条备份**、后删：某条备份写不进（磁盘满）就跳过那一条并记
+    `backup_failed`（宁删不成，与单条端点同一纪律）。
+    """
+    if body.action not in BULK_ACTIONS:
+        _reject(400, "bulk_bad_action",
+                f"action 只支持 {list(BULK_ACTIONS)}，本次 {body.action!r}",
+                "ops.bulk", "-")
+    action = f"ops.bulk.{body.action}"
+    keys = _dedup_keys(body.keys, action, "batch")
+    _need_text(body.confirm, str(len(keys)), action, "batch",
+               f"本次勾选的 {len(keys)} 条")
+
+    failed: List[Dict[str, str]] = []
+    succeeded = 0
+    for key in keys:
+        try:
+            row = storage.get_fragment(key)
+            if not row:
+                failed.append({"key": key, "reason": "not_found"})
+                continue
+            if body.action == "archive":
+                # 与 archive_fragment 同一路径：备份 → is_archived=1 + valid_until
+                # （版本化失效，不物理删；重复归档幂等，与单条端点一致）
+                audit.backup_fragment(key, row)
+                _apply(storage, key,
+                       {"is_archived": "1", "valid_until": _now_iso()}, action)
+            elif body.action == "delete":
+                audit.backup_fragment(key, row)        # 写不进 ⇒ OSError ⇒ 该条跳过
+                if storage.delete_fragments_batch([key]) != 1:
+                    failed.append({"key": key, "reason": "delete_failed"})
+                    continue
+            else:
+                on = body.action == "promote"
+                has = CORE_TAG in _tag_list(row.get("tags"))
+                if has == on:                          # 已在那一层 / 不在那一层
+                    failed.append({"key": key,
+                                    "reason": "already_core" if on else "not_core"})
+                    continue
+                audit.backup_fragment(key, row)
+                _apply(storage, key,
+                       {"tags": _with_core(row.get("tags"), on)}, action)
+            succeeded += 1
+        except HTTPException as e:        # _apply 回读对不上 / 后端拒写
+            failed.append({"key": key, "reason": _err_code(e)})
+        except OSError:                   # 备份落盘失败 —— 这条宁删不成
+            failed.append({"key": key, "reason": "backup_failed"})
+
+    backup_dir = str(audit.backup_dir()) if body.action == "delete" else None
+    audit.record(action, f"batch:{len(keys)}", ok=bool(succeeded) or not failed,
+                 reason=f"requested={len(keys)}; succeeded={succeeded}; "
+                        f"failed={len(failed)}; backup_dir={backup_dir or '-'}")
+    out: Dict[str, Any] = {"ok": True, "action": body.action,
+                           "requested": len(keys), "succeeded": succeeded,
+                           "failed": failed}
+    if backup_dir:
+        out["backup_dir"] = backup_dir
+    return out
+
+
+@router.post("/api/v1/ops/bulk-export", dependencies=[Depends(require_session)])
+def bulk_export(body: BulkExportBody,
+                storage: Any = Depends(get_storage)) -> StreamingResponse:
+    """**勾选批量导出**（JSONL / CSV）。**只读端点**：不挂 `write_guard`。
+
+    为什么是 POST 而不是 `GET /api/v1/export?keys=a,b,c`：500 个 key 拼进 query
+    约 11KB，nginx/uvicorn 的请求行上限（默认 8K）会直接 431 —— 「勾选导出」在最
+    大的勾选规模上必然失败。走 body 就没有这个上限。
+
+    🔴 **鉴权仍与 GET /api/v1/export 同级**（`require_session`）：它是纯读，但导出
+    的是记忆全文，不是公开端点；只是不挂 `write_guard`（不改数据，不必为审计
+    落盘位置 fail-closed）。
+    """
+    keys = _dedup_keys(body.keys, "memory.bulk_export", "batch")
+    rows = storage.get_fragments_batch(keys)
+    data = [dict(rows.get(k) or {}, key=k) for k in keys]
+    ext = "csv" if body.format == "csv" else "jsonl"
+    media = ("text/csv; charset=utf-8" if ext == "csv"
+             else "application/x-ndjson; charset=utf-8")
+    fname = f"keepsake-selected-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.{ext}"
+    return StreamingResponse(_stream(data, ext), media_type=media, headers={
+        "Content-Disposition": f'attachment; filename="{fname}"',
+        "Cache-Control": "no-store",
+    })
 
 
 # --------------------------------------------------------------------------

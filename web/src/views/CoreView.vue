@@ -63,6 +63,30 @@
       </div>
     </div>
 
+    <!-- 勾选批量：与记忆条目页同一组件、同一口径（选中集合跨页保留） -->
+    <SelectionBar
+      :count="selCount"
+      :page-count="items.length"
+      :page-selected="pageSelected"
+      @select-all="selectAll"
+      @clear="clearSel"
+    >
+      <el-button :disabled="!selCount || busyBulk" @click="askBulk('demote')">降常驻</el-button>
+      <el-button
+        :disabled="!selCount"
+        :loading="busyBulkExport"
+        title="未勾选时：用上方「导出 JSONL/CSV」导全部常驻条目"
+        @click="doExportSelected"
+      >导出选中</el-button>
+      <el-button :disabled="!selCount || busyBulk" @click="askBulk('archive')">归档</el-button>
+      <el-button
+        type="danger"
+        plain
+        :disabled="!selCount || busyBulk"
+        @click="askBulk('delete')"
+      >删除</el-button>
+    </SelectionBar>
+
     <div v-if="loading && !items.length" class="panel pad">
       <el-skeleton :rows="5" animated />
     </div>
@@ -83,16 +107,25 @@
         <template #tag>core</template>
         <template #time>{{ toLocal(row.updated_at) }}</template>
 
-        <span class="cell-key">
-          <span class="k" :title="row.key">{{ row.key }}</span>
-          <button class="copy-btn" title="复制 key" @click.stop="doCopy(row.key)">
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
-              <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
-            </svg>
-          </button>
-        </span>
+        <div class="pick-row">
+          <el-checkbox
+            class="pick"
+            :model-value="isOn(row.key)"
+            title="勾选这条（可跨页累积）"
+            @change="toggle(row.key)"
+            @click.stop
+          />
+          <span class="cell-key">
+            <span class="k" :title="row.key">{{ row.key }}</span>
+            <button class="copy-btn" title="复制 key" @click.stop="doCopy(row.key)">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
+                <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
+              </svg>
+            </button>
+          </span>
+        </div>
         <p class="card-body" :title="row.content">{{ row.content }}</p>
 
         <template #tags>
@@ -102,6 +135,7 @@
         <template #lead>查看全文 ↗</template>
         <template #actions>
           <button class="act-btn act-btn--danger" @click="demote(row)">降常驻</button>
+          <button class="act-btn act-btn--danger" @click="askDelete(row)">删除</button>
         </template>
       </ItemCard>
     </div>
@@ -212,6 +246,29 @@
       </template>
     </el-dialog>
 
+    <!-- 单条真删：与记忆条目页同一口径（手输 key 末 8 位 + 删前备份到审计目录） -->
+    <ConfirmDialog
+      v-model="deleting"
+      title="彻底删除这条常驻记忆？"
+      :consequences="deleteConsequences"
+      :expect="deleteExpect"
+      confirm-text="确认删除"
+      :busy="busyDelete"
+      @confirm="doDelete"
+    />
+
+    <!-- 勾选批量：expect = 选中条数，后果列出前 10 个 key -->
+    <ConfirmDialog
+      v-model="bulkAsk"
+      :title="bulkTitle"
+      :consequences="bulkConsequences"
+      :expect="bulkExpect"
+      :confirm-text="bulkConfirmText"
+      :tone="bulkAction === 'demote' ? 'primary' : 'danger'"
+      :busy="busyBulk"
+      @confirm="doBulk"
+    />
+
     <!-- 实跑确认：expect = 预演给出的「将新增 N 条」，与记忆条目页同一口径 -->
     <ConfirmDialog
       v-model="importRunAsk"
@@ -233,11 +290,12 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import DetailDrawer from '../components/DetailDrawer.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
+import SelectionBar from '../components/SelectionBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
-import { downloadFile, downloadTemplate } from '../utils/export'
+import { downloadFile, downloadTemplate, exportKeys } from '../utils/export'
 import { toLocal } from '../utils/format'
 import { isStale } from '../utils/kb'
 
@@ -251,6 +309,42 @@ const loading = ref(false)
 const error = ref('')
 const drawer = ref(false)
 const detail = ref(null)
+
+// ---- 单条真删（与记忆条目页同一口径：手输 key 末 8 位，删前备份由后端做）----
+const deleting = ref(false)
+const deleteRow = ref(null)
+const busyDelete = ref(false)
+const deleteExpect = computed(() => (deleteRow.value ? deleteRow.value.key.slice(-8) : ''))
+const deleteConsequences = computed(() =>
+  deleteRow.value
+    ? [
+        `真删 ${deleteRow.value.key}：从存储层物理移除，检索与常驻层立刻不再返回它，不可恢复。`,
+        '删前会自动备份到服务器审计目录（唯一的回退路径）；请照抄上面的 key 末 8 位确认。',
+        '写操作会落审计日志。',
+      ]
+    : [],
+)
+
+function askDelete(row) {
+  deleteRow.value = row
+  deleting.value = true
+}
+
+async function doDelete(typed) {
+  const row = deleteRow.value
+  if (!row) return
+  busyDelete.value = true
+  try {
+    await api.deleteFragment(row.key, typed)
+    deleting.value = false
+    showToast(`已删除：${row.key}`)
+    load()
+  } catch (e) {
+    showError(`删除失败：${e.message}`)
+  } finally {
+    busyDelete.value = false
+  }
+}
 
 // ---- 设置注入预算 ----
 const budgeting = ref(false)
@@ -285,6 +379,113 @@ const importConsequences = computed(() =>
       ]
     : [],
 )
+
+// ---- 勾选批量（跨页保留：Set 存 key，翻页不清，只有「清空选择」才清）----
+const sel = ref(new Set())
+const selKeys = computed(() => [...sel.value])
+const selCount = computed(() => sel.value.size)
+const pageSelected = computed(() => items.value.filter((r) => sel.value.has(r.key)).length)
+
+function isOn(key) {
+  return sel.value.has(key)
+}
+function toggle(key) {
+  const next = new Set(sel.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  sel.value = next
+}
+function selectAll(on) {
+  const next = new Set(sel.value)
+  items.value.forEach((r) => (on ? next.add(r.key) : next.delete(r.key)))
+  sel.value = next
+}
+function clearSel() {
+  sel.value = new Set()
+}
+
+const BULK_TITLES = {
+  demote: '把选中的常驻记忆移出常驻层？',
+  archive: '归档选中的常驻记忆？',
+  delete: '彻底删除选中的常驻记忆？',
+}
+const BULK_CONFIRM_TEXT = { demote: '降常驻', archive: '归档', delete: '确认删除' }
+const bulkAction = ref('')
+const bulkAsk = ref(false)
+const busyBulk = ref(false)
+const busyBulkExport = ref(false)
+const bulkExpect = computed(() => String(selKeys.value.length))
+const bulkTitle = computed(() => BULK_TITLES[bulkAction.value] || '批量操作')
+const bulkConfirmText = computed(() => BULK_CONFIRM_TEXT[bulkAction.value] || '确认执行')
+
+/** 后果文案：只列前 10 个 key，多的折成一句 */
+function _previewKeys() {
+  const ks = selKeys.value
+  return ks.slice(0, 10).join('、') + (ks.length > 10 ? `（共 ${ks.length} 条，其余略）` : '')
+}
+
+const bulkConsequences = computed(() => {
+  const n = selCount.value
+  if (!n) return []
+  const base = [`本次操作 ${n} 条：${_previewKeys()}`,
+    `请照抄「${n}」确认 —— 这个数就是当前勾选条数，写进去一条都不会多。`]
+  if (bulkAction.value === 'demote') {
+    base.push('降常驻后每轮 system_prompt 不再注入这些条目（条目本身仍在检索层，可回滚）。')
+  } else if (bulkAction.value === 'archive') {
+    base.push('置为失效：不再被召回，不物理删除，备份留在审计目录，可回溯。')
+  } else {
+    base.push('物理删除，不可恢复；删前逐条全文已备份到服务器审计目录（唯一的回退路径）。')
+    base.push('单条失败（不存在 / 备份写不进）只跳过那一条，其余照常执行 —— 结果会报「成功 X · 失败 Y」。')
+  }
+  base.push('写操作会落审计日志（批次汇总一条 + 每条改前备份）。')
+  return base
+})
+
+function askBulk(action) {
+  if (!selCount.value) return
+  bulkAction.value = action
+  bulkAsk.value = true
+}
+
+/**
+ * 批量实跑：`POST /api/v1/ops/bulk`（api.bulkOps 纯透传）。成功的清出勾选、
+ * 失败的**留在勾选里**（下一步逐条单点处理）。
+ */
+async function doBulk(typed) {
+  const action = bulkAction.value
+  const keys = selKeys.value
+  busyBulk.value = true
+  try {
+    const r = await api.bulkOps({ action, keys, confirm: typed })
+    bulkAsk.value = false
+    const bad = new Set((r.failed || []).map((f) => f.key))
+    sel.value = new Set([...sel.value].filter((k) => bad.has(k)))
+    if (r.failed?.length) {
+      const why = r.failed.slice(0, 3).map((f) => `${f.key}(${f.reason})`).join('、')
+      showError(`成功 ${r.succeeded} · 失败 ${r.failed.length}：${why}${r.failed.length > 3 ? '…' : ''}`)
+    } else {
+      showToast(`批量${BULK_CONFIRM_TEXT[action]}完成：成功 ${r.succeeded} 条`)
+    }
+    load()
+  } catch (e) {
+    showError(`批量操作失败：${e.message}`)
+  } finally {
+    busyBulk.value = false
+  }
+}
+
+/** 勾选导出：只导选中的那几条（未勾选时用上方「导出 JSONL/CSV」导全部常驻） */
+async function doExportSelected() {
+  if (!selKeys.value.length) return
+  busyBulkExport.value = true
+  try {
+    const name = await exportKeys(selKeys.value, 'jsonl')
+    showToast(`已导出选中 ${selKeys.value.length} 条：${name}`)
+  } catch (e) {
+    showError(`导出选中失败：${e.message}`)
+  } finally {
+    busyBulkExport.value = false
+  }
+}
 
 /** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它 */
 const dirty = computed(() => !!(q.value || '').trim())
@@ -512,6 +713,17 @@ onMounted(load)
 <style scoped>
 .pad {
   padding: 20px;
+}
+/* 勾选框与 key 同一行（与 FragmentsView 同一份配方：scoped 跨组件不生效，只能各写一份） */
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.pick-row .cell-key {
+  flex: 1;
+  min-width: 0;
 }
 /* 预算格：卡 + 「设置」入口同一列（StatCard 的 hint 是纯字符串，放不下按钮） */
 .budget-cell {

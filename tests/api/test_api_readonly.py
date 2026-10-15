@@ -32,9 +32,9 @@ AUTH_POST_PATHS = {
 
 #: 写面白名单（P2 + keepsake_memory_crud_be + keepsake_kb_crud_be +
 #: keepsake_budget_io_templates）：非 GET 路由
-#: **恰好**是这 14 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
-#: kb_crud 单新增，PUT 预算设置为本单新增，其余 6 条为 P2）+ 3 条认证，
-#: 其余一律不许出现。
+#: **恰好**是这 16 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
+#: kb_crud 单新增，PUT 预算设置与勾选批量 bulk / bulk-export 为 budget 单新增，
+#: 其余 6 条为 P2）+ 3 条认证，其余一律不许出现。
 #: 新增写端点时**只许往这份白名单里加，不许改成子集断言** ——
 #: 白名单是「写面没有悄悄长出第四条入口」的唯一凭据，宽松一分它就废了。
 ALLOWED_POST_PATHS = {
@@ -45,6 +45,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/fragments/{key}/archive",
     "/api/v1/fragments/{key}/delete",
     "/api/v1/import",
+    "/api/v1/ops/bulk",
+    "/api/v1/ops/bulk-export",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
     "/api/v1/kb/documents",
@@ -174,7 +176,7 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
-    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 14 条 + 认证 3 条，不多不少。
+    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 16 条 + 认证 3 条，不多不少。
 
     P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点，
     keepsake_memory_crud_be 再加 增/真删/导入 三条，keepsake_kb_crud_be 再加
@@ -188,12 +190,12 @@ def test_只读路由断言():
     paths = {getattr(r, "path", "") for r in app.routes}
     assert {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
             "/api/v1/fragments/{key}", "/api/v1/kb/summary", "/api/v1/kb/search",
-            "/api/v1/stats", "/api/v1/crons"} <= paths
+            "/api/v1/stats", "/api/v1/crons", "/api/v1/hits/stats"} <= paths
     assert len([p for p in paths if p.startswith("/api/v1/")]) >= 8
 
 
 def test_写路由全部需要token():
-    """写面 9 条 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
+    """写面 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
 
     认证的 3 条不在此列：setup / login 本来就公开（P3 硬要求），
     logout 的会话校验由 tests/api/test_auth.py 单独逐条打。

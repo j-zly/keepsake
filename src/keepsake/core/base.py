@@ -9,12 +9,25 @@
 方法面以「实际被调用点」为准（src/ cron/ scripts/ hermes-plugin/ 实测统计）。
 抽象方法全部带默认参数的实现约定：子类必须提供同名同签名的方法，
 签名漂移由 tests/test_storage_interface.py 检出。
+
+**唯一的例外（2026-10 ks_hit_tracking）**：本模块尾部有一小段「检索命中打点」
+的**共用实现**（限频 / 后台线程 / fail-open）。它们与后端无关（三个后端的差别
+只在「往哪儿 append 一行」），抄三份必然漂移，而漂移的后果不是报错而是
+**统计口径悄悄不一致**（下一单 core_tiering 拿它当升常驻信号）。共用的检索
+后处理历史上在 `storage_shared`，那一层是**纯函数**、不碰实例状态，打点这层要
+读 `self`（限频表挂实例）且必须与三个后端类同处一个 import 图 ⇒ 落在这里，
+两个理由都写在该节 docstring 里。
 """
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("keepsake.storage_base")
 
 
 class StorageBase(ABC):
@@ -307,6 +320,55 @@ class StorageBase(ABC):
         )
 
     # ------------------------------------------------------------------
+    # 检索命中打点（2026-10 ks_hit_tracking）
+    #
+    # 用途：给下一单 core_tiering（常驻层自动升降级）提供「热不热」信号。
+    # 本单只做**数据地基**（记事件 + 按天窗统计 + 过期清理），提名/升降级逻辑
+    # 不在这里实现 —— 谁也不许在本文件塞「够热就升常驻」的判断。
+    #
+    # 🔴 三个方法都**刻意不标 `@abstractmethod`**：标了就得同步改
+    # `tests/test_storage_interface.py` 那份写死的 `REQUIRED_METHODS`
+    # （本单范围外），而漏实现的后端在构造期就炸会波及既有测试。语义与
+    # `list_by_tag` 同一套：构造照常，真被调用时抛明确错误 ——
+    # 绝不返回空列表装成功（那会让「从没打过点」与「真没命中」不可区分，
+    # 下一单会据此把整批常驻层判冷）。
+    # ------------------------------------------------------------------
+
+    def record_hits(self, keys: List[str]) -> int:
+        """追加一批命中事件（`(key, ts)`），返回写入条数。
+
+        **纯追加、不 UPDATE 主表**（写放大零）：命中是流水事件，不是碎片字段 ——
+        碎片主表上加 `last_hit_at`/`hit_count` 会让每次检索都变成一次写放大，
+        而 PG 侧 `touch_fragment` 已经明写 unsupported（同款理由）。
+        同 key 的重复命中由 `storage_shared.fire_hits` 的 300 秒限频在上游挡掉。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 未实现 record_hits")
+
+    def hits_stats(
+        self,
+        window_days: int = 7,
+        min_hits: int = 5,
+        keys: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """窗口内命中统计 → `[{key, hits, last_hit}]`，`hits` 降序。
+
+        `keys` 给了就**只**算这些 key（供下一单核心查询：已知候选集、只要热度）；
+        不给就返回窗口内 `hits >= min_hits` 的全部（`limit` 封顶）。
+        空表返回空列表 —— 这是「真的没命中过」，不是错误。
+        `hits` 口径 = 事件行数；受 300 秒去抖影响，允许 ±5 分钟误差。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 未实现 hits_stats")
+
+    def prune_hit_events(self, days: int = 90) -> int:
+        """删掉 `days` 天前的命中事件，返回删除条数（防表膨胀）。
+
+        本单**只提供函数，不挂 cron**（运维接线由主脑做）：班车没接上时表会一直长，
+        但那只是占用问题，绝不构成数据错误。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 未实现 prune_hit_events")
+
+    # ------------------------------------------------------------------
     # 语料维护（批 2 与检索一起做）
     # ------------------------------------------------------------------
 
@@ -317,3 +379,91 @@ class StorageBase(ABC):
     @abstractmethod
     def generate_jieba_dict(self, output_path: str = None) -> Dict[str, Any]:
         """从碎片库 + 同义词表生成 jieba 自定义词典，返回统计信息。"""
+
+# ---------------------------------------------------------------------------
+# 检索命中打点（2026-10 ks_hit_tracking）—— 三后端共用的那一半
+# ---------------------------------------------------------------------------
+#
+# 为什么这一段落在 base.py（而不是 storage_shared）：
+#   * 限频表要挂在**实例**上（`_hit_seen`，不同 DSN / 不同 sqlite 文件的实例
+#     共享同一个 key 名空间是错的），所以它是「带 self 的共用实现」而不是纯函数；
+#   * 三个后端类都已经 `from .base import StorageBase`，放这里不用给三个文件
+#     各加一条 import，也就不会出现「某个后端漏接打点」的形态。
+# 另一半（真落库）是各后端的 `record_hits` / `hits_stats` / `prune_hit_events`，
+# 见 StorageBase 里的声明。
+#
+# 三条纪律（下一单 core_tiering 直接依赖，别改）：
+#   1. **绝不阻塞检索热路径**：默认执行器是 daemon 后台线程（与
+#      `query_expansion.schedule_background_expansion` 同一件做法）。
+#   2. **fail-open**：打点抛错只 debug 日志，检索结果一个字都不许变。
+#   3. **限频 300 秒**：同 key 五分钟内只记一次 —— 窗口统计因此有 ±5 分钟误差，
+#      这是**有意接受**的口径（不是 bug）。
+
+#: 同 key 打点去抖窗口（秒）。窗口统计允许 ±5 分钟误差，见上节纪律 3。
+HIT_RATE_LIMIT_S = 300.0
+
+#: 限频表的锁（表本身在各后端实例上，锁全局一张 ⇒ 临界区极短）
+_HIT_LOCK = threading.Lock()
+
+
+def hits_pending(storage: Any, keys: Any, now: Optional[float] = None) -> List[str]:
+    """限频闸：返回本次该记的 key（并把它们的「上次打点时刻」推到 now）。
+
+    限频表挂在 **storage 实例**上（`_hit_seen`）。空 key 一律丢掉；输入去重
+    （同一批里出现两次只记一次 —— 一次检索每个 key 至多出现一次）。
+    """
+    stamp = time.time() if now is None else float(now)
+    seen = getattr(storage, "_hit_seen", None)
+    if seen is None:
+        seen = {}
+        storage._hit_seen = seen        # noqa: SLF001 — 实例上的进程内限频表
+    out: List[str] = []
+    with _HIT_LOCK:
+        for key in dict.fromkeys(k for k in keys if k):
+            last = seen.get(key)
+            if last is None or (stamp - last) >= HIT_RATE_LIMIT_S:
+                seen[key] = stamp
+                out.append(key)
+    return out
+
+
+def submit_hit_work(fn: Any) -> bool:
+    """默认执行器：后台 daemon 线程跑打点（测试可替换成同步执行以断言语义）。
+
+    起线程失败也只 debug —— 打点是纯侧写，起不来就当没打，绝不影响检索。
+    """
+    try:
+        threading.Thread(target=fn, name="keepsake-hits", daemon=True).start()
+        return True
+    except Exception as e:      # noqa: BLE001
+        logger.debug("keepsake: 命中打点线程启动失败（fail-open）: %s: %s",
+                     type(e).__name__, e)
+        return False
+
+
+def fire_hits(storage: Any, keys: Any, submit: Any = None) -> int:
+    """检索命中打点：限频 → 后台落库 → fail-open。返回本次放行的 key 数。
+
+    `submit` 是执行器（默认 `submit_hit_work` = 后台 daemon 线程）：PG 侧传自己
+    那条复用线程池的执行器（worker 连接数才有上界，见 `PgStorage._submit_hit_work`）。
+    调用点（各后端 `search` / `search_bm25` 的**返回前**）一律 `try/except` 包住：
+    这层是纪律 2 的最后一道兜底 —— 连限频表本身出错也不许冒到检索。
+    """
+    try:
+        pending = hits_pending(storage, keys)
+    except Exception as e:      # noqa: BLE001
+        logger.debug("keepsake: 命中去抖失败（fail-open）: %s: %s", type(e).__name__, e)
+        return 0
+    if not pending:
+        return 0
+
+    def _write() -> None:
+        # 后台线程里落库；异常**只 debug** —— 打点失败绝不冒泡回检索路径。
+        try:
+            storage.record_hits(pending)
+        except Exception as e:      # noqa: BLE001
+            logger.debug("keepsake: 检索命中打点落库失败（fail-open，检索结果不受影响）: "
+                         "%s: %s", type(e).__name__, e)
+
+    (submit or submit_hit_work)(_write)
+    return len(pending)

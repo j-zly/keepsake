@@ -27,7 +27,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: 是故意的 —— 一边改漏了，另一边的相等断言会红）。P3 起再加 3 条认证 POST
 #: （setup / login 公开、logout 要会话 —— 那部分在 test_auth.py 里逐条打）。
 #: keepsake_memory_crud_be 起再加 3 条业务 POST（增 / 真删 / 导入），
-#: keepsake_kb_crud_be 起再加 4 条知识库写端点（新增 / 改 / 真删 / 导入）。
+#: keepsake_kb_crud_be 起再加 4 条知识库写端点（新增 / 改 / 真删 / 导入），
+#: keepsake_bulk_ops 起再加 2 条勾选批量端点（bulk 改数据 / bulk-export 纯读）。
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
@@ -42,6 +43,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/fragments/{key}/archive",
     "/api/v1/fragments/{key}/delete",
     "/api/v1/import",
+    "/api/v1/ops/bulk",
+    "/api/v1/ops/bulk-export",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
     "/api/v1/kb/documents",
@@ -450,13 +453,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有十四条业务写端点加三条认证POST():
+def test_写面只有十六条业务写端点加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 17
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 14
+    assert len(ALLOWED_POST_PATHS) == 19
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 16
 
 
 def test_P1只读路由未被写面影响(client):

@@ -88,6 +88,10 @@ export const api = {
   archive: (key, confirm) =>
     http.post(`/api/v1/fragments/${encodeURIComponent(key)}/archive`, { confirm }).then((r) => r.data),
   merge: (payload) => http.post('/api/v1/ops/merge', payload).then((r) => r.data),
+  // 勾选批量：{action: promote|demote|archive|delete, keys, confirm:<选中数>}。
+  // 原样透传：逐条成败由后端返回 failed，前端只负责报「成功 X · 失败 Y」+ 刷新。
+  // （勾选导出走 utils/export.js 的 fetch+blob，不走这里 —— 它是文件下载。）
+  bulkOps: (payload) => http.post('/api/v1/ops/bulk', payload).then((r) => r.data),
   forget: (payload) => http.post('/api/v1/ops/forget', payload).then((r) => r.data),
 
   // ---- 记忆 CRUD（控制台批1 后端）：纯透传，语义与护栏都在后端 ----
