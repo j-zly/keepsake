@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 #: 手动文档的 source_type。**灌入器的死文档清理只碰 skill/skill_hk，永不碰它**
 #: —— 控制台新增/导入的东西不会被当晚那轮清理扫掉。
@@ -24,7 +24,9 @@ MANUAL_SOURCE_TYPE = "manual"
 #: 单块字符上限（v3 同值）。中文按字符切，不是按字节。
 MAX_CHUNK_LEN = 1200
 
-#: 灌入器负责的来源类型（死文档清理范围，只此两个）
+#: 灌入器负责的来源类型（死文档清理范围，只此两个）。清理的**判据本身**在
+#: `scripts/kb_ingest.py`（灌入器专属：按 `(source_type, meta->>'node',
+#: meta->>'skill')` 元组比对 v3 的 live 集，不属"两处共用"），这里只留类型白名单。
 INGEST_SOURCE_TYPES = ("skill", "skill_hk")
 
 #: 表名与列名（生产 `keepsake` 库 documents/chunks 的口径）。
@@ -281,27 +283,3 @@ def delete_document(cur: Any, schema: str, doc_id: Any, *,
                 f"RETURNING {n['doc_id']}", [doc_id])
     row = cur.fetchone()
     return 0 if row is None else 1
-
-
-def prune_ingested(cur: Any, schema: str, live_keys: Sequence[str], *,
-                   names: Optional[Dict[str, str]] = None,
-                   source_types: Sequence[str] = INGEST_SOURCE_TYPES) -> int:
-    """死文档清理：**只**删 `source_type IN ('skill','skill_hk')` 且键不在 live 集里的。
-
-    🔴 手动文档（`source_type='manual'`）永远不在清理范围内 —— 一条 UPDATE 的
-    类型白名单就决定了「今晚这轮会不会把控制台写的东西扫掉」，别扩它。
-    先删 chunks 再删 documents（无级联依赖），返回删掉的文档数。
-    """
-    n = _names(names)
-    live = list(dict.fromkeys(live_keys))
-    where = (f"{n['src_type']} = ANY(%s) AND NOT ({n['src_key']} = ANY(%s))")
-    args = [list(source_types), live or [""]]
-    cur.execute(f"DELETE FROM {schema}.{n['chunks']} WHERE {n['chunk_doc']} IN "
-                f"(SELECT {n['doc_id']} FROM {schema}.{n['documents']} WHERE {where})",
-                args)
-    cur.execute(f"DELETE FROM {schema}.{n['documents']} WHERE {where} RETURNING {n['doc_id']}",
-                args)
-    deleted = 0
-    while cur.fetchone() is not None:
-        deleted += 1
-    return deleted
