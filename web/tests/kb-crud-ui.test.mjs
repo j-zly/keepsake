@@ -57,6 +57,28 @@ test('manual 域判定落在真实字段 source_type 上：skill 域不渲染写
   assert.match(KB, /v-if="!isManual\(doc\)"/, '非手动域要给只读徽标')
 })
 
+test('判据是严格的：字段缺席/未知一律按只读，缺省绝不放行成 manual', () => {
+  // 曾经的 bug：列表接口没投 source_type，判据写成「!source_type || ===manual」⇒ skill 文档渲染出编辑/删除
+  assert.match(KB, /return doc\.source_type === 'manual'/, 'isManual 必须只认 manual 精确值')
+  assert.ok(
+    !/return\s+!?doc\.source_type\s*\|\|/.test(KB),
+    '不许「字段缺席即手动」的放行式判据（保守方向：缺席=只读）',
+  )
+})
+
+test('来源筛选：下拉值原样透传后端 source_type，默认全量', () => {
+  assert.match(KB, /<el-select v-model="sourceType"/, '筛选区要有来源下拉')
+  assert.match(KB, /const sourceType = ref\(''\)/, '默认必须是全量（默认视图不变）')
+  // 两路都要带：浏览态 loadDocs 与检索态 loadBoth，漏一路 = 下拉只对一半场景生效
+  assert.equal(
+    (KB.match(/source_type: sourceType\.value/g) || []).length,
+    2,
+    'loadDocs 与 loadBoth 都要透传 source_type',
+  )
+  assert.match(KB, /function onSource\(\)/, '换来源要重查')
+  assert.match(KB, /sourceType\.value \? `\?source_type=\$\{encodeURIComponent/, '导出沿用当前来源筛选')
+})
+
 test('真删走 ConfirmDialog：手输标题全文，无原生弹框', () => {
   assert.ok(!/\balert\(|\bconfirm\(|\bprompt\(/.test(KB), '禁原生弹框，一律 utils/dialog')
   assert.match(KB, /<ConfirmDialog[\s\S]{0,400}?@confirm="doDelete"/)

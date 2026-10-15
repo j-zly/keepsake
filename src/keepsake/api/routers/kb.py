@@ -286,6 +286,7 @@ def kb_search(
             dependencies=[Depends(require_session)])
 def kb_documents(
     q: Optional[str] = Query(None, description="标题模糊词，可选；不给就全量浏览"),
+    source_type: str = Query("", description="只列某个来源类型（manual/skill/skill_hk）；空=全部"),
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
 ) -> KbDocumentList:
@@ -293,7 +294,20 @@ def kb_documents(
 
     切片条数用相关子查询按 doc_id 计数；q 复用检索那套手法（documents 表有 tsvector
     列走 tsquery，否则退标题 ILIKE）。表名/列名仍只认白名单探出来的名字。
+
+    🔴 **出参必须带 `source_type`**：前端按它判「手动域才渲染写按钮」，字段缺席会
+    让 skill 文档看起来也能改/删（`skill 归灌入器、UI 先挡一道` 这条设计就废了）。
+    探测不到这列时出参给空串 —— 前端按「非 manual 即只读」保守渲染，不会误开放。
+
+    🔴 `source_type` 过滤口径与导出端点**完全一致**（精确 `= %s` + 同一套标识符
+    校验），不在这里发明第二种前缀/模糊语义；与 q 同时给时是 AND 关系，
+    `count` 走同一条 WHERE ⇒ 计数口径=过滤后总数。
     """
+    st = (source_type or "").strip()
+    if st and not _SOURCE_TYPE_RE.match(st):
+        _reject(400, "bad_source_type",
+                f"source_type 只能是标识符（小写字母/数字/下划线）：{source_type}",
+                "kb.documents", "list")
     schema = _ident(config.pg_schema())
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
     gone = _missing(tabs)
@@ -309,6 +323,7 @@ def kb_documents(
     d_title = next((_ident(t) for t in _CAND_TITLE if t in docs), None)
     d_time = next((_ident(t) for t in _CAND_TIME if t in docs), None)
     d_tsv = next((_ident(c) for c in _CAND_TSV if c in docs), None)
+    d_src = next((_ident(c) for c in _CAND_SRC_TYPE if c in docs), None)
 
     keyword = (q or "").strip()
     if keyword and d_tsv:
@@ -319,6 +334,13 @@ def kb_documents(
     else:
         # 没词、或表里既没标题列也没索引列 ⇒ 不过滤（宁可多给，不假装筛过）
         where, params = "TRUE", []
+    if st and d_src:
+        where, params = f"{where} AND d.{d_src} = %s", [*params, st]
+    elif st:
+        # 要按来源筛但表里没这列 ⇒ 400，不静默给全量（给全量等于假装筛过）
+        _reject(400, "kb_schema_unknown",
+                f"{config.KB_TABLE_DOCUMENTS} 表未找到 source_type 列，无法按来源过滤",
+                "kb.documents", "list")
 
     src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
     chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
@@ -327,9 +349,10 @@ def kb_documents(
     # 标题/时间列探不到就 SELECT '' —— 出参留空串，不假装有值
     sel_title = f"d.{d_title}" if d_title else "''"
     sel_time = f"d.{d_time}" if d_time else "''"
+    sel_src = f"d.{d_src}" if d_src else "''"
 
     sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
-           f"{sel_time} AS updated_at, "
+           f"{sel_time} AS updated_at, {sel_src} AS source_type, "
            f"{chunk_ct} {src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -340,7 +363,10 @@ def kb_documents(
 
     items = [
         KbDocument(doc_id=str(r["doc_id"] or ""), title=str(r["title"] or ""),
-                   updated_at=str(r["updated_at"] or ""), chunk_count=int(r["chunk_count"] or 0))
+                   updated_at=str(r["updated_at"] or ""), chunk_count=int(r["chunk_count"] or 0),
+                   # `get` 与本文件「探不到就降级」同款：行里没这根键（老表/别的驱动投影）
+                   # 时给空串，出参按 schema 规则省略该键，而不是 KeyError 把整个列表带崩
+                   source_type=str(r.get("source_type") or ""))
         for r in rows
     ]
     return KbDocumentList(items=items, count=total, page=page, page_size=page_size)

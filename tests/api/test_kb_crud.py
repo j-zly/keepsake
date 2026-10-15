@@ -174,8 +174,9 @@ def create(client: TestClient, title: str, content: str, **kw: Any) -> Dict[str,
     return r.json()
 
 
-def docs(client: TestClient, q: str = "") -> Dict[str, Any]:
-    r = client.get(f"/api/v1/kb/documents?page_size=100" + (f"&q={q}" if q else ""),
+def docs(client: TestClient, q: str = "", source_type: str = "") -> Dict[str, Any]:
+    r = client.get(f"/api/v1/kb/documents?page_size=100" + (f"&q={q}" if q else "")
+                   + (f"&source_type={source_type}" if source_type else ""),
                    headers=AUTH)
     assert r.status_code == 200, r.text
     return r.json()
@@ -270,6 +271,88 @@ def test_新增_审计留痕(kb):
     assert files, "写操作必须留审计行"
     body = json.loads(files[0].read_text(encoding="utf-8").splitlines()[0])
     assert body["action"] == "kb.document.create" and body["ok"] is True
+
+
+# ---------------------------------------------------------------- 列表的 source_type
+
+@PG_ONLY
+def test_列表带source_type_且skill域值不冒充manual(kb):
+    """🔴 列表必须投影 source_type —— 前端按它判「写按钮只给手动域」；
+    字段缺席时前端判据落空（曾经的实锤 bug：skill 文档渲染出编辑/删除）。"""
+    create(kb.client, "值班手册", "联系人是张三")
+    skill_id = seed_skill(kb)
+    items = docs(kb.client)["items"]
+    assert {i["source_type"] for i in items} == {"manual", "skill"}
+    by_title = {i["title"]: i for i in items}
+    assert by_title["灌入器技能文档"]["doc_id"] == str(skill_id)
+    assert by_title["灌入器技能文档"]["source_type"] != "manual"
+
+
+@PG_ONLY
+def test_列表按source_type过滤_只回本域且计数同口径(kb):
+    create(kb.client, "值班手册", "联系人是张三")
+    seed_skill(kb)
+    only_manual = docs(kb.client, source_type="manual")
+    assert [i["source_type"] for i in only_manual["items"]] == ["manual"]
+    assert only_manual["count"] == 1                    # count 走过滤后口径，不是全库 2
+    assert [i["source_type"] for i in docs(kb.client, source_type="skill")["items"]] == ["skill"]
+    # 与 q 同时给 = AND：词命中手动文档，但按 skill 过滤 ⇒ 空
+    assert docs(kb.client, q="值班", source_type="skill")["items"] == []
+    assert [i["title"] for i in docs(kb.client, q="值班", source_type="manual")["items"]] == ["值班手册"]
+
+
+def test_列表source_type过滤_精确匹配且参数化_与q取AND():
+    """🔴 不碰库的接线判据：把 WHERE 拼装与参数钉死。
+
+    * 语义必须**精确** `= %s`（与导出端点 `kb_export?source_type=` 同一口径），
+      值走参数不拼串；拼串就等于把表内容当代码解释；
+    * 与 q 同时给时 AND，`count` 复用同一条 WHERE；
+    * SELECT 必须带 `source_type AS source_type`，否则出参字段恒空串。
+    """
+    calls: List[tuple] = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            calls.append((" ".join(sql.split()), params))
+        def fetchall(self):
+            return [{"doc_id": "1", "title": "值班手册", "updated_at": "2026-10-15 00:00:00+00",
+                     "source_type": "manual", "chunk_count": 3}]
+        def fetchone(self):
+            return {"n": 1}
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    cols = {"documents": {"id", "source_type", "title", "updated_at"},
+            "chunks": {"id", "document_id", "text"}}
+    saved_cols, saved_conn = kb_router._table_columns, kb_router._connect
+    kb_router._table_columns = lambda schema, tables: cols   # type: ignore[assignment]
+    kb_router._connect = lambda: _Conn()                     # type: ignore[assignment]
+    try:
+        body = kb_router.kb_documents(q="值班", source_type="manual", page=1, page_size=20)
+    finally:
+        kb_router._table_columns = saved_cols                # type: ignore[assignment]
+        kb_router._connect = saved_conn                     # type: ignore[assignment]
+
+    list_sql, list_params = calls[0]
+    count_sql, count_params = calls[1]
+    assert "source_type AS source_type" in list_sql
+    assert "d.source_type = %s" in list_sql and "LIKE" in list_sql and " AND " in list_sql
+    assert "manual" not in list_sql.replace("source_type", "")      # 值没进 SQL 文本
+    assert list_params == ["%值班%", "manual", 20, 0]
+    # 列表 SQL 的第一个 WHERE 在 chunk_count 子查询里 ⇒ 取最后一个（rsplit）
+    assert count_sql.rsplit("WHERE", 1)[1].strip() == \
+        list_sql.rsplit("WHERE", 1)[1].split("ORDER BY")[0].strip()
+    assert count_params == list_params[:2]                 # count 同一条 WHERE、同一组参数
+    assert body.items[0].source_type == "manual"
+    assert body.count == 1
+    # 空串不出参（拿不到来源就不假装有值）；前端严格判据把「缺席」与「非 manual」同样当只读
+    assert body.model_dump()["items"][0]["source_type"] == "manual"
+    assert "source_type" not in kb_router.KbDocument(doc_id="x").model_dump()
 
 
 # ---------------------------------------------------------------- 改

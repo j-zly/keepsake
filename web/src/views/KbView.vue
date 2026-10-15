@@ -9,7 +9,9 @@
 
   批2 加了写操作：新增 / 编辑 / 真删 / 导入 / 导出，全部只对**手动域**文档开放
   （skill 域归夜间灌入器，前端不渲染按钮，后端 _manual_only 409 兜底）。
-  危险动作一律 ConfirmDialog 手输确认串，导入先预演回显计数再手输条数。
+  手动域判定读列表接口真投影出来的 source_type，**严格判据**：字段缺席/未知一律
+  按只读渲染（缺省放行会让 skill 文档看着也能改）。筛选区加了来源下拉，值原样
+  透传后端 `source_type`（精确匹配，与导出端点同一套口径与校验）。
 -->
 <template>
   <div>
@@ -29,7 +31,7 @@
     <div class="filter-panel">
       <div class="filter-title">检索</div>
       <p class="filter-desc">
-        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。
+        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。来源下拉按来源类型精确筛选（手动 / 灌入器两档，另细分到 skill_hk）。
       </p>
       <div class="filter-ctl">
         <el-input
@@ -50,6 +52,12 @@
             </span>
           </template>
         </el-input>
+        <el-select v-model="sourceType" class="sel" title="来源" @change="onSource">
+          <el-option label="全部来源" value="" />
+          <el-option label="手动（可改删）" value="manual" />
+          <el-option label="技能 skill（灌入器）" value="skill" />
+          <el-option label="技能手册 skill_hk（灌入器）" value="skill_hk" />
+        </el-select>
         <el-button type="primary" :loading="loading" @click="search">搜索</el-button>
       </div>
       <!-- 操作区：新增走弹框（只进手动域）；导入先预演再手输条数；导出走后端流式端点（带 Authorization 头） -->
@@ -111,7 +119,8 @@
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
             <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
           </svg>
-          <p><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
+          <p v-if="!sourceType"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
+          <p v-else><b>该来源下还没有文档</b>当前只列 source_type={{ sourceType }} 的文档，换个来源或选「全部来源」再看看。</p>
         </div>
       </div>
 
@@ -363,6 +372,8 @@ const hits = ref([])
 const hitCount = ref(0)
 const hitPage = ref(1)
 const q = ref('')
+/** 来源筛选：''=全部（默认视图不变）；否则原样透传后端 `source_type`（精确匹配，同导出端点口径） */
+const sourceType = ref('')
 const loading = ref(false)
 const error = ref('')
 /** 三分状态用：请求中（骨架屏）/ 成功且真的 0 条（空态）/ 失败（错误横幅）——「零文档」只在成功后出现 */
@@ -423,14 +434,15 @@ const importConsequences = computed(() =>
 const busyExport = ref(false)
 
 /**
- * 只有手动域（source_type='manual'）的文档能改/删 —— skill 域归灌入器，后端 _manual_only 409 兜底。
+ * 只有手动域（source_type='manual'）的文档能改/删 —— skill/skill_hk 域归灌入器，
+ * 后端 _manual_only 409 兜底。
  *
- * 🟡 读接口目前**不投影** source_type（KbDocument 只有 doc_id/title/updated_at/chunk_count），
- * 字段缺席时这里按手动域渲染按钮：最坏结果是点下去被后端 409 挡回并说明原因，不会误改数据；
- * 等后端把 source_type 投出来，同一个判定自动生效，前端不用再动。
+ * 🔴 **判据严格**：字段缺席/值未知一律算**非手动域**（只读徽标、不渲染写按钮）。
+ * 反过来（缺省当手动）会在读接口没投出 source_type 时给 skill 文档渲染出
+ * 「编辑/删除」，看着能改、点下去才被 409 挡回 —— 保守方向才是安全方向。
  */
 function isManual(doc) {
-  return !doc.source_type || doc.source_type === 'manual'
+  return doc.source_type === 'manual'
 }
 
 // 防串：请求序号。发请求前 ++，回来时序号对不上 ⇒ 过期响应直接丢弃（utils/kb.js 的 isStale）。
@@ -457,7 +469,7 @@ async function loadDocs() {
   const seq = ++reqSeq
   loading.value = true
   try {
-    const data = await api.kbDocuments({ page: page.value, page_size: pageSize.value })
+    const data = await api.kbDocuments({ source_type: sourceType.value, page: page.value, page_size: pageSize.value })
     if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
@@ -484,7 +496,7 @@ async function loadBoth(term) {
   let docRes, hitRes
   try {
     [docRes, hitRes] = await Promise.all([
-      api.kbDocuments({ q: term, page: page.value, page_size: pageSize.value }),
+      api.kbDocuments({ q: term, source_type: sourceType.value, page: page.value, page_size: pageSize.value }),
       api.kbSearch({ q: term, page: hitPage.value, page_size: hitSize.value }),
     ])
   } catch (e) {
@@ -518,6 +530,13 @@ function onClear() {
   q.value = ''
   hits.value = []
   hitCount.value = 0
+  return search()
+}
+
+/** 换来源：文档列表与检索两路都按新来源重查（页码各回第 1 页，否则第 5 页多半是空页） */
+function onSource() {
+  page.value = 1
+  hitPage.value = 1
   return search()
 }
 
@@ -750,13 +769,14 @@ async function exportError(res) {
 /**
  * 导出：走 fetch 而不是裸 `<a href>` —— 端点要 Authorization 头，裸链子带不了
  * （token 只进请求头，绝不进 URL）。baseURL 取自 http 实例，不另写一份环境变量。
- * 后端导出只有 JSONL 一档；页面当前没有来源类型筛选，故不带 source_type（全量导）。
+ * 后端导出只有 JSONL 一档；带来源筛选时按同一口径只导那一类（空=全量）。
  */
 async function doExport() {
   busyExport.value = true
   try {
     const token = getToken()
-    const res = await fetch(`${http.defaults.baseURL || ''}/api/v1/kb/export`, {
+    const qs = sourceType.value ? `?source_type=${encodeURIComponent(sourceType.value)}` : ''
+    const res = await fetch(`${http.defaults.baseURL || ''}/api/v1/kb/export${qs}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     })
     if (!res.ok) throw new Error(await exportError(res))

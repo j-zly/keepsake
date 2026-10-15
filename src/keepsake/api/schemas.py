@@ -121,6 +121,12 @@ class KbDocument(BaseModel):
     title: str = ""
     updated_at: str = Field("", description="表内可用的更新时间列；没有时间列时为空串")
     chunk_count: int = 0
+    source_type: str = Field(
+        "",
+        exclude_if=lambda v: v == "",
+        description="来源类型：manual=控制台手动文档（可改/删），skill/skill_hk=灌入器维护（只读）。"
+                    "空串（表里没这列）时**不出这个键** —— 缺省不假装有值，前端按「非 manual 即只读」保守渲染",
+    )
 
 
 class KbDocumentList(BaseModel):
