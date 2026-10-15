@@ -30,12 +30,18 @@ AUTH_POST_PATHS = {
     "/api/v1/auth/logout",
 }
 
-#: 写面白名单（P2）：非 GET 路由**恰好**是这 6 条写操作 + 3 条认证，其余一律不许出现。
+#: 写面白名单（P2 + keepsake_memory_crud_be）：非 GET 路由**恰好**是这 9 条
+#: 写操作（增 / 真删 / 导入 为 crud 单新增，其余 6 条为 P2）+ 3 条认证，其余一律
+#: 不许出现。新增 3 条时**只许往这份白名单里加，不许改成子集断言** ——
+#: 白名单是「写面没有悄悄长出第四条入口」的唯一凭据，宽松一分它就废了。
 ALLOWED_POST_PATHS = {
     "/api/v1/core/{key}/promote",
     "/api/v1/core/{key}/demote",
+    "/api/v1/fragments",
     "/api/v1/fragments/{key}/update",
     "/api/v1/fragments/{key}/archive",
+    "/api/v1/fragments/{key}/delete",
+    "/api/v1/import",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
 } | AUTH_POST_PATHS
@@ -160,9 +166,10 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
-    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 6 条 + 认证 3 条 POST，不多不少。
+    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 9 条 + 认证 3 条 POST，不多不少。
 
-    P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点 ——
+    P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点，
+    keepsake_memory_crud_be 再加 增/真删/导入 三条 ——
     多一条（比如漏加 require_session 依赖的临时端点）同样会被这里抓住。
     """
     app = create_app()
@@ -177,7 +184,7 @@ def test_只读路由断言():
 
 
 def test_写路由全部需要token():
-    """写面 6 条 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
+    """写面 9 条 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
 
     认证的 3 条不在此列：setup / login 本来就公开（P3 硬要求），
     logout 的会话校验由 tests/api/test_auth.py 单独逐条打。

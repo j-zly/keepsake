@@ -1,31 +1,43 @@
-"""**写**操作端点：打标 / 改 / 归档 + 合并 / 遗忘（dry-run 一等公民）。
+"""**写**操作端点：新增 / 改 / 删 / 归档 / 导入 + 打标 / 合并 / 遗忘
+（dry-run 一等公民）。
 
 🔴 四条硬约束（任务书 P2），全部在这一层兑现：
 
-1. **写必须走 keepsake 自己的 API** —— `storage.update_fragment_fields`
-   （打标 / 改正文 / 归档）与 `Consolidator` / `Forgetter`（合并 / 遗忘，
-   它们内部自己走 `storage.write_fragments_batch` / `delete_fragments_batch`）。
+1. **写必须走 keepsake 自己的 API** —— `storage.update_fragment_fields` /
+   `update_fragment_content`（打标 / 改正文 / 归档）、`storage.store`
+   （新增 / 导入）、`storage.delete_fragments_batch`（真删）与
+   `Consolidator` / `Forgetter`（合并 / 遗忘，它们内部自己走
+   `storage.write_fragments_batch` / `delete_fragments_batch`）。
    **不自拼 UPDATE/DELETE SQL**：那样会绕开存储层的去重 / supersede /
    失效语义（索引不重算 = 检索静默召回旧内容，而不是召不回）。
    走 `update_fragment_fields` 而**不是** `write_fragments_batch`：后者在
    Sqlite 后端是**迁移专用**的 upsert，未传的列会被写成空串（等于抹字段）。
-2. **dry-run 是一等公民**：merge/forget 默认 `dry_run=true`；实跑
-   （`dry_run=false`）必须带 `confirm="<当前计数>"`（防手滑）——
+   🟡 **改正文另走 `update_fragment_content`**：前者契约上不动检索索引，
+   PG 后端用它改正文会让 BM25 索引失真（见 `_apply` 的说明段）。
+2. **dry-run 是一等公民**：merge/forget/**import** 默认 `dry_run=true`；
+   实跑（`dry_run=false`）必须带 `confirm="<当前计数>"`（防手滑）——
    缺 ⇒ 400 `confirm_required`，不匹配 ⇒ 400 `confirm_mismatch`。
    **除 `dry_run=false` 外没有第二条实跑入口。**
 3. **写前自动备份**（`audit.backup_fragment`）：备份写不成功 ⇒ 整个写操作
    中止，数据一秒都没动。审计落盘位置在进路由时就自检过（`write_guard`）——
    记不上账 ⇒ 这次写根本不做。
+   （批量导入例外：逐条备份没意义，改记一行**批次摘要** count+来源。）
 4. **每次写（含被拒绝的）审计一行 JSON**（`audit.record`）。
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, NoReturn, Optional
+from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from keepsake.core.shared import fragment_key_for, sanitize_reserved_tags
 
 from .. import audit, config
 from ..deps import get_storage, require_session
@@ -35,6 +47,16 @@ router = APIRouter(tags=["ops"])
 
 #: 归档确认串长度（手输 key 末 8 位，防手滑）
 CONFIRM_SUFFIX_LEN = 8
+
+#: 导出的字段并集（各后端缺哪根就给空串 —— 导出契约不许随后端变）
+EXPORT_FIELDS = ("key", "content", "tags", "entities", "created", "updated_at")
+
+#: 导出护栏：默认一万条、封顶五万条，超了 400（提示分页口径，绝不默默截断）
+EXPORT_LIMIT_DEFAULT = 10000
+EXPORT_LIMIT_MAX = 50000
+
+#: 单次导入条数上限（同上：超了 400，绝不默默截断成「前 N 条」）
+IMPORT_MAX_ITEMS = 5000
 
 
 # --------------------------------------------------------------------------
@@ -48,7 +70,7 @@ class ConfirmFlag(BaseModel):
 
 
 class ConfirmText(BaseModel):
-    """`{"confirm": "<期望串>"}` —— 归档用手输的 key 末 8 位。"""
+    """`{"confirm": "<期望串>"}` —— 归档/真删用手输的 key 末 8 位。"""
 
     confirm: str = ""
 
@@ -59,6 +81,30 @@ class UpdateBody(BaseModel):
     confirm: bool = False
     content: Optional[str] = None
     tags: Optional[str] = None
+
+
+class CreateBody(BaseModel):
+    """`{"confirm": true, "content": "...", "tags": "a,b"}` —— 控制台新增记忆。"""
+
+    confirm: bool = False
+    content: str = ""
+    tags: str = ""
+
+
+class ImportItem(BaseModel):
+    """导入的单条：`{"content": "...", "tags": "a,b"}`。"""
+
+    content: str = ""
+    tags: str = ""
+
+
+class ImportBody(BaseModel):
+    """`{"items": [...], "dry_run": true}` /
+    `{"items": [...], "dry_run": false, "confirm": "<will_add 数>"}`。"""
+
+    items: List[ImportItem] = []
+    dry_run: bool = True
+    confirm: Optional[str] = None
 
 
 class BulkOpsBody(BaseModel):
@@ -156,20 +202,32 @@ def _load(storage: Any, key: str, action: str) -> Dict[str, Any]:
 
 
 def _apply(storage: Any, key: str, fields: Dict[str, Any], action: str) -> None:
-    """把改动落到存储层 —— 一律走 `storage.update_fragment_fields`（局部字段更新）。
+    """把改动落到存储层 —— 一律走存储层原语（局部字段更新）。
+
+    🔴 **改正文走 `update_fragment_content`，其余字段走 `update_fragment_fields`**：
+    后者的契约是「不动 content_tsv / embedding」（维护面更新用它），所以在
+    PG 后端用它改正文会让 BM25 索引留着旧词 —— 检索**不报错、不空召回**，只是
+    **召回旧内容**，控制台看着「改成功了」而记忆库在骗人。
+    `update_fragment_content` 由基类声明、PG 覆写（单事务内重算 `content_tsv`，
+    与 `store()` 同一套分词/拼接函数）；SQLite 就地重算 FTS、Redis 的 RediSearch
+    索引随 HSET 自动维护，两者用基类的默认实现即语义正确。
 
     写后**回读校验**：后端可能只认自己白名单里的列（返回 False 或静默丢弃），
     那样控制台会报「成功」而数据没动。回读一次对不上就 500（数据已被后端改动
     前的备份兜着，见 `audit.backup_fragment`）。
 
-    🟡 已知后端差异（控制台不替后端打补丁，也不自拼 SQL 去补索引）：
-    Sqlite 后端会在改了 `content`/`tags`/`entities` 时**就地重算** FTS；
-    Pg 后端的 `update_fragment_fields` 只 UPDATE 列、**不重算 `content_tsv`** ——
-    这是它自己 docstring 里写明的维护语义（基类也把该原语定义为「不动 content /
-    content_tsv / embedding」）。真要在 PG 上改正文并保持索引一致，得由后端补一条
-    原语（控制台侧的自助 UPDATE 会绕过这道守卫，正是任务书禁止的）。
+    🟡 **只改 tags 时仍走 `update_fragment_fields`**：那是维护面原语，改标签不
+    改正文。PG 上它不重算 `content_tsv` ⇒ 标签的 B 权重部分会滞后到下次改正文
+    才跟上（改标签本身仍会落库、列表/过滤照常，只是「按标签全文召回」这一点在
+    PG 上略有滞后）。收口办法是给基类再开一条 `update_fragment_tags`，把同款
+    重算逻辑复用过去 —— 现在不开：一条没人调的原语就是没人测的语义。
     """
-    if not storage.update_fragment_fields(key, fields):
+    if "content" in fields:
+        ok = storage.update_fragment_content(
+            key, str(fields["content"]), tags=fields.get("tags"))
+    else:
+        ok = storage.update_fragment_fields(key, fields)
+    if not ok:
         _reject(500, "update_failed",
                 f"存储层拒绝了这次写入，未改动任何数据：{key}", action, key)
     now = storage.get_fragment(key) or {}
@@ -270,6 +328,260 @@ def archive_fragment(key: str, body: ConfirmText,
     audit.record(action, key, ok=True, reason=f"backup={backup}")
     return {"ok": True, "action": action, "key": key,
             "is_archived": "1", "physical_delete": False, "backup": backup}
+
+
+# --------------------------------------------------------------------------
+# 增 / 删 / 导入 / 导出（控制台记忆 CRUD）
+# --------------------------------------------------------------------------
+
+def _clean_tags(raw: Any, action: str, target: str) -> str:
+    """剥除治理保留标签；`core` **直接 400**（不许新增直打常驻）。
+
+    判据与自动提炼（`cron/memory_distill.py`）**共用** `sanitize_reserved_tags`
+    —— 谁能声明 `core`/`core_candidate`/`shared`/`agent:*` 就是谁能决定常驻层、
+    候选审核队列与代理归属，两处各写一份黑名单 = 迟早漂一份，假申请就进来了。
+    差异只在 `core` 的处置：提炼无权声明（剥掉继续写），控制台是**人在点**，
+    静默吃掉他打的标签 = 静默丢用户意图 ⇒ 报 400 让他自己选（走既有条目的
+    promote，或走候选审核）。
+    """
+    clean, touched = sanitize_reserved_tags(raw, forbid=(CORE_TAG,))
+    for tag, reason in touched:
+        if reason == "forbidden":
+            _reject(400, "reserved_tag",
+                    f"不许直接打 {tag!r} 标签：进常驻请对既有条目走 promote 或候选审核",
+                    action, target)
+    return clean
+
+
+def _store_one(storage: Any, content: str, tags: str,
+               action: str, target: str) -> str:
+    """落一条记忆，返回**真正落库那一行**的 key（新增与导入**同一入库函数**）。
+
+    走 `storage.store()`（与提炼/合并同一条写路径 ⇒ 去重、版本化、分词建索引
+    全部同一套），写后**回读校验**正文确实在库里 —— 后端静默丢弃不该被报成成功。
+
+    🔴 **为什么要多这一步找 key**：`store()` 的去重语义是「同内容不覆盖、另起
+    `:<epoch>` 新键并把旧版标失效」（三后端一致）。所以同内容第二次提交时，
+    新行落在 `base:epoch`，而**内容 hash 算出来的仍是 base** —— 直接把 base
+    返回给前端，它指向的是那条刚被标失效的旧行：列表里看不见、导出里不出现、
+    删它删的是历史版本。⇒ 先点查 base 是否已存在，存在才去同前缀里取最大 key
+    （keyset 升序 ⇒ 版本后缀排在基础 key 之后，末位即最新一版）。
+    """
+    base = fragment_key_for(content)
+    # 三态：True=已存在（会版本化）；False/None 一律按「全新」算，store() 自己把关
+    versioned = storage.fragment_exists(base) is True
+    if not storage.store(text=content, tags=tags, category="manual",
+                         source="console", fragment_type="memory"):
+        _reject(500, "store_failed", f"存储层拒绝了这次写入：{target}", action, target)
+    key = base
+    if versioned:
+        _, same = storage.scan_fragment_keys("", 20, prefix=base)
+        live = [k for k in same if k != base]
+        if live:
+            key = live[-1]
+    row = storage.get_fragment(key) or {}
+    if str(row.get("content", "")) != content:
+        _reject(500, "store_not_persisted",
+                f"写入后回读对不上（后端可能未落库），key={key}", action, target)
+    return key
+
+
+@router.post("/api/v1/fragments", dependencies=[Depends(require_session), Depends(write_guard)])
+def create_fragment(body: CreateBody,
+                    storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """新增一条记忆条目（控制台手打，非提炼）。
+
+    正文空 / 纯空白 ⇒ 400（空条目进库就是纯噪音，还会占掉去重 key）。
+    标签里的治理保留字：`core` 拒绝（进常驻走 promote 或候选审核），其余剥除。
+    """
+    action = "fragment.create"
+    _need_flag(body.confirm, action, "-", '新增记忆条目必须显式传 {"confirm": true}')
+    content = (body.content or "").strip()
+    if not content:
+        _reject(400, "empty_content", "content 不能为空", action, "-")
+    tags = _clean_tags(body.tags, action, "-")
+    key = _store_one(storage, content, tags, action, "-")
+    audit.record(action, key, ok=True, reason=f"tags={tags!r}")
+    return {"ok": True, "action": action, "key": key, "tags": tags, "score": None}
+
+
+@router.post("/api/v1/fragments/{key}/delete",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def delete_fragment(key: str, body: ConfirmText,
+                    storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**真删**一条记忆条目（物理删除，不是归档的软失效）。
+
+    与归档同款二次确认（手输 key 末 8 位）。执行序固定：
+    取行 → **备份（失败则不删）** → `delete_fragments_batch` → 审计。
+    常驻层条目也可直接删 —— 删完 `list_by_tag` 自然少一条，与 promote/demote 无耦合。
+
+    与归档的分工：归档 = 版本化失效（可回溯、检索层仍能查到历史）；真删 = 这条
+    记忆不该存在（如误打、含敏感信息）。备份文件是唯一的回退路径，所以它写不成
+    就绝不删。
+    """
+    action = "fragment.delete"
+    expect = key[-CONFIRM_SUFFIX_LEN:]
+    _need_text(body.confirm, expect, action, key, "key 末 8 位")
+    row = _load(storage, key, action)
+    backup = audit.backup_fragment(key, row)
+    deleted = storage.delete_fragments_batch([key])
+    if deleted != 1:
+        _reject(500, "delete_failed",
+                f"存储层删除了 {deleted} 条（应为 1），条目可能已被并发删掉：{key}",
+                action, key)
+    audit.record(action, key, ok=True, reason=f"deleted=1; backup={backup}")
+    return {"ok": True, "action": action, "key": key, "deleted": True, "backup": backup}
+
+
+def _export_rows(storage: Any, q: str, tag: str, limit: int,
+                 action: str) -> List[Dict[str, Any]]:
+    """按 (q, tag) 取要导出的条目，**多取一条**用来判「超限 ⇒ 400」。
+
+    绝不默默截断：用户拿到的文件必须是他以为的那一份。
+    """
+    if q:
+        keys = [str(r.get("key") or r.get("_key") or "") for r in storage.search(q, tag_filter=tag)]
+    elif tag:
+        keys = [str(r.get("key") or "") for r in storage.list_by_tag(tag)]
+    else:
+        _, keys = storage.scan_fragment_keys("", limit + 1)
+    keys = [k for k in keys if k]
+    if len(keys) > limit:
+        _reject(400, "export_too_large",
+                f"命中 {len(keys)}+ 条，超过本次导出上限 {limit}："
+                "请用 ?q= 检索词 或 ?tag= 标签分批导出", action, "export")
+    fetched = storage.get_fragments_batch(keys)
+    return [dict(fetched.get(k) or {}, key=k) for k in keys]
+
+
+def _export_line(row: Dict[str, Any], fmt: str) -> bytes:
+    """一行导出记录（JSONL 行 或 CSV 行），UTF-8 字节。"""
+    rec = {f: str(row.get(f, "") or "") for f in EXPORT_FIELDS}
+    # `updated_at` 各后端字段名不同（sqlite/redis=updated、PG 没有 updated_at，
+    # 回落到 created）—— 与 `routers/fragments._UPDATED_KEYS` 同一套回退顺序，
+    # 否则导出的时间列在 sqlite/redis 库上整列空（同一份数据、两种口径）。
+    if not rec["updated_at"]:
+        for k in ("updated", "created"):
+            if row.get(k):
+                rec["updated_at"] = str(row[k])
+                break
+    if fmt == "csv":
+        buf = io.StringIO()
+        csv.writer(buf).writerow([rec[f] for f in EXPORT_FIELDS])
+        return buf.getvalue().encode("utf-8")
+    return (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _stream(rows: List[Dict[str, Any]], fmt: str) -> Iterator[bytes]:
+    """流式吐行（不把整个导出塞进内存缓冲；header 行在首个数据行之前）。"""
+    if fmt == "csv":
+        # BOM 的动机是 Excel 直开 CSV（不认 UTF-8 会按本地编码解，中文全乱码）。
+        # JSONL 的消费方是程序：`utf-8-sig` 之外的严格解析器会被 BOM 噎住，
+        # 而它并不存在「用 Excel 打开 JSONL」这种用法 ⇒ BOM 只给 CSV。
+        yield b"\xef\xbb\xbf"
+        buf = io.StringIO()
+        csv.writer(buf).writerow(EXPORT_FIELDS)
+        yield buf.getvalue().encode("utf-8")
+    for row in rows:
+        yield _export_line(row, fmt)
+
+
+@router.get("/api/v1/export", dependencies=[Depends(require_session)])
+def export_fragments(
+    q: str = Query("", description="BM25 过滤（走 storage.search）；为空则全库/按标签"),
+    tag: str = Query("", description="标签精确过滤（走 storage.list_by_tag）"),
+    format: str = Query("jsonl", pattern="^(jsonl|csv)$", description="导出格式"),
+    limit: int = Query(EXPORT_LIMIT_DEFAULT, ge=1, le=EXPORT_LIMIT_MAX,
+                       description="单次导出条数上限；超了报 400（分批导出，不截断）"),
+    storage: Any = Depends(get_storage),
+) -> StreamingResponse:
+    """导出记忆条目（JSONL / CSV）。**只读端点**：不挂 `write_guard`。
+
+    `?limit=` 默认 10000、封顶 50000；命中条数超了报 400 而不是截断
+    （被截断的文件是「看起来完整」的假数据，比报错危险得多）。
+
+    🟡 **`?q=` 是 top-k 口径，不是全量导出**：它走 `storage.search`（检索侧同一条
+    路径），而检索的 `final_limit` 默认 5 ⇒ 带 `?q=` 最多导出 5 条（`?limit=`
+    管不着它，它限制的是输出条数上限、不是召回条数）。要导出**全部**命中项请用
+    `?tag=`（走 `list_by_tag`，全量）或不带过滤（走 keyset 扫描）。
+    这里不去私调后端的召回上限 —— 那等于在 API 层另开一套检索参数口径，
+    与控制台列表页看到的名次对不上。
+    """
+    rows = _export_rows(storage, q.strip(), tag.strip(), limit, "memory.export")
+    ext = "csv" if format == "csv" else "jsonl"
+    media = "text/csv; charset=utf-8" if ext == "csv" else "application/x-ndjson; charset=utf-8"
+    fname = f"keepsake-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.{ext}"
+    return StreamingResponse(_stream(rows, ext), media_type=media, headers={
+        "Content-Disposition": f'attachment; filename="{fname}"',
+        # 导出的是记忆全文，不许被任何中间层缓存
+        "Cache-Control": "no-store",
+    })
+
+
+@router.post("/api/v1/import", dependencies=[Depends(require_session), Depends(write_guard)])
+def import_fragments(body: ImportBody,
+                     storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """批量导入（JSON body）。**默认 dry-run，零写入**。
+
+    实跑必须带 `confirm="<will_add 数>"`（先跑一次 dry-run 拿到数再手输，防手滑，
+    与 merge/forget 同款）。去重是**内容级**：按 `store()` 的内容 hash key
+    （`shared.fragment_key_for`，与三后端 store 同一函数）查，存在即 skip。
+
+    治理保留字：条级拒 —— 带 `core` 的那条**不导入**并计入 `rejected_reserved`
+    （批量场景不能为一条打回整批，那会让「导入了 4999/5000 条」说不清）。
+    """
+    action, target = "memory.import", "batch"
+    if len(body.items) > IMPORT_MAX_ITEMS:
+        _reject(400, "import_too_large",
+                f"一次最多导入 {IMPORT_MAX_ITEMS} 条，本次 {len(body.items)} 条："
+                "请分批导入（超限不截断）", action, target)
+
+    counts = {"total": len(body.items), "would_add": 0, "skipped_duplicate": 0,
+              "rejected_reserved": 0, "rejected_empty": 0}
+    plan: List[tuple] = []          # (content, tags) —— 待写入的那些
+    for item in body.items:
+        content = (item.content or "").strip()
+        if not content:
+            counts["rejected_empty"] += 1
+            continue
+        clean, touched = sanitize_reserved_tags(item.tags, forbid=(CORE_TAG,))
+        if any(reason == "forbidden" for _, reason in touched):
+            counts["rejected_reserved"] += 1
+            continue
+        # `fragment_exists` 三态：None = 后端不可达，本条判据作废、按新条目算，
+        # 真写不进去时 store() 自己会失败（不静默当重复跳掉）。
+        # 判据打在**未版本化的基础 key** 上 ⇒ 同内容即便已被归档也算「已存在」，
+        # 不重复灌库（store() 的版本化会让同内容再存一次变成新 key:epoch）。
+        if storage.fragment_exists(fragment_key_for(content)):
+            counts["skipped_duplicate"] += 1
+            continue
+        plan.append((content, clean))
+
+    counts["would_add"] = len(plan)
+    if body.dry_run:
+        audit.record(action, target, ok=True, reason="dry_run; " + _counts_reason(counts))
+        return {"ok": True, "dry_run": True, "action": action,
+                "confirm_required": str(len(plan)), **counts}
+
+    # 确认串对不上时**一条都不许写**（计数这一步已经惰性做完，与 merge 同口径）
+    _need_text(body.confirm or "", str(len(plan)), action, target,
+               f"本次将新增 {len(plan)} 条（先跑 dry-run 拿 confirm_required）")
+    # 批量写：逐条备份没意义（5000 个备份文件比库还大），记一行批次摘要即可。
+    # 记不上账 ⇒ 整批不写（fail-closed，与单条写同一纪律）。
+    audit.record(action, target, ok=True, reason="running; " + _counts_reason(counts))
+    keys = [_store_one(storage, c, t, action, target) for c, t in plan]
+    audit.record(action, target, ok=True, reason="done; " + _counts_reason(counts)
+                 + f"; keys={len(keys)}")
+    return {"ok": True, "dry_run": False, "action": action,
+            "keys": keys, **counts}
+
+
+def _counts_reason(counts: Dict[str, int]) -> str:
+    """批次计数摘要（审计行里的短理由；**只写 count，不写内容**）。"""
+    return (f"total={counts['total']}; would_add={counts['would_add']}; "
+            f"skipped_duplicate={counts['skipped_duplicate']}; "
+            f"rejected_reserved={counts['rejected_reserved']}; "
+            f"rejected_empty={counts['rejected_empty']}")
 
 
 # --------------------------------------------------------------------------

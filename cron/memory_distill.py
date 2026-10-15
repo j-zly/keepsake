@@ -17,6 +17,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 from keepsake.consolidator import resolve_llm_channel_cached
+from keepsake.core.shared import sanitize_reserved_tags
 
 DB = "/root/.hermes/state.db"
 WATERMARK_FILE = "/tmp/memory_distill_watermark"
@@ -181,17 +182,16 @@ def _sanitize_llm_tags(raw: str) -> str:
     实测事故：提炼 LLM 聊「候选审核」话题时给记忆自打 `core_candidate`，
     假申请混进控制台审核队列。`core`/`shared`/`agent:*` 同属治理保留字——
     自动提炼无权声明常驻、共享或代理归属，出现即剥除并记日志。
+
+    🔴 判据**单点**在 `keepsake.core.shared.sanitize_reserved_tags`：控制台的
+    新增/导入端点（`api/routers/ops.py`）判的是同一份保留字，只是对 `core`
+    从「剥除」升级为「400 拒收」（那是人在点，静默吃掉他打的标签等于丢意图）。
+    两处各写一份 set = 迟早漂一份，而漂的那份就是假申请的入口。
     """
-    reserved_exact = {"core", "core_candidate", "shared"}
-    kept = []
-    for t in (x.strip() for x in (raw or "").split(",")):
-        if not t:
-            continue
-        if t in reserved_exact or t.startswith("agent:"):
-            print(f"[distill] 剥除 LLM 自造保留标签: {t!r}")
-            continue
-        kept.append(t)
-    return ",".join(kept)
+    clean, touched = sanitize_reserved_tags(raw)
+    for tag, _reason in touched:
+        print(f"[distill] 剥除 LLM 自造保留标签: {tag!r}")
+    return clean
 
 
 def store_to_keepsake(items, dry_run):

@@ -230,6 +230,41 @@ class StorageBase(ABC):
         """局部更新一条碎片的若干字段（**不动 content / content_tsv / embedding**）。"""
         ...
 
+    def update_fragment_content(
+        self,
+        key: str,
+        content: str,
+        tags: Optional[str] = None,
+        entities: Optional[str] = None,
+    ) -> bool:
+        """改正文（可选同改标签/实体），**必须让检索索引跟着正文一起更新**。
+
+        与 `update_fragment_fields` 的分工：那条原语是「维护面更新」（标记
+        consumed / 打归档标），契约上**明写不动 content_tsv** —— 正文明改了索引
+        不跟着改，检索会**静默召回旧内容**（不是召不回，是召回错的），这是
+        PG 后端历史上真实存在的缺陷（它的 `update_fragment_fields` 只 UPDATE 列）。
+        所以「改正文」必须走这一条。
+
+        **默认实现 = 转调 `update_fragment_fields`**，两个后端天然满足语义，
+        无需各自实现：
+          * `SqliteStorage`：改了 content/entities/tags 就**就地重算
+            `content_tsv` 并同步 FTS**（见其实现注释）；
+          * `RedisStorage`：索引是 `FT.CREATE ... ON HASH PREFIX 1 memory:frag:`
+            （无 `NOINDEX`/`SKIPINITIALSCAN` 排除），RediSearch 对命中前缀的
+            hash **每次写都自动维护索引** ⇒ HSET 新正文后 BM25/KNN 立即跟随，
+            且 Redis 没有 `content_tsv` 列，本就无第二份索引要同步。
+          * `PgStorage`：**覆写**本方法（同事务内重算 `content_tsv`，A=正文
+            / B=实体+标签，参数与拼接口径复用 `store()` 的同一份函数）。
+
+        `tags` / `entities` 传 `None` = 这一列不动（B 权重按库里现值算）。
+        """
+        fields: Dict[str, Any] = {"content": content}
+        if tags is not None:
+            fields["tags"] = tags
+        if entities is not None:
+            fields["entities"] = entities
+        return self.update_fragment_fields(key, fields)
+
     @abstractmethod
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量删除碎片，返回实际删除条数。"""

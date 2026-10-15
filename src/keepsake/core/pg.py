@@ -103,6 +103,7 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     accumulate_co_occurrence,
     accumulate_word_freq,
     discover_synonym_pairs,
+    fragment_key_for,
     jieba_dict_entries,
     jieba_dict_words,
     merge_synonym_maps,
@@ -310,6 +311,29 @@ SEARCH_COLUMNS = ("content_tsv", "embedding")
 # FRAGMENT_FIELDS 裁剪、不含这三列；加进去会让 PG 侧检索结果多出字段 ⇒ 形状漂移。
 # 维护路径（合并/遗忘）单独按 MAINTENANCE_COLUMNS 读。
 MAINTENANCE_COLUMNS = ("level", "consumed_by", "consumed_at")
+
+
+# ---------------------------------------------------------------------------
+# content_tsv 的**唯一拼法与分词口径**（写路径三处共用，见 tsv_expr_params）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么必须单点：`upsert_fragment` / `store` / `update_fragment_content`
+#   都往 `content_tsv` 写。若新原语另写一份 `to_tsvector` 拼法（哪怕只差
+#   `'simple'` 配置或 A/B 权重位），后果是**正文改了、索引没跟着改** ——
+#   检索不报错、不空召回，只是**召回错内容**，这是最难被发现的一类失败。
+#   分词也走同一份 `tsv_lexemes`（= `_tsv_tokens` 的实现），不做二次实现。
+TSV_SETWEIGHT_SQL = ("setweight(to_tsvector('simple', %s), 'A') "
+                     "|| setweight(to_tsvector('simple', %s), 'B')")
+
+
+def tsv_expr_params(content: str, entities: str = "", tags: str = "") -> List[str]:
+    """`TSV_SETWEIGHT_SQL` 的两个绑定参数：正文词元（A）+ 实体/标签词元（B）。
+
+    三处写路径都调它 —— 拼接口径（`TSV_SETWEIGHT_SQL`）与分词口径
+    （`tsv_lexemes`）**同源**。要改权重位或换分词器，只改这一处。
+    """
+    return [" ".join(tsv_lexemes(content)),
+            " ".join(tsv_lexemes(f"{entities or ''} {tags or ''}"))]
 
 
 def _maintenance_column_ddl() -> tuple:
@@ -2097,8 +2121,12 @@ class PgStorage(StorageBase):
 
     @staticmethod
     def _fragment_key_for(text: str) -> str:
-        """碎片 key —— 与 Redis store() 同一套算法（sha256 前 12 位）。"""
-        return f"memory:frag:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+        """碎片 key —— 与 Redis/SQLite store() 同一套算法（sha256 前 12 位）。
+
+        转调 `storage_shared.fragment_key_for`：控制台导入的去重判据也走那个
+        函数，两处各拼一次 sha256 迟早漂一份，漂了就是「去重静默失效」。
+        """
+        return fragment_key_for(text)
 
     @staticmethod
     def _tsv_tokens(text: str) -> List[str]:
@@ -2188,10 +2216,7 @@ class PgStorage(StorageBase):
         else:
             vec = self._text_to_vector(content)
 
-        tsv_sql = ("setweight(to_tsvector('simple', %s), 'A') "
-                   "|| setweight(to_tsvector('simple', %s), 'B')")
-        params.extend([" ".join(self._tsv_tokens(content)),
-                       " ".join(self._tsv_tokens(f"{entities} {tags}"))])
+        params.extend(tsv_expr_params(content, entities, tags))
         vec_sql = "%s::vector" if vec else "NULL::vector"
         if vec:
             params.append(self._vector_literal(vec))
@@ -2201,7 +2226,7 @@ class PgStorage(StorageBase):
             cur.execute(
                 f"""
                 INSERT INTO ks_fragment ({', '.join(cols)}, content_tsv, embedding)
-                VALUES ({', '.join(['%s'] * len(cols))}, {tsv_sql}, {vec_sql})
+                VALUES ({', '.join(['%s'] * len(cols))}, {TSV_SETWEIGHT_SQL}, {vec_sql})
                 ON CONFLICT (key) DO UPDATE SET {set_sql},
                     content_tsv = EXCLUDED.content_tsv,
                     embedding = COALESCE(EXCLUDED.embedding, ks_fragment.embedding)
@@ -2270,12 +2295,9 @@ class PgStorage(StorageBase):
             # ---- 批 2：同步算好检索用的两列，别让调用方回填 ----
             # 1) content_tsv = A(content 的 jieba 分词) || B(entities + tags)
             #    与 Redis 侧的 @content / @entities / @tags 三路 OR 召回面同源。
-            tsv_sql = (
-                "setweight(to_tsvector('simple', %s), 'A') "
-                "|| setweight(to_tsvector('simple', %s), 'B')"
-            )
-            tsv_params = [" ".join(self._tsv_tokens(text)),
-                          " ".join(self._tsv_tokens(f"{entities_str} {final_tags}"))]
+            #    拼法/分词与 `update_fragment_content` 同一份（TSV_SETWEIGHT_SQL
+            #    + tsv_expr_params）—— 改正文时索引才跟得上（见 tsv_expr_params 注释）。
+            tsv_params = tsv_expr_params(text, entities_str, final_tags)
             # 2) embedding：与 Redis 侧同一 embedder 的 float32 向量
             # 无 embedder → 向量列留 NULL（KNN 查不到这条，但 BM25 照常命中；
             # 与 Redis 侧「没 embedder 就没 embed_bin」的处理完全一致）
@@ -2289,7 +2311,7 @@ class PgStorage(StorageBase):
                     sentiment_score, sentiment_label, feedback_score,
                     entities, fragment_type, content_tsv, embedding
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          {tsv_sql}, {vec_sql})
+                          {TSV_SETWEIGHT_SQL}, {vec_sql})
                 """,
                 (
                     key, text, final_tags, category, source, now_iso,
@@ -2749,6 +2771,68 @@ class PgStorage(StorageBase):
                 params,
             )
             return cur.rowcount > 0
+
+    @with_deadlock_retry
+    def update_fragment_content(
+        self,
+        key: str,
+        content: str,
+        tags: Optional[str] = None,
+        entities: Optional[str] = None,
+    ) -> bool:
+        """改正文（可选同改标签/实体），**同事务内重算 `content_tsv`**。
+
+        为什么必须有这条原语：`update_fragment_fields` 的契约是「不动
+        content_tsv」（维护面更新用它），所以在 PG 上改正文若走那条路径，
+        正文变了、BM25 索引还留着旧词 —— 检索**不报错、不空召回**，只是
+        **召回旧内容**，控制台看着「改成功了」而记忆库在骗人。
+
+        🔴 拼法与分词与 `store()` **同一个函数**（`TSV_SETWEIGHT_SQL` +
+        `tsv_expr_params`，见模块里那一节的注释）：A = 新正文的 jieba 词元，
+        B = 实体 + 标签的词元。另写一份 `to_tsvector` 就是上面那个 bug 复发。
+
+        `tags` / `entities` 传 `None` = 该列不动，但 **B 权重按库里现值算**
+        （先 `SELECT ... FOR UPDATE` 取回，避免用空串把标签的召回面抹掉）。
+
+        返回前**回读校验**正文确实变了：控制台要的是「报成功 == 真改到了」，
+        后端静默丢弃不该被报成成功。key 不存在 / 正文为空 ⇒ False。
+        """
+        if not key or not (content or "").strip():
+            return False
+        with self._tx() as cur:
+            # FOR UPDATE：同事务里取现值再改，别让并发写把 B 权重算成旧标签。
+            cur.execute(
+                "SELECT COALESCE(entities, ''), COALESCE(tags, '') "
+                "FROM ks_fragment WHERE key = %s FOR UPDATE",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            cur_entities = row[0] if entities is None else entities
+            cur_tags = row[1] if tags is None else tags
+
+            set_parts = ["content = %s", f"content_tsv = {TSV_SETWEIGHT_SQL}"]
+            params: List[Any] = [content]
+            params.extend(tsv_expr_params(content, cur_entities, cur_tags))
+            if entities is not None:
+                set_parts.append("entities = %s")
+                params.append(entities)
+            if tags is not None:
+                set_parts.append("tags = %s")
+                params.append(tags)
+            params.append(key)
+            cur.execute(
+                f"UPDATE ks_fragment SET {', '.join(set_parts)} WHERE key = %s",
+                params,
+            )
+            ok = cur.rowcount > 0
+        if not ok:
+            return False
+        # 正文换了 ⇒ content_tsv 换了 ⇒ N/avgdl/df 快照陈旧（与 upsert/store 同款）
+        self._snap_drop("n_avgdl", "dfs")
+        now = self.get_fragment(key) or {}
+        return str(now.get("content", "")) == content
 
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量硬删。一条 DELETE + 一条时间线清理（碎片没了，时间线成员就是死引用）。

@@ -465,14 +465,16 @@ def test_me_过期时间与登录回包一致(client):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是六条业务POST加三条auth_POST():
+def test_写面仍是九条业务POST加三条auth_POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == {
         "/api/v1/auth/setup", "/api/v1/auth/login", "/api/v1/auth/logout",
         "/api/v1/core/{key}/promote", "/api/v1/core/{key}/demote",
-        "/api/v1/fragments/{key}/update", "/api/v1/fragments/{key}/archive",
+        "/api/v1/fragments", "/api/v1/fragments/{key}/update",
+        "/api/v1/fragments/{key}/archive", "/api/v1/fragments/{key}/delete",
+        "/api/v1/import",
         "/api/v1/ops/merge", "/api/v1/ops/forget",
     }, sorted(write)
 
@@ -483,8 +485,10 @@ def test_业务路由全部挂了require_session():
     protected = {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
                  "/api/v1/fragments/{key}", "/api/v1/kb/summary",
                  "/api/v1/kb/search", "/api/v1/stats", "/api/v1/crons",
+                 "/api/v1/export",
                  "/api/v1/core/{key}/promote", "/api/v1/core/{key}/demote",
                  "/api/v1/fragments/{key}/update", "/api/v1/fragments/{key}/archive",
+                 "/api/v1/fragments/{key}/delete", "/api/v1/import",
                  "/api/v1/ops/merge", "/api/v1/ops/forget", "/api/v1/auth/logout",
                  "/api/v1/auth/me"}
     for r in app.routes:

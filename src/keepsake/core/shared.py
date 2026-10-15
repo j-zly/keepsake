@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -254,6 +255,63 @@ def tag_match_sql(col: str, tags: List[str], placeholder: str,
     hay = _TAG_COL_NORM.format(col=col)
     sql = "(" + " OR ".join([f"{pos_fn}({hay}, {placeholder}) > 0"] * len(tags)) + ")"
     return sql, [f",{t}," for t in tags]
+
+
+# ---------------------------------------------------------------------------
+# 治理保留标签（单一判据：提炼 cron 与控制台写端点共用本节）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么必须单点（实测事故 + 复发路径）：
+#   `core` / `core_candidate` / `shared` / `agent:*` 是**治理保留字** —— 谁
+#   能声明它们，等于谁就能决定「这条记忆是否进常驻、是否进候选审核队列、
+#   是否归属某个代理」。自动提炼的 LLM 无权声明（它聊到「候选审核」就会
+#   自打 `core_candidate`，假申请混进控制台审核队列），控制台的**新增/导入**
+#   端点同样无权直打 `core`（进常驻必须走既有条目的 promote 或候选审核）。
+#   两处各写一份 set = 迟早漂一份，而漂的那份就是「假申请」的入口。
+
+#: 精确相等的保留标签（逗号边界上的完整标签，不做子串误伤：
+#: `core_x` / `ycore` / `kind:fact` 都不是保留字）。
+RESERVED_TAG_EXACT = frozenset({"core", "core_candidate", "shared"})
+
+#: 前缀即保留的标签族（代理归属由存储层按 `_agent_id` 注入，不是调用方能填的）。
+RESERVED_TAG_PREFIX = "agent:"
+
+
+def sanitize_reserved_tags(raw: Any, forbid: Tuple[str, ...] = ()) -> Tuple[str, List[Tuple[str, str]]]:
+    """剥除治理保留标签。返回 `(清洗后的逗号串, [(被处理标签, 原因)])`。
+
+    原因取 `"stripped"`（静默剥除）或 `"forbidden"`（调用方不许写、只剥不够用）。
+
+    `forbid` 里的标签走 `forbidden` 分支：调用方（控制台新增/导入）拿到它就该
+    报 400 而不是悄悄丢掉用户的标签 —— 「我打的常驻标签被系统吃掉了」是
+    静默丢数据。自动提炼（`cron/memory_distill.py`）传空 `forbid`：它无权声明，
+    剥掉继续写。
+
+    ponytail: 不做去重与顺序重排 —— 判据只有「是不是保留字」，其余语义
+    （重复标签要不要合并）由存储层的 tags 列自己兜，多做一层就多一处口径。
+    """
+    banned = set(forbid)
+    kept: List[str] = []
+    touched: List[Tuple[str, str]] = []
+    for t in (x.strip() for x in str(raw or "").split(",")):
+        if not t:
+            continue
+        if t in RESERVED_TAG_EXACT or t.startswith(RESERVED_TAG_PREFIX):
+            reason = "forbidden" if t in banned else "stripped"
+            touched.append((t, reason))
+            continue
+        kept.append(t)
+    return ",".join(kept), touched
+
+
+def fragment_key_for(text: str) -> str:
+    """记忆条目 key —— 三后端 `store()` 的**同一套算法**（sha256 前 12 位）。
+
+    调用方（控制台导入的去重判据）必须走这里，而不是自己再拼一遍 sha256：
+    两处各拼一次，某一侧改了截断长度，去重就会静默失效（每条都被当成新条目
+    重复入库）。`PgStorage._fragment_key_for` 直接转调本函数。
+    """
+    return f"memory:frag:{hashlib.sha256((text or '').encode()).hexdigest()[:12]}"
 
 
 # ---------------------------------------------------------------------------

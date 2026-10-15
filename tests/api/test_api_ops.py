@@ -26,6 +26,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: 写面白名单（与 test_api_readonly.ALLOWED_POST_PATHS 同一份口径；两处各写一遍
 #: 是故意的 —— 一边改漏了，另一边的相等断言会红）。P3 起再加 3 条认证 POST
 #: （setup / login 公开、logout 要会话 —— 那部分在 test_auth.py 里逐条打）。
+#: keepsake_memory_crud_be 起再加 3 条业务 POST（增 / 真删 / 导入）。
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
@@ -35,8 +36,11 @@ AUTH_POST_PATHS = {
 ALLOWED_POST_PATHS = {
     "/api/v1/core/{key}/promote",
     "/api/v1/core/{key}/demote",
+    "/api/v1/fragments",
     "/api/v1/fragments/{key}/update",
     "/api/v1/fragments/{key}/archive",
+    "/api/v1/fragments/{key}/delete",
+    "/api/v1/import",
     "/api/v1/ops/merge",
     "/api/v1/ops/forget",
 } | AUTH_POST_PATHS
@@ -110,8 +114,11 @@ def test_所有写端点都要求token(client):
     """少挂一个 require_token 依赖就会红 —— 这里逐条打一遍。"""
     cases = [("/api/v1/core/memory%3Afrag%3Aaaa/promote", {"confirm": True}),
              ("/api/v1/core/memory%3Afrag%3Aaaa/demote", {"confirm": True}),
+             ("/api/v1/fragments", {"confirm": True, "content": "x"}),
              ("/api/v1/fragments/memory%3Afrag%3Aaaa/update", {"confirm": True, "content": "x"}),
              ("/api/v1/fragments/memory%3Afrag%3Aaaa/archive", {"confirm": "frag:aaa"}),
+             ("/api/v1/fragments/memory%3Afrag%3Aaaa/delete", {"confirm": "frag:aaa"}),
+             ("/api/v1/import", {"items": [{"content": "x"}]}),
              ("/api/v1/ops/merge", {"dry_run": True}),
              ("/api/v1/ops/forget", {"dry_run": True})]
     for url, body in cases:
@@ -437,13 +444,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有六条业务POST加三条认证POST():
+def test_写面只有九条业务POST加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 9
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 6
+    assert len(ALLOWED_POST_PATHS) == 12
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 9
 
 
 def test_P1只读路由未被写面影响(client):
