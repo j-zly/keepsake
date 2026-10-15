@@ -1,5 +1,7 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
+> 最后校准: 2026-10-15（对齐 HEAD 2ca18c5：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
+
 碎片化记忆系统 — 每次对话自动检索相关记忆注入上下文。
 
 ```text
@@ -47,6 +49,11 @@
 | 🧪 **自动记忆提炼** | `cron/memory_distill.py`（线上部署在 `/root/scripts/`）走 keepsake LLM 通道（config `llm` 节热生效）把近期对话提炼为一句结论入库，watermark 增量更新，LLM 自造治理标签由保留字黑名单剥除（可开关） |
 | 📊 **检索质量抽查集** | `scripts/eval_spotcheck.py` 30 条真实查询回归测试持续追踪检索质量（v1.4 BM25-only：60% → 67%；+向量 KNN 融合 2026-09：73%） |
 | 🧩 **Hermes 插件壳** | 内含 `hermes-plugin/` 目录（plugin.yaml + __init__.py），即拷即用 |
+| 🔌 **通用记忆接口与 MCP** | `MemoryProvider` 是不绑宿主的 `Protocol`，三段失败语义写死（注入 fail-open / 检索显式抛错 / 写 fail-closed）；`build_server(provider)` 三行把任意实现接成 MCP 服务。见「通用记忆接口与 MCP」节 |
+| 🛡️ **多代理记忆治理** | 四道闸：非 primary 检索放开 core、写 core 自动降 `core_candidate`、控制台候选审核队列、主脑 `retrieval.exclude_tags` 挡候选。见「多代理记忆治理」节 |
+| 🖥️ **控制台记忆条目 CRUD** | 新增 / 真删（confirm=key 末 8 位，删前备份）/ JSONL·CSV 导出 / 导入（dry-run 预演+手输实跑）；常驻层列表带 `?q=` 搜索 |
+| 📚 **知识库 CRUD 与灌入器** | 记忆库旁的 documents/chunks 文档库：manual 域归控制台、skill 域归夜间灌入器，切块判据单点收在 `keepsake.kb.ingest`。见「知识库（documents / chunks）与灌入器」节 |
+| 🧰 **记忆维护独立页** | 合并/遗忘 dry-run 与实跑 + 常驻候选审核区，从看板摘出为控制台独立页 |
 
 ## 设计哲学：为 LLM 优化的干净记忆
 
@@ -352,6 +359,7 @@ yeah
 | `synonym_min_co_occurrence` | — | `3` | 两词绝对共现次数 ≥ 此值视为同义 |
 | `entity_cooc_top_n` | — | `3` | 搜索时扩展多少个关联实体 |
 | `entity_cooc_min_count` | — | `2` | 实体共现几次才算有效关联 |
+| `retrieval.exclude_tags` | — | `core_candidate` | 检索时要排除的标签（逗号分隔）。写空串 = 关闸。在 `initialize()` 里解析一次 ⇒ **改它要重启**。见「多代理记忆治理」节 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -551,6 +559,71 @@ redis-cli HSET keepsake:synonyms setup '["安装","配置","部署","搭建"]'
 redis-cli HSET keepsake:synonyms fix '["修","改","补","修复","解决"]'
 ```
 
+## 知识库（documents / chunks）与灌入器
+
+记忆库之外还有一套文档知识库（`kb_documents` + `kb_chunks`），从控制台的知识库页检索。与 `ks_fragment` 同库不同表，互不干扰。
+
+**按 `source_type` 分域 —— 谁的地盘谁能写：**
+
+| `source_type` | 归属 | 控制台行为 |
+|---------------|------|-----------|
+| `manual` | 控制台 | 可自由增/改/删。`source_key` 由内容 hash 派生，同样的内容再导一次是幂等而不是重复入库。 |
+| `skill` / `skill_hk` | 夜间灌入器 | 任何写操作一律 **HTTP 409** —— 改了下当晚那轮会被覆盖，删了技能再现就被清理回来。UI 上这两类文档只渲染只读徽标，不给写按钮。 |
+
+**切块判据单点收口。**「一篇文档怎么切块、怎么幂等落库」在仓库里只有一份实现：`keepsake.kb.ingest` 的 `split_chunks` / `upsert_document` / `content_hash` / `replace_chunks` / `update_document`。控制台写端点与灌入器 CLI 都从这里 import，测试还用「是同一个函数对象」把这条钉死 —— 否则控制台写进去的文档会被灌入器切成另一种粒度，检索命中与页面显示对不上。改正文时 **同事务重切 chunks**（删旧 + 插新），文档永远不会留下一堆与正文矛盾的切片。`MANUAL_SOURCE_TYPE` 也从这个包导出，所有 manual 域判据都读常量而不写死字面量。
+
+**灌入器** —— `scripts/kb_ingest.py` 从源 skill 文档库读、往 `documents` / `chunks` 写，行为与它收编的旧版**逐字段等价**（在生产库上把两版都跑 `--dry` 对过账）。凭据只走环境变量或口令文件路径，源码零明文。先预演：
+
+```bash
+python3 scripts/kb_ingest.py --dry     # 只统计，结束时回滚
+python3 scripts/kb_ingest.py           # 实跑
+```
+
+它顺带清理死文档：`skill` / `skill_hk` 中 `(source_type, meta.node, meta.skill)` 已不在 live 集合里的那些。`manual` 是控制台的地盘，本脚本永不动它。生产 PG 节点的 cron 已指向本脚本。
+
+**控制台端点**：文档列表（分页、关键词与 `source_type` 双过滤，且响应里**必带** `source_type`，前端据此判断哪些可写）、增 / 改（改正文连带重切）/ 删（confirm = 文档标题全文，删前先写快照备份）、JSONL 导入（dry-run 预演，实跑须手输 `would_add` 计数）、JSONL 导出。
+
+## 通用记忆接口与 MCP
+
+`keepsake.adapters.generic.protocol.MemoryProvider` 是一个 `runtime_checkable` 的 `typing.Protocol`，描述「一个记忆系统对宿主暴露什么」。该模块不 import 任何宿主的东西 —— 描述的是形状，与调用方是谁无关；依赖方向严格是 `adapters.hermes → adapters.generic`。
+
+失败语义按层写死，新后端不能自己发明一套：
+
+| 层 | 方法 | 后端出故障时 |
+|------|------|-------------|
+| 注入层 | `system_prompt_block()`、`prefetch(query)` | **fail-open** —— 吞掉异常，降级成静态文案 / 空串，至多一条 `logger.warning`。这两个方法在每轮组装上下文的**关键路径**上，这里抛异常等于整轮对话失败 —— 记忆是增强项，不该有能力让对话瘫掉。 |
+| 检索层 | `search(query, limit)`、`get(key)` | **显式抛错。** 静默返回 `[]` 是最危险的失败形态：记忆静默搜不到、没有任何告警，用户只会以为「AI 忘了」。 |
+| 写层 | `add(text, tags)`、`update(key, …)`、`remove(target)` | **fail-closed** —— 明确报告失败（返回 falsy / 抛错 / `status=error`），绝不假装成功。写失败被当成成功，调用方就会继续往下走并向用户确认「已保存」—— 那是在撒谎。 |
+
+外加维护层 —— `merge(dry_run=True)` 与 `forget(dry_run=True)`，**两者缺省即 dry-run** —— 以及能力声明 `capabilities()`。注意 `get(key)` 返回 `None` 的语义是「确实没有这条」，不是「查不出来」。
+
+### 任意宿主三行接入
+
+```python
+from keepsake.mcp_server.server import build_server
+server = build_server(MyMemoryProvider())   # 实现上面那套协议
+server.run("stdio")                         # 任何 MCP 客户端连上就能用
+```
+
+`build_server(provider)` 挂 8 个 tool —— `memory_capabilities`、`memory_search`、`memory_get`、`memory_core_list`、`memory_add`、`memory_remove`、`memory_merge`、`memory_forget` —— 外加两个 resource：`memory://core`（常驻层全文，取的就是每轮注入上下文那份渲染的逐字原件）与 `memory://fragment/{key}`。不传参则用 keepsake 自己的默认装配（`factory.default_provider()`，按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连库）。MCP 的写 tool 与 `provider.add()` 共用同一道写闸，下面的治理规则对 MCP 调用方同样成立。
+
+**传输。** `stdio` 是缺省。`http`（streamable-http）**只听 `127.0.0.1`** —— 绑非回环地址直接以退出码 2 终止，不启动。记忆库没有自带认证，把它暴露到网络上等于把一个人的长期记忆公开读；要对外请走反向代理。CLI：`python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`。
+
+## 多代理记忆治理
+
+四道闸，均已在生产生效：
+
+| 闸 | 行为 | 配置键 | 生效层 |
+|----|------|--------|--------|
+| **A — 非 primary 检索放开 `core`** | 子代理也能召回常驻层，而不只是自己的私有条目；但仍写不进去 | `is_primary` | 存储过滤 —— 三个后端的 BM25 路径均生效；PG 与 SQLite 共用同一个 `_search_filter_sql` 出口，BM25 与 KNN 一并覆盖 |
+| **B — 写 `core` 自动降级** | 非 primary 代理写 `core` 标签时，该标签被改写成 `core_candidate`（其余标签保留），并打一条告警 | — | `provider._apply_write_gate`，挂在 `provider.add()` 上；MCP 的 `memory_add` 走同一条 |
+| **C — 控制台候选审核队列** | 控制台「记忆维护」页分页列出 `core_candidate` 条目。批准 = 先 promote 进 `core` 再摘掉候选标（顺序不能反，反了可能两头空）；驳回 = 只摘候选标，条目仍留在检索层 | — | 控制台 |
+| **D — 主脑噪音过滤** | `retrieval.exclude_tags` 在检索出口按标签丢弃条目。缺省挡掉 `core_candidate`，不让「待审申请」在主脑自己的召回里当成事实重复出现；写空串即关闸 | `retrieval.exclude_tags` | `search` / `prefetch` 的同一出口，**先过滤再截断** |
+
+第 D 闸的值在 `initialize()` 里解析一次，所以**改它要重启**；过滤本身每次查询都跑，但跑的是那份冻结下来的集合。
+
+`core_candidate` 的语义因此是「进入常驻层的待审申请」，而不是 LLM 可以自己发明的标签。保留字判据全仓只有一份实现 —— `core/shared.py` 的 `sanitize_reserved_tags()`，提炼 cron（剥掉保留字并记日志）与控制台新增/导入（打 `core` 直接 400）共用。保留集合：精确标签 `core` / `core_candidate` / `shared`，外加 `agent:` 前缀族；按逗号边界精确匹配，所以 `core_x` 不算保留字。
+
 ## 验证
 
 启动后检查日志：
@@ -582,14 +655,24 @@ keepsake: auto-registered cron job '记忆去重'
 ```
 keepsake/
 ├── src/keepsake/         # Python 包 — 记忆提供者核心
+│   ├── domain/           # 类型与契约（Fragment / Hit / Capabilities）
+│   ├── core/             # 存储后端与共用判据链
+│   ├── adapters/
+│   │   ├── generic/      # 不绑宿主的 MemoryProvider 契约
+│   │   └── hermes/       # Hermes 插件 provider
+│   ├── kb/               # 知识库写侧共用层（切块 / 幂等 upsert）
+│   ├── mcp_server/       # 通用 MCP 入口 —— build_server(provider)
+│   └── api/              # 控制台后端（路由、鉴权、审计）
+├── web/                  # 控制台前端（Vue 3 + Vite）
 ├── hermes-plugin/        # Hermes 插件壳（拷到 ~/.hermes/plugins/ 即用）
 │   ├── plugin.yaml
 │   └── __init__.py
 ├── cron/                 # 定时任务包装脚本
 │   ├── memory-maintenance.py   # 每 2h — 选择性遗忘（合并不在此脚本，见「维护能力」）
+│   ├── memory_distill.py       # 近期对话提炼为一句结论（剥除保留字）
 │   ├── dedup-memory.sh         # 每 1h — 去重
 │   └── discover-synonyms.py    # 每 8h — 同义词自动发现
-├── scripts/              # 独立工具脚本（开发/测试）
+├── scripts/              # 独立工具脚本（开发/测试），含知识库灌入器 kb_ingest.py
 ├── README.md
 └── pyproject.toml
 ```

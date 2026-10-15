@@ -1,5 +1,7 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
+> 最后校准: 2026-10-15（对齐 HEAD 2ca18c5：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
+
 The Keepsake system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
 
 ```text
@@ -43,6 +45,11 @@ User: "How did we set up that React project structure last time?"
 - **Auto-Registered Cron Jobs** — when used as a Hermes plugin, three cron jobs (memory maintenance every 2h, deduplication every 1h, synonym discovery every 8h) are automatically registered on plugin initialization — zero manual setup
 - **Hermes Plugin Wrapper** — ready-to-use `hermes-plugin/` directory with `plugin.yaml` and `__init__.py` for drop-in installation
 - **Two-Phase Pipeline (v2, 2026-09)** — Mem0-style extract/update phases run async on a daemon thread, sealing old facts via `superseded_by` edges (not physical delete) so stale snapshots (e.g. completed tasks marked pending) never reappear. Cost-capped at `llm_pipeline.max_calls_per_window`; any LLM/JSON failure or budget breach falls back to v1 rule-gate storage — messages are never silently dropped.
+- **Generic Memory Interface & MCP** — `MemoryProvider` is a host-agnostic `Protocol` with three fixed failure tiers (injection fail-open / retrieval raises / write fail-closed); `build_server(provider)` wires any implementation into an MCP server in three lines. See [Generic Memory Interface & MCP](#generic-memory-interface--mcp)
+- **Multi-Agent Memory Governance** — four gates keep sub-agents out of the resident layer's write path while leaving it readable: non-primary read-open on `core`, automatic `core_candidate` downgrade on write, a console review queue, and the main brain's `retrieval.exclude_tags` filter. See [Multi-Agent Memory Governance](#multi-agent-memory-governance)
+- **Console Memory CRUD** — create, delete (confirm the last 8 characters of the key, backed up first), JSONL/CSV export and dry-run import from the console; the resident-layer list takes `?q=` free-text search
+- **Knowledge Base CRUD and Ingestor** — document/chunk storage beside the memory store, with a manual domain owned by the console and a `skill` domain owned by the nightly ingestor; chunking is single-sourced in `keepsake.kb.ingest`. See [Knowledge Base (documents / chunks) and the Ingestor](#knowledge-base-documents--chunks-and-the-ingestor)
+- **Standalone Memory Maintenance Page** — merge / forget dry-run and real run plus the resident-layer candidate review queue, split out of the dashboard into its own console page
 
 ## Design Philosophy: Clean Memory for LLMs
 
@@ -366,6 +373,7 @@ Then reference it in config.json:
 | `synonym_min_co_occurrence` | — | `3` | Min co-occurrence for synonym detection |
 | `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search |
 | `entity_cooc_min_count` | — | `2` | Min co-occurrence for entity association |
+| `retrieval.exclude_tags` | — | `core_candidate` | Tags (comma-separated) excluded from retrieval. Empty string = gate off. Resolved once in `initialize()` ⇒ **restart to apply**. See [Multi-Agent Memory Governance](#multi-agent-memory-governance) |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -655,6 +663,71 @@ Conservative filtering of the high-entropy fallback (Category 5) avoids false po
 - **Chinese text** — `我的密码本很厚` (no separator) → no mask
 - **Common `key=value` pairs** — `Server=localhost`, `Database=mydb` in DSN strings → no mask
 
+## Knowledge Base (documents / chunks) and the Ingestor
+
+Beside the memory store sits a document knowledge base (`kb_documents` + `kb_chunks`), searched from the console's knowledge base page. It is a separate store from `ks_fragment` — same PG database, different tables.
+
+**Domain split by `source_type`** — who may write what:
+
+| `source_type` | Owner | Console behaviour |
+|---------------|-------|-------------------|
+| `manual` | the console | Create / edit / delete freely. `source_key` is derived from the content hash, so re-importing identical content is idempotent rather than duplicating. |
+| `skill` / `skill_hk` | the nightly ingestor | **HTTP 409** on any write — an edit would be overwritten by the next ingest run, and a delete would be undone when the skill reappears. The UI renders these read-only (a badge instead of the write buttons). |
+
+**Chunking is single-sourced.** "How a document is cut into chunks, and how it lands idempotently" exists exactly once, in `keepsake.kb.ingest`: `split_chunks`, `upsert_document`, `content_hash`, `replace_chunks`, `update_document`. The console write endpoints and the ingestor CLI both import it, and a test asserts they are the *same* function object — otherwise the console would write documents the ingestor re-cuts at a different granularity, and search hits would disagree with what the page shows. Editing a body re-chunks **inside the same transaction** (delete old + insert new), so a document can never be left holding chunks that contradict its body. `MANUAL_SOURCE_TYPE` is exported from that same package, and every manual-domain check reads the constant rather than repeating the literal.
+
+**The ingestor** — `scripts/kb_ingest.py` reads the source skill-document store and writes `documents` / `chunks`. Its behaviour is field-by-field equivalent to the version it absorbed (verified on a production database with both versions run in `--dry`). Credentials come only from environment variables or a password-file path — no plaintext in the source. Dry run first:
+
+```bash
+python3 scripts/kb_ingest.py --dry     # counts only, rolls back at the end
+python3 scripts/kb_ingest.py           # real run
+```
+
+It also prunes dead documents: `skill` / `skill_hk` entries whose `(source_type, meta.node, meta.skill)` is no longer in the live set. `manual` is never touched — that domain belongs to the console. The production PG node's cron already points at this script.
+
+**Console endpoints**: document list (paged, free-text and `source_type` filters, and `source_type` always present in the response so the UI knows which entries are writable), create / update (re-chunking) / delete (confirm = the document's full title; snapshot + backup written before the delete), JSONL import (dry-run preview, real run requires typing the `would_add` count), and JSONL export.
+
+## Generic Memory Interface & MCP
+
+`keepsake.adapters.generic.protocol.MemoryProvider` is a runtime-checkable `typing.Protocol` describing what a memory system exposes to its host. The module imports nothing host-specific — it describes the shape, not the caller — and the dependency direction is strictly `adapters.hermes → adapters.generic`.
+
+Failure semantics are pinned per tier, so a new backend cannot invent its own:
+
+| Tier | Methods | On backend failure |
+|------|---------|--------------------|
+| Injection | `system_prompt_block()`, `prefetch(query)` | **fail-open** — swallow the error, degrade to static text / empty string, at most a `logger.warning`. These sit on the critical path of every turn; an exception here fails the whole conversation, and memory is an enhancement, not a dependency. |
+| Retrieval | `search(query, limit)`, `get(key)` | **raise.** A silent `[]` is the most dangerous failure shape: memories silently unfindable, no warning anywhere, and the user just concludes "the AI forgot". |
+| Write | `add(text, tags)`, `update(key, …)`, `remove(target)` | **fail-closed** — report failure explicitly (falsy / raise / `status=error`), never pretend to have succeeded. A swallowed write failure has the caller go on to tell the user "saved", which is a lie. |
+
+Plus the maintenance tier — `merge(dry_run=True)` and `forget(dry_run=True)`, both dry-run by default — and `capabilities()` for capability declaration. Note `get(key)` returning `None` means "genuinely absent", not "could not be checked".
+
+### Three lines to any host
+
+```python
+from keepsake.mcp_server.server import build_server
+server = build_server(MyMemoryProvider())   # implements the protocol above
+server.run("stdio")                         # any MCP client connects and is done
+```
+
+`build_server(provider)` registers 8 tools — `memory_capabilities`, `memory_search`, `memory_get`, `memory_core_list`, `memory_add`, `memory_remove`, `memory_merge`, `memory_forget` — plus the resources `memory://core` (the resident-layer text, returned verbatim as the same rendering injected every turn) and `memory://fragment/{key}`. Called with no argument it assembles keepsake's own provider (`factory.default_provider()`, connecting per `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json`). The MCP write tools share the provider's write gate, so the governance rules below apply to MCP callers too.
+
+**Transport.** `stdio` is the default. `http` (streamable-http) listens on `127.0.0.1` only — a non-loopback bind address exits with code 2 rather than starting. The memory store has no authentication of its own, so exposing it on the network is equivalent to publishing a person's long-term memory; put a reverse proxy in front of it instead. CLI: `python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`.
+
+## Multi-Agent Memory Governance
+
+Four gates, all live in production:
+
+| Gate | Behaviour | Config key | Effective layer |
+|------|-----------|------------|-----------------|
+| **A — non-primary may read `core`** | A sub-agent recalls the resident layer instead of only its own private entries; it still cannot write there | `is_primary` | storage filter — the BM25 path on every backend; PG and SQLite share a single `_search_filter_sql` exit covering both BM25 and KNN |
+| **B — writes to `core` are downgraded** | A non-primary agent that writes the `core` tag has it rewritten to `core_candidate` (its other tags are kept) and gets a warning | — | `provider._apply_write_gate`, on `provider.add()`; the MCP `memory_add` path inherits it |
+| **C — console candidate review queue** | The console's memory maintenance page lists `core_candidate` entries with paging. Approve = promote into `core` and drop the candidate tag (in that order — reversing it can lose the candidate outright); reject = drop the candidate tag only, keeping the entry in the retrieval layer | — | console |
+| **D — main-brain noise filter** | `retrieval.exclude_tags` drops tagged entries at the retrieval exit. The default keeps `core_candidate` out of the main brain's own recall — a pending application must not double as a fact; an empty string turns the gate off | `retrieval.exclude_tags` | the single `search` / `prefetch` exit, applied **before** truncation |
+
+Gate D is resolved once in `initialize()`, so **changing it requires a restart**; the filter itself runs per query over that frozen set.
+
+`core_candidate` therefore means "a pending application to enter the resident layer", not a tag an LLM may invent. The reserved-tag judgement has exactly one implementation — `sanitize_reserved_tags()` in `core/shared.py` — shared by the distill cron (which strips reserved tags and logs them) and the console create/import paths (which return 400 on `core`). Reserved set: the exact tags `core`, `core_candidate`, `shared`, plus anything prefixed `agent:`. Matching is exact on the comma boundary, so `core_x` is not reserved.
+
 ## Verification
 
 Check logs after startup:
@@ -684,14 +757,24 @@ Measured effect on the 30-query regression suite (`scripts/eval_spotcheck.py`): 
 ```
 keepsake/
 ├── src/keepsake/         # Python package — the memory provider
+│   ├── domain/           # Types and contracts (Fragment / Hit / Capabilities)
+│   ├── core/             # Storage backends and the shared judgement chains
+│   ├── adapters/
+│   │   ├── generic/      # Host-agnostic MemoryProvider contract
+│   │   └── hermes/       # Hermes plugin provider
+│   ├── kb/               # Knowledge-base write shared layer (chunking / idempotent upsert)
+│   ├── mcp_server/       # Generic MCP entrypoint — build_server(provider)
+│   └── api/              # Console backend (routers, auth, audit)
+├── web/                  # Console frontend (Vue 3 + Vite)
 ├── hermes-plugin/        # Hermes plugin wrapper (drop-in for ~/.hermes/plugins/)
 │   ├── plugin.yaml
 │   └── __init__.py
 ├── cron/                 # Cron wrapper scripts for scheduled tasks
 │   ├── memory-maintenance.py   # Every 2h — selective forgetting (consolidation is ops-invoked)
+│   ├── memory_distill.py       # Distill recent turns into one-line entries (strips reserved tags)
 │   ├── dedup-memory.sh         # Every 1h — deduplication
 │   └── discover-synonyms.py    # Every 8h — synonym auto-discovery
-├── scripts/              # Standalone utility scripts (dev/test)
+├── scripts/              # Standalone utility scripts (dev/test), incl. the knowledge-base ingestor kb_ingest.py
 ├── README.md
 └── pyproject.toml
 ```
@@ -833,5 +916,3 @@ Keepsake carries resident memory under the **`core` tag**, making the fragment s
 ## License
 
 MIT
-
-> 最后校准：对齐 HEAD 33727f2（2026-10-12）
