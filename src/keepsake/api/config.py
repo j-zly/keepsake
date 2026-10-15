@@ -156,14 +156,46 @@ def static_dir() -> Path:
 
 
 def core_char_budget() -> int:
-    """常驻层注入预算（字符数），与 provider 注入路径同源。
+    """常驻层注入预算（字符数）—— **只转发 provider 的 `_core_budget()`**。
 
-    优先取 `keepsake.adapters.hermes.provider._CORE_MAX_CHARS`（唯一真值源），
-    取不到才回退常量 —— 预算口径不许在控制台另起一份。
+    唯一真值源是 `retrieval.core_char_budget`（provider 侧按 config.json mtime
+    缓存热载）。控制台再读一遍 config 或再存一份常量，都会让「页面显示的
+    占用率」和「注入时真正截断的阈值」在某次改配置后悄悄对不上 —— 口径只有
+    一份，两处调同一个函数。
     """
     try:
-        from keepsake.adapters.hermes.provider import _CORE_MAX_CHARS
+        from keepsake.adapters.hermes.provider import _core_budget
 
-        return int(_CORE_MAX_CHARS)
+        return int(_core_budget())
     except Exception:       # noqa: BLE001 —— provider 不可导入时用兜底常量
         return 60000
+
+
+def keepsake_config_file() -> Path:
+    """provider 注入路径实际读的 config.json 完整路径（写配置的端点用这个）。
+
+    必须走 provider 的 `config_path()`：读取端解析 env 的规则若与写入端各写
+    一份，就会出现「PUT 返回成功、注入却读的还是另一个文件」。
+    """
+    try:
+        from keepsake.adapters.hermes.provider import config_path
+
+        return config_path()
+    except Exception:       # noqa: BLE001 —— provider 不可导入时退回默认路径
+        return Path(_env(STORAGE_CONFIG_ENV)
+                    or "~/.config/keepsake/config.json").expanduser()
+
+
+def forget_core_budget_cache() -> None:
+    """改完 config.json 后丢弃 provider 侧的预算缓存（写完必须调，见下）。
+
+    为什么不能只靠 (mtime_ns, size) 指纹：**同尺寸改值**（20000→30000）在
+    mtime 粒度粗的文件系统上指纹一字不变 ⇒ 缓存命中 ⇒ 界面说「改成功了」，
+    注入却还按老预算截断。写完主动失效是唯一不依赖文件系统精度的做法。
+    """
+    try:
+        from keepsake.adapters.hermes.provider import invalidate_core_budget_cache
+
+        invalidate_core_budget_cache()
+    except Exception:       # noqa: BLE001 —— provider 不可导入时没有缓存可失效
+        pass

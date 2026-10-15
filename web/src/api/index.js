@@ -98,7 +98,12 @@ export const api = {
   deleteFragment: (key, confirm) =>
     http.post(`/api/v1/fragments/${encodeURIComponent(key)}/delete`, { confirm }).then((r) => r.data),
   // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
+  // promote=true = 导入即升常驻（后端逐条打 core 标签，与 promote 端点同一条写路径）。
   importFragments: (payload) => http.post('/api/v1/import', payload).then((r) => r.data),
+  // 设置常驻层注入预算：confirm 传**当前生效值**的字符串（改的是全局阈值，
+  // 回退影响每轮注入，所以确认串是「现在是多少」而不是 key 末 8 位）。
+  setCoreBudget: (budget, confirm) =>
+    http.put('/api/v1/settings/core-budget', { budget, confirm }).then((r) => r.data),
 
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。

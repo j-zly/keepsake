@@ -48,6 +48,7 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/{id}/update",
     "/api/v1/kb/documents/{id}/delete",
     "/api/v1/kb/import",
+    "/api/v1/settings/core-budget",
 } | AUTH_POST_PATHS
 
 #: fixture 语料：一部分常驻、一部分普通、一条待归档
@@ -449,13 +450,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有十三条业务POST加三条认证POST():
+def test_写面只有十四条业务写端点加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 16
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 13
+    assert len(ALLOWED_POST_PATHS) == 17
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 14
 
 
 def test_P1只读路由未被写面影响(client):

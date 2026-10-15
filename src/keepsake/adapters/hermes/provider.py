@@ -131,12 +131,91 @@ _CORE_CACHE_TTL = 60.0
 #: 上下文也不能让对话卡住 —— 记忆缺失是降级，卡死是事故。
 _CORE_READ_BUDGET_S = 2.0
 
-#: 核心层注入的字符预算。MEMORY.md/USER.md 原先全量注入约 8 万字符，
+#: 核心层注入字符预算的**兜底默认值**。真实生效值走 `_core_budget()`
+#: （读 config.json 的 `retrieval.core_char_budget`）—— 这个常量只在配置缺失/
+#: 非法时兜底，不再是唯一真值源。MEMORY.md/USER.md 原先全量注入约 8 万字符，
 #: 8 万 token 级的内容会挤爆上下文，所以设一个硬上限并**显式标注截断**。
 _CORE_MAX_CHARS = 60000
 
 #: 进程级缓存 `{"ts": 单调时刻, "frags": [{key, content, tags, updated_at}, ...]}`
 _CORE_CACHE: Dict[str, Any] = {"ts": 0.0, "frags": None}
+
+#: `retrieval.core_char_budget` 的进程内缓存 `{配置路径: (指纹, 预算)}`。
+#: 指纹取 (mtime_ns, size) —— 照抄 `consolidator.resolve_llm_channel_cached` 的
+#: 缓存手法（改了 config.json 下一轮注入就热生效，不必重启进程）。
+_CORE_BUDGET_CACHE: Dict[str, Any] = {}
+
+
+def config_path() -> Path:
+    """本进程实际读取的 `config.json` 路径（`KEEPSAKE_CONFIG` > 默认）。
+
+    控制台的预算设置端点写的就是这个文件 —— 读写两端必须同一条解析规则，
+    各写一份 env 判断迟早变成「改了却不生效」。
+    """
+    return Path(os.environ.get("KEEPSAKE_CONFIG") or _DEFAULT_CONFIG_PATH).expanduser()
+
+
+def _core_budget() -> int:
+    """常驻层注入字符预算 —— **单点真值源**（注入路径与控制台口径共用本函数）。
+
+    取 config.json 的 `retrieval.core_char_budget`；键缺失 / 非整数 / ≤0 ⇒ 回落
+    `_CORE_MAX_CHARS` 并 warning（一次，每次配置变更至多一条）。
+
+    🔴 按文件指纹（mtime_ns, size）缓存而不是每次重读：注入路径每轮对话都走，
+    而 config.json 大概率不变；无脑重读是每轮一次多余的 stat+parse。指纹变了
+    自然 miss ⇒ 改完配置下一轮就生效。文件不存在也缓存住（fp=None），避免
+    「配置永久缺失」时每轮都 stat 一次。
+
+    🔴 **同尺寸改值指纹可能不变**（20000→30000 在 mtime 粒度粗的文件系统上
+    mtime_ns 一字不改），所以写配置的一侧必须调 `invalidate_core_budget_cache()`；
+    光靠指纹在这一种情况下会「提示改成功了、注入预算还是老值」。
+    """
+    path = config_path()
+    key = str(path)
+    try:
+        st = os.stat(path)
+        fp = (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+    except OSError:
+        fp = None
+
+    hit = _CORE_BUDGET_CACHE.get(key)
+    if hit is not None and hit[0] == fp:
+        return hit[1]
+
+    budget = _CORE_MAX_CHARS
+    if fp is not None:
+        try:
+            with open(path) as f:
+                raw = (json.load(f) or {}).get("retrieval", {}).get("core_char_budget")
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            logger.warning("keepsake: config 读取失败（%s: %s），core 预算回落 %d",
+                           path, e, _CORE_MAX_CHARS)
+        else:
+            # 只认 int 与「整数形态的字符串」。float/bool 一律拒：`int(1.5)` 会
+            # 悄悄截成 1（预算变 1 字符 = 常驻层全被截掉），`int(True)` 是 1 同理。
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                n = 0
+            else:
+                try:
+                    n = int(raw)
+                except ValueError:
+                    n = 0
+            if n > 0:
+                budget = n
+            elif raw is not None:
+                logger.warning("keepsake: retrieval.core_char_budget=%r 非法，回落 %d",
+                               raw, _CORE_MAX_CHARS)
+    _CORE_BUDGET_CACHE[key] = (fp, budget)
+    return budget
+
+
+def invalidate_core_budget_cache() -> None:
+    """丢弃 `_core_budget()` 的进程内缓存（改完 config.json 的一侧必须调）。
+
+    存在理由见 `_core_budget` 文档段：指纹是 (mtime_ns, size)，同尺寸改值可能
+    指纹不变，光靠指纹会漏掉这一次热生效。
+    """
+    _CORE_BUDGET_CACHE.clear()
 
 
 def _has_tag(tags: Any, tag: str) -> bool:
@@ -735,18 +814,19 @@ class KeepsakeProvider(MemoryProvider):
         if not frags:
             return ""
         lines = [f"- {f.get('content', '')}" for f in frags]
-        if sum(len(x) for x in lines) > _CORE_MAX_CHARS:
+        budget = _core_budget()
+        if sum(len(x) for x in lines) > budget:
             # 按 list_by_tag 的稳定顺序（updated_at 升序、key 升序）**从头截** ——
             # 老条目是常驻记忆里最该被无条件看到的那部分，末尾的超预算条目才丢。
             kept, total = [], 0
             for line in lines:
-                if total + len(line) > _CORE_MAX_CHARS:
+                if total + len(line) > budget:
                     break
                 kept.append(line)
                 total += len(line)
             lines = kept + [f"[core 层已截断：共 {len(frags)} 条，本次注入 {len(kept)} 条]"]
             logger.warning("keepsake: core 层超 %d 字符预算，截断为 %d 条",
-                           _CORE_MAX_CHARS, len(kept))
+                           budget, len(kept))
         return "\n".join(["<keepsake-core>", *lines, "</keepsake-core>"])
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:

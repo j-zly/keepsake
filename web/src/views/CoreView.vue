@@ -11,13 +11,18 @@
       <StatCard label="条数" :value="stats?.count ?? '-'" unit="条" />
       <StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" />
       <StatCard label="注入预算" :value="stats?.budget ?? '-'" unit="字符" />
-      <StatCard
-        label="预算占用"
-        :value="stats ? `${stats.percent}%` : '-'"
-        :percent="stats ? stats.percent : null"
-        :tone="budgetTone"
-        :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
-      />
+      <!-- 包一层：StatCard 的 hint 是纯字符串 prop，放不下可点的「设置」入口，
+           而 StatCard.vue 不在本次改动范围内。卡撑满格高，入口贴在卡下沿。 -->
+      <div class="budget-cell">
+        <StatCard
+          label="预算占用"
+          :value="stats ? `${stats.percent}%` : '-'"
+          :percent="stats ? stats.percent : null"
+          :tone="budgetTone"
+          :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
+        />
+        <button class="soft-btn" @click="openBudget">设置注入预算…</button>
+      </div>
     </div>
 
     <div class="filter-panel">
@@ -51,6 +56,9 @@
         <div class="acts">
           <button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选</button>
           <button class="ghost-btn" :disabled="loading" @click="load">刷新</button>
+          <button class="ghost-btn" :disabled="loading" @click="doExport('jsonl')">导出 JSONL</button>
+          <button class="ghost-btn" :disabled="loading" @click="doExport('csv')">导出 CSV</button>
+          <el-button @click="openImport">导入</el-button>
         </div>
       </div>
     </div>
@@ -112,12 +120,116 @@
       :allow-archive="false"
       @saved="load"
     />
+
+    <!-- 设置注入预算：数字 + 手输当前生效值 confirm（改的是全局阈值，回退影响每轮注入） -->
+    <el-dialog
+      v-model="budgeting"
+      title="设置常驻层注入预算"
+      width="460px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyBudget"
+      :show-close="!busyBudget"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="注入预算（字符，可设 1000 ~ 500000）">
+          <el-input v-model="draftBudget" type="number" :min="1000" :max="500000" step="1000" />
+        </el-form-item>
+        <el-form-item :label="`手输当前生效值 ${stats?.budget ?? '-'} 以确认`">
+          <el-input v-model="draftConfirm" placeholder="见上方「注入预算」卡片" />
+        </el-form-item>
+      </el-form>
+      <p class="tip">
+        预算即每轮 system_prompt 注入常驻层的字符上限，超出的老条目从尾部截断（并标注截断）。
+        改完立刻热生效，不必重启服务。
+      </p>
+      <template #footer>
+        <el-button :disabled="busyBudget" @click="budgeting = false">取消</el-button>
+        <el-button type="primary" :loading="busyBudget" :disabled="!canSaveBudget" @click="saveBudget">
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 常驻层导入：先解析 → 预演（零写入）回显计数 → 手输 N 才实跑；默认「导入即升常驻」 -->
+    <el-dialog
+      v-model="importing"
+      title="导入常驻记忆（JSONL）"
+      width="560px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyPlan && !busyRun"
+      :show-close="!busyPlan && !busyRun"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item>
+          <span class="fld">
+            每行一条 {content, tags?}
+            <a class="tpl-link" href="#" @click.prevent="getTemplate">下载模板</a>
+          </span>
+          <el-input
+            v-model="importText"
+            type="textarea"
+            :rows="7"
+            placeholder='{"content": "这条常驻记忆是什么", "tags": "ops"}'
+          />
+        </el-form-item>
+        <el-form-item>
+          <!-- 改 promote 就要作废已有预演：would_promote 是按 promote 值算出来的，
+               拿着上一次的数去实跑，弹框里「其中 N 条会升常驻」会与实际不符 -->
+          <el-checkbox v-model="importPromote" @change="importPlan = null">
+            导入即升常驻（每条落库后打 core 标签 —— 与在记忆条目页逐条点「升常驻」同一效果）
+          </el-checkbox>
+        </el-form-item>
+      </el-form>
+      <p v-if="importParse.broken" class="banner banner--danger">
+        有 {{ importParse.broken }} 行不是合法的 {"content": ...}，未计入下方条目 —— 不静默丢行，请修正后重试。
+      </p>
+      <p v-else-if="importParse.items.length" class="tip">
+        已解析 {{ importParse.items.length }} 条，点「预演」后端会按内容去重、剥治理标签，并回显将新增多少条。
+      </p>
+      <p v-if="importPlan" class="tip">
+        预演结果：将新增 {{ importPlan.would_add }} 条
+        <template v-if="importPromote">（含升常驻 {{ importPlan.would_promote ?? 0 }} 条）</template>
+        · 跳过重复 {{ importPlan.skipped_duplicate }} 条 · 拒收治理标签 {{ importPlan.rejected_reserved }} 条
+        · 空正文 {{ importPlan.rejected_empty }} 条（共 {{ importPlan.total }} 条）。
+      </p>
+      <template #footer>
+        <el-button :disabled="busyPlan || busyRun" @click="importing = false">取消</el-button>
+        <el-button :loading="busyPlan" :disabled="busyRun || !importParse.items.length" @click="planImport">
+          预演（不写入）
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="busyRun"
+          :disabled="busyPlan || !importPlan || !importPlan.would_add"
+          @click="importRunAsk = true"
+        >
+          实跑导入
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 实跑确认：expect = 预演给出的「将新增 N 条」，与记忆条目页同一口径 -->
+    <ConfirmDialog
+      v-model="importRunAsk"
+      title="按预演结果实跑导入？"
+      :consequences="importConsequences"
+      :expect="importExpect"
+      confirm-text="确认导入"
+      :busy="busyRun"
+      tone="primary"
+      @confirm="doImportRun"
+    />
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import DetailDrawer from '../components/DetailDrawer.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
@@ -125,6 +237,7 @@ import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
+import { downloadFile, downloadTemplate } from '../utils/export'
 import { toLocal } from '../utils/format'
 import { isStale } from '../utils/kb'
 
@@ -138,6 +251,40 @@ const loading = ref(false)
 const error = ref('')
 const drawer = ref(false)
 const detail = ref(null)
+
+// ---- 设置注入预算 ----
+const budgeting = ref(false)
+const busyBudget = ref(false)
+const draftBudget = ref('')
+const draftConfirm = ref('')
+/** 与后端同一区间（1000~500000）；confirm 必须逐字等于当前生效值 */
+const canSaveBudget = computed(() => {
+  const n = Number(draftBudget.value)
+  return Number.isInteger(n) && n >= 1000 && n <= 500000
+    && String(draftConfirm.value).trim() === String(stats.value?.budget ?? '')
+})
+
+// ---- 常驻层导入 ----
+const importing = ref(false)
+const importText = ref('')
+const importParse = reactive({ items: [], broken: 0 })
+const importPlan = ref(null)
+const busyPlan = ref(false)
+const busyRun = ref(false)
+const importPromote = ref(true)     // 常驻层页的导入，默认就是「导入即升常驻」
+const importRunAsk = ref(false)
+const importExpect = computed(() => (importPlan.value ? String(importPlan.value.would_add) : ''))
+const importConsequences = computed(() =>
+  importPlan.value
+    ? [
+        `将写入 ${importPlan.value.would_add} 条新常驻记忆（重复 ${importPlan.value.skipped_duplicate} 条会跳过，不覆盖旧条目）。`,
+        importPromote.value
+          ? `其中 ${importPlan.value.would_promote ?? 0} 条会同时打上 core 标签，之后每轮都注入。`
+          : '未勾「导入即升常驻」：这些条目只进检索层，不会被注入。',
+        `请照抄「${importExpect.value}」确认 —— 这个数就是预演出来的将新增条数，写进去一条都不会多。`,
+      ]
+    : [],
+)
 
 /** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它 */
 const dirty = computed(() => !!(q.value || '').trim())
@@ -240,11 +387,162 @@ async function demote(row) {
   }
 }
 
+// ---- 设置注入预算 ----
+/** 打开时把当前生效值预填进输入框，confirm 留空手输（防手滑：改全局阈值） */
+function openBudget() {
+  draftBudget.value = stats.value?.budget ?? 60000
+  draftConfirm.value = ''
+  budgeting.value = true
+}
+
+async function saveBudget() {
+  if (!canSaveBudget.value) return
+  busyBudget.value = true
+  try {
+    const r = await api.setCoreBudget(Number(draftBudget.value), draftConfirm.value.trim())
+    budgeting.value = false
+    showToast(`已设置注入预算：${r.budget} 字符（写入 ${r.path}）`)
+    load()
+  } catch (e) {
+    showError(`设置预算失败：${e.message}`)
+  } finally {
+    busyBudget.value = false
+  }
+}
+
+// ---- 导出 ----
+/**
+ * 常驻层导出：固定 `?tag=core`（**不带 q**）—— 导出的必须是「升常驻的那批」本身，
+ * 不受页面上那个搜索词影响；搜索词只管屏幕上这页列表。
+ */
+async function doExport(fmt) {
+  try {
+    const name = await downloadFile(`/api/v1/export?tag=core&format=${fmt}`, `keepsake-core.${fmt}`)
+    showToast(`导出已开始下载：${name}`)
+  } catch (e) {
+    showError(`导出失败：${e.message}`)
+  }
+}
+
+// ---- 导入 ----
+/** JSONL 逐行解析成 items；坏行**计数返回**，绝不静默丢（与记忆条目页同一口径） */
+function parseJsonl(text) {
+  const items = []
+  let broken = 0
+  for (const line of (text || '').split('\n')) {
+    const s = line.trim()
+    if (!s) continue
+    try {
+      const o = JSON.parse(s)
+      if (o && typeof o.content === 'string') items.push({ content: o.content, tags: o.tags || '' })
+      else broken += 1
+    } catch {
+      broken += 1
+    }
+  }
+  return { items, broken }
+}
+
+function openImport() {
+  importText.value = ''
+  importParse.items = []
+  importParse.broken = 0
+  importPlan.value = null
+  importing.value = true
+}
+
+/** 模板下载走 fetch+blob（端点要 Authorization 头，裸 href 会把 token 丢给浏览器历史） */
+async function getTemplate() {
+  try {
+    await downloadTemplate('core')
+    showToast('已下载导入模板（keepsake-import-template-core.jsonl）')
+  } catch (e) {
+    showError(`下载模板失败：${e.message}`)
+  }
+}
+
+function currentItems() {
+  const p = parseJsonl(importText.value)
+  importParse.items = p.items
+  importParse.broken = p.broken
+  return p.items
+}
+
+/** 预演：后端零写入，回显「将新增 / 其中升常驻 / 跳过重复 / 拒收」 */
+async function planImport() {
+  busyPlan.value = true
+  try {
+    importPlan.value = await api.importFragments({
+      items: currentItems(),
+      dry_run: true,
+      promote: importPromote.value,
+    })
+  } catch (e) {
+    showError(`导入预演失败：${e.message}`)
+  } finally {
+    busyPlan.value = false
+  }
+}
+
+async function doImportRun(typed) {
+  busyRun.value = true
+  try {
+    const r = await api.importFragments({
+      items: importParse.items,
+      dry_run: false,
+      confirm: typed,
+      promote: importPromote.value,
+    })
+    importRunAsk.value = false
+    importing.value = false
+    showToast(
+      `导入完成：新增 ${r.would_add} 条 · 升常驻 ${r.promoted} 条 · 跳过重复 ${r.skipped_duplicate} 条`,
+    )
+    load()
+  } catch (e) {
+    showError(`导入失败：${e.message}`)
+  } finally {
+    busyRun.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
 <style scoped>
 .pad {
   padding: 20px;
+}
+/* 预算格：卡 + 「设置」入口同一列（StatCard 的 hint 是纯字符串，放不下按钮） */
+.budget-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.budget-cell :deep(.stat) {
+  flex: 1;
+}
+/* 字段名旁的「下载模板」：和正文标题同一行，不另起一行抢视线 */
+.fld {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.tpl-link {
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: none;
+}
+.tpl-link:hover {
+  text-decoration: underline;
+}
+/* 弹框里的说明行：与 FragmentsView 的 .tip 同一份配方（scoped 跨组件不生效，
+   只能各写一份，数值不许自创） */
+.tip {
+  margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>

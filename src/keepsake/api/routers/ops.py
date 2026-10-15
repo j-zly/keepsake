@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from keepsake.core.shared import fragment_key_for, sanitize_reserved_tags
@@ -100,11 +100,25 @@ class ImportItem(BaseModel):
 
 class ImportBody(BaseModel):
     """`{"items": [...], "dry_run": true}` /
-    `{"items": [...], "dry_run": false, "confirm": "<will_add 数>"}`。"""
+    `{"items": [...], "dry_run": false, "confirm": "<will_add 数>"}`。
+
+    `promote=true` 时每条落库后紧接着打 core 标签（导入即升常驻）—— 这是
+    **批量版的 promote 端点**，与 `/api/v1/core/{key}/promote` 同一存储路径
+    （`_with_core` + `_apply`）；条自带的 `core` 标签仍然拒收（治理口径不变：
+    常驻只能由「人在点」这一个入口决定，或由导入时显式勾 promote）。
+    """
 
     items: List[ImportItem] = []
     dry_run: bool = True
     confirm: Optional[str] = None
+    promote: bool = False
+
+
+class CoreBudgetBody(BaseModel):
+    """`{"budget": 60000, "confirm": "<当前生效值>"}` —— 设置常驻层注入预算。"""
+
+    budget: int = 0
+    confirm: str = ""
 
 
 class BulkOpsBody(BaseModel):
@@ -529,6 +543,9 @@ def import_fragments(body: ImportBody,
 
     治理保留字：条级拒 —— 带 `core` 的那条**不导入**并计入 `rejected_reserved`
     （批量场景不能为一条打回整批，那会让「导入了 4999/5000 条」说不清）。
+
+    `promote=true` = 导入即升常驻：每条落库后紧接着打 core 标签（`_promote_batch`，
+    与 promote 端点同一条存储路径）。dry_run 时只回 `would_promote` 计数，零写入。
     """
     action, target = "memory.import", "batch"
     if len(body.items) > IMPORT_MAX_ITEMS:
@@ -559,21 +576,48 @@ def import_fragments(body: ImportBody,
 
     counts["would_add"] = len(plan)
     if body.dry_run:
-        audit.record(action, target, ok=True, reason="dry_run; " + _counts_reason(counts))
+        audit.record(action, target, ok=True, reason="dry_run; " + _counts_reason(counts)
+                     + f"; promote={body.promote}")
         return {"ok": True, "dry_run": True, "action": action,
-                "confirm_required": str(len(plan)), **counts}
+                "confirm_required": str(len(plan)),
+                "would_promote": len(plan) if body.promote else 0, **counts}
 
     # 确认串对不上时**一条都不许写**（计数这一步已经惰性做完，与 merge 同口径）
     _need_text(body.confirm or "", str(len(plan)), action, target,
                f"本次将新增 {len(plan)} 条（先跑 dry-run 拿 confirm_required）")
     # 批量写：逐条备份没意义（5000 个备份文件比库还大），记一行批次摘要即可。
     # 记不上账 ⇒ 整批不写（fail-closed，与单条写同一纪律）。
-    audit.record(action, target, ok=True, reason="running; " + _counts_reason(counts))
+    audit.record(action, target, ok=True, reason="running; " + _counts_reason(counts)
+                 + f"; promote={body.promote}")
     keys = [_store_one(storage, c, t, action, target) for c, t in plan]
+    promoted = 0
+    if body.promote:
+        promoted = _promote_batch(storage, keys, action)
+    counts["promoted"] = promoted
     audit.record(action, target, ok=True, reason="done; " + _counts_reason(counts)
-                 + f"; keys={len(keys)}")
+                 + f"; keys={len(keys)}; promote={body.promote}")
     return {"ok": True, "dry_run": False, "action": action,
-            "keys": keys, **counts}
+            "keys": keys, "promoted": promoted, **counts}
+
+
+def _promote_batch(storage: Any, keys: List[str], action: str) -> int:
+    """给刚导入的这批 key 打 core 标签，返回**实际升上去**的条数。
+
+    🔴 **与 `promote_core` 端点同一条存储路径**（`_with_core` + `_apply`），
+    不是另写一份 `tags = tags + ",core"`：打标签必须走 `update_fragment_fields`
+    并回读校验，否则「升常驻成功」可能只是标签没落库。
+    差异只在备份：批量导入逐条备份没意义（与本模块既有的批次摘要同一纪律），
+    真要回退走 manifest 里的原始 JSONL 文本。
+    """
+    n = 0
+    for key in keys:
+        row = storage.get_fragment(key) or {}
+        if CORE_TAG in _tag_list(row.get("tags")):
+            continue
+        tags = _with_core(row.get("tags"), True)
+        _apply(storage, key, {"tags": tags}, action)
+        n += 1
+    return n
 
 
 def _counts_reason(counts: Dict[str, int]) -> str:
@@ -706,3 +750,117 @@ def ops_forget(body: BulkOpsBody, storage: Any = Depends(get_storage)) -> Dict[s
     return {"ok": True, "dry_run": False, "action": action, "stats": stats,
             "confirm_required": expect, "dry_run_report": dry_path,
             "affected_backup": aff_path, "affected_keys": len(keys)}
+
+# --------------------------------------------------------------------------
+# 常驻层注入预算（设置）
+# --------------------------------------------------------------------------
+
+#: 预算取值区间。下限 1000：低于这个量连一两条正常记忆都放不下，等于把常驻层
+#: 关掉却还开着口；上限 500000：再大就是「不设预算」，注入路径会退化成全量注入。
+CORE_BUDGET_MIN = 1000
+CORE_BUDGET_MAX = 500000
+
+
+@router.put("/api/v1/settings/core-budget",
+            dependencies=[Depends(require_session), Depends(write_guard)])
+def set_core_budget(body: CoreBudgetBody) -> Dict[str, Any]:
+    """设置常驻层注入字符预算（写 config.json 的 `retrieval.core_char_budget`）。
+
+    🔴 **只动这一个键**：读原 JSON → 改 `retrieval` 节的这一个键 → 原样回写，
+    其余键与键序都不变（`json.loads` 进 dict 保序，赋值已存在的键不换位）。
+    config.json 里还有存储后端、LLM 通道等配置，一个手滑重排/丢键就能让
+    provider 读不到 DSN —— 「改预算」绝不能有这种副作用。
+
+    确认串 = **当前生效值**的字符串（不是 key 末 8 位那种记认的）：改的是一个
+    全局阈值，回退它影响每一轮注入，所以要人先看一眼界面上现在是多少。
+    写前把原 config 整份备份进审计备份目录（`audit.backup_json`），备份写不成
+    ⇒ 不写（与本模块其它写端点同一纪律）。
+
+    🔴 **必须打 write_guard**：它第一次改的是**进程外的文件**，审计落不下账的
+    机器上这次配置改动将无法追溯。
+    """
+    action, target = "settings.core_budget", "retrieval.core_char_budget"
+    if not (CORE_BUDGET_MIN <= body.budget <= CORE_BUDGET_MAX):
+        _reject(400, "budget_out_of_range",
+                f"预算必须在 {CORE_BUDGET_MIN}~{CORE_BUDGET_MAX} 字符之间，本次 {body.budget}",
+                action, target)
+    current = config.core_char_budget()
+    _need_text(body.confirm, str(current), action, target,
+               f"当前生效预算 {current}")
+
+    path = config.keepsake_config_file()
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            _reject(500, "config_unreadable",
+                    f"config.json 读不出来，拒绝覆盖（{path}: {e}）", action, target)
+        if not isinstance(raw, dict):
+            _reject(500, "config_not_object",
+                    f"config.json 顶层不是 JSON 对象，拒绝覆盖：{path}", action, target)
+    else:
+        raw = {}
+    backup = audit.backup_json(f"config.core-budget.{audit.stamp()}.json", raw)
+
+    new = dict(raw)                                  # 顶层保序
+    retrieval = dict(new.get("retrieval") or {})     # 节内也保序
+    retrieval["core_char_budget"] = int(body.budget)
+    new["retrieval"] = retrieval
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as e:
+        _reject(500, "config_write_failed", f"config.json 写失败：{e}", action, target)
+    config.forget_core_budget_cache()   # 同尺寸改值时指纹可能不变 ⇒ 主动失效
+
+    audit.record(action, target, ok=True,
+                 reason=f"{current} -> {body.budget}; backup={backup}; path={path}")
+    return {"ok": True, "action": action, "budget": int(body.budget),
+            "path": str(path), "backup": backup}
+
+
+# --------------------------------------------------------------------------
+# 导入模板（只读下载）
+# --------------------------------------------------------------------------
+
+#: 三种导入模板。**每行都是合法可导入的 JSON**（不塞 `#` 注释行 —— 用户多半
+#: 直接把模板改完当 JSONL 喂进来，注释行会被解析成坏行）。示例里零 IP、零口令、
+#: 零真实业务数字，全是 `示例`/`demo` 这类占位。
+IMPORT_TEMPLATES: Dict[str, str] = {
+    "memory": (
+        '{"content":"示例：一条要进检索层的记忆","tags":"demo,import"}\n'
+        '{"content":"示例：第二条记忆。tags 可省略，省略即空标签；'
+        'core / core_candidate / shared / agent:* 是治理保留标签，写了会被后端拒收或剥除"}\n'
+    ),
+    "kb": (
+        '{"title":"示例文档标题","content":"示例正文，可多行\\n转义"}\n'
+        '{"title":"示例：第二篇文档","content":"标题与正文都必填，任一为空这篇会被拒收（不静默丢）"}\n'
+    ),
+    "core": (
+        '{"content":"示例：一条要进检索层的记忆","tags":"demo,import"}\n'
+        '{"content":"示例：想直接进常驻层？在「常驻层」页点「导入」并勾选「导入即升常驻」，'
+        '不必手打 core 标签（core / core_candidate 由后端管控，写了也会被拒收或剥除）",'
+        '"tags":"demo,core_candidate"}\n'
+    ),
+}
+
+
+@router.get("/api/v1/import/template", dependencies=[Depends(require_session)])
+def import_template(
+    kind: str = Query("memory", pattern="^(memory|kb|core)$", description="模板形态"),
+) -> PlainTextResponse:
+    """下载导入模板（JSONL 示例）。**只读端点**：不挂 `write_guard`。
+
+    为什么要有它：导入弹框要求每行一个 JSON 对象，但字段名/形状（记忆条目是
+    `content`，知识库是 `title`+`content`）只能靠猜 —— 猜错的表现是「导入了 N 条
+    但全是 0」，用户无从判断是自己文件错了还是功能坏了。
+    """
+    return PlainTextResponse(
+        IMPORT_TEMPLATES[kind],
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="keepsake-import-template-{kind}.jsonl"',
+            "Cache-Control": "no-store",
+        },
+    )

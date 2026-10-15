@@ -287,7 +287,11 @@
       append-to-body
     >
       <el-form label-position="top">
-        <el-form-item label="每行一篇 {title, content}">
+        <el-form-item>
+          <span class="fld">
+            每行一篇 {title, content}
+            <a class="tpl-link" href="#" @click.prevent="getTemplate">下载模板</a>
+          </span>
           <el-input
             v-model="importText"
             type="textarea"
@@ -356,6 +360,7 @@ import StatCard from '../components/StatCard.vue'
 import http, { api, getToken } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
+import { downloadTemplate } from '../utils/export'
 import { toLocal } from '../utils/format'
 import { hasAnyHit, isStale, mergeCounts } from '../utils/kb'
 
@@ -716,6 +721,19 @@ function openImport() {
   importing.value = true
 }
 
+/**
+ * 下载导入模板：走 fetch+blob（端点要 Authorization 头，裸 `<a href>` 带不了，
+ * token 会漏进浏览器历史）。共用 utils/export.js，与记忆条目页同一套下载器。
+ */
+async function getTemplate() {
+  try {
+    await downloadTemplate('kb')
+    showToast('已下载导入模板（keepsake-import-template-kb.jsonl）')
+  } catch (e) {
+    showError(`下载模板失败：${e.message}`)
+  }
+}
+
 function currentItems() {
   const p = parseJsonl(importText.value)
   importParse.items = p.items
@@ -853,5 +871,20 @@ onMounted(() => {
   color: var(--text-dim);
   line-height: 1.7;
   white-space: pre-wrap;
+}
+/* 字段名旁的「下载模板」：与正文标题同一行，不另起一行抢视线 */
+.fld {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.tpl-link {
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: none;
+}
+.tpl-link:hover {
+  text-decoration: underline;
 }
 </style>
