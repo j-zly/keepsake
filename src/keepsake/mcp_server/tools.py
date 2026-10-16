@@ -1,8 +1,13 @@
-"""MCP 工具面 —— 8 个 tool 的实现，**取数只经 `MemoryProvider` 协议**。
+"""MCP 工具面 —— 8 个记忆 tool + 5 个治理 tool 的实现。
+
+**取数只经 `MemoryProvider` 协议**：数据出口只有
+`provider.search/get/add/remove/merge/forget/capabilities/system_prompt_block`。
 
 本模块不 import 任何宿主的东西（`agent` / `hermes` 一律不许出现），
-也不自建存储：数据出口只有 `provider.search/get/add/remove/merge/forget/
-capabilities/system_prompt_block`。
+也不自建存储 —— 治理面那 5 个 `agent_*` 工具只经**同一个 `Registry` 实例**
+（`gate.registry`，即 `provider._registry`）与控制台共用一套方法，不另开连线。
+import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯文件 /
+纯常量与后端适配），与「宿主」无关：`audit.py` 只 import 标准库。
 
 --------------------------------------------------------------------------
 写语义（与 P2 控制台一致，这几条是硬约束不是建议）
@@ -33,8 +38,17 @@ from typing import Any, Dict, List, Protocol, runtime_checkable
 
 from mcp.server.fastmcp.exceptions import ToolError
 
+from ..api import audit
+from ..govern.registry import (
+    ROLE_PRIMARY,
+    ROLES,
+    STATUS_APPROVED,
+    STATUS_REVOKED,
+)
+
 __all__ = ["ToolError", "StorageIntrospection", "register_tools",
-           "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS"]
+           "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS",
+           "GOVERN_TOOLS", "GOVERN_DENIED"]
 
 #: `memory_search` 结果里单条正文的截断长度（全文走 `memory_get` / resource）
 SEARCH_PREVIEW_CHARS = 300
@@ -218,17 +232,187 @@ def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "") -> Dic
 
 
 # --------------------------------------------------------------------------
+# 治理面（agent_*）：主代理在对话里直接审核别的代理 —— 与控制台同一套 registry 方法
+#
+# 🔴 **只对 role=primary 的调用方放行**：判定源是 `AgentGate` 那条已有的身份链
+# （http 头 Bearer → `verify_any`；stdio env/本机通道 → `verify` / `verify_local`），
+# 工具里**不发明第二条身份路径**（见 `_govern_identity`）。
+# 🔴 **审计与界面同款**：改前 `backup_json` 快照 + 每个写（含被拒绝的）一行审计，
+#   来源位恒为 `source=mcp`（`api/audit.record` 的 `actor` 常量写死 "console"，
+#   本单不许改那个文件，故来源进 reason 首段 —— 查 `source=mcp` 即本通道发出的治理写）。
+# 🔴 **凭据明文只出现在 `agent_approve` 的返回值**（与界面同语义）：不进审计、不进日志。
+# --------------------------------------------------------------------------
+
+#: 5 个治理工具的名字（写口 4 个在 `server.GATE_WRITE_TOOLS` 里也登记过一次）
+GOVERN_TOOLS = (
+    "agent_list", "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
+)
+
+#: 非 primary 调用方的**唯一**拒绝文案。带上 role 与 status 两个字段 ——
+#: 「已批准但只是 sub」与「压根没批准（pending）」必须一眼可分，
+#: 而不与记忆工具那道 `GATE_DENIED`（未批准/已吊销）混同。
+GOVERN_DENIED = ("治理工具仅主代理可用：{caller} 当前 role={role} status={status}"
+                 "（{why}）—— 请到控制台批准该代理并置为 primary")
+
+#: 吊销的确认串 = agent_id **前 8 位**（与 `api/routers/agents.REVOKE_HINT_LEN` 同口径：
+#: 手输一段记认得到的前缀，错一个代理不至于按下去）。
+REVOKE_CONFIRM_LEN = 8
+
+#: 批准响应里的回显提示（与界面同义，只是把「界面」换成「转交给用户」）
+CREDENTIAL_ONCE_NOTE = (
+    "凭据只此一次返回，库里只存 sha256 —— 请立即转交并通知用户在界面外妥善保存；"
+    "丢失请重新调用 agent_approve 换一条（旧凭据随即失效）。"
+)
+
+#: 置 primary 时必须让人看见的后果（旧主被降级）
+ROLE_PRIMARY_NOTE = "全库唯一 primary：原 primary 已自动降为 sub（可用 agent_list 核对）。"
+
+
+def _audit(action: str, target: Any, ok: bool, reason: str = "") -> None:
+    """审计一行（`source=mcp` 恒在 reason 首段）。"""
+    audit.record(action, target, ok=ok, reason=f"source=mcp; {reason}")
+
+
+def _backup(action: str, rows: Any) -> str:
+    """改前快照：落不进盘 ⇒ 不许改（与 `api/routers/agents._backup` 同一纪律）。"""
+    return audit.backup_json(f"agents.mcp.{action}.{audit.stamp()}.json", rows)
+
+
+def _govern_identity(gate: Any, registry: Any, tool_name: str) -> str:
+    """治理工具的身份闸：**只放行 role=primary 的调用方**，返回它的 agent_id。
+
+    判定走 `gate.identify`（`check` 的同一份实现），差别只在两点：
+
+    * 不抛 `GATE_DENIED` 而是由调用方回 `GOVERN_DENIED`（要带 status 字段）；
+    * 放行**之后**才 `record_activity`（被拒的调用不记账，与记忆工具同款）。
+
+    http/本机/凭据三种装配的差别全部在闸门内部解决，这里只问「是不是 primary」。
+    """
+    if registry is None or gate is None:
+        raise ToolError("治理工具需要代理注册表（当前 provider 未装配 ks_agent）")
+    res = gate.identify(tool_name)
+    role = str(res.get("role") or "")
+    if not res.get("ok") or role != ROLE_PRIMARY:
+        raise ToolError(GOVERN_DENIED.format(
+            caller=str(res.get("agent_id") or ""), role=role or "-",
+            status=str(res.get("status") or "unknown"),
+            why=str(res.get("reason") or "not_primary")))
+    gate.record_activity(str(res.get("agent_id") or ""), tool_name)
+    return str(res.get("agent_id") or "")
+
+
+def _govern_row(registry: Any, agent_id: str, action: str) -> Dict[str, Any]:
+    """取代理行；查不到 ⇒ 抛 `ToolError`（**先审计**再抛，与控制台 404 同纪律）。"""
+    row = registry.get(agent_id)
+    if not row:
+        _audit(action, agent_id, ok=False, reason="agent_not_found")
+        raise ToolError(f"注册表里没有这个代理：{agent_id}")
+    return row
+
+
+def agent_list(registry: Any) -> Dict[str, Any]:
+    """注册表全量 + 待审计数（与 `GET /api/v1/agents` 同一形状）。
+
+    🔴 精简口径由 `registry._public` 保证：**永不回显 `credential_hash`**，
+    只带 `credential_hint`（凭据前 8 位，供人比对手上那条对不对）。
+    """
+    items = registry.list_agents()
+    return {"count": len(items), "pending_count": registry.pending_count(), "items": items}
+
+
+def agent_approve(registry: Any, agent_id: str) -> Dict[str, Any]:
+    """批准并签发**一次性凭据**（明文只在这个返回值里出现一次，库里只落 sha256）。"""
+    action = "agents.approve"
+    aid = (agent_id or "").strip()
+    row = _govern_row(registry, aid, action)
+    audit.precheck()                       # 审计落不下账 ⇒ 这次治理变更不许做
+    backup = _backup("approve", row)
+    credential = registry.approve(aid)
+    if not credential:      # 竞态：行在读与写之间消失 ⇒ 报错，不谎报「已批准」
+        _audit(action, aid, ok=False, reason="agent_race")
+        raise ToolError("代理在批准过程中消失，请重试")
+    _audit(action, aid, ok=True, reason="credential issued (one-time)")
+    return {"ok": True, "agent_id": aid, "status": STATUS_APPROVED,
+            "credential": credential, "credential_hint": credential[:8],
+            "note": CREDENTIAL_ONCE_NOTE, "backup": backup}
+
+
+def agent_revoke(registry: Any, agent_id: str, confirm: str = "") -> Dict[str, Any]:
+    """吊销（随时可做）：凭据哈希一并清掉，旧凭据**立即**作废。
+
+    `confirm` 必须等于 agent_id **前 8 位**（与界面同一道闸的口径）。
+    """
+    action = "agents.revoke"
+    aid = (agent_id or "").strip()
+    row = _govern_row(registry, aid, action)
+    want = aid[:REVOKE_CONFIRM_LEN]
+    if str(confirm or "") != want:
+        _audit(action, aid, ok=False, reason="confirm_mismatch")
+        raise ToolError(f"吊销需要确认串 = agent_id 前 {REVOKE_CONFIRM_LEN} 位（{want}）")
+    audit.precheck()
+    backup = _backup("revoke", row)
+    registry.revoke(aid)
+    _audit(action, aid, ok=True, reason=f"backup={backup}")
+    return {"ok": True, "agent_id": aid, "status": STATUS_REVOKED, "backup": backup}
+
+
+def agent_set_role(registry: Any, agent_id: str, role: str, confirm: str = "") -> Dict[str, Any]:
+    """改角色。**全库唯一 primary**：置 primary 会把原 primary 自动降为 sub。
+
+    `confirm` 必须等于**完整 agent_id**（这道操作改的是全库身份，不是单个开关）。
+    改前备份**整份注册表**（连带降级的那一行也要能人工复原）。
+    """
+    action = "agents.role"
+    aid = (agent_id or "").strip()
+    row = _govern_row(registry, aid, action)
+    want = str(role or "").strip().lower()
+    if want not in ROLES:
+        _audit(action, aid, ok=False, reason="bad_role")
+        raise ToolError(f"role 只能是 {list(ROLES)}，收到 {role!r}")
+    if str(confirm or "") != aid:
+        _audit(action, aid, ok=False, reason="confirm_mismatch")
+        raise ToolError(f"改角色需要确认串 = 完整 agent_id（{aid}）")
+    audit.precheck()
+    backup = _backup("role", registry.list_agents())
+    demoted = registry.set_role(aid, want)
+    _audit(action, aid, ok=True,
+           reason=f"{row['role']} -> {want}; demoted={demoted}; backup={backup}")
+    return {"ok": True, "agent_id": aid, "role": want, "demoted": demoted,
+            "note": ROLE_PRIMARY_NOTE if want == ROLE_PRIMARY else "", "backup": backup}
+
+
+def agent_set_exclude(registry: Any, agent_id: str, exclude: bool = False) -> Dict[str, Any]:
+    """「这个代理的条目进不进主脑上下文」开关（退役的 `exclude_tags` 的新家）。"""
+    action = "agents.exclude"
+    aid = (agent_id or "").strip()
+    row = _govern_row(registry, aid, action)
+    audit.precheck()
+    backup = _backup("exclude", row)
+    changed = registry.set_exclude(aid, bool(exclude))
+    _audit(action, aid, ok=True,
+           reason=f"exclude={bool(exclude)} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": aid, "exclude_from_primary": bool(exclude),
+            "changed": changed, "backup": backup}
+
+
+# --------------------------------------------------------------------------
 # 注册到 FastMCP/MCPServer
 # --------------------------------------------------------------------------
 
-def register_tools(server: Any, provider: Any, gate: Any = None) -> Any:
-    """把 8 个 tool 挂到 `server` 上。工具实现见本模块同名函数。
+def register_tools(server: Any, provider: Any, gate: Any = None, *,
+                   govern: bool = False) -> Any:
+    """把 8 个记忆 tool（+ `govern=True` 时再挂 5 个治理 tool）挂到 `server` 上。
 
     `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
     先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
     闸门负责按 read/write 打活动计数，所以它必须挂在 tool 入口，
     而不是塞进各工具函数体里（漏一处就是一个绕过闸门的入口）。
+
+    治理那 5 个走 `gate.identify` + `role == primary`（见 `_govern_identity`）：
+    自造 provider 没有注册表（`gate is None`）时它们照常注册，只是每个都明确报
+    「治理工具需要代理注册表」—— 不静默消失，免得调用方以为治理面不存在。
     """
+    registry = getattr(gate, "registry", None)
 
     def _authorize(tool_name: str) -> None:
         if gate is not None:
@@ -297,5 +481,49 @@ def register_tools(server: Any, provider: Any, gate: Any = None) -> Any:
     def _forget(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
         _authorize("memory_forget")
         return memory_forget(provider, dry_run, confirm)
+
+    # ---- 治理面：仅 primary，且只在本单显式开了 govern 时才存在 ----------
+    # 二次判定在每个治理工具**函数体第一行**（`_govern_identity`）而不是靠
+    # `_authorize`：那 5 个要回带 status 的专用文案，与记忆工具的拒绝不是一句。
+    if govern:
+        @server.tool(
+            name="agent_list",
+            description="列出全部代理（role/status/凭据提示/读写计数），含待审数量。仅主代理可用。",
+        )
+        def _agents() -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_list")
+            return agent_list(registry)
+
+        @server.tool(
+            name="agent_approve",
+            description="批准一个 pending 代理并签发一次性 ksk_ 凭据（明文只此一次返回）。仅主代理可用。",
+        )
+        def _agent_approve(agent_id: str) -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_approve")
+            return agent_approve(registry, agent_id)
+
+        @server.tool(
+            name="agent_revoke",
+            description="吊销代理（旧凭据立即作废）。confirm 必须等于 agent_id 前 8 位。仅主代理可用。",
+        )
+        def _agent_revoke(agent_id: str, confirm: str = "") -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_revoke")
+            return agent_revoke(registry, agent_id, confirm)
+
+        @server.tool(
+            name="agent_set_role",
+            description="改角色（primary 全库唯一，置 primary 自动降旧主）。confirm 必须等于完整 agent_id。仅主代理可用。",
+        )
+        def _agent_set_role(agent_id: str, role: str, confirm: str = "") -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_set_role")
+            return agent_set_role(registry, agent_id, role, confirm)
+
+        @server.tool(
+            name="agent_set_exclude",
+            description="开关「该代理的条目进不进主脑上下文」。exclude=true 表示排除。仅主代理可用。",
+        )
+        def _agent_set_exclude(agent_id: str, exclude: bool = False) -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_set_exclude")
+            return agent_set_exclude(registry, agent_id, exclude)
 
     return server

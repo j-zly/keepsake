@@ -69,6 +69,13 @@ INSTRUCTIONS = (
     "删除必须显式 confirm；merge/forget 默认 dry-run，只统计不写。"
 )
 
+#: 治理面只在 `build_server(govern=True)` 时存在 —— 那时才把它写进 instructions，
+#: 免得模型按一段并不存在的工具说明去调（govern=False 时那段话是假的）。
+GOVERN_HINT = (
+    "治理面 agent_list/agent_approve/agent_revoke/agent_set_role/agent_set_exclude "
+    "只对注册表里的 primary 代理开放，与控制台同一套操作。"
+)
+
 
 # --------------------------------------------------------------------------
 # 代理闸门（2026-10 ks_agent_registry）
@@ -79,7 +86,11 @@ INSTRUCTIONS = (
 # --------------------------------------------------------------------------
 
 #: 写类工具（其余算读）：决定 `touch(read|write)` 的口径。
-GATE_WRITE_TOOLS = frozenset({"memory_add", "memory_remove", "memory_merge", "memory_forget"})
+#: `agent_*` 治理写口自然算写 —— 批准/吊销/改角色/改上下文开关都动注册表。
+GATE_WRITE_TOOLS = frozenset({
+    "memory_add", "memory_remove", "memory_merge", "memory_forget",
+    "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
+})
 
 #: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
 GATE_RECHECK_S = 60.0
@@ -112,10 +123,14 @@ class AgentGate:
     def __init__(self, registry: Any, server: Any, *,
                  agent_id: str = "", credential: str = "") -> None:
         self._registry = registry
+        #: 注册表公开句柄：治理工具面（`tools.agent_*`）与测试/探针用它取同一个
+        #: Registry 实例 —— 工具因此不必再去 provider 上摸私有属性。
+        self.registry = registry
         self._server = server
         self.agent_id = agent_id
         self._credential = credential
         self._stdio_ok: Optional[bool] = None      # None = 还没复核过
+        self._stdio_res: Dict[str, Any] = {}       # 上次复核的**完整**结论（含 role/status）
         self._stdio_at = 0.0                       # 上次复核的单调时刻
         self._stop = threading.Event()
 
@@ -142,12 +157,14 @@ class AgentGate:
     def _recheck(self) -> bool:
         """复核一次并记住结论与时刻（异常一律按未通过 —— fail-closed）。"""
         try:
-            ok = bool(self._stdio_verify().get("ok"))
+            res = dict(self._stdio_verify() or {})
         except Exception as e:      # noqa: BLE001
             logger.warning("keepsake MCP: 凭据复核异常（按拒绝处理）: %s", type(e).__name__)
-            ok = False
-        self._stdio_ok, self._stdio_at = ok, time.monotonic()
-        return ok
+            res = {}
+        res["ok"] = bool(res.get("ok"))
+        self._stdio_res = res
+        self._stdio_ok, self._stdio_at = res["ok"], time.monotonic()
+        return res["ok"]
 
     def start(self) -> None:
         """启动时校验一次，并起一个 daemon 线程每 60s 复核。"""
@@ -190,25 +207,42 @@ class AgentGate:
         raw = str(raw).strip()
         return raw[len("Bearer "):].strip() if raw.startswith("Bearer ") else ""
 
-    def check(self, tool_name: str) -> None:
-        """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
+    def identify(self, tool_name: str = "") -> Dict[str, Any]:
+        """**本次调用的身份判定结论**（不抛、不记账）：`{ok, agent_id, role, status, reason}`。
+
+        这是身份链的**唯一**入口：`check()` 与治理工具面（`tools.agent_*`）都走它，
+        谁都不许在工具里再解一遍凭据。分工是「判定」与「放行」：
+
+        * `check` —— 判定 + 未放行即抛 `ToolError` + 打活动（8 个记忆工具的入口）；
+        * `identify` —— 只给结论，让治理工具自己去判 `role == primary` 并回自己的文案
+          （pending 与「已批准但不是主」要能分开说，见 `tools.GOVERN_DENIED`）。
+
+        复核期已到就在本次调用里顺带复核一次：吊销/停用的生效延迟因此恒 ≤
+        `GATE_RECHECK_S`（哪怕工具一直在被调、复核线程还没轮到）。
+        """
         headers = self._http_headers()
         if headers is not None:
             # http：头里只有 Bearer，身份由凭据反查（`verify_any`）—— 不采信客户端
             # 自报的 agent_id，那正是这套治理要拔掉的东西。
-            res = self._registry.verify_any(self._bearer(headers))
-            caller = str(res.get("agent_id") or self.agent_id)
-            if not res.get("ok"):
-                raise ToolError(GATE_DENIED.format(agent_id=caller))
+            res = dict(self._registry.verify_any(self._bearer(headers)))
         else:
-            # 复核期已到就在本次调用里顺带复核一次：吊销/停用的生效延迟因此
-            # 恒 ≤ GATE_RECHECK_S（哪怕工具一直在被调、复核线程还没轮到）。
             if self._stdio_ok is None or time.monotonic() - self._stdio_at >= GATE_RECHECK_S:
                 self._recheck()
-            if not self._stdio_ok:
-                raise ToolError(GATE_DENIED.format(agent_id=self.agent_id))
-            caller = self.agent_id
+            res = dict(self._stdio_res)
+        res["agent_id"] = str(res.get("agent_id") or self.agent_id)
+        return res
+
+    def record_activity(self, caller: str, tool_name: str) -> None:
+        """按工具口径打活动（`check` 与治理工具面共用的记账点）。"""
         self._registry.touch(caller, "write" if tool_name in GATE_WRITE_TOOLS else "read")
+
+    def check(self, tool_name: str) -> Dict[str, Any]:
+        """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
+        res = self.identify(tool_name)
+        if not res.get("ok"):
+            raise ToolError(GATE_DENIED.format(agent_id=res["agent_id"]))
+        self.record_activity(res["agent_id"], tool_name)
+        return res
 
 
 def _run_detached(call: Callable[[], Any]) -> Any:
@@ -341,12 +375,20 @@ def _sync_view(fn: Any, *, str_uri: bool = False) -> Any:
     return view
 
 
-def build_server(provider: Optional[Any] = None) -> Any:
-    """构造挂好 8 个 tool + 2 个 resource 的 MCP 服务。
+def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any:
+    """构造挂好 8 个记忆 tool（+ 2 个 resource，可选再加 5 个治理 tool）的 MCP 服务。
 
     `provider` 省略时用 keepsake 默认装配（`factory.default_provider()`，
     按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连接）。
     传入自己的 `MemoryProvider` 实现即可让任意宿主复用同一套工具面。
+
+    🔴 `govern=True` 才挂 `agent_*` 五个治理工具（列代理/批准/吊销/改角色/exclude，
+    **只对注册表里 role=primary 的调用方放行**，见 `tools._govern_identity`）。
+    默认关闭是**兼容性**决定：那 5 个工具是本文件对外承诺过的 8 工具契约之外的新面，
+    对「把工具面枚举出来喂给模型的宿主」是可见的破坏性变更 —— 宿主若要治理面，
+    显式开一个参数即可。CLI 入口 `main()` 恒开（治理是主脑的日常动作）。
+    没开 `govern` 时治理面**不存在**（而不是存在却默默全拒），免得调用方
+    以为治理可用。
 
     默认装配的 provider 带代理注册表 ⇒ 工具面挂上 `AgentGate`（每次调用按注册表
     判身份）。传入的第三方 provider 没有注册表 ⇒ **不挂闸门**（它压根不碰 keepsake
@@ -361,9 +403,10 @@ def build_server(provider: Optional[Any] = None) -> Any:
     """
     if provider is None:
         provider = default_provider()
-    server = FastMCP(name=SERVER_NAME, instructions=INSTRUCTIONS)
+    server = FastMCP(name=SERVER_NAME,
+                     instructions=INSTRUCTIONS + (GOVERN_HINT if govern else ""))
     gate = AgentGate.for_provider(provider, server)
-    register_tools(server, provider, gate=gate)
+    register_tools(server, provider, gate=gate, govern=govern)
     register_resources(server, provider)
     # 闸门句柄挂在 server 上（探针 / 运维脚本看「现在放不放行」用；工具调用本身
     # 走 `gate.check`，不经过这个属性 —— 改它不会放松任何一道闸）。
@@ -392,7 +435,7 @@ def main(argv: Optional[list] = None) -> int:
             "（记忆库无自带认证，不许直接暴露到网络上）"
         )
 
-    server = build_server()
+    server = build_server(govern=True)      # 治理面在 CLI 入口恒开（见 build_server 的 govern）
     if args.transport == "stdio":
         # stdio 传输下 stdout 就是协议通道：任何 print/log 都会污染协议流。
         server.run("stdio")
