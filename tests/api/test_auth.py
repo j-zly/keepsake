@@ -465,7 +465,7 @@ def test_me_过期时间与登录回包一致(client):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是十六条业务写端点加三条auth_POST():
+def test_写面仍是十九条业务写端点加三条auth_POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
@@ -480,6 +480,8 @@ def test_写面仍是十六条业务写端点加三条auth_POST():
         "/api/v1/kb/documents", "/api/v1/kb/documents/{id}/update",
         "/api/v1/kb/documents/{id}/delete", "/api/v1/kb/import",
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
+        "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
+        "/api/v1/crons/{job_id}/edit",
     }, sorted(write)
 
 
@@ -497,7 +499,9 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/auth/me",
                  "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
                  "/api/v1/tiering/status", "/api/v1/import/template",
-                 "/api/v1/ops/bulk", "/api/v1/ops/bulk-export"}
+                 "/api/v1/ops/bulk", "/api/v1/ops/bulk-export",
+                 "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
+                 "/api/v1/crons/{job_id}/edit"}
     for r in app.routes:
         if getattr(r, "path", "") in protected:
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}

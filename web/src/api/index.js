@@ -118,6 +118,17 @@ export const api = {
   setTiering: (tiering, confirm) =>
     http.put('/api/v1/settings/tiering', { tiering, confirm }).then((r) => r.data),
 
+  // ---- 定时任务管理（暂停 / 恢复 / 改调度）----
+  // 三条都是纯透传：后端拿 job_id 去调官方 `hermes cron` CLI（argv 列表，
+  // 不碰 jobs.json），这里只负责把 confirm 显式带上、把 400 的校验原文
+  // 原样抛回页面（表达式错在哪由后端那句话说了算）。
+  cronPause: (jobId) =>
+    http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/pause`, { confirm: true }).then((r) => r.data),
+  cronResume: (jobId) =>
+    http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/resume`, { confirm: true }).then((r) => r.data),
+  cronEdit: (jobId, schedule) =>
+    http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/edit`, { confirm: true, schedule }).then((r) => r.data),
+
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
   kbCreateDocument: (payload) =>

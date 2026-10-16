@@ -55,6 +55,10 @@
     </div>
 
     <h3 class="section-title">记忆类定时任务</h3>
+    <div class="sched-line">
+      <span class="sched-k">调度器</span>
+      <span class="sched-v">{{ schedulerStatus || '未知' }}</span>
+    </div>
     <div v-if="cronError" class="banner banner--danger">{{ cronError }}</div>
 
     <div v-if="loading && !crons.length" class="panel pad">
@@ -101,14 +105,67 @@
         </template>
 
         <template #lead>复制脚本路径 ↗</template>
+
+        <!-- 管理按钮**只对认得出 job_id 的行出现**：取不到 id 的行保持只读，
+             宁可少一个按钮，也不去对一个没读懂的 jobs.json 乱发写请求。 -->
+        <template #actions>
+          <button v-if="row.job_id" class="act-btn" @click.stop="askToggle(row)">
+            {{ row.enabled ? '暂停' : '恢复' }}
+          </button>
+          <button v-if="row.job_id" class="act-btn" @click.stop="openEdit(row)">改调度</button>
+        </template>
       </ItemCard>
     </div>
     <div class="src">来源：{{ cronSource }}</div>
+
+    <!-- 暂停 / 恢复：一句后果 + 确认（不写无信息量的那句问话） -->
+    <ConfirmDialog
+      v-model="toggleAsk"
+      :title="toggleTitle"
+      :consequences="toggleConsequences"
+      :confirm-text="toggleConfirmText"
+      tone="primary"
+      :busy="busyCron"
+      @confirm="doToggle"
+    />
+
+    <!-- 改调度：旧值 → 新值对比在正文里，确认按钮前就能看见改成了什么 -->
+    <el-dialog
+      v-model="editAsk"
+      width="460px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyCron"
+      :show-close="!busyCron"
+      append-to-body
+      title="改这条任务的调度"
+    >
+      <p class="edit-old mono">{{ row?.schedule || '（无）' }}</p>
+      <label class="edit-label">
+        <span>新调度（cron 表达式）</span>
+        <el-input
+          v-model="newSchedule"
+          placeholder="例：30 4 * * *"
+          autocomplete="off"
+          spellcheck="false"
+          @keyup.enter="doEdit"
+        />
+      </label>
+      <p v-if="editError" class="edit-err">{{ editError }}</p>
+      <p class="edit-tip">改完由官方 hermes cron CLI 执行并立即生效；表达式非法时后端会带例子回你。</p>
+      <template #footer>
+        <el-button :disabled="busyCron" @click="editAsk = false">取消</el-button>
+        <el-button type="primary" :loading="busyCron" :disabled="!newSchedule.trim()" @click="doEdit">
+          确认改调度
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
@@ -119,11 +176,31 @@ import { toLocal } from '../utils/format'
 const data = ref(null)
 const crons = ref([])
 const cronSource = ref('')
+const schedulerStatus = ref('')
 const loading = ref(false)
 const error = ref('')
 const cronError = ref('')
 const tiering = ref(null)
 const tieringError = ref('')
+
+/* ---------------------------------------------------------------- 定时任务管理
+ * 三条操作（暂停 / 恢复 / 改调度）都改的是网关那份 jobs.json —— 本端只发请求，
+ * 真动作由后端调官方 `hermes cron` CLI 执行。成功后一律重拉列表：启停状态与
+ * next_run 都由文件说了算，本地改一改很快就和真实调度对不上了。 */
+const row = ref(null)            // 正在操作的那一行
+const busyCron = ref(false)
+const toggleAsk = ref(false)
+const editAsk = ref(false)
+const newSchedule = ref('')
+const editError = ref('')
+
+const pausing = computed(() => !!row.value && row.value.enabled)
+const toggleTitle = computed(() => (pausing.value ? '暂停这条定时任务？' : '恢复这条定时任务？'))
+const toggleConsequences = computed(() => [
+  pausing.value ? '暂停后不再按计划执行（已跑的这一次不受影响）' : '恢复后按当前调度继续执行',
+  '改的是网关的 jobs.json（官方 hermes cron CLI 执行），本控制台只留一条操作账',
+])
+const toggleConfirmText = computed(() => (pausing.value ? '确认暂停' : '确认恢复'))
 
 /**
  * 班车卡片的水位配色：≥100% danger（水已经溢出，注入在截断）、≥90% accent
@@ -184,6 +261,8 @@ async function load() {
     const c = await api.crons()
     crons.value = c.jobs
     cronSource.value = c.source
+    // 无 hermes CLI 时后端给 null —— 这一行显示「未知」，不许把整页拖成报错
+    schedulerStatus.value = c.scheduler_status || ''
     cronError.value = c.count ? '' : `没有匹配到记忆类任务（jobs.json：${c.source}）`
   } catch (e) {
     cronError.value = `读取定时任务失败：${e.message}`
@@ -205,6 +284,56 @@ async function doCopy(text) {
   ok ? showToast('已复制') : showError('复制失败，请手动选中复制')
 }
 
+/** 暂停 / 恢复：先开确认框，确认后才发请求（后端还会再要一次 confirm）。 */
+function askToggle(r) {
+  if (!r.job_id) return
+  row.value = r
+  toggleAsk.value = true
+}
+
+async function doToggle() {
+  const r = row.value
+  busyCron.value = true
+  try {
+    const res = r.enabled ? await api.cronPause(r.job_id) : await api.cronResume(r.job_id)
+    toggleAsk.value = false
+    showToast(res.action === 'pause' ? '已暂停' : '已恢复')
+    await load()
+  } catch (e) {
+    showError(`${toggleTitle.value.replace('？', '')}失败：${e.message}`)
+  } finally {
+    busyCron.value = false
+  }
+}
+
+/** 改调度：弹框里预填当前表达式，正文就是「旧值 → 新值」的对比。 */
+function openEdit(r) {
+  if (!r.job_id) return
+  row.value = r
+  newSchedule.value = r.schedule || ''
+  editError.value = ''
+  editAsk.value = true
+}
+
+async function doEdit() {
+  const r = row.value
+  const expr = newSchedule.value.trim()
+  if (!expr || busyCron.value) return
+  busyCron.value = true
+  editError.value = ''
+  try {
+    await api.cronEdit(r.job_id, expr)
+    editAsk.value = false
+    showToast('调度已改')
+    await load()
+  } catch (e) {
+    // 表达式非法（400）由后端带 example 回来，原样显示在弹框里，不弹 toast
+    editError.value = e.message || '改调度失败'
+  } finally {
+    busyCron.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -216,5 +345,47 @@ onMounted(load)
   margin-top: 12px;
   color: var(--text-faint);
   font-size: 12px;
+}
+/* 调度器状态一行：与 stat-grid 同色板，不新造颜色 */
+.sched-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+.sched-k {
+  color: var(--text-faint);
+}
+.sched-v {
+  color: var(--text-dim);
+}
+/* 改调度弹框：旧值在上（弱），新值在下（可编辑），错误回显贴在输入框下 */
+.edit-old {
+  margin: 0 0 14px;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.edit-label {
+  display: block;
+  cursor: text;
+}
+.edit-label > span {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.edit-err {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.edit-tip {
+  margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

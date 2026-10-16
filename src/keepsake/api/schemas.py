@@ -179,9 +179,25 @@ class CronJob(BaseModel):
     last_status: Optional[str] = None
     #: 下次执行时间（jobs.json 的 next_run_at）；缺键退空串，前端 toLocal 出「—」
     next_run: str = ""
+    #: jobs.json 里的任务 id。**认不出 / 不合 12 位十六进制就退空串** ——
+    #: 前端据此不渲染管理按钮（防对未知形状的文件乱写），CLI 也永远收不到脏 id。
+    job_id: str = ""
 
 
 class CronList(BaseModel):
     jobs: List[CronJob]
     count: int
     source: str = Field(..., description="读到的 jobs.json 路径（不存在时也回显，便于定位）")
+    #: 调度器状态一行（`hermes cron status`）；本机无 CLI ⇒ null，前端显示「未知」
+    scheduler_status: Optional[str] = None
+
+
+class CronActionBody(BaseModel):
+    """pause / resume / edit 三条管理端点共用的请求体。
+
+    `confirm` 必须显式 true（与其余写端点同一道闸）；`schedule` 只对 edit 有
+    意义，pause/resume 忽略它 —— 少写一个模型，少一处以后要同步的地方。
+    """
+
+    confirm: bool = False
+    schedule: str = ""

@@ -28,7 +28,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: （setup / login 公开、logout 要会话 —— 那部分在 test_auth.py 里逐条打）。
 #: keepsake_memory_crud_be 起再加 3 条业务 POST（增 / 真删 / 导入），
 #: keepsake_kb_crud_be 起再加 4 条知识库写端点（新增 / 改 / 真删 / 导入），
-#: keepsake_bulk_ops 起再加 2 条勾选批量端点（bulk 改数据 / bulk-export 纯读）。
+#: keepsake_bulk_ops 起再加 2 条勾选批量端点（bulk 改数据 / bulk-export 纯读），
+#: keepsake_cron_manage 起再加 3 条定时任务管理端点（暂停 / 恢复 / 改调度）。
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
@@ -53,6 +54,9 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/import",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
+    "/api/v1/crons/{job_id}/pause",
+    "/api/v1/crons/{job_id}/resume",
+    "/api/v1/crons/{job_id}/edit",
 } | AUTH_POST_PATHS
 
 #: fixture 语料：一部分常驻、一部分普通、一条待归档
@@ -454,13 +458,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有十六条业务写端点加三条认证POST():
+def test_写面只有十九条业务写端点加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 20
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 17
+    assert len(ALLOWED_POST_PATHS) == 23
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 20
 
 
 def test_P1只读路由未被写面影响(client):
