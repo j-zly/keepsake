@@ -79,7 +79,9 @@
         @lead="doCopy(row.script)"
       >
         <template #tag>{{ row.enabled ? '已启用' : '已停用' }}</template>
-        <template #time>{{ toLocal(row.last_run_at) }}</template>
+        <template #time>
+          上次 {{ toLocal(row.last_run_at) }}<template v-if="row.next_run"> · 下次 {{ toLocal(row.next_run) }}</template>
+        </template>
 
         <p class="card-title">{{ row.name }}</p>
         <span class="cell-key">

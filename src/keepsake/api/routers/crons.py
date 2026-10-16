@@ -19,7 +19,12 @@ from ..schemas import CronJob, CronList
 router = APIRouter(tags=["crons"])
 
 #: 兜底的「记忆类」关键词（provider 不可导入时用；与 CRON_JOBS 同源口径）
-_FALLBACK_KEYS = ("memory", "记忆", "distill", "dedup", "synonym")
+#: 「班车」/「tiering」覆盖分级班车：主脑手挂的「分级班车 dry 观察」不在
+#: CRON_JOBS 里（**故意不登记**——provider 的 _ensure_cron_jobs 会在启动时把
+#: CRON_JOBS 里不存在的任务**写进** jobs.json，而本包没有 src/keepsake/cron/
+#: 脚本目录，登记只会在别的节点凭空注册一个指向空脚本的死任务），但它确实是
+#: 记忆体系的一环，面板必须看得见。见 tasks: keepsake_cron_panel。
+_FALLBACK_KEYS = ("memory", "记忆", "distill", "dedup", "synonym", "班车", "tiering")
 
 
 def _memory_keys() -> Tuple[Set[str], Set[str]]:
@@ -60,7 +65,7 @@ def _schedule_text(job: Dict[str, Any]) -> str:
 def list_crons(
     all_jobs: bool = Query(False, description="true=不过滤，返回 jobs.json 里的全部任务"),
 ) -> CronList:
-    """记忆类定时任务（name / last_run_at / last_status）。
+    """记忆类定时任务（name / last_run_at / next_run / last_status）。
 
     文件不存在 ⇒ 返回空列表（并回显 source 路径，便于定位「是没配还是没读到」）；
     文件存在但解析失败 / 读不了 ⇒ **500 + 结构化 detail**（不许装成「没有任务」）。
@@ -91,6 +96,9 @@ def list_crons(
             enabled=bool(j.get("enabled", True)),
             last_run_at=(str(j["last_run_at"]) if j.get("last_run_at") else None),
             last_status=(str(j["last_status"]) if j.get("last_status") else None),
+            # jobs.json 里有 next_run_at；缺键 / 非标量都退空串，前端 toLocal 出「—」
+            next_run=(str(j["next_run_at"])
+                      if isinstance(j.get("next_run_at"), (str, int, float)) else ""),
         )
         for j in picked
     ]

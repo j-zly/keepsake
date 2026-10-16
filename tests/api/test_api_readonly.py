@@ -371,6 +371,40 @@ def test_crons_坏文件_500(client, monkeypatch, tmp_path):
     assert r.json()["detail"]["error"] == "cron_read_failed"
 
 
+def test_crons_班车任务可见(client, monkeypatch, tmp_path):
+    """分级班车不在 CRON_JOBS 里（故意不登记），靠兜底关键词命中——
+    面板看不见 = 用户实拍过的 bug，钉死。
+    """
+    jobs = {"jobs": [
+        {"name": "分级班车 dry 观察", "script": "tiering_cron_dry.sh",
+         "schedule": {"kind": "cron", "expr": "30 4 * * *", "display": "30 4 * * *"},
+         "enabled": True, "last_status": "ok"},
+        {"name": "清理磁盘", "script": "clean-disk.sh"},
+    ]}
+    f = tmp_path / "jobs.json"
+    f.write_text(__import__("json").dumps(jobs, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
+    body = client.get("/api/v1/crons", headers=AUTH).json()
+    assert [j["name"] for j in body["jobs"]] == ["分级班车 dry 观察"]
+    assert body["jobs"][0]["script"] == "tiering_cron_dry.sh"
+    assert body["jobs"][0]["schedule"] == "30 4 * * *"
+
+
+def test_crons_next_run_透出与缺键容错(client, monkeypatch, tmp_path):
+    jobs = {"jobs": [
+        {"name": "记忆提炼", "next_run_at": "2026-10-17T04:30:00+00:00"},
+        {"name": "记忆去重"},                                  # 缺键
+        {"name": "记忆维护", "next_run_at": {"坏形状": 1}},       # 非标量
+    ]}
+    f = tmp_path / "jobs.json"
+    f.write_text(__import__("json").dumps(jobs, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
+    body = client.get("/api/v1/crons", headers=AUTH).json()
+    got = {j["name"]: j["next_run"] for j in body["jobs"]}
+    assert got["记忆提炼"] == "2026-10-17T04:30:00+00:00"
+    assert got["记忆去重"] == "" and got["记忆维护"] == ""      # 逐项容错，不炸整页
+
+
 # ---------------------------------------------------------------- KB 假驱动
 # 88 上没有 KEEPSAKE_PG_DSN、也不许连 180，所以 KB 一律用假驱动覆盖。
 

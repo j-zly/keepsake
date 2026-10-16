@@ -177,6 +177,8 @@ class CronJob(BaseModel):
     enabled: bool = True
     last_run_at: Optional[str] = None
     last_status: Optional[str] = None
+    #: 下次执行时间（jobs.json 的 next_run_at）；缺键退空串，前端 toLocal 出「—」
+    next_run: str = ""
 
 
 class CronList(BaseModel):
