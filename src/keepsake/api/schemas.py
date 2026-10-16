@@ -201,3 +201,55 @@ class CronActionBody(BaseModel):
 
     confirm: bool = False
     schedule: str = ""
+
+
+# --------------------------------------------------------------------------
+# 代理注册表（keepsake_agent_registry）
+# --------------------------------------------------------------------------
+
+
+class AgentItem(BaseModel):
+    """注册表里的一行（对外形状与 `govern.registry` 的 `_public` 逐字一致）。
+
+    🔴 **没有 `credential_hash` 也没有明文凭据**：读面永远不回显凭据，
+    明文只在 `POST /agents/{id}/approve` 的一次性响应里出现。
+    """
+
+    agent_id: str
+    name: str = ""
+    role: str = Field(..., description="primary / sub；全库唯一 primary")
+    status: str = Field(..., description="pending / approved / revoked")
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    reads: int = 0
+    writes: int = 0
+    exclude_from_primary: bool = Field(
+        False, description="该代理的条目是否排除出主脑上下文（退役键的新家）")
+    credential_hint: str = Field("", description="凭据前 8 位，供人工比对（不是凭据）")
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentList(BaseModel):
+    items: List[AgentItem]
+    #: 待审数量（pending）—— 面板唯一要盯的数：新代理接入默认 pending、读写全拒
+    pending_count: int
+    count: int = 0
+
+
+class AgentActionBody(BaseModel):
+    """approve / revoke / exclude 三条端点共用的请求体。
+
+    `confirm` 的口径按端点不同：approve 与 exclude 要 `true`，revoke 要手输
+    agent_id 前 8 位 —— 同一个字段承载三道闸，具体判据在各自端点里。
+    `exclude` 只对 exclude 端点有意义（其余端点忽略它）。
+    """
+
+    confirm: Any = False
+    exclude: bool = False
+
+
+class AgentRoleBody(BaseModel):
+    """`{"role": "primary"|"sub", "confirm": "<完整 agent_id>"}`。"""
+
+    role: str = ""
+    confirm: Any = False

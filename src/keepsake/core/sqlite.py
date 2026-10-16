@@ -102,6 +102,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
+# 代理注册表 `ks_agent` 的 DDL 唯一定义处（本模块只 import，不重复实现语义）
+from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
 from .base import StorageBase, fire_hits
 from . import shared as storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
@@ -306,6 +308,11 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
         ts  TEXT NOT NULL
     )
     """),
+    # 2026-10 ks_agent_registry：代理注册表（身份 / 角色 / 凭据 / 上下文开关）。
+    # DDL **不在这里另抄一份** —— 唯一定义处是 `govern/registry.py::KS_AGENT_DDL`
+    # （它只依赖标准库，反向 import 不会成环）；两个后端建表语句复制一份必然漂，
+    # 而漂的后果是「注册表在一侧永远不存在、治理在换后端时静默失效」。
+    (TABLE_KS_AGENT, KS_AGENT_DDL),
 )
 
 _DDL_INDEXES: Tuple[Tuple[str, str], ...] = (

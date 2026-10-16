@@ -221,14 +221,25 @@ def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "") -> Dic
 # 注册到 FastMCP/MCPServer
 # --------------------------------------------------------------------------
 
-def register_tools(server: Any, provider: Any) -> Any:
-    """把 8 个 tool 挂到 `server` 上。工具实现见本模块同名函数。"""
+def register_tools(server: Any, provider: Any, gate: Any = None) -> Any:
+    """把 8 个 tool 挂到 `server` 上。工具实现见本模块同名函数。
+
+    `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
+    先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
+    闸门负责按 read/write 打活动计数，所以它必须挂在 tool 入口，
+    而不是塞进各工具函数体里（漏一处就是一个绕过闸门的入口）。
+    """
+
+    def _authorize(tool_name: str) -> None:
+        if gate is not None:
+            gate.check(tool_name)
 
     @server.tool(
         name="memory_capabilities",
         description="记忆后端能力声明（version / core_tier / knn / dry_run_merge）。",
     )
     def _capabilities() -> Dict[str, Any]:
+        _authorize("memory_capabilities")
         return memory_capabilities(provider)
 
     @server.tool(
@@ -236,6 +247,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）。",
     )
     def _search(query: str, limit: int = 10) -> Dict[str, Any]:
+        _authorize("memory_search")
         return memory_search(provider, query, limit)
 
     @server.tool(
@@ -243,6 +255,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="按 key 取一条记忆的全文；key 不存在则报错。",
     )
     def _get(key: str) -> Dict[str, Any]:
+        _authorize("memory_get")
         return memory_get(provider, key)
 
     @server.tool(
@@ -250,6 +263,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="列出常驻层（core）记忆：条数 + 每条预览。",
     )
     def _core_list(preview_chars: int = CORE_PREVIEW_CHARS) -> Dict[str, Any]:
+        _authorize("memory_core_list")
         return memory_core_list(provider, preview_chars)
 
     @server.tool(
@@ -257,6 +271,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="写入一条记忆，返回它的 key。",
     )
     def _add(text: str, tags: str = "") -> Dict[str, Any]:
+        _authorize("memory_add")
         return memory_add(provider, text, tags)
 
     @server.tool(
@@ -264,6 +279,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="删除一条记忆。必须 confirm=True，否则拒绝。",
     )
     def _remove(key: str, confirm: bool = False) -> Dict[str, Any]:
+        _authorize("memory_remove")
         return memory_remove(provider, key, confirm)
 
     @server.tool(
@@ -271,6 +287,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="合并记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前 core 条数。",
     )
     def _merge(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
+        _authorize("memory_merge")
         return memory_merge(provider, dry_run, confirm)
 
     @server.tool(
@@ -278,6 +295,7 @@ def register_tools(server: Any, provider: Any) -> Any:
         description="遗忘过期记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前记忆条目总数。",
     )
     def _forget(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
+        _authorize("memory_forget")
         return memory_forget(provider, dry_run, confirm)
 
     return server

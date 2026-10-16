@@ -40,6 +40,10 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
 from ...core.embedder import create_embedder
 from ...core.redis import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
 from ...core.ops.forgetter import Forgetter
+# 治理收口（2026-10 ks_agent_registry）：身份 / 角色 / 上下文的判定源。
+# `govern` 只依赖标准库，这里 import 它不会与 `core/*` 成环。
+from ...govern.registry import AGENT_TAG_PREFIX, Registry
+from ...govern.registry import ROLE_PRIMARY as REGISTRY_ROLE_PRIMARY
 # v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
 from ...core.pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
 # 通用契约的 Capabilities（依赖方向只准 hermes → generic）
@@ -126,6 +130,10 @@ CORE_CANDIDATE_TAG = "core_candidate"
 
 #: 核心层缓存 TTL（秒）。每轮都查库没有意义 —— core 层是低频变的常驻记忆。
 _CORE_CACHE_TTL = 60.0
+
+#: **代理角色缓存 TTL（秒）**：写闸每轮都可能判定身份，而角色是低频变的。
+#: 取 5s 是「approve / set_role 之后最多 5s 收敛」与「不在热路径上每轮查库」的折中。
+_ROLE_CACHE_TTL = 5.0
 
 #: 单次核心层读取的时间预算（秒）。超了就本轮不注入（fail-open），宁可少一轮
 #: 上下文也不能让对话卡住 —— 记忆缺失是降级，卡死是事故。
@@ -315,12 +323,20 @@ class KeepsakeProvider(MemoryProvider):
     _storage: Optional[RedisStorage] = None
     _tag_filter: str = ""
     _is_primary: bool = False
-    #: 主脑检索出口要剔除的噪音标签（`retrieval.exclude_tags`，初始化时读入）。
+    #: 主脑检索出口要剔除的噪音标签（`retrieval.exclude_tags`，初始化时读入 +
+    #: 治理收口后并入注册表里标了 `exclude_from_primary` 的代理标签）。
     #: 类属性兜底 = 未 initialize 的实例（如测试直接挂 storage）不排除任何东西。
     _exclude_tags: Tuple[str, ...] = ()
     _forgetter: Optional[Forgetter] = None
     _last_maintenance: float = 0.0
     _maintenance_interval: float = 7200.0  # 每 2h 跑一次维护
+    #: 代理注册表（`keepsake.govern.registry.Registry`）：身份 / 角色 / 上下文的唯一真相源。
+    #: **类属性兜底 None** = 没装配注册表（裸实例 / 单测），此时写闸回落到 config 自报。
+    _registry: Optional[Any] = None
+    #: 本进程自己的 agent_id（注册表登记与角色查询用）
+    _agent_id: str = ""
+    #: 角色查询的进程内缓存 `{"ts": 单调时刻, "is_primary": bool}`
+    _role_cache: Optional[Dict[str, Any]] = None
 
     def __init__(self, **config):
         """
@@ -607,6 +623,9 @@ class KeepsakeProvider(MemoryProvider):
             "keepsake: connected (session=%s, top_k=%d, tag_filter=%s)",
             session_id, top_k, self._tag_filter or "(none)",
         )
+
+        # 治理收口（2026-10 ks_agent_registry）：自登记 + 角色归注册表 + 迁移退役键
+        self._init_governance(cfg)
 
         # 初始化 skip patterns 配置
         self._skip_min_length = cfg.get("skip_min_length", 2)
@@ -1347,15 +1366,83 @@ class KeepsakeProvider(MemoryProvider):
 
     # ---- 写层（fail-closed）----
 
+    # ------------------------------------------------------------------
+    # 治理收口（2026-10 ks_agent_registry）
+    # ------------------------------------------------------------------
+
+    def _init_governance(self, cfg: dict) -> None:
+        """装配代理注册表：自登记 → 本机 bootstrap → 迁移退役的 exclude 键。
+
+        **绝不因治理失败而拦住对话**（与本文件其余注入路径同款 fail-open）：
+        注册表不可用时 `self._registry` 留 None，写闸据此 fail-closed 按 sub
+        （见 `_registry_is_primary`）—— 记忆写入降级，人还能用。
+        """
+        try:
+            registry = Registry(self._storage)
+            if not registry.ensure_schema():
+                logger.warning("keepsake: 注册表 schema 未就绪，写闸将按 sub 处理（fail-closed）")
+                return
+            self._agent_id = str(cfg.get("agent_id") or self._agent_id or "")
+            # 本机文件通道：批准自己；`is_primary` 为真且库里还没有主脑时才上位。
+            # 🔴 这一行的 `is_primary` 只是**首次引导**的种子，之后角色一律由注册表
+            #    说了算（控制台改一次即生效，写闸 5s 内收敛）。
+            registry.bootstrap_local(self._agent_id, self._agent_id,
+                                     as_primary=bool(cfg.get("is_primary", False)))
+            registry.migrate_exclude_tags(cfg)
+            self._registry = registry
+            self._role_cache = None
+            # 「是否进主脑上下文」现在是每个代理身上的开关：被排除的代理，
+            # 它的 `agent:<id>` 标签进检索排除表（配置键退役后的新家）。
+            extra = tuple(
+                f"{AGENT_TAG_PREFIX}{a['agent_id']}"
+                for a in registry.list_agents() if a["exclude_from_primary"]
+            )
+            if extra:
+                self._exclude_tags = tuple(dict.fromkeys(self._exclude_tags + extra))
+            logger.info("keepsake: 代理注册表已装配（agent_id=%s）", self._agent_id)
+        except Exception as e:      # noqa: BLE001 —— 治理不拦对话（写闸 fail-closed 兜底）
+            logger.warning("keepsake: 注册表装配失败（写闸按 sub 处理）: %s: %s",
+                           type(e).__name__, e)
+
+    def _registry_is_primary(self) -> bool:
+        """**我是不是主脑** —— 判定源是注册表角色（5s 缓存），不是 config 自报。
+
+        🔴 三条 fail-closed 纪律：
+          * 没装配注册表（裸实例 / 单测）⇒ 回落 `_is_primary`（保持既有装配行为）；
+          * 注册表里查不到 / 不是 primary ⇒ sub；
+          * **注册表抛异常 ⇒ sub**（宁可多拦一个 core 写入，也不放进一个假 primary）。
+        """
+        registry = self._registry
+        if registry is None:
+            return bool(self._is_primary)
+        import time as _time
+
+        now = _time.monotonic()
+        cache = self._role_cache
+        if cache is not None and now - cache["ts"] < _ROLE_CACHE_TTL:
+            return bool(cache["is_primary"])
+        try:
+            info = registry.verify_local(self._agent_id)
+            is_primary = bool(info.get("ok")) and info.get("role") == REGISTRY_ROLE_PRIMARY
+        except Exception as e:      # noqa: BLE001 —— fail-closed 按 sub
+            logger.warning("keepsake: 注册表角色查询失败（按 sub 处理）: %s", type(e).__name__)
+            is_primary = False
+        self._role_cache = {"ts": now, "is_primary": is_primary}
+        return is_primary
+
     def _apply_write_gate(self, tags: str) -> str:
         """写闸：非 primary 写 `core` 一律降级为 `core_candidate`（多代理治理第二条）。
+
+        🔴 2026-10 ks_agent_registry：判定源已从 config 自报的 `_is_primary`
+        切到 **registry 的角色**（`self._registry_is_primary()`，5s 缓存；
+        注册表不可达时 fail-closed 按 sub —— 见那处的三条纪律）。
 
         子代理对常驻层**只读** —— 它写 `core` 不能直接进常驻层，只能落候选，
         经审核后由主脑转正。标签判据是**逗号边界的完整标签相等**（复用 `_has_tag`，
         `core_x` / `xcore` 不算命中），其余标签原样保留、顺序不变。
         primary 原样放行；返回 key 语义不受影响。
         """
-        if self._is_primary or not _has_tag(tags, _CORE_TAG):
+        if self._registry_is_primary() or not _has_tag(tags, _CORE_TAG):
             return tags
         parts = [t.strip() for t in str(tags).split(",") if t.strip()]
         kept = [CORE_CANDIDATE_TAG if t == _CORE_TAG else t for t in parts]

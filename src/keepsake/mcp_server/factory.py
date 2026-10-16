@@ -24,6 +24,11 @@ __all__ = ["KeepsakeMCPProvider", "default_provider", "DEFAULT_AGENT_ID", "SCAN_
 
 #: 配置里没有 agent_id 时的兜底值。MCP 是独立进程，没有天然宿主 id；
 #: 用固定值而不是空串 —— 空串会让后端的 agent 隔离把条目全部滤掉。
+#:
+#: 🔴 2026-10 ks_agent_registry：这个 id **只用于去注册表登记/判身份**，
+#: 不再是「你就是主脑」的通行证 —— 闸门在 `server.AgentGate`，读的是
+#: `KEEPSAKE_AGENT_ID` + `KEEPSAKE_CREDENTIAL`（凭据由控制台批准时签发）。
+#: 新代理接入默认 pending，读写全拒。
 DEFAULT_AGENT_ID = "mcp"
 
 #: count_fragments 的 keyset 分页大小

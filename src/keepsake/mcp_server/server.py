@@ -35,18 +35,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import logging
+import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import anyio
 from mcp.server.fastmcp import FastMCP
 
-from .factory import default_provider
+from .factory import DEFAULT_AGENT_ID, default_provider
 from .resources import register_resources
-from .tools import register_tools
+from .tools import ToolError, register_tools
 
-__all__ = ["build_server", "main", "DEFAULT_HTTP_HOST", "DEFAULT_HTTP_PORT"]
+__all__ = ["build_server", "main", "AgentGate", "GATE_DENIED",
+           "DEFAULT_HTTP_HOST", "DEFAULT_HTTP_PORT"]
+
+logger = logging.getLogger("keepsake.mcp_server")
 
 #: 🔴 HTTP 传输只听回环地址。不给「--host 0.0.0.0」留口子：
 #: 要暴露到外面走反向代理 + 控制台那套 Bearer 认证，那是另一条路的职责。
@@ -61,6 +68,147 @@ INSTRUCTIONS = (
     "resource memory://fragment/{key}，常驻记忆在 resource memory://core。"
     "删除必须显式 confirm；merge/forget 默认 dry-run，只统计不写。"
 )
+
+
+# --------------------------------------------------------------------------
+# 代理闸门（2026-10 ks_agent_registry）
+#
+# 此前 MCP 是**无认证**的：任何能连上 stdio/http 的客户端都能读写主脑的记忆，
+# 且身份全凭它自己的 config 自报。本节把「能不能用」改成注册表说了算：
+# 新代理接入默认 pending，读写全拒，管理员在控制台批准并领取 `ksk_` 凭据后才放行。
+# --------------------------------------------------------------------------
+
+#: 写类工具（其余算读）：决定 `touch(read|write)` 的口径。
+GATE_WRITE_TOOLS = frozenset({"memory_add", "memory_remove", "memory_merge", "memory_forget"})
+
+#: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
+GATE_RECHECK_S = 60.0
+
+#: 未批准 / 凭据不对时的**唯一**对外文案（🔴 不回显任何凭据内容）。
+GATE_DENIED = "代理 {agent_id} 未批准/已吊销，请到控制台审核通过后领取凭据"
+
+#: 环境变量名（stdio 客户端启动时带；`KEEPSAKE_AGENT_ID` 缺省仍是 `DEFAULT_AGENT_ID`）
+ENV_AGENT_ID = "KEEPSAKE_AGENT_ID"
+ENV_CREDENTIAL = "KEEPSAKE_CREDENTIAL"
+
+
+class AgentGate:
+    """每次 tool 调用的身份闸门 —— 判定源是注册表，不是客户端自报。
+
+    **http 传输**：每次调用从请求头取 `Authorization: Bearer ksk_…` → `verify_any`
+    （头里没有 agent_id，按凭据反查）；失败即 `ToolError`。
+
+    **stdio 传输**：启动时校验 `KEEPSAKE_CREDENTIAL`，之后每 60s 复核；期间任何一次
+    复核失败 ⇒ **全部工具降级为拒绝**（不退出进程 —— 宿主会反复重启刷屏，人话错误
+    留在工具返回里比一个反复重启的进程有用）。
+
+    🟡 **stdio 没配凭据时的兜底**：退到 `verify_local()`（本机文件通道）——
+    即「与主脑同机同配置、且注册表里那行带 `meta.bootstrap=local`」。这条兜底的
+    边界写在 `tests/test_agent_registry.py` 与闸门文件里：它防的是**远端/陌生
+    客户端**，不是同机同配置（那种进程本来就能直连库，闸门对它只是仪式）。
+    `ponytail:` 要把本机也卡死，设 `KEEPSAKE_CREDENTIAL` 即可（配了就只认凭据）。
+    """
+
+    def __init__(self, registry: Any, server: Any, *,
+                 agent_id: str = "", credential: str = "") -> None:
+        self._registry = registry
+        self._server = server
+        self.agent_id = agent_id
+        self._credential = credential
+        self._stdio_ok: Optional[bool] = None      # None = 还没复核过
+        self._stdio_at = 0.0                       # 上次复核的单调时刻
+        self._stop = threading.Event()
+
+    @classmethod
+    def for_provider(cls, provider: Any, server: Any) -> Optional["AgentGate"]:
+        """按 provider 装配闸门；**没有注册表就没有闸门**（见下方说明）。
+
+        「别的 agent 实现协议就能用」是本模块的承诺：一个自带记忆系统、自己不碰
+        keepsake 存储的 provider（如 `tests/mcp` 里的 `_ForeignProvider`）不该被
+        keepsake 的注册表拦住 —— 它压根没有身份可言。
+        """
+        registry = getattr(provider, "_registry", None)
+        if registry is None:
+            return None
+        agent_id = (os.environ.get(ENV_AGENT_ID)
+                    or getattr(provider, "_agent_id", "")
+                    or DEFAULT_AGENT_ID)
+        gate = cls(registry, server, agent_id=agent_id,
+                   credential=(os.environ.get(ENV_CREDENTIAL) or "").strip())
+        gate.start()
+        return gate
+
+    # ---- 复核（stdio） ------------------------------------------------
+    def _recheck(self) -> bool:
+        """复核一次并记住结论与时刻（异常一律按未通过 —— fail-closed）。"""
+        try:
+            ok = bool(self._stdio_verify().get("ok"))
+        except Exception as e:      # noqa: BLE001
+            logger.warning("keepsake MCP: 凭据复核异常（按拒绝处理）: %s", type(e).__name__)
+            ok = False
+        self._stdio_ok, self._stdio_at = ok, time.monotonic()
+        return ok
+
+    def start(self) -> None:
+        """启动时校验一次，并起一个 daemon 线程每 60s 复核。"""
+        self._recheck()
+        if not self._stdio_ok:
+            logger.error("keepsake MCP: 代理 %s 尚未在注册表里批准 —— "
+                         "全部工具将被拒绝（到控制台批准并领取 ksk_ 凭据）", self.agent_id)
+
+        def _loop() -> None:
+            while not self._stop.wait(GATE_RECHECK_S):
+                self._recheck()
+
+        threading.Thread(target=_loop, name="keepsake-agent-gate", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ---- 判定 --------------------------------------------------------
+    def _stdio_verify(self) -> Dict[str, Any]:
+        """stdio 侧的校验：有凭据走凭据，没有就退本机通道。"""
+        if self._credential:
+            return self._registry.verify(self.agent_id, self._credential)
+        return self._registry.verify_local(self.agent_id)
+
+    def _http_headers(self) -> Any:
+        """当前调用的 HTTP 请求头；**stdio 下返回 None**（没有请求上下文）。"""
+        try:
+            request = self._server.get_context().request_context.request
+        except Exception:       # noqa: BLE001 —— 请求上下文不存在 ⇒ 非 http 调用
+            return None
+        return getattr(request, "headers", None)
+
+    @staticmethod
+    def _bearer(headers: Any) -> str:
+        raw = ""
+        try:
+            raw = headers.get("authorization") or headers.get("Authorization") or ""
+        except Exception:       # noqa: BLE001 —— 畸形头当没带
+            return ""
+        raw = str(raw).strip()
+        return raw[len("Bearer "):].strip() if raw.startswith("Bearer ") else ""
+
+    def check(self, tool_name: str) -> None:
+        """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
+        headers = self._http_headers()
+        if headers is not None:
+            # http：头里只有 Bearer，身份由凭据反查（`verify_any`）—— 不采信客户端
+            # 自报的 agent_id，那正是这套治理要拔掉的东西。
+            res = self._registry.verify_any(self._bearer(headers))
+            caller = str(res.get("agent_id") or self.agent_id)
+            if not res.get("ok"):
+                raise ToolError(GATE_DENIED.format(agent_id=caller))
+        else:
+            # 复核期已到就在本次调用里顺带复核一次：吊销/停用的生效延迟因此
+            # 恒 ≤ GATE_RECHECK_S（哪怕工具一直在被调、复核线程还没轮到）。
+            if self._stdio_ok is None or time.monotonic() - self._stdio_at >= GATE_RECHECK_S:
+                self._recheck()
+            if not self._stdio_ok:
+                raise ToolError(GATE_DENIED.format(agent_id=self.agent_id))
+            caller = self.agent_id
+        self._registry.touch(caller, "write" if tool_name in GATE_WRITE_TOOLS else "read")
 
 
 def _run_detached(call: Callable[[], Any]) -> Any:
@@ -200,6 +348,10 @@ def build_server(provider: Optional[Any] = None) -> Any:
     按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连接）。
     传入自己的 `MemoryProvider` 实现即可让任意宿主复用同一套工具面。
 
+    默认装配的 provider 带代理注册表 ⇒ 工具面挂上 `AgentGate`（每次调用按注册表
+    判身份）。传入的第三方 provider 没有注册表 ⇒ **不挂闸门**（它压根不碰 keepsake
+    的存储，见 `AgentGate.for_provider`）。
+
     返回值就是 SDK 的 FastMCP/MCPServer 本体（不是包装类），
     另有两处便利改造：SDK 的 `list_tools` / `list_resources` 是 `async def`
     （协议层用），这里换成 `_LazyEnum` 视图（并把 resource 的 `uri` 落成 str），
@@ -210,8 +362,12 @@ def build_server(provider: Optional[Any] = None) -> Any:
     if provider is None:
         provider = default_provider()
     server = FastMCP(name=SERVER_NAME, instructions=INSTRUCTIONS)
-    register_tools(server, provider)
+    gate = AgentGate.for_provider(provider, server)
+    register_tools(server, provider, gate=gate)
     register_resources(server, provider)
+    # 闸门句柄挂在 server 上（探针 / 运维脚本看「现在放不放行」用；工具调用本身
+    # 走 `gate.check`，不经过这个属性 —— 改它不会放松任何一道闸）。
+    server.agent_gate = gate
     server.list_tools = _sync_view(FastMCP.list_tools.__get__(server))
     server.list_resources = _sync_view(FastMCP.list_resources.__get__(server), str_uri=True)
     return server

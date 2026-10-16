@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
-from .routers import auth, core, crons, fragments, hits, kb, ops, stats
+from .routers import agents, auth, core, crons, fragments, hits, kb, ops, stats
 
 logger = logging.getLogger("keepsake.api")
 
@@ -62,6 +62,9 @@ def create_app() -> FastAPI:
 
     # ---- 写操作路由（全部 POST / 全部需 token / 全部二次确认+备份+审计）----
     app.include_router(ops.router)
+    # 代理注册表治理面（keepsake_agent_registry）：读面一条 GET + 四条写端点，
+    # 写端点与 ops 同款纪律（require_session + write_guard + 备份 + 审计）。
+    app.include_router(agents.router)
 
     # ---- 全局异常：任一数据源异常 ⇒ 500 + 结构化 detail，绝不吞成空结果 ----
     @app.exception_handler(Exception)
