@@ -52,7 +52,7 @@
       <p class="filter-desc">
         {{
           candDir === 'demote'
-            ? '常驻层吃掉太多注入预算时，班车按「最不活跃先走」提名退居（豁免的主脑手写条目只进建议、永不自动降）。批准=退出常驻层（正文不删、不失效）；驳回=摘掉建议标，这条继续留在常驻层。'
+            ? '常驻层吃掉太多注入预算时，班车按「最不活跃先走」提名退居；收到负反馈、或写侧管线判「这条与新事实冲突」时也会直接提名（手写条目只进建议、永不自动降，冲突证据会摆在卡上）。批准=退出常驻层（正文不删、不失效）；驳回=摘掉建议标，这条继续留在常驻层。'
             : '非主代理写 core 会被拦成候选，分级班车也会给够热的条目提名。批准后进入常驻层、每轮注入；驳回只摘掉候选标，条目仍留在检索层可召回。'
         }}
       </p>
@@ -95,6 +95,16 @@
             </button>
           </span>
           <p class="card-body" :title="row.content">{{ row.content }}</p>
+
+          <!-- 冲突证据：写侧管线判「这条常驻与新事实矛盾」时留下的 key（后端
+               tier:evid:<key>）。审核的人得看得见跟哪条打架才判得了，所以这里
+               按需懒加载正文；查不到就说查不到，不崩也不编。 -->
+          <div v-if="candDir === 'demote' && evidKeysOf(row.tags).length" class="evid">
+            <div v-for="k in evidKeysOf(row.tags)" :key="k" class="evid-row">
+              <span class="evid-label">与这条新事实冲突：</span>
+              <span class="evid-text" :title="evidText(k)">{{ evidText(k) }}</span>
+            </div>
+          </div>
 
           <template #tags>
             <span v-for="t in splitTags(row.tags)" :key="t" class="tag">{{ t }}</span>
@@ -299,7 +309,7 @@ const CANDIDATE_TAG = 'core_candidate'
 const DEMOTE_CANDIDATE_TAG = 'tier:demote-candidate'
 
 // ------------------------------------------------------------------
-// 标签串的三个纯函数。**这一段必须零依赖**（只用 JS 内建）：
+// 标签串的四个纯函数。**这一段必须零依赖**（只用 JS 内建）：
 // tests/candidate-review.test.mjs 会原样抽出这段直接跑，改成 import 任何东西
 // 测试就抽不出来 —— 所以想复用别处的话，先把它挪去 utils/ 再改测试。
 //
@@ -318,16 +328,41 @@ function splitTags(s) {
 }
 
 /**
+ * 冲突证据标前缀（后端 `keepsake/core/tiering.py` 的 EVID_PREFIX + ':'）。
+ * 退居建议卡上会带 `tier:evid:<新事实 key>`：写侧管线判「这条常驻与新事实冲突」
+ * 时打的 —— 审核的人得看得见「它到底跟哪条打架」才判得了。
+ */
+const EVID_PREFIX = 'tier:evid:'
+
+/**
  * 从逗号串里摘掉一个**完整标签**，其余原样保留、顺序不变。
  * 幂等：标签不存在时原样返回（重复驳回同一条不会把别的标签吃掉）。
  * 本标签是唯一标签时返回空串 —— 正文不受影响，条目仍在检索层。
+ *
+ * 🔴 摘 `tier:demote-candidate` 时**连带摘掉它带的 `tier:evid:` 证据标**：
+ * 证据标是「这条建议为什么被提」的从属物，方向标一摘它就成了没人看得见的孤儿
+ * （列表按方向标过滤 ⇒ 永远不显示 ⇒ 白留）。两条路径（驳回 = 摘标、批准 =
+ * demote 后按返回的 tags 摘标）都走这一个函数，所以不漏。
  */
 function dropTag(s, tag) {
   const t = String(tag ?? '').trim()
   if (!t) return String(s ?? '')
+  // 这里的字面量是**故意**不引 DEMOTE_CANDIDATE_TAG 的：上面那段纯函数要被单测
+  // 原样抽出来单跑，段外的常量在那个作用域里不存在（抽出来就 ReferenceError）。
+  // 代价是同一个标在页面里出现两次 —— 测试正反两面都钉着它（tiering-ui 钉常量、
+  // 本段的测试钉联动），漂了会红。
+  const alsoEvid = t === 'tier:demote-candidate'
   return splitTags(s)
-    .filter((x) => x !== t)
+    .filter((x) => x !== t && !(alsoEvid && x.startsWith(EVID_PREFIX)))
     .join(',')
+}
+
+/** 取出证据 key 列表（`tier:evid:<key>` 的 key，逗号边界口径同 splitTags）。无则 []。 */
+function evidKeysOf(s) {
+  return splitTags(s)
+    .filter((t) => t.startsWith(EVID_PREFIX))
+    .map((t) => t.slice(EVID_PREFIX.length).trim())
+    .filter(Boolean)
 }
 
 /** 找 `agent:xxx` 标签里的 xxx；没有或格式不对返回空串（页面据此显示「未知」）。 */
@@ -350,6 +385,39 @@ const candPage = ref(1)
 const candPageSize = ref(20)
 const candLoading = ref(false)
 const candError = ref('')
+
+/**
+ * 冲突证据正文缓存：key → `null`（读取中）/ 文本 / `''`（查不到：条目被删或无权限）。
+ * 一页 20 张卡 ⇒ 最多 20 次既有读接口调用，翻回本页不再重拉。
+ * 懒加载而不是列表接口直接带：证据条目**不在**这一页里，让列表接口按 key 反查
+ * 等于让分页接口替人做 N+1；而漏查一条也只是显示「证据已不可查」，不崩。
+ */
+const evidCache = ref({})
+
+/** 证据展示文案：读取中 / 正文 / 证据已不可查（三态都摆出来，绝不空白让人猜） */
+function evidText(key) {
+  const v = evidCache.value[key]
+  if (v === undefined || v === null) return '读取中…'
+  return v || '证据已不可查'
+}
+
+/** 拉这批卡的证据正文；逐条独立失败（一条 404 不许拖垮整卡）。只退居方向要拉。 */
+async function loadEvid(rows) {
+  await Promise.all(
+    rows
+      .flatMap((row) => (candDir.value === 'demote' ? evidKeysOf(row.tags) : []))
+      .map(async (k) => {
+        if (k in evidCache.value) return
+        evidCache.value[k] = null
+        try {
+          const d = await api.fragment(k)
+          evidCache.value[k] = String(d?.content || '')
+        } catch {
+          evidCache.value[k] = ''
+        }
+      }),
+  )
+}
 
 /**
  * 分页条总数，口径与「记忆条目」页（FragmentsView）完全一致：
@@ -385,11 +453,15 @@ const candConsequences = computed(() => {
     // 剩余标签直接从行里的 tags 算（FragmentItem 带 tags 字段，不必再打一次详情接口）
     const rest = splitTags(dropTag(row.tags, tag)).join('、') || '（无）'
     if (candDir.value === 'demote') {
-      return [
+      const lines = [
         `摘掉 ${DEMOTE_CANDIDATE_TAG} 标签，其余标签原样保留：${rest}。`,
         '这条继续留在常驻层、继续每轮注入 —— 驳回只是告诉班车「别再提它」。',
         '常驻层水位仍高时，下一轮班车还会重新提名（自动升进来的条目更容易被提名）。',
       ]
+      if (evidKeysOf(row.tags).length) {
+        lines.push(`连同 ${evidKeysOf(row.tags).length} 条冲突证据标一起摘掉 —— 证据标只是「这条建议为什么被提」的从属物，留着就成了没人看得见的孤儿。`)
+      }
+      return lines
     }
     return [
       `摘掉 ${tag} 标签，其余标签原样保留：${rest}。`,
@@ -440,6 +512,8 @@ async function loadCandidates() {
     candCount.value = data.count
     candHasMore.value = data.has_more
     candError.value = ''
+    // 证据懒加载：不 await（列表先出，证据后到），失败全在 loadEvid 内部兜住
+    loadEvid(data.items)
   } catch (e) {
     if (seq !== candSeq) return
     cands.value = []
@@ -619,6 +693,33 @@ async function saveTiering() {
 }
 .dir-switch {
   margin: 8px 0 4px;
+}
+/* 冲突证据：两行夹住（label 不折、正文超长截断），窄卡里也不会把卡片撑变形 */
+.evid {
+  margin: 6px 0 2px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--border-2);
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.evid-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+.evid-label {
+  flex: none;
+}
+.evid-text {
+  flex: 1;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text-dim);
 }
 .src {
   margin-top: 10px;

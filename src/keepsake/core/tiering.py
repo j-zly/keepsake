@@ -29,8 +29,13 @@
    （与界面批准同一条存储路径 `ops._with_core` + `ops._apply`），摘候选标、
    加 `tier:auto-promoted` 痕迹。**预算护栏**：`used + len(content) > budget`
    ⇒ 本轮跳过、留在队列里等下一轮 —— 绝不硬塞。
-3. **降级双轨**：
-   * **压力轨**：`used/budget ≥ warn_ratio` ⇒ 按「最不活跃先走」提名退居候选
+3. **降级三轨**（全部只**提名** + 进审核队列；只有「强降」是自动动作）：
+   * **信号轨**（`_rule_signal_demote`，**不看水位**，本单新增）：常驻条目的
+     `feedback_score` 解析为负（人工点「没用」-2 / 已纠正 -1）⇒ 直接打
+     `tier:demote-candidate`。**不受 `explicit_core` 豁免**（豁免只保护
+     「自动降级」这个动作，见下）；已带建议标的跳过（幂等）。stats 键
+     `signal_nominate`。
+   * **压力轨**（`_rule_demote`）：`used/budget ≥ warn_ratio` ⇒ 按「最不活跃先走」提名退居候选
      （`tier:demote-candidate`），降到 `release_ratio` 为止或 `batch_cap` 到顶。
      排序分 = 近 90 天命中数**升序** → `last_hit` 旧 → `updated` 旧。
      🟡 **信号弱化注释**：常驻条目绝大多数命中为 0（它们是被**注入**的，不是靠
@@ -41,6 +46,8 @@
    * **豁免**：`demote_exempt.explicit_core` 命中的条目**只进建议、永不自动降**
      （可被提名、可被人审核掉，但班车不许替主脑决定）；自动升进来的
      （`tier:auto-promoted`）**不豁免** —— 它是机器放进来的，机器也该能请出去。
+     🔴 豁免挡的是**自动动作**（强降），不挡**提名**：信号轨对手写条目照样提名
+     （见上），否则「这条误导」这句人话在常驻层里没人听得到。
 
 ## 为什么降级建议**不进** `retrieval.exclude_tags`（与晋升候选方向相反）
 
@@ -95,6 +102,13 @@ AUTO_HOT_PREFIX = "tier:auto-hot"
 
 #: 自动升进来的痕迹（压力轨**不豁免**它们，见模块 docstring 规则 3）。
 AUTO_PROMOTED_TAG = "tier:auto-promoted"
+
+#: 冲突证据标前缀，**带 key**：`tier:evid:memory:frag:xxxx`。
+#: 谁打的：写侧管线（`core/pipeline.py`）判 UPDATE/DELETE 且目标是常驻条目时 ——
+#: 那正是「这条常驻与更新的事实冲突」的一手证据，写侧不该自己封常驻（那是人的
+#: 拍板），改把它连同证据 key 一起提名进本队列，由人在审核页裁决。
+#: 前缀的**唯一定义在这里**，pipeline 反向 import 本常量（G5 单点闸）。
+EVID_PREFIX = "tier:evid"
 
 #: `explicit_core` 豁免判据的三个信号（判据本体见 `is_explicit_core`）：
 EXEMPT_TAG = "memory"        # Hermes 显式写 core 时 tags 恒含它（provider `_core_write`）
@@ -350,6 +364,24 @@ def nominated_on(row: Dict[str, Any]) -> Optional[datetime]:
     return None
 
 
+def feedback_of(row: Dict[str, Any]) -> float:
+    """`feedback_score`（**文本列**）→ 数值；解析不出来一律当 **0**，不是负。
+
+    文本列的脏形态是常态：空串 / NULL / `'-2'`（人工负反馈）/ `'-1'`（已纠正）/
+    `'−2'`（U+2212 减号，人手输的）等。判据是「**确实解析出负数**」才算负反馈：
+    把读不懂的值猜成负反馈会凭空提名一批常驻条目（误伤），漏判只少一个建议 ——
+    这个方向上宁可漏、不误伤。
+    """
+    raw = str((row or {}).get("feedback_score") or "").strip()
+    if not raw:
+        return 0.0
+    text = raw.replace("−", "-").replace("﹣", "-").replace("－", "-").replace(" ", "")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
 def _age_days(row: Dict[str, Any], now: datetime) -> float:
     """挂了候选标的天数。
 
@@ -582,9 +614,64 @@ def _pressure_order(rows: List[Dict[str, Any]], hits: Dict[str, int],
     )
 
 
+def _rule_signal_demote(storage: Any, t: Dict[str, Any], *, dry_run: bool,
+                        stats: Dict[str, Any]) -> None:
+    """信号轨（**不看水位**）：常驻条目吃了负反馈 ⇒ 直接提名退居。
+
+    为什么排在压力轨前面：压力轨的排序分（命中 / 时间）在本层是弱信号，常驻条目
+    绝大多数命中为 0 ⇒ 实际退化成「按年龄排序」，那是**保命阀**（水位真的顶住了
+    才动），不是判据。而「人说过这条没用」是**真信号**：负反馈走的是
+    `record_feedback(False)`（-2）/ `correct_fragments`（-1），都是人在点。
+
+    🔴 **本轨不受 `demote_exempt.explicit_core` 豁免**（与压力轨/强降的处置刻意
+    不同）：豁免保护的是「班车替主脑做主、自动降级」；本轨只**提名**一个建议，
+    批不批仍然在人手里。若连提名都豁免，用户明确说过「这条误导」也会被班车装作
+    没听见 —— 那条豁免就荒谬了。只有 100% 强降那条**自动动作**维持豁免。
+
+    幂等：已带 `DEMOTE_CANDIDATE_TAG` 的跳过（一天只提一次，不刷标签）。
+    """
+    out: Dict[str, Any] = {"count": 0, "keys": [], "already": 0, "dry_run": dry_run}
+    stats["signal_nominate"] = out
+    rows = [r for r in storage.list_by_tag(CORE_TAG) or [] if r.get("key")]
+    if not rows:
+        return
+    # `list_by_tag` 的列集里**没有** feedback_score（那是「列常驻条目的浏览面」，
+    # 加列要动三个后端，本单不值得）⇒ 批量补一次全字段读（三后端都实现了）。
+    try:
+        full = storage.get_fragments_batch([str(r["key"]) for r in rows]) or {}
+    except Exception as e:      # noqa: BLE001 —— 读不到就一条都不提（宁可漏）
+        logger.warning("keepsake: tiering 信号轨读反馈失败 %s: %s", type(e).__name__, e)
+        return
+    picked: List[str] = []
+    for row in rows:
+        if len(picked) >= t["batch_cap"]:
+            break
+        key = str(row["key"])
+        tags = tag_list(row.get("tags"))
+        if DEMOTE_CANDIDATE_TAG in tags:
+            out["already"] += 1
+            continue
+        if feedback_of(full.get(key) or {}) >= 0:
+            continue
+        picked.append(key)
+        if not dry_run:
+            try:
+                _write_tags(storage, key,
+                            ",".join(_add_tag(tags, DEMOTE_CANDIDATE_TAG)),
+                            "tiering.signal_nominate")
+            except Exception as e:      # noqa: BLE001 —— 单条失败不中断整轮
+                picked.pop()
+                stats["failed"].append({"rule": "signal_nominate", "key": key,
+                                        "reason": type(e).__name__})
+    out["count"] = len(picked)
+    out["keys"] = picked[:DETAIL_KEYS]
+
+
 def _rule_demote(storage: Any, t: Dict[str, Any], *, budget_total: int, used: int,
                  dry_run: bool, stats: Dict[str, Any]) -> None:
-    """压力轨：水位 ≥ warn_ratio ⇒ 按最不活跃提名退居；100% 时强降**恰好 1 条**。"""
+    """信号轨（前置，不看水位）+ 压力轨：水位 ≥ warn_ratio ⇒ 按最不活跃提名退居；
+    100% 时强降**恰好 1 条**（强降仍享 `explicit_core` 豁免）。"""
+    _rule_signal_demote(storage, t, dry_run=dry_run, stats=stats)
     cfg = t["demote_pressure"]
     exempt_on = t["demote_exempt"]["explicit_core"]
     ratio = (used / budget_total) if budget_total > 0 else 0.0

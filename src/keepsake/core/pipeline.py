@@ -26,6 +26,19 @@ superseded_by/superseded_at 时间窗，检索默认只出当前有效。
               UPDATE：新碎片 supersedes=<old>；旧碎片只打 superseded_by 标记
               DELETE：旧碎片 superseded_by='__void__'
 
+# 🔴 常驻层的否决权在人手里（治理拍板）
+
+更新相的候选是 `search_bm25` 全库 top-K，**不排除 `core`** —— 于是「LLM 说这条
+常驻过时了」本来会直接把它 `supersede_fragment` 掉：常驻层是每轮都注入 prompt
+的东西，它的生死不该由一次自动提炼说了算。本模块的处理不是「排除 core」
+（那等于把「这条常驻与新事实冲突」这个**最难得的一手信号**一起扔掉），而是：
+
+  目标带 core 标 + 动作 ∈ {UPDATE, DELETE} ⇒ **不封边**，改打退居建议标 +
+  冲突证据标（`tiering.DEMOTE_CANDIDATE_TAG` / `tiering.EVID_PREFIX:<新事实 key>`，
+  见 `_nominate_core_conflict`）⇒ 转进审核队列「退居建议」，由人裁决。
+  冲突证据（那条新事实）先落库再提名，审核页上看得见「它跟哪条新事实打架」。
+  两个标签的字面量**只在 tiering 一处**（本模块 import，禁复制 —— 见 G5）。
+
 # 故障兜底
 
   * LLM 提取/更新任一调用失败或 JSON 解析失败 → 窗口整体回落 v1 decide() 路径
@@ -49,6 +62,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
+# 常驻层治理的**标签口径**从 tiering 单点 import（core.pipeline → core.tiering
+# 单向；tiering 不 import 本模块，没有环）。理由是 G5 那条单点闸：同一个标在两个
+# 模块各写一份字面量，漂移之后的表现是「班车提了名、审核页按另一半前缀过滤」，
+# 建议凭空消失而没人发现。**依赖方向别反过来**：tiering 反向依赖 pipeline 才是环。
+from .tiering import CORE_TAG, DEMOTE_CANDIDATE_TAG, EVID_PREFIX, tag_list
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
@@ -580,17 +599,22 @@ class Pipeline:
     # 写入 / 封边（不 import redis，全走注入 storage）
     # ------------------------------------------------------------------
 
-    def _do_add(self, fact: Fact) -> None:
-        """ADD：直接写新碎片（category=fact_v2 让消费侧可识别）。
+    def _store_fact(self, fact: Fact) -> Optional[str]:
+        """落一条新事实（ADD / UPDATE / 常驻提名的证据共用），返回它的 key；失败 None。
 
-        R7 接线：写库前先 scrub_secrets（凭据打码源头闸门）。
+        证据必须**先有实体**：常驻否决提名的证据标（EVID_PREFIX + ':' + key）指向这条新事实，
+        而 DELETE 路径原来根本不写库（只封旧）⇒ 走提名时得在这里补一次落库，
+        否则审核页上的证据点开是空的（比没有证据更糟：看起来像编的）。
+
+        R7 接线：写库前先 scrub_secrets（凭据打码源头闸门）；返回值用
+        scrub 后的正文算 key（否则算出来的 key 与库里那条对不上）。
         """
         from .ingest_gate import scrub_secrets
         try:
             scrubbed, _ = scrub_secrets(fact.content)
             content = scrubbed if scrubbed else fact.content
         except Exception as e:
-            logger.debug("pipeline: scrub_secrets failed for ADD: %s; storing raw", e)
+            logger.debug("pipeline: scrub_secrets failed: %s; storing raw", e)
             content = fact.content
         try:
             self._storage.store(
@@ -601,7 +625,70 @@ class Pipeline:
                 fragment_type="memory",
             )
         except Exception as e:
-            logger.warning("pipeline: ADD failed for fact %r: %s", fact.content[:60], e)
+            logger.warning("pipeline: store failed for fact %r: %s", fact.content[:60], e)
+            return None
+        return self._key_for_content(content)
+
+    def _do_add(self, fact: Fact) -> None:
+        """ADD：直接写新碎片（category=fact_v2 让消费侧可识别）。"""
+        self._store_fact(fact)
+
+    # ------------------------------------------------------------------
+    # 常驻否决：管线对 core 的 UPDATE/DELETE 意图**不封边**，转成退居提名
+    # ------------------------------------------------------------------
+
+    def _is_core(self, key: Optional[str]) -> bool:
+        """目标碎片是不是常驻条目（tags 含完整标签 `core`，逗号边界口径同 `tag_list`）。
+
+        读不到（后端异常 / 存储没实现 get_fragment）⇒ **按非 core 放行**：
+        这是治理闸不是存储闸，一次读失败就把正常管线的 UPDATE 全变成提名，
+        等于把「记忆写不进去」换成了「审核队列被灌满」，两个都坏。
+        放行的代价（漏封一次常驻）比另一种代价（管线整体瘫痪）小，且有日志。
+        """
+        if not key:
+            return False
+        try:
+            row = self._storage.get_fragment(key) or {}
+        except Exception as e:
+            logger.warning("pipeline: core 判定读不到 %s（按非 core 放行）: %s", key, e)
+            return False
+        return CORE_TAG in tag_list(row.get("tags"))
+
+    def _nominate_core_conflict(self, core_key: str, *, action: str,
+                                evid_key: Optional[str]) -> bool:
+        """管线判 UPDATE/DELETE、目标是常驻 ⇒ 打退居提名标（带冲突证据），**不封边**。
+
+        为什么不是「直接拒绝」：LLM 说「这条常驻与新事实冲突」是**最难得的一手
+        信号** —— 管线自己找到了矛盾。直接丢掉等于把最有价值的证据扔进垃圾桶。
+        转成提名 + 证据标（EVID_PREFIX:<新事实 key>）交到审核队列，批不批仍然是人的事
+        （「常驻层只由人与审核决定」这条治理拍板一个字没让）。
+
+        幂等：已在退居队列的**不重复打标**（只 warning）—— 一天里同一场对话触发
+        多次也只提一次，队列里也不会堆出 N 条同义建议。
+        """
+        try:
+            row = self._storage.get_fragment(core_key) or {}
+        except Exception as e:
+            logger.warning("pipeline: 常驻提名读不到 %s（放弃提名）: %s", core_key, e)
+            return False
+        tags = tag_list(row.get("tags"))
+        if DEMOTE_CANDIDATE_TAG in tags:
+            logger.info("pipeline: core 冲突已在退居队列，跳过重复提名 core=%s "
+                        "evid=%s action=%s", core_key, evid_key or "-", action)
+            return False
+        new_tags = tags + [DEMOTE_CANDIDATE_TAG]
+        if evid_key:
+            new_tags.append(f"{EVID_PREFIX}:{evid_key}")
+        try:
+            ok = self._storage.update_fragment_fields(core_key, {"tags": ",".join(new_tags)})
+        except Exception as e:
+            logger.warning("pipeline: 常驻提名写标签失败 core=%s: %s", core_key, e)
+            return False
+        # 提名标本身不作为检索词（`tier:` 前缀词不进分词面），改 tags 不重算 tsv
+        # 是既有 `update_fragment_fields` 语义（tiering 打标同款），此处接受。
+        logger.info("pipeline: core 冲突转退居提名 core=%s evid=%s action=%s ok=%s",
+                    core_key, evid_key or "-", action, ok)
+        return True
 
     def _do_update(self, fact: Fact, target_key: Optional[str] = None) -> None:
         """UPDATE：写新碎片 supersedes=<old>；旧碎片 superseded_by=<new>。
@@ -609,48 +696,48 @@ class Pipeline:
         target_key 由 _update_phase 的 LLM 提供（已过 _sane_target 校验）；
         若为 None（LLM 没给 / 幻觉被拒）→ 走 _find_supersede_target（同样过 exists 校验）。
 
-        R7 接线：新碎片写库前 scrub_secrets；supersedes 链路仍用 scrubbed
-        后的内容计算 Redis key（否则新 key 与原 key 不一致，封边断裂）。
+        R7 接线：新碎片写库前 scrub_secrets（见 `_store_fact`）；supersedes 链路仍用
+        scrubbed 后的内容计算 key（否则新 key 与原 key 不一致，封边断裂）。
+
+        🔴 目标是常驻条目时**不封边**，改走退居提名（`_nominate_core_conflict`）。
         """
-        from .ingest_gate import scrub_secrets
         old_key = target_key or self._find_supersede_target(fact.content)
         if not old_key:
             # 找不到候选 → 退化 ADD（避免静默丢）
             self._do_add(fact)
             return
-        try:
-            scrubbed, _ = scrub_secrets(fact.content)
-            content = scrubbed if scrubbed else fact.content
-        except Exception as e:
-            logger.debug("pipeline: scrub_secrets failed for UPDATE: %s; storing raw", e)
-            content = fact.content
-        try:
-            self._storage.store(
-                text=content,
-                tags=self._tags_for(fact),
-                category="fact_v2",
-                source="pipeline_v2",
-                fragment_type="memory",
-            )
-        except Exception as e:
-            logger.warning("pipeline: UPDATE store failed: %s", e)
+        new_key = self._store_fact(fact)
+        if not new_key:
             return
-        new_key = self._key_for_content(content)
-        if new_key:
-            try:
-                # 新碎片加 supersedes 字段（单向留痕，走后端中立接口）
-                self._storage.set_supersedes(new_key, old_key)
-            except Exception as e:
-                logger.debug("pipeline: set supersedes field failed: %s", e)
-            try:
-                self._storage.supersede_fragment(old_key, new_key)
-            except Exception as e:
-                logger.warning("pipeline: supersede_fragment failed: %s", e)
+        # 🔴 常驻否决：目标是 core ⇒ **不封边**，把「新事实 vs 这条常驻」的冲突
+        # 转成退居提名（新事实已入库，正好当证据）。放在 store 之后、supersede
+        # 之前 —— 两个动作互斥且顺序固定（先有证据实体，再提名）。
+        if self._is_core(old_key):
+            self._nominate_core_conflict(old_key, action="UPDATE", evid_key=new_key)
+            return
+        try:
+            # 新碎片加 supersedes 字段（单向留痕，走后端中立接口）
+            self._storage.set_supersedes(new_key, old_key)
+        except Exception as e:
+            logger.debug("pipeline: set supersedes field failed: %s", e)
+        try:
+            self._storage.supersede_fragment(old_key, new_key)
+        except Exception as e:
+            logger.warning("pipeline: supersede_fragment failed: %s", e)
 
     def _do_delete(self, fact: Fact, target_key: Optional[str] = None) -> None:
-        """DELETE：封旧（superseded_by=__void__），不写新事实。"""
+        """DELETE：封旧（superseded_by=__void__），不写新事实。
+
+        🔴 目标是 core 时**例外**：不封边，改走退居提名（见 `_nominate_core_conflict`）；
+        这条路径要把触发性新事实**先落库**（DELETE 原语义不写库），否则证据 key
+        指向一个不存在的条目。
+        """
         old_key = target_key or self._find_supersede_target(fact.content)
         if not old_key:
+            return
+        if self._is_core(old_key):
+            evid_key = self._store_fact(fact)
+            self._nominate_core_conflict(old_key, action="DELETE", evid_key=evid_key)
             return
         try:
             self._storage.supersede_fragment(old_key, VOID_KEY)
