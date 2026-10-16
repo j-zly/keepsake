@@ -109,6 +109,15 @@ export const api = {
   setCoreBudget: (budget, confirm) =>
     http.put('/api/v1/settings/core-budget', { budget, confirm }).then((r) => r.data),
 
+  // ---- 常驻层分级班车（提名 / 自动升 / 压力降）----
+  // 状态：{enabled, last_run, last_stats, budget:{used,total,ratio}, settings}
+  tieringStatus: () => http.get('/api/v1/tiering/status').then((r) => r.data),
+  // 设置开关与阈值：body 装的是 config.json 里 `tiering` 整节（与表单一一对应），
+  // confirm 传**当前生效 enabled** 的字符串 'true'/'false'（开这个开关等于让
+  // 班车每天动常驻层，确认串是「现在是不是开着」而不是条数）。
+  setTiering: (tiering, confirm) =>
+    http.put('/api/v1/settings/tiering', { tiering, confirm }).then((r) => r.data),
+
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
   kbCreateDocument: (payload) =>

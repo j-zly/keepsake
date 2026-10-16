@@ -54,6 +54,7 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/{id}/delete",
     "/api/v1/kb/import",
     "/api/v1/settings/core-budget",
+    "/api/v1/settings/tiering",
 } | AUTH_POST_PATHS
 
 

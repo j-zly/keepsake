@@ -148,6 +148,18 @@ class BulkExportBody(BaseModel):
     format: str = Field("jsonl", pattern="^(jsonl|csv)$")
 
 
+class TieringBody(BaseModel):
+    """`{"tiering": {...}, "confirm": "<当前 enabled>"}` —— 设置分级班车阈值。
+
+    body 装的是 `tiering` **整节**（与 config.json 里的形状逐字相同），而不是
+    摊平成一串顶层键：页面上的表单与配置文件里的节必须长得一样，改一个键不用
+    回来猜它原来在哪一层。
+    """
+
+    tiering: Dict[str, Any] = Field(default_factory=dict)
+    confirm: str = ""
+
+
 # --------------------------------------------------------------------------
 # 拒绝 / 确认的公共闸门
 # --------------------------------------------------------------------------
@@ -781,6 +793,38 @@ CORE_BUDGET_MIN = 1000
 CORE_BUDGET_MAX = 500000
 
 
+def _read_config_or_reject(action: str, target: str) -> Dict[str, Any]:
+    """读 config.json 原始 JSON；读不出 / 不是对象 ⇒ 500（绝不覆盖一份坏配置）。
+
+    **写配置的两个端点共用这一份**（`settings/core-budget` 与 `settings/tiering`）：
+    各写一份判据迟早漂一份，而漂移的表现是「把存储后端 / LLM 通道的配置连同坏值
+    一起回写下去」。
+    """
+    path = config.keepsake_config_file()
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        _reject(500, "config_unreadable",
+                f"config.json 读不出来，拒绝覆盖（{path}: {e}）", action, target)
+    if not isinstance(raw, dict):
+        _reject(500, "config_not_object",
+                f"config.json 顶层不是 JSON 对象，拒绝覆盖：{path}", action, target)
+    return raw
+
+
+def _write_config_or_reject(new: Dict[str, Any], action: str, target: str) -> None:
+    """把整份配置写回去；写失败 ⇒ 500（备份已经落盘，可人工回退）。"""
+    path = config.keepsake_config_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as e:
+        _reject(500, "config_write_failed", f"config.json 写失败：{e}", action, target)
+
+
 @router.put("/api/v1/settings/core-budget",
             dependencies=[Depends(require_session), Depends(write_guard)])
 def set_core_budget(body: CoreBudgetBody) -> Dict[str, Any]:
@@ -808,36 +852,134 @@ def set_core_budget(body: CoreBudgetBody) -> Dict[str, Any]:
     _need_text(body.confirm, str(current), action, target,
                f"当前生效预算 {current}")
 
-    path = config.keepsake_config_file()
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            _reject(500, "config_unreadable",
-                    f"config.json 读不出来，拒绝覆盖（{path}: {e}）", action, target)
-        if not isinstance(raw, dict):
-            _reject(500, "config_not_object",
-                    f"config.json 顶层不是 JSON 对象，拒绝覆盖：{path}", action, target)
-    else:
-        raw = {}
+    raw = _read_config_or_reject(action, target)
     backup = audit.backup_json(f"config.core-budget.{audit.stamp()}.json", raw)
 
     new = dict(raw)                                  # 顶层保序
     retrieval = dict(new.get("retrieval") or {})     # 节内也保序
     retrieval["core_char_budget"] = int(body.budget)
     new["retrieval"] = retrieval
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
-    except OSError as e:
-        _reject(500, "config_write_failed", f"config.json 写失败：{e}", action, target)
+    _write_config_or_reject(new, action, target)
     config.forget_core_budget_cache()   # 同尺寸改值时指纹可能不变 ⇒ 主动失效
 
     audit.record(action, target, ok=True,
-                 reason=f"{current} -> {body.budget}; backup={backup}; path={path}")
+                 reason=f"{current} -> {body.budget}; backup={backup}; "
+                        f"path={config.keepsake_config_file()}")
     return {"ok": True, "action": action, "budget": int(body.budget),
-            "path": str(path), "backup": backup}
+            "path": str(config.keepsake_config_file()), "backup": backup}
+
+
+# --------------------------------------------------------------------------
+# 分级班车（core tiering）：只读状态 + 设置开关/阈值
+# --------------------------------------------------------------------------
+
+#: 状态端点带回的固定文案。**默认关死**这件事不许只写在代码注释里 ——
+#: 看板与设置页都要能看到「机制已上线但默认没开」这件事本身。
+TIERING_DISABLED_NOTE = (
+    "分级班车默认关闭（config 缺 tiering 节 / enabled=false 即缺省关）："
+    "上线≠机制启动，先用 scripts/tiering_cron.py --dry 观察几天，"
+    "看清 stats 再在这里打开总开关。"
+)
+
+
+def _tiering_settings() -> Dict[str, Any]:
+    """当前生效的 `tiering` 节（读 config.json；读不出 ⇒ 缺省，即全关）。
+
+    路径走 `config.keepsake_config_file()`（与 PUT 写的是同一个文件），
+    只读端点绝不能因为配置坏了就 500 —— 看板要照常显示「默认关」。
+    """
+    from keepsake.core import tiering as tiering_mod
+
+    return tiering_mod.resolve_tiering(_read_config_quiet())
+
+
+def _read_config_quiet() -> Dict[str, Any]:
+    """config.json 原始 JSON；读不出 / 不是对象 ⇒ `{}`（**不抛**，只读面用）。"""
+    try:
+        raw = json.loads(config.keepsake_config_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+@router.get("/api/v1/tiering/status", dependencies=[Depends(require_session)])
+def tiering_status(storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """分级班车状态（**只读端点**：不挂 `write_guard`）。
+
+    `{enabled, last_run, last_stats, budget:{used,total,ratio}}`。
+    * `budget` 与 `GET /api/v1/core/stats` 同源同口径（同一原语 `list_by_tag("core")`
+      + 同一个预算函数），页面上的占用率与注入截断永远同口径；
+    * `last_run` / `last_stats` 来自班车状态文件（`scripts/tiering_cron.py` 写的）。
+      **从没跑过 ⇒ 两个都是 null / 空**，不是「上次成功」—— 一次没跑过的班车
+      不能显示成绿灯。
+    """
+    from keepsake.core import tiering as tiering_mod
+
+    t = _tiering_settings()
+    rows = list(storage.list_by_tag(CORE_TAG))
+    used = sum(len(str(r.get("content", "") or "")) for r in rows)
+    total = config.core_char_budget()
+    state = tiering_mod.read_state()
+    return {
+        "enabled": bool(t["enabled"]),
+        "note": "" if t["enabled"] else TIERING_DISABLED_NOTE,
+        "last_run": state.get("last_run") or None,
+        "last_dry_run": bool(state.get("dry_run", True)),
+        "last_stats": _stats_body(state),
+        "settings": t,
+        "budget": {
+            "used": used,
+            "total": total,
+            "ratio": round(used * 100.0 / total, 2) if total > 0 else 0.0,
+        },
+    }
+
+
+def _stats_body(state: Dict[str, Any]) -> Dict[str, Any]:
+    """状态文件里给看板看的那部分（去掉 last_run / 路径等自述字段）。"""
+    return {k: v for k, v in state.items()
+            if k not in ("last_run", "state_file", "enabled", "dry_run")}
+
+
+@router.put("/api/v1/settings/tiering",
+            dependencies=[Depends(require_session), Depends(write_guard)])
+def set_tiering(body: TieringBody) -> Dict[str, Any]:
+    """设置分级班车的开关与阈值（写 config.json 的 `tiering` 一节）。
+
+    与 `set_core_budget` **同一套纪律**：只动这一节、其余键与键序不变
+    （`dict(raw)` 浅拷贝后赋值，已存在的键不换位）；写前把原 config 整份备份进
+    审计备份目录，写不成功 ⇒ 一条都不写；必须打 `write_guard`（第一次改的是
+    进程外的文件）。
+
+    🔴 **confirm = 当前生效 enabled 的字符串 `"true"` / `"false"`**：这个开关决定
+    班车每天会不会动常驻层，回退它的影响面是整个常驻层，所以确认串是「现在是不是
+    开着」而不是「条数」（条数在另一张卡上，不防这种手滑）。
+
+    非法值 **400**（不回落）：手改 config.json 才是「回落缺省 + warning」那层
+    容错；控制台提交是机器输入，半截阈值绝不许落盘（判据与缺省表在
+    `keepsake.core.tiering.validate_tiering`，与班车读配置用的是同一份 schema）。
+    """
+    from keepsake.core import tiering as tiering_mod
+
+    action, target = "settings.tiering", "tiering"
+    try:
+        clean = tiering_mod.validate_tiering(body.tiering)
+    except ValueError as e:
+        _reject(400, "invalid_tiering", f"tiering 配置不合法：{e}", action, target)
+    current = bool(_tiering_settings()["enabled"])
+    _need_text(body.confirm, str(current).lower(), action, target,
+               f"当前生效的 enabled（{str(current).lower()}）")
+
+    raw = _read_config_or_reject(action, target)
+    backup = audit.backup_json(f"config.tiering.{audit.stamp()}.json", raw)
+    new = dict(raw)                          # 顶层保序
+    new["tiering"] = clean                   # 节内由 validate_tiering 补齐成完整一份
+    _write_config_or_reject(new, action, target)
+
+    audit.record(action, target, ok=True,
+                 reason=f"enabled={current} -> {clean['enabled']}; backup={backup}")
+    return {"ok": True, "action": action, "enabled": clean["enabled"],
+            "tiering": clean, "backup": backup}
 
 
 # --------------------------------------------------------------------------

@@ -479,7 +479,7 @@ def test_写面仍是十六条业务写端点加三条auth_POST():
         "/api/v1/ops/bulk", "/api/v1/ops/bulk-export",
         "/api/v1/kb/documents", "/api/v1/kb/documents/{id}/update",
         "/api/v1/kb/documents/{id}/delete", "/api/v1/kb/import",
-        "/api/v1/settings/core-budget",
+        "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
     }, sorted(write)
 
 
@@ -495,7 +495,8 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/fragments/{key}/delete", "/api/v1/import",
                  "/api/v1/ops/merge", "/api/v1/ops/forget", "/api/v1/auth/logout",
                  "/api/v1/auth/me",
-                 "/api/v1/settings/core-budget", "/api/v1/import/template",
+                 "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
+                 "/api/v1/tiering/status", "/api/v1/import/template",
                  "/api/v1/ops/bulk", "/api/v1/ops/bulk-export"}
     for r in app.routes:
         if getattr(r, "path", "") in protected:

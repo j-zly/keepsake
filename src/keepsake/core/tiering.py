@@ -1,0 +1,719 @@
+"""常驻层自动分级班车（core tiering）—— 提名 / 自动升 / 压力降 三条规则。
+
+调度**不在本文件**：`run_tiering()` 只跑一轮、纯同步、无线程无定时器；
+每天的 cron 由 `scripts/tiering_cron.py` 发起（挂 cron 是运维接线的事，本模块不碰）。
+
+## 🔴 默认关死
+
+`tiering.enabled` **缺省 false**，缺这一节 / `enabled=false` ⇒ `run_tiering()`
+第一行就返回 `{"skipped": "disabled"}`，**一条都不写**（连状态文件都不碰）。
+上线 ≠ 机制启动：观察期用 `--dry`（`enabled=true` + dry）人肉跑几天，
+看清 stats 再由人在设置弹框里开总开关。这是本单的第一条红线。
+
+## 命中数据为什么对全库一视同仁（别误以为要按 agent 分域）
+
+命中打点（`storage.record_hits`）在 **primary（主脑）检索**里同样产生 ——
+主脑每轮注入前的那次 prefetch 检索，召回了什么就记什么。所以：
+「升提名只统计非 primary 可检索域」这个问题**不成立**，本模块也不按 agent 分域。
+提名对全库一视同仁，「别把我的手写常驻记忆降掉」这件事由 `is_explicit_core()`
+豁免判据挡（见下），而不是靠分域。
+
+## 三条规则
+
+1. **升提名**：检索层条目（非 `core`、非已带 `core_candidate`）在
+   `promote_nominate.window_days` 内命中 ≥ `min_hits` ⇒ 打 `core_candidate` +
+   `tier:auto-hot:<提名日>`（reason 写进 tags，审核页一眼看出是哪来的申请）。
+   **不新造表**：复用既有候选审核队列。
+2. **升自动通过**：挂着 `core_candidate` 满 `promote_auto.age_days`、且
+   `recent_window_days` 内命中 ≥ `recent_min_hits` ⇒ 自动 promote
+   （与界面批准同一条存储路径 `ops._with_core` + `ops._apply`），摘候选标、
+   加 `tier:auto-promoted` 痕迹。**预算护栏**：`used + len(content) > budget`
+   ⇒ 本轮跳过、留在队列里等下一轮 —— 绝不硬塞。
+3. **降级双轨**：
+   * **压力轨**：`used/budget ≥ warn_ratio` ⇒ 按「最不活跃先走」提名退居候选
+     （`tier:demote-candidate`），降到 `release_ratio` 为止或 `batch_cap` 到顶。
+     排序分 = 近 90 天命中数**升序** → `last_hit` 旧 → `updated` 旧。
+     🟡 **信号弱化注释**：常驻条目绝大多数命中为 0（它们是被**注入**的，不是靠
+     检索召回的），所以「最不活跃」在多数时候退化成「最旧的那条」——
+     这是有意的保守：宁可降旧不降新、也不要用一个根本不存在的热度差去排序。
+   * **强降**：占比达 100% 且 `force_at_full` ⇒ 队列里**最尾部的一条**自动 demote。
+     保守到只降 1 条：一次只让水位回到可谈判的区间，其余仍走人工审核。
+   * **豁免**：`demote_exempt.explicit_core` 命中的条目**只进建议、永不自动降**
+     （可被提名、可被人审核掉，但班车不许替主脑决定）；自动升进来的
+     （`tier:auto-promoted`）**不豁免** —— 它是机器放进来的，机器也该能请出去。
+
+## 为什么降级建议**不进** `retrieval.exclude_tags`（与晋升候选方向相反）
+
+主脑检索出口默认排除 `core_candidate`（未审的晋升候选会污染注入、还会抢召回）。
+`tier:demote-candidate` 恰恰**不排除**：降级建议存在的意义就是「提醒主脑这条
+常驻在吃预算、建议退位」，藏进排除区它就永远没人看得见 —— 一个没人看得见的
+提醒等于没有提醒。两个方向处理不同，是刻意的，不是漏配。
+
+## 写路径纪律
+
+升/降/打标**一律**经既有单条路径（`api/routers/ops.py` 的 `_with_core` /
+`_apply`，隐含「写前备份 + 写后回读 + 审计」）：本模块**不自拼 UPDATE SQL**、
+不自己开 PG 连接（G4 静态闸）。层次上 `core` 反向 `import api` 看着别扭，
+但在这里让「打标签的语义只有一份」比层次洁癖重要 —— 那是防漂移的唯一办法。
+（`api.routers.ops` 也不 import 本模块的写路径，只用它的**配置 schema**，
+没有环。）
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("keepsake.core.tiering")
+
+# --------------------------------------------------------------------------
+# 标签与阈值常量
+# --------------------------------------------------------------------------
+
+#: 常驻标签（与 `adapters/hermes/provider.py::_CORE_TAG`、`api/routers/core.py`
+#: 同名字面量）。三处任一改动都必须三处一起改，否则「打上了但注入排不掉」。
+CORE_TAG = "core"
+
+#: 晋升候选标（与 `provider.CORE_CANDIDATE_TAG` 同名）：子代理写 core 被降级后的
+#: 待审层，**复用既有候选审核队列**，本模块不新造表。
+CANDIDATE_TAG = "core_candidate"
+
+#: 退居建议标（压力轨提名）。**刻意不是 `core_candidate`** —— 那是晋升方向的
+#: 徽标，混进同一个队列会让审核页分不清「批准=升常驻」还是「批准=降常驻」。
+DEMOTE_CANDIDATE_TAG = "tier:demote-candidate"
+
+#: 晋升提名标前缀，**带提名日**：`tier:auto-hot:2026-10-16`。
+#: 为什么要日期：规则二判「挂了候选标满 age_days」，而打标签**不动**条目时间戳
+#: （`update_fragment_fields` 不刷 `updated`；PG 侧压根没有 `updated_at` 列）。
+#: 没有一个跨后端可读的「打标时刻」，就没有跨后端可比的「挂多久了」。
+#: 审核页显示成「auto-hot · 2026-10-16」，顺带回答「这条是谁、什么时候提的」。
+AUTO_HOT_PREFIX = "tier:auto-hot"
+
+#: 自动升进来的痕迹（压力轨**不豁免**它们，见模块 docstring 规则 3）。
+AUTO_PROMOTED_TAG = "tier:auto-promoted"
+
+#: `explicit_core` 豁免判据的三个信号（判据本体见 `is_explicit_core`）：
+EXEMPT_TAG = "memory"        # Hermes 显式写 core 时 tags 恒含它（provider `_core_write`）
+DISTILL_TAG = "auto-distill" # 提炼产物恒含它 ⇒ 非人手写
+AGENT_PREFIX = "agent:"      # 第三方域（子代理）⇒ 非主脑手写
+
+#: 阈值缺省（= config 里 `tiering` 节写不写都一样；见模块 docstring）
+DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "promote_nominate": {"window_days": 7, "min_hits": 5},
+    "promote_auto": {"age_days": 15, "recent_window_days": 7, "recent_min_hits": 2},
+    "demote_pressure": {"warn_ratio": 0.90, "release_ratio": 0.80, "force_at_full": True},
+    "demote_exempt": {"explicit_core": True},
+    "batch_cap": 50,
+}
+
+#: 各值域（校验与回落用同一份，PUT 与读配置两条路径不许各写一套区间）
+BOUNDS = {
+    "window_days": (1, 365, int),
+    "min_hits": (1, 100000, int),
+    "age_days": (1, 3650, int),
+    "recent_window_days": (1, 365, int),
+    "recent_min_hits": (1, 100000, int),
+    "warn_ratio": (0.01, 1.0, float),
+    "release_ratio": (0.0, 1.0, float),
+    "batch_cap": (1, 10000, int),
+}
+
+#: 压力轨的排序窗口（命中数 / last_hit 都看这么远）。90 天 = 打点事件的保留期，
+#: 超过这个窗口连事件都被 prune 了，再往回看只会读到「更早但已删」的假冷。
+PRESSURE_WINDOW_DAYS = 90
+
+#: stats 明细里最多回带多少个 key（够人核账，又不至于把日志撑爆）。
+DETAIL_KEYS = 20
+
+#: 规则一要拉多宽的热榜（`hits_stats` 的 limit）。取 batch_cap 的 10 倍：候选层
+#: 绝大多数会被「已是 core / 已带候选标」筛掉，10 倍余量够筛完又不至于全表扫。
+HOT_SCAN_FACTOR = 10
+HOT_SCAN_MIN = 500
+
+#: `hits_stats(keys=…)` 一次最多塞多少个 key（SQLite 的参数上限 999，留一半余量；
+#: 超过就分块问，见 `_hits_by_key`）。
+HITS_KEY_CHUNK = 400
+
+
+# --------------------------------------------------------------------------
+# 配置：读（容错回落）/ 写（严格拒绝）
+# --------------------------------------------------------------------------
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    """布尔解析：只认真布尔与 `true/1/yes/on`（大小写不敏感）的字符串。
+
+    🟡 **数字不认**（`enabled: 1` 到底是开还是关不该猜），其它一律回落缺省 ——
+    对 `enabled` 来说回落就是 `false`，也就是「关」：把一个看不懂的值猜成
+    「开」，等于让班车在用户没说要开的时候每天动常驻层。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _parse_num(value: Any, name: str, default: Any) -> Any:
+    """数值解析 + 值域校验；非法 ⇒ warning + 回落缺省（风格同 `exclude_tags`）。
+
+    **键缺省不走这条路**（`value is None` 静默回落）：「没配」是正常状态，
+    为它 warning 一次会让每次读配置都刷一屏噪音，噪音里真正的非法值反而看不见了。
+    """
+    lo, hi, kind = BOUNDS[name]
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        logger.warning("keepsake: tiering.%s=%r 非法，回落 %r", name, value, default)
+        return default
+    try:
+        n = kind(value)
+    except (TypeError, ValueError):
+        logger.warning("keepsake: tiering.%s=%r 非法，回落 %r", name, value, default)
+        return default
+    if not (lo <= n <= hi):
+        logger.warning("keepsake: tiering.%s=%r 越界(%s~%s)，回落 %r",
+                       name, value, lo, hi, default)
+        return default
+    return n
+
+
+def _section(raw: Any, name: str) -> Dict[str, Any]:
+    """取 `tiering` 的子节；不是 dict 一律当空节（配置坏了不该让班车崩）。"""
+    if not isinstance(raw, dict):
+        return {}
+    sub = raw.get(name)
+    return sub if isinstance(sub, dict) else {}
+
+
+def resolve_tiering(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """从 config dict（整份 config.json）解析出**完整**的 `tiering` 节。
+
+    任何缺失 / 非法值都回落缺省并 warning（风格照 `retrieval.exclude_tags`）：
+    配置坏了的代价是「按缺省跑」，不是「班车崩掉」。
+    `enabled` 是总开关，**非法值回落 false**（回落成 true 才是事故）。
+    """
+    raw = _section(config if isinstance(config, dict) else {}, "tiering")
+    pn = _section(raw, "promote_nominate")
+    pa = _section(raw, "promote_auto")
+    dp = _section(raw, "demote_pressure")
+    de = _section(raw, "demote_exempt")
+    return {
+        "enabled": _parse_bool(raw.get("enabled"), DEFAULTS["enabled"]),
+        "promote_nominate": {
+            "window_days": _parse_num(pn.get("window_days"), "window_days",
+                                      DEFAULTS["promote_nominate"]["window_days"]),
+            "min_hits": _parse_num(pn.get("min_hits"), "min_hits",
+                                   DEFAULTS["promote_nominate"]["min_hits"]),
+        },
+        "promote_auto": {
+            "age_days": _parse_num(pa.get("age_days"), "age_days",
+                                   DEFAULTS["promote_auto"]["age_days"]),
+            "recent_window_days": _parse_num(
+                pa.get("recent_window_days"), "recent_window_days",
+                DEFAULTS["promote_auto"]["recent_window_days"]),
+            "recent_min_hits": _parse_num(pa.get("recent_min_hits"), "recent_min_hits",
+                                          DEFAULTS["promote_auto"]["recent_min_hits"]),
+        },
+        "demote_pressure": {
+            "warn_ratio": _parse_num(dp.get("warn_ratio"), "warn_ratio",
+                                     DEFAULTS["demote_pressure"]["warn_ratio"]),
+            "release_ratio": _parse_num(dp.get("release_ratio"), "release_ratio",
+                                        DEFAULTS["demote_pressure"]["release_ratio"]),
+            "force_at_full": _parse_bool(dp.get("force_at_full"),
+                                         DEFAULTS["demote_pressure"]["force_at_full"]),
+        },
+        "demote_exempt": {
+            "explicit_core": _parse_bool(de.get("explicit_core"),
+                                         DEFAULTS["demote_exempt"]["explicit_core"]),
+        },
+        "batch_cap": _parse_num(raw.get("batch_cap"), "batch_cap",
+                                DEFAULTS["batch_cap"]),
+    }
+
+
+def validate_tiering(payload: Any) -> Dict[str, Any]:
+    """`PUT /api/v1/settings/tiering` 的**严格**校验：非法 ⇒ `ValueError`。
+
+    与 `resolve_tiering` 的容错回落是两层、不是两套判据：
+    * 手改 config.json（人肉写错）→ 回落缺省 + warning，班车照跑；
+    * 走控制台端点（机器提交）→ **400 拒绝**，不许把半截阈值写进配置。
+    未知键一律拒收：写进去就是一条没人读、还会在下回合被规范化悄悄吃掉的垃圾。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("tiering 必须是 JSON 对象")
+    unknown = set(payload) - set(DEFAULTS)
+    if unknown:
+        raise ValueError(f"未知键：{sorted(unknown)}（允许：{sorted(DEFAULTS)}）")
+    out = resolve_tiering({"tiering": payload})
+    # 回落过的值就是非法值：逐键比一遍，命中即拒
+    def _walk(flat: Dict[str, Any], given: Dict[str, Any]) -> None:
+        for name, value in flat.items():
+            raw = given.get(name, "<缺省>")
+            if isinstance(value, dict):
+                _walk(value, raw if isinstance(raw, dict) else {})
+            elif raw != "<缺省>" and raw != value:
+                raise ValueError(f"{name}={raw!r} 非法或越界")
+    _walk(out, payload)
+    for name in ("promote_nominate", "promote_auto", "demote_pressure", "demote_exempt"):
+        if name in payload and not isinstance(payload[name], dict):
+            raise ValueError(f"{name} 必须是 JSON 对象")
+    if out["demote_pressure"]["release_ratio"] > out["demote_pressure"]["warn_ratio"]:
+        raise ValueError("release_ratio 不得大于 warn_ratio（降级水位高于告警水位 ⇒ 永远降不动）")
+    return out
+
+
+# --------------------------------------------------------------------------
+# 豁免判据（钉死的可判据）
+# --------------------------------------------------------------------------
+
+def tag_list(tags: Any) -> List[str]:
+    """逗号串 → 标签数组（去空白、丢空项）。与 ops._tag_list / 前端 splitTags 同口径。"""
+    return [t.strip() for t in str(tags or "").split(",") if t.strip()]
+
+
+def is_explicit_core(tags: Any, *, exempt: bool = True) -> bool:
+    """这条是不是**主脑显式写入**的常驻条目（`demote_exempt.explicit_core` 判据）。
+
+    🔴 判据（三个条件全中才算，写死在这里 + 单测双向钉）：
+      1. tags 里有**完整标签** `memory` —— Hermes `memory` 工具写 core 时 tags 恒为
+         `core,{target}`，target 缺省就是 `memory`（provider `_core_write`）；
+      2. **不含** `auto-distill` —— 自动提炼产物恒带这个标（有则说明是机器写的）；
+      3. **不含** `agent:` 前缀标签 —— 那是子代理的第三方域声明。
+
+    反面（MCP add、控制台新增/导入带 promote）**不豁免**：它们写的 tags 里没有
+    `memory` 标 —— 机器写进来的东西就该能被机器请出去，只有「人自己写的」才享有
+    豁免。`exempt=False` 时整条豁免关掉（配置项本身可关）。
+    """
+    if not exempt:
+        return False
+    ts = tag_list(tags)
+    return EXEMPT_TAG in ts and DISTILL_TAG not in ts and not any(
+        t.startswith(AGENT_PREFIX) for t in ts)
+
+
+# --------------------------------------------------------------------------
+# 小工具：时间 / 标签串 / 状态文件
+# --------------------------------------------------------------------------
+
+def _now_dt(now: Any = None) -> datetime:
+    """本轮的「现在」。**所有 age / 窗口判据都吃这个参数**（别去 monkeypatch 时钟造 flaky）。"""
+    if isinstance(now, datetime):
+        return now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """ISO8601 时刻 → datetime（UTC）；解析不出来返回 None（不是 0 时刻）。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _row_time(row: Dict[str, Any]) -> Optional[datetime]:
+    """条目时间戳（`updated_at` → `updated` → `created`，各后端字段名不同）。"""
+    for field in ("updated_at", "updated", "created"):
+        dt = _parse_ts(row.get(field))
+        if dt:
+            return dt
+    return None
+
+
+def _drop_tag(tags: List[str], tag: str) -> List[str]:
+    return [t for t in tags if t != tag]
+
+
+def _add_tag(tags: List[str], tag: str) -> List[str]:
+    return tags if tag in tags else tags + [tag]
+
+
+def nominated_on(row: Dict[str, Any]) -> Optional[datetime]:
+    """这条的**提名时刻**：`tier:auto-hot:<日期>` 标签上的日期；没有则 None。"""
+    for t in tag_list(row.get("tags")):
+        if t.startswith(AUTO_HOT_PREFIX + ":"):
+            day = _parse_ts(t.rsplit(":", 1)[-1] + "T00:00:00+00:00")
+            if day:
+                return day
+    return None
+
+
+def _age_days(row: Dict[str, Any], now: datetime) -> float:
+    """挂了候选标的天数。
+
+    有提名日标就用它；**没有的（老数据 / 子代理直接打的 `core_candidate`）回落到
+    条目的 `updated_at`/`created`** —— 与条目同生共死，判据偏保守（老条目算挂得久），
+    但绝不因此崩掉或当成刚挂上（那会让老候选第二天集体自动升）。
+    """
+    since = nominated_on(row) or _row_time(row)
+    return (now - since).total_seconds() / 86400.0 if since else -1.0
+
+
+def state_path() -> Path:
+    """班车状态文件（`GET /api/v1/tiering/status` 的 `last_run` / `last_stats` 来源）。
+
+    env `KEEPSAKE_TIERING_STATE` 可改路径；缺省 `~/.keepsake/tiering_last.json`。
+    """
+    env = (os.environ.get("KEEPSAKE_TIERING_STATE") or "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".keepsake" / "tiering_last.json"
+
+
+def write_state(payload: Dict[str, Any]) -> str:
+    """落本轮 stats 状态。**写不成不算失败**（记忆数据没动，只是一行遥测丢了）。"""
+    path = state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as e:      # noqa: PERF203 —— 一条 warning，不许因遥测中止班车
+        logger.warning("keepsake: tiering 状态文件写失败 %s: %s", path, e)
+        return ""
+    return str(path)
+
+
+def read_state() -> Dict[str, Any]:
+    """读状态文件；没有 / 坏 JSON ⇒ `{}`（看板显示「还没跑过」，不是报错）。"""
+    try:
+        raw = json.loads(state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _hits_by_key(storage: Any, keys: List[str], window_days: int) -> Tuple[Dict[str, int], Dict[str, str]]:
+    """一批 key 的窗口命中数 / 最近命中时刻 → `({key: hits}, {key: last_hit})`。
+
+    🔴 **分块问存储层**：三个后端的 `hits_stats(keys=...)` 都把 keys 摊成一条
+    `IN (?,?,…)`，而 SQLite 的参数上限是 999（PG/Redis 同理有上限）。一次把上千个
+    常驻条目的 key 丢过去 ⇒ 查询直接炸 ⇒ 班车一整个跑不起来。常驻层上百条时
+    平时不炸，正是「平时没事、攒够就整轮挂掉」的那种坏，所以这里固定分块。
+    """
+    hits: Dict[str, int] = {}
+    last_hit: Dict[str, str] = {}
+    uniq = [k for k in dict.fromkeys(keys) if k]
+    for i in range(0, len(uniq), HITS_KEY_CHUNK):
+        rows = storage.hits_stats(window_days=window_days, keys=uniq[i:i + HITS_KEY_CHUNK],
+                                  limit=HITS_KEY_CHUNK) or []
+        for row in rows:
+            key = str(row.get("key") or "")
+            if key:
+                hits[key] = int(row.get("hits") or 0)
+                last_hit[key] = str(row.get("last_hit") or "")
+    return hits, last_hit
+
+
+# --------------------------------------------------------------------------
+# 写路径：全部复用 api/routers/ops.py 的单条路径（隐含备份 + 回读 + 审计）
+# --------------------------------------------------------------------------
+
+def _write_tags(storage: Any, key: str, tags: str, action: str) -> None:
+    """打标签（提名 / 摘标）：`ops._apply` —— 局部字段写 + 写后回读校验 + 审计。
+
+    延迟 import：层次上是 `core` 反向引用 `api`（见模块 docstring 末段），
+    延迟引用还顺带保证了 `api.routers.ops` ↔ 本模块之间**没有 import 环**。
+    """
+    from keepsake.api.routers.ops import _apply
+
+    _apply(storage, key, {"tags": tags}, action)
+
+
+def _promote(storage: Any, key: str, action: str, extra: List[str],
+             drop: List[str]) -> None:
+    """升常驻 = 单条 promote 的**存储路径**（`_with_core` + `_apply`）。
+
+    与界面批准 `POST /api/v1/core/{key}/promote` 逐条同款：同标签口径
+    （`core` 放最前）、同备份、同写后回读。`extra`/`drop` 是分级附带的痕迹
+    （`tier:auto-promoted` / 摘 `core_candidate`）—— 合成一次写，不做两趟。
+    """
+    from keepsake.api import audit
+    from keepsake.api.routers.ops import _apply, _with_core
+
+    row = storage.get_fragment(key) or {}
+    tags = tag_list(_with_core(row.get("tags"), True))
+    for t in drop:
+        tags = _drop_tag(tags, t)
+    for t in extra:
+        tags = _add_tag(tags, t)
+    audit.backup_fragment(key, row)      # 备份写不成功 ⇒ 抛，整条不做
+    _apply(storage, key, {"tags": ",".join(tags)}, action)
+
+
+def _demote(storage: Any, key: str, action: str, extra: List[str],
+            drop: List[str]) -> None:
+    """降常驻 = 单条 demote 的存储路径（`_with_core(tags, False)` + `_apply`）。"""
+    from keepsake.api import audit
+    from keepsake.api.routers.ops import _apply, _with_core
+
+    row = storage.get_fragment(key) or {}
+    tags = tag_list(_with_core(row.get("tags"), False))
+    for t in drop:
+        tags = _drop_tag(tags, t)
+    for t in extra:
+        tags = _add_tag(tags, t)
+    audit.backup_fragment(key, row)
+    _apply(storage, key, {"tags": ",".join(tags)}, action)
+
+
+# --------------------------------------------------------------------------
+# 规则一：升提名
+# --------------------------------------------------------------------------
+
+def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
+                   dry_run: bool, stats: Dict[str, Any]) -> None:
+    """窗口内够热 ⇒ 打候选标（进既有审核队列，不直接升常驻）。"""
+    cfg = t["promote_nominate"]
+    cap = t["batch_cap"]
+    limit = max(HOT_SCAN_MIN, cap * HOT_SCAN_FACTOR)
+    hot = storage.hits_stats(window_days=cfg["window_days"], min_hits=cfg["min_hits"],
+                             keys=None, limit=limit) or []
+    keys = [str(r.get("key") or "") for r in hot if r.get("key")]
+    rows = storage.get_fragments_batch(keys) if keys else {}
+    picked: List[str] = []
+    skipped_candidate = 0
+    for key in keys:
+        row = rows.get(key) or {}
+        tags = tag_list(row.get("tags"))
+        if CORE_TAG in tags or CANDIDATE_TAG in tags:
+            skipped_candidate += 1
+            continue
+        if len(picked) >= cap:
+            break
+        picked.append(key)
+        if not dry_run:
+            new_tags = ",".join(_add_tag(tags, CANDIDATE_TAG) + [
+                f"{AUTO_HOT_PREFIX}:{now:%Y-%m-%d}"])
+            try:
+                _write_tags(storage, key, new_tags, "tiering.nominate")
+            except Exception as e:      # noqa: BLE001 —— 单条失败不中断整轮
+                picked.pop()
+                stats["failed"].append({"rule": "nominate", "key": key,
+                                        "reason": type(e).__name__})
+    stats["nominate"] = {"count": len(picked), "keys": picked[:DETAIL_KEYS],
+                         "already": skipped_candidate, "window_days": cfg["window_days"],
+                         "min_hits": cfg["min_hits"], "dry_run": dry_run}
+
+
+# --------------------------------------------------------------------------
+# 规则二：升自动通过（带预算护栏）
+# --------------------------------------------------------------------------
+
+def _rule_auto_promote(storage: Any, t: Dict[str, Any], now: datetime, *,
+                       budget_total: int, used: int, dry_run: bool,
+                       stats: Dict[str, Any]) -> int:
+    """挂够天 + 最近够热 ⇒ 自动升常驻；预算不够就**留在队列里**（绝不硬塞）。
+
+    返回本轮新的占用字符数（`used` 的增量），供规则三接着算水位。
+    """
+    cfg = t["promote_auto"]
+    rows = [r for r in storage.list_by_tag(CANDIDATE_TAG) or [] if r.get("key")]
+    keys = [str(r["key"]) for r in rows]
+    recent = _hits_by_key(storage, keys, cfg["recent_window_days"])[0]
+    used_now = used
+    promoted: List[str] = []
+    held: List[str] = []
+    for row in sorted(rows, key=lambda r: (-recent.get(str(r["key"]), 0), str(r["key"]))):
+        key = str(row["key"])
+        if len(promoted) >= t["batch_cap"]:
+            break
+        if _age_days(row, now) < cfg["age_days"]:
+            continue
+        if recent.get(key, 0) < cfg["recent_min_hits"]:
+            continue
+        length = len(str(row.get("content") or ""))
+        if budget_total > 0 and used_now + length > budget_total:
+            held.append(key)       # 预算护栏：留队列，下轮再试
+            continue
+        if not dry_run:
+            try:
+                _promote(storage, key, "tiering.auto_promote",
+                         extra=[AUTO_PROMOTED_TAG], drop=[CANDIDATE_TAG])
+            except Exception as e:      # noqa: BLE001
+                stats["failed"].append({"rule": "auto_promote", "key": key,
+                                        "reason": type(e).__name__})
+                continue
+        promoted.append(key)
+        used_now += length
+    stats["auto_promote"] = {
+        "count": len(promoted), "keys": promoted[:DETAIL_KEYS],
+        "held_for_budget": len(held), "held_keys": held[:DETAIL_KEYS],
+        "age_days": cfg["age_days"], "recent_min_hits": cfg["recent_min_hits"],
+        "dry_run": dry_run,
+    }
+    return used_now - used
+
+
+# --------------------------------------------------------------------------
+# 规则三：降级（压力轨提名 + 100% 强降 1 条 + 豁免）
+# --------------------------------------------------------------------------
+
+def _pressure_order(rows: List[Dict[str, Any]], hits: Dict[str, int],
+                    last_hit: Dict[str, str]) -> List[Dict[str, Any]]:
+    """「最不活跃先走」排序：近 90 天命中数升序 → last_hit 旧 → updated 旧。
+
+    🟡 **命中数这个信号在常驻层是弱化的**（见模块 docstring 规则 3）：常驻条目是被
+    **注入**的，不是靠检索召回的，绝大多数长期命中为 0 ⇒ 实际多数轮次由后两个键
+    决定顺序。这是刻意的保守：没有真实热度差时，按「旧」总比按「新」安全。
+
+    时间戳**升序**即「越旧越靠前」；解析不出来的记 `-inf`（当作最旧 ——
+    没有时间戳的条目不该因为「排不进去」而被判成最新、永远留在常驻里）。
+    """
+    def _ts_key(value: Any) -> float:
+        dt = _parse_ts(value)
+        return dt.timestamp() if dt else float("-inf")
+
+    return sorted(
+        rows,
+        key=lambda r: (hits.get(str(r.get("key")), 0),
+                       _ts_key(last_hit.get(str(r.get("key")))),
+                       _ts_key(_row_time(r)),
+                       str(r.get("key"))),
+    )
+
+
+def _rule_demote(storage: Any, t: Dict[str, Any], *, budget_total: int, used: int,
+                 dry_run: bool, stats: Dict[str, Any]) -> None:
+    """压力轨：水位 ≥ warn_ratio ⇒ 按最不活跃提名退居；100% 时强降**恰好 1 条**。"""
+    cfg = t["demote_pressure"]
+    exempt_on = t["demote_exempt"]["explicit_core"]
+    ratio = (used / budget_total) if budget_total > 0 else 0.0
+    out: Dict[str, Any] = {"warned": False, "ratio": round(ratio, 4),
+                           "nominated": {"count": 0, "keys": []},
+                           "forced": {"count": 0, "keys": []},
+                           "exempt_held": 0, "dry_run": dry_run}
+    stats["demote"] = out
+    if budget_total <= 0 or ratio < cfg["warn_ratio"]:
+        return
+
+    rows = [r for r in storage.list_by_tag(CORE_TAG) or [] if r.get("key")]
+    keys = [str(r["key"]) for r in rows]
+    hits, last_hit = _hits_by_key(storage, keys, PRESSURE_WINDOW_DAYS)
+    ordered = _pressure_order(rows, hits, last_hit)
+
+    queued = {str(r["key"]): r for r in ordered
+              if DEMOTE_CANDIDATE_TAG in tag_list(r.get("tags"))}
+    # 待退位队列的预期释放量：已经在队列里的那些（等审核），本轮不再重复提名
+    relief = sum(len(str(r.get("content") or "")) for r in queued.values())
+    target = used - cfg["release_ratio"] * budget_total
+    nominated: List[str] = []
+    for row in ordered:
+        if len(nominated) >= t["batch_cap"]:
+            break
+        if relief >= target:
+            break
+        key = str(row["key"])
+        if key in queued or DEMOTE_CANDIDATE_TAG in tag_list(row.get("tags")):
+            continue
+        if is_explicit_core(row.get("tags"), exempt=exempt_on):
+            out["exempt_held"] += 1     # 豁免：可以进建议，但班车不替主脑做主
+        nominated.append(key)
+        relief += len(str(row.get("content") or ""))
+        if not dry_run:
+            tags = _add_tag(tag_list(row.get("tags")), DEMOTE_CANDIDATE_TAG)
+            try:
+                _write_tags(storage, key, ",".join(tags), "tiering.demote_nominate")
+            except Exception as e:      # noqa: BLE001
+                nominated.pop()
+                relief -= len(str(row.get("content") or ""))
+                stats["failed"].append({"rule": "demote_nominate", "key": key,
+                                        "reason": type(e).__name__})
+    out["warned"] = True
+    out["nominated"] = {"count": len(nominated), "keys": nominated[:DETAIL_KEYS],
+                        "release_ratio": cfg["release_ratio"], "batch_cap": t["batch_cap"]}
+
+    # 100% 才强降，且**只降 1 条**：从队列尾部往上找第一条不豁免的。
+    # 「队列」= 本轮之前已在等的 + 本轮刚提名进去的（它们此刻同样在等人审）——
+    # 队列一条都没有时不强降：那等于跳过审核直接动常驻，宁可多占一轮预算。
+    queue_keys = set(queued) | set(nominated)
+    if ratio >= 1.0 and cfg["force_at_full"]:
+        victim = None
+        for row in reversed(ordered):
+            key = str(row["key"])
+            if key not in queue_keys:
+                continue
+            if is_explicit_core(row.get("tags"), exempt=exempt_on):
+                continue
+            victim = row
+            break
+        if victim is not None and not dry_run:
+            key = str(victim["key"])
+            try:
+                _demote(storage, key, "tiering.demote_force",
+                        extra=[], drop=[DEMOTE_CANDIDATE_TAG])
+                out["forced"] = {"count": 1, "keys": [key]}
+            except Exception as e:      # noqa: BLE001
+                stats["failed"].append({"rule": "demote_force", "key": key,
+                                        "reason": type(e).__name__})
+
+
+# --------------------------------------------------------------------------
+# 班车本体
+# --------------------------------------------------------------------------
+
+def budget_total_of(config: Optional[Dict[str, Any]]) -> int:
+    """注入预算字符数（`retrieval.core_char_budget`）。
+
+    🔴 口径与 provider 的 `_core_budget()` **同一个键**：调用方
+    （`scripts/tiering_cron.py`）把整份 config.json **读一次**传进来，
+    预算与 provider 读的是同一个文件里的同一个值 —— 口径仍只有一份，
+    不在这里另存一份常量。键缺失 / 非法 ⇒ 回落 60000（与 provider 同款兜底）。
+    """
+    raw = (config or {}).get("retrieval", {}) if isinstance(config, dict) else {}
+    value = (raw or {}).get("core_char_budget") if isinstance(raw, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return 60000
+    try:
+        n = int(value)
+    except ValueError:
+        return 60000
+    return n if n > 0 else 60000
+
+
+def run_tiering(storage: Any, config: Optional[Dict[str, Any]] = None, *,
+                dry_run: bool = False, now: Any = None) -> Dict[str, Any]:
+    """跑一轮分级班车 → stats dict。**三条规则顺序执行，单条失败不中断整轮**。
+
+    * `enabled=false` ⇒ 第一行返回 `{"skipped": "disabled"}`，**零写**；
+    * `dry_run=True` ⇒ 只算不写（观察期人肉跑；`enabled=true` 但不落任何数据）；
+    * `now` 注入本轮的「现在」，**所有 age / 窗口判据都吃它**（测试别去改时钟）；
+    * 跑完（dry 也算）落一份状态文件给 `GET /api/v1/tiering/status` 读。
+    """
+    t = resolve_tiering(config)
+    if not t["enabled"]:
+        return {"skipped": "disabled", "enabled": False, "dry_run": dry_run,
+                "reason": "tiering.enabled=false（缺省关死；观察期用 --dry 人肉跑，"
+                          "看清 stats 再在设置里开总开关）"}
+    now_dt = _now_dt(now)
+    total = budget_total_of(config)
+    core_rows = [r for r in storage.list_by_tag(CORE_TAG) or [] if r.get("key")]
+    used = sum(len(str(r.get("content") or "")) for r in core_rows)
+
+    stats: Dict[str, Any] = {
+        "enabled": True,
+        "dry_run": bool(dry_run),
+        "now": now_dt.isoformat(),
+        "budget": {"used": used, "total": total,
+                   "ratio": round(used / total, 4) if total > 0 else 0.0},
+        "core_count": len(core_rows),
+        "failed": [],
+    }
+    _rule_nominate(storage, t, now_dt, dry_run=dry_run, stats=stats)
+    used += _rule_auto_promote(storage, t, now_dt, budget_total=total, used=used,
+                               dry_run=dry_run, stats=stats)
+    _rule_demote(storage, t, budget_total=total, used=used, dry_run=dry_run, stats=stats)
+    stats["budget"]["used_after"] = used
+
+    stats["last_run"] = now_dt.isoformat()
+    stats["state_file"] = write_state(stats)
+    return stats

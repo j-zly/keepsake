@@ -52,6 +52,7 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/{id}/delete",
     "/api/v1/kb/import",
     "/api/v1/settings/core-budget",
+    "/api/v1/settings/tiering",
 } | AUTH_POST_PATHS
 
 #: fixture 语料：一部分常驻、一部分普通、一条待归档
@@ -458,8 +459,8 @@ def test_写面只有十六条业务写端点加三条认证POST():
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 19
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 16
+    assert len(ALLOWED_POST_PATHS) == 20
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 17
 
 
 def test_P1只读路由未被写面影响(client):

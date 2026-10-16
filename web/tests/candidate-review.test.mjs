@@ -36,8 +36,14 @@ test('审核区接的是三个既有接口，没有自造第四个', () => {
   for (const call of ['api.fragments(', 'api.promote(', 'api.updateFragment(']) {
     assert.ok(VIEW.includes(call), `MaintenanceView 里没有 ${call}`)
   }
-  // 候选数据源必须是按标签列（tag=core_candidate），不是全文检索
-  assert.match(VIEW, /api\.fragments\(\{\s*tag: CANDIDATE_TAG/)
+  // 候选数据源必须是按标签列（tag 取自当前审核方向），不是全文检索。
+  // 分级批次加了「方向」后 tag 由 dirTag 决定（promote=core_candidate /
+  // demote=tier:demote-candidate），这里跟的是接线本身，不是某一个字面量。
+  assert.match(VIEW, /api\.fragments\(\{\s*tag: dirTag\.value/)
+  assert.match(
+    VIEW,
+    /const dirTag = computed\(\(\) => \(candDir\.value === 'demote' \? DEMOTE_CANDIDATE_TAG : CANDIDATE_TAG\)\)/,
+  )
   assert.ok(VIEW.includes('core_candidate'), '候选标签常量不见了')
   assert.ok(VIEW.includes('常驻候选'), '区块标题文案不见了')
 })
@@ -91,8 +97,9 @@ test('摘标签只摘完整标签：core_candidate 不误伤 core_candidate_v2 /
 })
 
 test('驳回走的是「只摘候选标」这条路径，不是删条目', () => {
-  // 摘完的标签串交给 updateFragment；content 一个字都不带过去
-  assert.match(VIEW, /api\.updateFragment\(row\.key, \{ tags: dropTag\(row\.tags, CANDIDATE_TAG\) \}\)/)
+  // 摘完的标签串交给 updateFragment；content 一个字都不带过去。
+  // 分级批次后摘的是**当前方向**的标（dirTag），方向两条路都只摘标、都不删条目。
+  assert.match(VIEW, /api\.updateFragment\(row\.key, \{ tags: dropTag\(row\.tags, tag\) \}\)/)
   assert.ok(!/api\.remove\(|api\.archive\(/.test(VIEW), '驳回不许顺带删/归档条目')
 })
 

@@ -25,6 +25,28 @@
       />
     </div>
 
+    <h3 class="section-title">分级班车</h3>
+    <div class="stat-grid">
+      <StatCard
+        label="常驻预算水位"
+        :value="tiering?.budget ? `${tiering.budget.ratio}%` : '-'"
+        :percent="tiering?.budget?.ratio ?? null"
+        :tone="tieringTone"
+        :hint="tiering?.budget ? `已占 ${tiering.budget.used} / ${tiering.budget.total} 字符` : '读取失败'"
+      />
+      <StatCard
+        label="班车状态"
+        :value="tiering ? (tiering.enabled ? '已开' : '默认关') : '-'"
+        :hint="tieringHint"
+      />
+      <StatCard
+        label="上次运行"
+        :value="tieringLastRun"
+        :hint="tiering?.last_run ? (tiering.last_dry_run ? 'dry-run（只算不写）' : '实跑') : '班车还没跑过'"
+      />
+    </div>
+    <div v-if="tieringError" class="banner banner--danger">{{ tieringError }}</div>
+
     <h3 class="section-title">知识库</h3>
     <div class="stat-grid">
       <StatCard label="skill_docs" :value="kb.skill_docs.value" :hint="kb.skill_docs.hint" />
@@ -98,6 +120,30 @@ const cronSource = ref('')
 const loading = ref(false)
 const error = ref('')
 const cronError = ref('')
+const tiering = ref(null)
+const tieringError = ref('')
+
+/**
+ * 班车卡片的水位配色：≥100% danger（水已经溢出，注入在截断）、≥90% accent
+ * （快到告警线，班车下一轮就要提名退位）。口径与 `routers/ops.tiering_status`
+ * 给的 ratio 同一个（percent）。
+ */
+const tieringTone = computed(() => {
+  const r = tiering.value?.budget?.ratio
+  if (typeof r !== 'number') return ''
+  if (r >= 100) return 'danger'
+  if (r >= 90) return 'accent'
+  return 'ok'
+})
+
+const tieringHint = computed(() => {
+  if (!tiering.value) return ''
+  const t = tiering.value
+  if (t.enabled) return `提名 ≥${t.settings.promote_nominate.min_hits} 次/窗口，每轮上限 ${t.settings.batch_cap} 条`
+  return t.note || '总开关关着，班车只算不写'
+})
+
+const tieringLastRun = computed(() => (tiering.value?.last_run ? toLocal(tiering.value.last_run) : '—'))
 
 const budgetTone = computed(() => {
   const p = data.value?.core?.percent
@@ -139,6 +185,14 @@ async function load() {
     cronError.value = c.count ? '' : `没有匹配到记忆类任务（jobs.json：${c.source}）`
   } catch (e) {
     cronError.value = `读取定时任务失败：${e.message}`
+  }
+  // 分级班车状态单独读：它挂了就挂这一段，不许把上面两张卡一起拖成报错
+  try {
+    tiering.value = await api.tieringStatus()
+    tieringError.value = ''
+  } catch (e) {
+    tiering.value = null
+    tieringError.value = `读取分级班车状态失败：${e.message}`
   } finally {
     loading.value = false
   }
