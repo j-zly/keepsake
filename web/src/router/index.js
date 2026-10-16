@@ -1,6 +1,7 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
 import { api, getToken } from '../api'
+import AgentsView from '../views/AgentsView.vue'
 import CoreView from '../views/CoreView.vue'
 import FragmentsView from '../views/FragmentsView.vue'
 import KbView from '../views/KbView.vue'
@@ -20,6 +21,7 @@ const routes = [
   { path: '/fragments', name: 'fragments', component: FragmentsView, meta: { title: '检索层' } },
   { path: '/maintenance', name: 'maintenance', component: MaintenanceView, meta: { title: '记忆维护' } },
   { path: '/kb', name: 'kb', component: KbView, meta: { title: '知识库' } },
+  { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理治理' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]
 

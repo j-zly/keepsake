@@ -121,11 +121,13 @@ const ICON = {
   shield: '<path d="M8 1.9 2.9 3.9v3.7c0 3 2.1 5.4 5.1 6.5 3-1.1 5.1-3.5 5.1-6.5V3.9Z"/><path d="m6.1 7.9 1.4 1.4 2.6-2.7"/>',
   broom:
     '<path d="M10.4 2.9 13.1 5.6 8.6 10.1 5.9 7.4Z"/><path d="m6.7 8.2-3.4 3.4 2.4 2.4 3.4-3.4"/><path d="M4.6 13.4h6.8"/>',
+  users:
+    '<circle cx="6.1" cy="5.3" r="2.5"/><path d="M2.1 13.4a4.1 4.1 0 0 1 8 0"/><path d="M10.7 3.3a2.5 2.5 0 0 1 0 4.9"/><path d="M11.7 9.7a4.1 4.1 0 0 1 2.2 3.4"/>',
   logout:
     '<path d="M6.4 2.9H3.6a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.8"/><path d="M10.2 5.5 13.1 8l-2.9 2.5"/><path d="M13.1 8H6.6"/>',
 }
 
-// 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目）· 知识库（知识库）
+// 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（知识库）
 // 看板是总览入口，业界惯例 Overview 置顶，所以它单独成组排第一。
 // 面包屑也从这份结构取，所以两处永远说同一句话（看板页：总览 › 看板）。
 const GROUPS = [
@@ -139,6 +141,7 @@ const GROUPS = [
       { path: '/core', label: '常驻层', icon: ICON.layers },
       { path: '/fragments', label: '记忆条目', icon: ICON.search },
       { path: '/maintenance', label: '记忆维护', icon: ICON.broom },
+      { path: '/agents', label: '代理治理', icon: ICON.users },
     ],
   },
   {

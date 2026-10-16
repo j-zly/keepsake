@@ -129,6 +129,21 @@ export const api = {
   cronEdit: (jobId, schedule) =>
     http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/edit`, { confirm: true, schedule }).then((r) => r.data),
 
+  // ---- 代理治理（agent_registry）：五条全透传，闸门口径照抄后端 ----
+  // approve / exclude 的 confirm 是 `true`；revoke 要**手输 agent_id 前 8 位**；
+  // role 要**手输完整 agent_id**（改的是全库唯一 primary 这件事，不是单个开关）。
+  // 🔴 approve 的响应里带**一次性凭据明文**：只许由页面当场展示转交，
+  // 不许落任何持久面（不进 URL、不进浏览器存储）。
+  listAgents: () => http.get('/api/v1/agents').then((r) => r.data),
+  approveAgent: (agentId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/approve`, { confirm: true }).then((r) => r.data),
+  revokeAgent: (agentId, confirm) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/revoke`, { confirm }).then((r) => r.data),
+  setAgentRole: (agentId, role, confirm) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/role`, { role, confirm }).then((r) => r.data),
+  setAgentExclude: (agentId, exclude) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/exclude`, { confirm: true, exclude }).then((r) => r.data),
+
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
   kbCreateDocument: (payload) =>
