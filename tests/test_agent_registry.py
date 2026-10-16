@@ -570,3 +570,82 @@ def test_pg_库里没有明文凭据(pg_registry):
     assert row["credential_hash"] == hash_credential(credential)
     assert credential not in json.dumps(row, ensure_ascii=False)
     assert os.environ.get("KEEPSAKE_PG_DSN", "") == ""    # 凭据只来自文件，不来自环境
+
+
+# --------------------------------------------------------------------------
+# ⑧ 主脑路径的活动计数（provider 侧挂点）
+# --------------------------------------------------------------------------
+
+def _provider_with_registry(tmp_path, agent_id: str):
+    """一个**已装配注册表**的 provider（不跑完整 initialize：那条要连 Redis/embedding）。
+
+    只摆出 `_storage` / `_registry` / `_agent_id` 三件套 —— 与 `_init_governance`
+    装配完之后的状态同形，够跑读写路径。
+    """
+    from keepsake.adapters.hermes.provider import KeepsakeProvider
+    from keepsake.core.sqlite import SqliteStorage
+
+    st = SqliteStorage(path=str(tmp_path / f"{agent_id}.db"))
+    assert st.ensure_index() is True
+    reg = Registry(st)
+    reg.ensure_schema()
+    reg.bootstrap_local(agent_id, agent_id, as_primary=True)   # 主脑本机 bootstrap
+    p = KeepsakeProvider()
+    p._storage = st
+    p._registry = reg
+    p._agent_id = agent_id
+    return p, reg, st
+
+
+def test_主脑检索路径记read计数(tmp_path):
+    """🔴 主脑每轮都在检索，reads 恒为 0 就是挂点漏了。
+
+    `Registry.touch()` 原先只有 MCP 闸门一个调用点（子代理连上来的那条路）；
+    主脑是同进程直接调 provider、**从不经过 MCP**，所以计数必须在这里自己打。
+    """
+    p, reg, st = _provider_with_registry(tmp_path, "main-brain")
+    try:
+        # 直接经存储层落数据，**不走 provider.add** —— add 自己也会打一次活动，
+        # 而 `touch()` 是 60s 限频的（按 agent_id 计），先把额度用掉就测不出读计数了。
+        st.store("主脑写入的一条记忆")
+        before = reg.get("main-brain")["reads"]
+        p.search("主脑")
+        after = reg.get("main-brain")["reads"]
+        assert after == before + 1, "provider.search() 没有打活动计数"
+    finally:
+        st.close()
+
+
+def test_主脑写入路径记write计数(tmp_path):
+    p, reg, st = _provider_with_registry(tmp_path, "main-brain")
+    try:
+        assert p.add("第二条记忆")
+        row = reg.get("main-brain")
+        assert row["writes"] == 1, "provider.add() 没有打活动计数"
+        assert row["last_seen_at"], "打活动必须顺带刷新 last_seen_at"
+    finally:
+        st.close()
+
+
+def test_写入失败不记write计数(tmp_path):
+    """计数是**落库**活动，不是**尝试**活动：写失败不该把 writes 撑起来。"""
+    p, reg, st = _provider_with_registry(tmp_path, "main-brain")
+    try:
+        def _boom():
+            raise RuntimeError("后端不可达")
+
+        p._require_storage = _boom
+        assert p.add("写不进去的一条") == ""
+        assert reg.get("main-brain")["writes"] == 0
+    finally:
+        st.close()
+
+
+def test_没装配注册表时不记也不崩():
+    """裸实例（`_registry is None`）必须安静跳过 —— 治理不许把对话带崩。"""
+    from keepsake.adapters.hermes.provider import KeepsakeProvider
+
+    p = KeepsakeProvider()
+    p._registry = None
+    p._agent_id = "main-brain"
+    p._touch("read")      # 不抛即通过

@@ -7,6 +7,10 @@
   🔴 凭据纪律（本页唯一不可让步的一条）：明文只放在 cred 这一个 ref 里，
   弹框一关就清（@closed="forget"）。不进 URL、不进浏览器存储、不进日志；
   页面里的复制只到剪贴板为止，转交由人自己走别的渠道。
+
+  🔴 主代理保护：primary 行**不给任何动作按钮**（approve/revoke/role/exclude 全无），
+  只留一句「不可吊销 / 不可排除」。换主的唯一路径是给别的行点「设为主代理」——
+  那次会自动把旧主降级。后端同口径 409，绕开 UI 打 API 也一样被挡。
 -->
 <template>
   <div>
@@ -36,6 +40,44 @@
       {{ pendingCount }} 个代理待审核 —— 在这页批准之前，它们连不上、也写不进任何记忆。
     </div>
 
+    <!-- 搜索 + 分页：与常驻层/知识库同一套 filter-panel 口径（回车查、清空回全量、seq 防串） -->
+    <div class="filter-panel">
+      <div class="filter-title">代理列表</div>
+      <p class="filter-desc">
+        按 agent_id 或名称搜索；清空回全量。🔴 主代理行没有动作按钮 —— 吊销它等于把主脑降级，
+        要换主请用别行的「设为主代理」。
+      </p>
+      <div class="filter-ctl">
+        <el-input
+          v-model="q"
+          class="grow"
+          placeholder="搜索 agent_id 或名称（清空回全量）"
+          clearable
+          @keyup.enter="search"
+          @clear="onClear"
+        >
+          <template #prefix>
+            <span class="search-ico">
+              <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="7" cy="7" r="4.3" />
+                <path d="m10.3 10.3 3.4 3.4" />
+              </svg>
+            </span>
+          </template>
+        </el-input>
+        <el-button type="primary" :loading="loading" @click="search">查询</el-button>
+      </div>
+      <div class="filter-result">
+        <!-- pending_count 是全量口径（后端不随 q 变）：红条上的数永远等于全库待审数 -->
+        <span>共 {{ count }} 个匹配 · 全库待审 {{ pendingCount }} 个 · 每页 {{ pageSize }}</span>
+        <div class="acts">
+          <button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选</button>
+          <button class="ghost-btn" :disabled="loading" @click="load">刷新</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="loading && !agents.length" class="panel pad">
       <el-skeleton :rows="4" animated />
     </div>
@@ -47,7 +89,11 @@
           <path d="M15.4 5.2a3.4 3.4 0 0 1 0 6.4" stroke-linecap="round" />
           <path d="M16.6 14.2a5.8 5.8 0 0 1 4.6 4" stroke-linecap="round" />
         </svg>
-        <p>
+        <!-- 空态三分支：筛选无结果 vs 全库为空，说的不是同一件事 -->
+        <p v-if="dirty">
+          <b>没有匹配到这个词</b>换个更短的 agent_id 或名称试试，或点「清除筛选」回全量列表。
+        </p>
+        <p v-else>
           <b>还没有代理接入过</b>
           让子代理的 MCP 连上来（带上 agent_id 与名称），它就会出现在这里等你审。
         </p>
@@ -94,28 +140,46 @@
         </template>
 
         <template #actions>
-          <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
-          <button
-            v-if="a.status !== 'approved'"
-            class="act-btn"
-            :disabled="busy"
-            @click="ask('approve', a)"
-          >
-            {{ a.status === 'revoked' ? '重新批准' : '批准' }}
-          </button>
-          <template v-if="a.status === 'approved'">
-            <!-- 主代理行不给「设为主代理」：防的就是把自己降了、还没人批 -->
-            <button v-if="a.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask('role', a)">
-              设为主代理
+          <!--
+            🔴 主代理行**只留一句话**，四个动作一个都不给（approve/revoke/role/exclude）：
+            吊销它 = 写闸 fail-closed 把主脑降成 sub，常驻写入全降级、候选链瘫痪；
+            排除它更没有意义（过滤是给别人的看的，它自己每轮就在上下文里）。
+            换主的唯一安全路径是「先把另一个设为主代理」，那次会自动把它降级。
+            后端同口径 409（`_need_not_primary`）—— 这里只是不让人看见那个钮。
+          -->
+          <span v-if="a.role === 'primary'" class="act-note">主代理 · 不可吊销 / 不可排除</span>
+          <template v-else>
+            <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
+            <button
+              v-if="a.status !== 'approved'"
+              class="act-btn"
+              :disabled="busy"
+              @click="ask('approve', a)"
+            >
+              {{ a.status === 'revoked' ? '重新批准' : '批准' }}
             </button>
-            <button class="act-btn" :disabled="busy" @click="ask('exclude', a)">
-              {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
-            </button>
-            <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
+            <template v-if="a.status === 'approved'">
+              <!-- 内层这道 v-if 是本地护栏：外层已经按 role 分流，这里再钉一次 -->
+              <button v-if="a.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask('role', a)">
+                设为主代理
+              </button>
+              <button class="act-btn" :disabled="busy" @click="ask('exclude', a)">
+                {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
+              </button>
+              <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
+            </template>
           </template>
         </template>
       </ItemCard>
     </div>
+
+    <PagerBar
+      :total="count"
+      :page="page"
+      :page-size="pageSize"
+      @update:page="onPage"
+      @update:page-size="onSize"
+    />
 
     <!-- 四个动作共用一个确认框：kind 决定标题 / 后果 / 确认串 / 按钮色（照抄记忆维护页那套） -->
     <ConfirmDialog
@@ -158,11 +222,13 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
+import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { isStale } from '../utils/kb'
 
 /** 状态徽标的显示词；后端给什么就显示什么（未知值也不吞，退回原串）。 */
 const STATUS_TEXT = { approved: '已批准', pending: '待审核', revoked: '已吊销' }
@@ -172,10 +238,19 @@ const loading = ref(true)
 const error = ref('')
 const busy = ref(false)
 
+// 搜索 + 服务端分页（口径照抄 CoreView：回车查、清空回全量、seq 防串）
+const q = ref('')
+const page = ref(1)
+const pageSize = ref(20)
+
 const agents = computed(() => data.value?.items || [])
+/** `count` 是**过滤后**的总数（后端口径），PagerBar 拿它算页数，前端不另算。 */
 const count = computed(() => data.value?.count ?? agents.value.length)
+/** 🔴 待审数恒为全量口径：后端不随 q 变，红条上的数永远等于全库待审数。 */
 const pendingCount = computed(() => data.value?.pending_count || 0)
 const primaryId = computed(() => agents.value.find((a) => a.role === 'primary')?.agent_id || '')
+/** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它。 */
+const dirty = computed(() => !!(q.value || '').trim())
 
 /** approved 走蓝底、pending 红底（此刻它正在被拒，要醒目）、revoked 中性灰。 */
 function chipTone(a) {
@@ -192,20 +267,55 @@ function hintText(a) {
 /** 静默重拉的失败提示：连着几轮都失败只报第一次，免得 10 秒刷一次屏。 */
 let lastErr = ''
 
+// 请求序号：连续改词/翻页时旧响应只丢弃，不覆盖新结果（照抄 CoreView 的收口口径）
+let reqSeq = 0
+
 async function load(silent = false) {
+  const seq = ++reqSeq
   if (!silent) loading.value = true
   try {
-    data.value = await api.listAgents()
+    // q / page / page_size 全透传：过滤与分页在服务端做，匹配语义也在服务端
+    const list = await api.listAgents({
+      q: (q.value || '').trim() || undefined,
+      page: page.value,
+      page_size: pageSize.value,
+    })
+    if (isStale(seq, reqSeq)) return
+    data.value = list
     error.value = ''
     lastErr = ''
   } catch (e) {
+    if (isStale(seq, reqSeq)) return
     // 保留旧数据不清屏：一次抖动不该把正在审的列表抽走
     error.value = `读取代理列表失败：${e.message}`
     if (lastErr !== error.value) showError(error.value)
     lastErr = error.value
   } finally {
-    loading.value = false
+    if (!isStale(seq, reqSeq)) loading.value = false
   }
+}
+
+/** 回车 / 「查询」：改词一律回第 1 页（在第 5 页搜词却停在第 5 页 = 空列表）。 */
+function search() {
+  page.value = 1
+  load()
+}
+
+/** 清空 ✕ / 「清除筛选」：无条件回全量（不是空态），与 CoreView/KbView 同一口径。 */
+function onClear() {
+  q.value = ''
+  search()
+}
+
+function onPage(p) {
+  page.value = p
+  load()
+}
+
+function onSize(s) {
+  pageSize.value = s
+  page.value = 1
+  load()
 }
 
 // 代理侧是「随时在动」的（子代理启动/退出都会改计数），所以列表每 10 秒自拉一次；
@@ -392,6 +502,12 @@ async function doAction(typed) {
 }
 .tip {
   margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.7;
+}
+/* 主代理行的那句说明：不是按钮，是「这里本来该有按钮、但按规矩不给」的人话 */
+.act-note {
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.7;

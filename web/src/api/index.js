@@ -134,7 +134,7 @@ export const api = {
   // role 要**手输完整 agent_id**（改的是全库唯一 primary 这件事，不是单个开关）。
   // 🔴 approve 的响应里带**一次性凭据明文**：只许由页面当场展示转交，
   // 不许落任何持久面（不进 URL、不进浏览器存储）。
-  listAgents: () => http.get('/api/v1/agents').then((r) => r.data),
+  listAgents: (params) => http.get('/api/v1/agents', { params }).then((r) => r.data),
   approveAgent: (agentId) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/approve`, { confirm: true }).then((r) => r.data),
   revokeAgent: (agentId, confirm) =>

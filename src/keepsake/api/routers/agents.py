@@ -13,13 +13,17 @@
 🔴 **凭据纪律**：明文只在 `approve` 的响应体里出现**一次**，之后库里只有 sha256。
 审计 / 备份 / 错误消息里都不许出现明文 —— 本文件没有一处把它写进 `audit.record`
 的 `reason`（那里只写「issued」这类与凭据无关的字样）。
+
+🔴 **现役 primary 的三道闸**（`revoke` / `role` / `exclude` 一律 409）：前端
+不给那三个钮只是「不让人看见」，绕开 UI 直接打 API 一样能点进来 —— 所以同一道
+闸必须在后端再挡一次，判据与理由见 `_need_not_primary`。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from keepsake.govern.registry import (
     ROLE_PRIMARY,
@@ -30,6 +34,7 @@ from keepsake.govern.registry import (
 )
 
 from .. import audit
+from .. import config
 from ..deps import get_storage, require_session
 from ..schemas import AgentItem, AgentList, AgentActionBody, AgentRoleBody
 from .ops import _need_flag, _need_text, _reject, write_guard
@@ -75,13 +80,62 @@ def _backup(action: str, rows: Any) -> str:
     return audit.backup_json(f"agents.{action}.{audit.stamp()}.json", rows)
 
 
+#: 试图动现役 primary 时的回显（前端提示与 409 的 detail 共用这一句口径）。
+PRIMARY_LOCKED_NOTE = (
+    "现役主代理不可直接吊销/降级/排除 —— 先把另一个代理设为主代理，再回来动它。"
+)
+
+
+def _need_not_primary(registry: Registry, agent_id: str, action: str) -> None:
+    """🔴 **现役 primary 的三道闸**（前端不给按钮，这里再挡一次 API）。
+
+    为什么非挡不可：吊销 primary ⇒ 写闸 fail-closed 把它降成 sub ⇒ 主脑的
+    常驻写入全降级成候选、候选审批链没人批；exclude 对 primary 更是没有意义
+    （过滤是给**别人**看的，它自己就在上下文里）。绕过 UI 直接打 API 也一样
+    绕进同一个坑，所以这层必须是后端 —— 前端只负责不让人看见那个钮。
+
+    口径上拦的是「**现役** primary」= `role=primary` 且 `status=approved`：
+    尚未批准的 primary 读写本就全拒，动它不改变任何放行状态，拦下来只会
+    把「还没批准的主代理行」变成一个既不能批也不能改的死格（`approve` 端点
+    本身也不受这道闸管，主代理待审照样能批 —— 见 `approve_agent`）。
+    """
+    row = registry.get(agent_id)
+    if row and row.get("role") == ROLE_PRIMARY and row.get("status") == STATUS_APPROVED:
+        _reject(409, "primary_protected", PRIMARY_LOCKED_NOTE, action, agent_id)
+
+
 @router.get("/api/v1/agents", response_model=AgentList,
             dependencies=[Depends(require_session)])
-def list_agents(storage: Any = Depends(get_storage)) -> AgentList:
-    """注册表全量（`items` + `pending_count`）—— 待审数量是这块面板唯一要盯的数。"""
+def list_agents(
+    q: str = Query("", description="搜索词：agent_id + name 大小写不敏感子串；为空即全量"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
+    storage: Any = Depends(get_storage),
+) -> AgentList:
+    """注册表（`items` + `pending_count`）—— 待审数量是这块面板唯一要盯的数。
+
+    服务端 `q` + 分页（口径照抄 `core.list_core`）：先在全量行上按
+    **agent_id + name** 子串过滤，再切页；`count` 是**过滤后**的总数
+    （前端 PagerBar 拿它算页数，不另算）。
+
+    🔴 `pending_count` 恒为**全量口径**，不受 `q` / `page` 影响：红条上的
+    「N 个待审核」必须永远等于全库待审数 —— 被搜索词吞掉的待审代理只会
+    继续在闸门外被拒，却从红条上消失了，那正是这块面板最不能出的错。
+    """
     registry = _registry(storage)
-    items: List[AgentItem] = [AgentItem(**a) for a in registry.list_agents()]
-    return AgentList(items=items, pending_count=registry.pending_count(), count=len(items))
+    rows = registry.list_agents()
+    needle = q.strip().lower()
+    if needle:
+        rows = [r for r in rows
+                if needle in str(r.get("agent_id", "")).lower()
+                or needle in str(r.get("name", "")).lower()]
+    start = (page - 1) * page_size
+    return AgentList(
+        items=[AgentItem(**a) for a in rows[start:start + page_size]],
+        count=len(rows),
+        # 🔴 全量口径：pending_count 走的是注册表原始计数，不是过滤后的 len(rows)
+        pending_count=registry.pending_count(),
+    )
 
 
 @router.post("/api/v1/agents/{agent_id}/approve",
@@ -111,10 +165,15 @@ def approve_agent(agent_id: str, body: AgentActionBody,
              dependencies=[Depends(require_session), Depends(write_guard)])
 def revoke_agent(agent_id: str, body: AgentActionBody,
                  storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """吊销（随时可做）：凭据哈希一并清掉，旧凭据**立即**作废。"""
+    """吊销（随时可做）：凭据哈希一并清掉，旧凭据**立即**作废。
+
+    🔴 现役 primary 除外 ⇒ 409（见 `_need_not_primary`）：吊销它等于把全库
+    写闸 fail-closed 到 sub，主脑的常驻写入从此全降级、候选链瘫痪。
+    """
     action = "agents.revoke"
     registry = _registry(storage)
     row = _need_agent(registry, agent_id, action)
+    _need_not_primary(registry, agent_id, action)
     _need_text(body.confirm, agent_id[:REVOKE_HINT_LEN], action, agent_id,
                f"agent_id 前 {REVOKE_HINT_LEN} 位（{agent_id[:REVOKE_HINT_LEN]}）")
     backup = _backup("revoke", row)
@@ -131,10 +190,15 @@ def set_agent_role(agent_id: str, body: AgentRoleBody,
 
     确认串 = 完整 agent_id（这道操作改的是全库身份，不是单个代理的开关）。
     改前把**涉及的整份注册表**备份下来（连带降级的那一行也要能人工复原）。
+
+    🔴 现役 primary 除外 ⇒ 409（见 `_need_not_primary`）：直接把现役主脑降成
+    sub 与吊销它是同一个自锁。**先设别人为主**（那条走本端点的另一条路径，
+    它会自动把旧主降级，是设计上唯一安全的换主路径），再回来动它。
     """
     action = "agents.role"
     registry = _registry(storage)
     row = _need_agent(registry, agent_id, action)
+    _need_not_primary(registry, agent_id, action)
     role = (body.role or "").strip().lower()
     if role not in ROLES:
         _reject(400, "bad_role", f"role 只能是 {list(ROLES)}，收到 {body.role!r}",
@@ -153,10 +217,15 @@ def set_agent_role(agent_id: str, body: AgentRoleBody,
              dependencies=[Depends(require_session), Depends(write_guard)])
 def set_agent_exclude(agent_id: str, body: AgentActionBody,
                       storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """「这个代理的条目进不进主脑上下文」开关（退役的 `retrieval.exclude_tags` 的新家）。"""
+    """「这个代理的条目进不进主脑上下文」开关（退役的 `retrieval.exclude_tags` 的新家）。
+
+    🔴 现役 primary 除外 ⇒ 409（见 `_need_not_primary`）：过滤是给**别人**看的，
+    它自己每轮就在上下文里，把主代理自己排除掉没有任何意义只有自锁风险。
+    """
     action = "agents.exclude"
     registry = _registry(storage)
     row = _need_agent(registry, agent_id, action)
+    _need_not_primary(registry, agent_id, action)
     _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改上下文开关')
     backup = _backup("exclude", row)
     changed = registry.set_exclude(agent_id, bool(body.exclude))

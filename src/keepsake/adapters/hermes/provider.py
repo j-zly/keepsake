@@ -1357,12 +1357,15 @@ class KeepsakeProvider(MemoryProvider):
         storage = self._require_storage()
         hits = self._filter_excluded(
             list(storage.search(query.strip(), tag_filter=self._tag_filter)))
+        self._touch("read")      # 活动计数：主脑每轮都在检索，这条路径必须记
         return hits[:limit]
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """按 key 取单条碎片；**确实不存在**返回 None，后端故障抛错。"""
         storage = self._require_storage()
-        return storage.get_fragment(key)
+        row = storage.get_fragment(key)
+        self._touch("read")
+        return row
 
     # ---- 写层（fail-closed）----
 
@@ -1430,6 +1433,28 @@ class KeepsakeProvider(MemoryProvider):
         self._role_cache = {"ts": now, "is_primary": is_primary}
         return is_primary
 
+    def _touch(self, kind: str) -> None:
+        """打活动计数（`reads` / `writes`）—— **本机 provider 侧的记账点**。
+
+        🔴 为什么主脑路径必须自己打（2026-10 计数排查）：`Registry.touch()`
+        原先只有一个调用点 —— MCP 闸门 `server.py:237` 的 `record_activity`。
+        那是**子代理**经 MCP 连上来时的路径；主脑是同进程直接调 provider 的
+        `search()` / `add()`，**从不经过 MCP 闸门**，于是它的 reads/writes 恒为 0
+        （面板上「主代理 0/0」的由来）。挂点补在这里，语义与 MCP 那侧逐字一致。
+
+        三条 fail-open 纪律（与本文件其余注入路径同款）：
+          * 没装配注册表（裸实例 / 单测）⇒ 直接返回；
+          * `touch()` 抛异常 ⇒ 吞掉记日志，**绝不让计数把记忆读写带崩**；
+          * 限频 60s 在 `Registry.touch()` 内部，这里不重复实现。
+        """
+        registry = self._registry
+        if registry is None or not self._agent_id:
+            return
+        try:
+            registry.touch(self._agent_id, kind)
+        except Exception as e:      # noqa: BLE001 —— 计数是遥测，不是账本
+            logger.debug("keepsake: 活动计数失败（忽略）: %s: %s", type(e).__name__, e)
+
     def _apply_write_gate(self, tags: str) -> str:
         """写闸：非 primary 写 `core` 一律降级为 `core_candidate`（多代理治理第二条）。
 
@@ -1479,6 +1504,7 @@ class KeepsakeProvider(MemoryProvider):
         if not ok:
             logger.warning("keepsake: add 未落库（fail-closed，返回空串）")
             return ""
+        self._touch("write")     # 落库成功才记：写失败的尝试不是写入活动
         return self._fragment_key_for(text)
 
     def update(
@@ -1497,18 +1523,24 @@ class KeepsakeProvider(MemoryProvider):
         if not fields:
             return False
         try:
-            return bool(self._require_storage().update_fragment_fields(key, fields))
+            ok = bool(self._require_storage().update_fragment_fields(key, fields))
         except Exception as e:
             logger.warning("keepsake: update(%s) 失败（fail-closed，返回 False）: %s", key, e)
             return False
+        if ok:
+            self._touch("write")
+        return ok
 
     def remove(self, target: str) -> bool:
         """按 key 删除；key 不存在或后端失败返回 False。"""
         try:
-            return bool(self._require_storage().delete_fragments_batch([target]))
+            ok = bool(self._require_storage().delete_fragments_batch([target]))
         except Exception as e:
             logger.warning("keepsake: remove(%s) 失败（fail-closed，返回 False）: %s", target, e)
             return False
+        if ok:
+            self._touch("write")
+        return ok
 
     # ---- 维护层 ----
 
