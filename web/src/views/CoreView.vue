@@ -108,13 +108,6 @@
         <template #time>{{ toLocal(row.updated_at) }}</template>
 
         <div class="pick-row">
-          <el-checkbox
-            class="pick"
-            :model-value="isOn(row.key)"
-            title="勾选这条（可跨页累积）"
-            @change="toggle(row.key)"
-            @click.stop
-          />
           <span class="cell-key">
             <span class="k" :title="row.key">{{ row.key }}</span>
             <button class="copy-btn" title="复制 key" @click.stop="doCopy(row.key)">
@@ -125,6 +118,14 @@
               </svg>
             </button>
           </span>
+          <!-- 勾选框挪到行尾：占最左会把整条 key 右推 ~28px，卡内左基准线与正文/chip/按钮不齐 -->
+          <el-checkbox
+            class="pick"
+            :model-value="isOn(row.key)"
+            title="勾选这条（可跨页累积）"
+            @change="toggle(row.key)"
+            @click.stop
+          />
         </div>
         <p class="card-body" :title="row.content">{{ row.content }}</p>
 
@@ -724,6 +725,12 @@ onMounted(load)
 .pick-row .cell-key {
   flex: 1;
   min-width: 0;
+}
+/* 行尾勾选框：不参与伸缩、不吃 element-plus 自带的 30px 右外边距，
+   贴着 key 行右缘即可（key 过长时由上面的 min-width:0 省略号让位） */
+.pick {
+  flex: none;
+  margin: 0;
 }
 /* 预算格：卡 + 「设置」入口同一列（StatCard 的 hint 是纯字符串，放不下按钮） */
 .budget-cell {

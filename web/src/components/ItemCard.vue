@@ -34,3 +34,35 @@ defineProps({
 })
 defineEmits(['lead'])
 </script>
+
+<style scoped>
+/* 窄卡（网格 3~5 列）下的操作行：按钮要么单行放得下，要么**整组换到下一行**，
+   绝不逐字折成「升常/驻」那种竖排（tokens.css 的 .act-btn 没有 nowrap 兜底）。
+   槽内容是父页编译的（带父页 scope id），scoped 选择器够不着，得 :deep。 */
+.card-foot {
+  /* 极端窄卡下连「查看全文」+按钮组都塞不进一行：整块换行，别把链接压没 */
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.card-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  white-space: nowrap;
+}
+.card-acts {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+:deep(.act-btn) {
+  white-space: nowrap;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+</style>
