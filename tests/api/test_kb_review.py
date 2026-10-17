@@ -35,7 +35,7 @@ from keepsake.api.routers import kb as kb_router
 # 共用 fixture 与建表 DDL（测试库形状与生产同款，含 status / review_meta）
 from test_kb_crud import (                                                    # noqa: F401
     AUTH, CREATE, EXPORT, IMPORT, PG_ONLY, create, docs, kb, legacy_kb,
-    raw, search, seed_skill, snippets, _kb_with,
+    raw, search, seed_skill, snippets, _kb_with, DDL,
 )
 
 #: 「批1 已迁移、批2 还没迁」的老表形状：有 content_type 与 tags、**没有 status /
@@ -137,6 +137,22 @@ def revoked_agent(monkeypatch) -> Iterator[_Reg]:
 def no_status_kb(monkeypatch, tmp_path) -> Iterator[Any]:
     """隔离 schema：批1 已迁移、**status / review_meta 还没迁**（缺列窗口期）。"""
     yield from _kb_with(monkeypatch, tmp_path, DDL_NO_STATUS)
+
+
+#: 生产同款形状：chunks 带 **tsvector** 列（180 库有 `tsv`，走 tsquery 检索路）。
+#: 🔴 91 测试库的默认 DDL 没这根列 ⇒ 测试全走 ILIKE 兜底路，**永远逮不到 tsquery
+#: 参数错位**（批2 首收口时生产实锤过：`[*params, *rank_params]` 把 status 值喂给
+#: tsquery ⇒ 迁移后检索恒 0）。这条 fixture 就是把这个盲区钉进回归网。
+DDL_TSV = DDL + (
+    'ALTER TABLE "{s}".chunks ADD COLUMN tsv tsvector GENERATED ALWAYS AS '
+    "(to_tsvector('simple', coalesce(text, ''))) STORED",
+)
+
+
+@pytest.fixture()
+def tsv_kb(monkeypatch, tmp_path) -> Iterator[Any]:
+    """隔离 schema + chunks.tsv（生产同款检索路径）。"""
+    yield from _kb_with(monkeypatch, tmp_path, DDL_TSV)
 
 
 def pending(client, **params) -> Dict[str, Any]:
@@ -472,6 +488,34 @@ def test_重复提交同一篇不进队列_也不搅已生效那篇(kb, primary_
     assert rmeta(kb, doc["id"]) == {}                       # 台账一个字没多
     assert pending(kb.client)["pending_count"] == 0
     assert search(kb.client, "张三")["items"]                # 照常可检索
+
+
+# ---------------------------------------------------------------- tsvector 检索回归（生产实锤过的错位）
+
+@PG_ONLY
+def test_tsvector路_批准后可检索_参数不错位(tsv_kb, sub_agent):
+    """🔴 生产盲区回归：chunks.tsv 在（tsquery 路径）时，status 谓词的值**不许**被
+    喂给 plainto_tsquery —— 批2 首收口在生产实锤：`[*params, *rank_params]` 顺序
+    与占位符出现顺序（ts_rank 在 SELECT、先于 WHERE）不匹配 ⇒ 迁移后检索恒 0。
+    91 测试库默认无 tsv 列全走 ILIKE，此用例把 tsquery 路径钉进回归网。"""
+    r = tsv_kb.client.post(CREATE, json={"confirm": True, "title": "tsv路探针",
+                                         "content": "ZZPROBEWORD9001 动量因子",
+                                         }, headers=SUB_AUTH)
+    assert r.status_code == 200, r.text
+    doc_id = r.json()["id"]
+    # pending：tsquery 路径也看不见（status 谓词生效）
+    assert search(tsv_kb.client, "ZZPROBEWORD9001")["mode"] == "tsvector"
+    assert search(tsv_kb.client, "ZZPROBEWORD9001")["items"] == []
+    a = tsv_kb.client.post(f"/api/v1/kb/documents/{doc_id}/approve",
+                           json={"confirm": True}, headers=AUTH)
+    assert a.status_code == 200, a.text
+    hits = search(tsv_kb.client, "ZZPROBEWORD9001")
+    assert hits["mode"] == "tsvector"
+    assert [i["doc_id"] for i in hits["items"]] == [doc_id]   # 🔴 批准即检索得到（错位=恒 0）
+    # pending 的另一篇不许漏进来
+    tsv_kb.client.post(CREATE, json={"confirm": True, "title": "tsv路待审",
+                                     "content": "ZZPROBEWORD9002 未审稿"}, headers=SUB_AUTH)
+    assert [i["doc_id"] for i in search(tsv_kb.client, "ZZPROBEWORD9002")["items"]] == []
 
 
 # ---------------------------------------------------------------- 站内手建零回归

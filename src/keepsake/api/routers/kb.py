@@ -378,7 +378,13 @@ def kb_search(
     )
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [*params, *rank_params, page_size, (page - 1) * page_size])
+            # 🔴 占位符顺序 = SQL 文本里的出现顺序：ts_rank(%s) 在 SELECT（第 1 个），
+            # WHERE 的 tsquery(%s) 与 status(%s) 在后 ⇒ 必须 **rank_params 在前**、
+            # params 在后。批2 前两边都是同一个 q、顺序无所谓；批2 往 params 里追加了
+            # status 值后，[*params, *rank_params] 会把 'effective' 喂给 tsquery、
+            # 把 q 喂给 status ⇒ 迁移后生产（有 tsv 列）检索恒 0（91 测试库无 tsv 列
+            # 走 ILIKE 路径，逮不住这个错位 —— 回归判据见 test_kb_review 的 tsvector 用例）。
+            cur.execute(sql, [*rank_params, *params, page_size, (page - 1) * page_size])
             rows = cur.fetchall()
     items = [
         KbHit(chunk_id=str(r["chunk_id"]), doc_id=str(r["doc_id"] or ""),
