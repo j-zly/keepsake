@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.api.routers import kb as kb_router
-from keepsake.kb.ingest import split_chunks
+from keepsake.kb.ingest import chunk_document, link_body, split_chunks
 
 TOKEN = "kbcrud-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -47,8 +47,25 @@ ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 #: 与生产 `keepsake` 库同款 DDL（含 (source_type, source_key) 唯一约束 ——
-#: upsert 的 ON CONFLICT 依赖它）
+#: upsert 的 ON CONFLICT 依赖它）。
+#: 🆕 `content_type text NOT NULL DEFAULT 'note'` —— 与生产迁移后的列**同形状**
+#: （DEFAULT + NOT NULL 都要有：DEFAULT 保证存量 INSERT 不带这列也能落，
+#: NOT NULL 保证 GROUP BY 出来的类型集合是全集而不是一堆 NULL）。
 DDL = (
+    'CREATE SCHEMA "{s}"',
+    'CREATE TABLE "{s}".documents ('
+    ' id bigserial PRIMARY KEY, source_type text NOT NULL, source_key text NOT NULL,'
+    ' content_type text NOT NULL DEFAULT \'note\','
+    ' title text, meta jsonb, content_hash text,'
+    ' updated_at timestamptz NOT NULL DEFAULT now(),'
+    ' UNIQUE (source_type, source_key))',
+    'CREATE TABLE "{s}".chunks ('
+    ' id bigserial PRIMARY KEY, document_id bigint NOT NULL'
+    ' REFERENCES "{s}".documents(id), ord int NOT NULL, text text, source_path text)',
+)
+
+#: 迁移**之前**的老表形状（没有 content_type 列）—— 用来钉「缺列时人话报错不裸崩」
+DDL_NO_CTYPE = (
     'CREATE SCHEMA "{s}"',
     'CREATE TABLE "{s}".documents ('
     ' id bigserial PRIMARY KEY, source_type text NOT NULL, source_key text NOT NULL,'
@@ -58,6 +75,15 @@ DDL = (
     'CREATE TABLE "{s}".chunks ('
     ' id bigserial PRIMARY KEY, document_id bigint NOT NULL'
     ' REFERENCES "{s}".documents(id), ord int NOT NULL, text text, source_path text)',
+)
+
+#: 生产迁移 SQL（与主脑手执行的形状逐字一致；测试跑它来保证幂等 + 真能迁）
+MIGRATE_SQL = (
+    'ALTER TABLE "{s}".documents ADD COLUMN IF NOT EXISTS '
+    'content_type text NOT NULL DEFAULT \'note\'',
+    'UPDATE "{s}".documents SET content_type=\'skill\' '
+    'WHERE source_type IN (\'skill\',\'skill_hk\')',
+    'CREATE INDEX IF NOT EXISTS idx_documents_content_type ON "{s}".documents(content_type)',
 )
 
 
@@ -120,11 +146,21 @@ def test_manual_source_key_内容级幂等():
 @pytest.fixture()
 def kb(monkeypatch, tmp_path) -> Iterator[SimpleNamespace]:
     """隔离 schema 的真库 + 控制台客户端；用完 DROP SCHEMA CASCADE。"""
+    yield from _kb_with(monkeypatch, tmp_path, DDL)
+
+
+@pytest.fixture()
+def legacy_kb(monkeypatch, tmp_path) -> Iterator[SimpleNamespace]:
+    """**迁移之前**的老表（没有 content_type 列）—— 缺列窗口期的读/写行为。"""
+    yield from _kb_with(monkeypatch, tmp_path, DDL_NO_CTYPE)
+
+
+def _kb_with(monkeypatch, tmp_path, ddl) -> Iterator[SimpleNamespace]:
     if not _pg_ready:
         pytest.skip("无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
     schema = f"ks_kb_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(DSN, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
-        for stmt in DDL:
+        for stmt in ddl:
             cur.execute(stmt.format(s=schema))
 
     monkeypatch.setenv("KEEPSAKE_PG_DSN", DSN)
@@ -155,16 +191,25 @@ def raw(kb: SimpleNamespace, sql: str, params: Any = ()) -> List[tuple]:
 
 
 def seed_skill(kb: SimpleNamespace, title: str = "灌入器技能文档") -> int:
-    """手工塞一篇 skill 域文档（模拟灌入器的产物）。"""
+    """手工塞一篇 skill 域文档（模拟灌入器的产物：source_type=skill 且 content_type=skill）。"""
     with psycopg.connect(kb.dsn, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
         cur.execute(f'INSERT INTO "{kb.schema}".documents'
-                    '(source_type, source_key, title, meta, content_hash, updated_at)'
-                    " VALUES ('skill','node/skill/a.md',%s,'{}'::jsonb,'sha:x:a.md',now())"
-                    " RETURNING id", [title])
+                    '(source_type, source_key, title, meta, content_hash, updated_at'
+                    + (", content_type" if _has_ctype(kb) else "")
+                    + ")"
+                    " VALUES ('skill','node/skill/a.md',%s,'{}'::jsonb,'sha:x:a.md',now()"
+                    + (", 'skill'" if _has_ctype(kb) else "")
+                    + ") RETURNING id", [title])
         doc_id = cur.fetchone()[0]
         cur.execute(f'INSERT INTO "{kb.schema}".chunks(document_id, ord, text, source_path)'
                     ' VALUES (%s, 0, %s, %s)', [doc_id, "技能正文", "node/skill/a.md"])
     return doc_id
+
+
+def _has_ctype(kb: SimpleNamespace) -> bool:
+    return bool(raw(kb, "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema='{s}' AND table_name='documents' "
+                        "AND column_name='content_type'"))
 
 
 def create(client: TestClient, title: str, content: str, **kw: Any) -> Dict[str, Any]:
@@ -174,9 +219,11 @@ def create(client: TestClient, title: str, content: str, **kw: Any) -> Dict[str,
     return r.json()
 
 
-def docs(client: TestClient, q: str = "", source_type: str = "") -> Dict[str, Any]:
+def docs(client: TestClient, q: str = "", source_type: str = "",
+         content_type: str = "") -> Dict[str, Any]:
     r = client.get(f"/api/v1/kb/documents?page_size=100" + (f"&q={q}" if q else "")
-                   + (f"&source_type={source_type}" if source_type else ""),
+                   + (f"&source_type={source_type}" if source_type else "")
+                   + (f"&content_type={content_type}" if content_type else ""),
                    headers=AUTH)
     assert r.status_code == 200, r.text
     return r.json()
@@ -600,3 +647,393 @@ def test_导出切片查询的id入参恒为int_不靠驱动隐式适配():
     rows = [json.loads(line) for line in lines]
     assert [r["chunks"] for r in rows] == [["切片甲"], ["切片乙"]]
     assert [r["id"] for r in rows] == ["1", "2"]        # 出参仍是 str
+
+
+# ---------------------------------------------------------------- 内容类型（content_type）
+
+# 纯函数用例（不碰库，任何环境都跑）：切块注册表是「唯一判据来源」
+
+def test_chunk_document_注册表_文本类逐字走split_chunks():
+    """🔴 note/article/skill 的切块必须与 `split_chunks` **一字不差**：
+    分类只是分池子，切块粒度不许趁机改（否则老文档的检索命中会整体漂移）。"""
+    text = "## 第一段\n内容一\n## 第二段\n内容二\n"
+    for ct in ("skill", "note", "article", "image"):
+        assert chunk_document(text, ct) == split_chunks(text), ct
+    assert chunk_document("", "note") == [""]            # 空文兜底仍在
+    assert [len(c) for c in chunk_document("a" * 2500, "note")] == [1200, 1200, 100]
+
+
+def test_chunk_document_link_单块不切正文():
+    """🔴 link = 一条记录一个块：`标题\\nURL\\n摘要`。
+    切碎的后果是命中后半截只有裸 URL、snippet 是断头链接。"""
+    assert chunk_document("一篇讲 PG 的文章", "link",
+                          title="PG 教程", url="https://example.com/pg") == \
+        ["PG 教程\nhttps://example.com/pg\n一篇讲 PG 的文章"]
+    # 摘要可空 ⇒ 省略该行（不留悬空尾巴）
+    assert chunk_document("", "link", title="空摘要", url="https://a.example") == \
+        ["空摘要\nhttps://a.example"]
+    # 再长也不切（刻意为之：链接是一张卡片，不是一篇文档）
+    long_summary = "摘" * 5000
+    assert len(chunk_document(long_summary, "link", title="长", url="https://a.example")) == 1
+
+
+def test_chunk_document_未登记类型退文本_不抛():
+    """脏值/未来新增类型不许把切块整条路炸掉（存量行可能是任何值）。"""
+    assert chunk_document("## 甲\n内容", "future_type") == split_chunks("## 甲\n内容")
+
+
+def test_link_body_逐行拼装_跳过空段():
+    assert link_body("标题", "https://a.example", "摘要") == "标题\nhttps://a.example\n摘要"
+    assert link_body("标题", "https://a.example", "") == "标题\nhttps://a.example"
+
+
+# 落库形状（真库）
+
+@PG_ONLY
+def test_新增_note缺省类型_列表出参带content_type(kb):
+    """不传 content_type ⇒ note（存量行的缺省口径），出参必须带出这根字段
+    （前端 Tab 的判据落在它上面；字段缺席会让分类视图落空）。"""
+    body = create(kb.client, "值班手册", "联系人是张三")
+    assert body["content_type"] == "note"
+    assert docs(kb.client)["items"][0]["content_type"] == "note"
+    assert raw(kb, 'SELECT content_type FROM "{s}".documents WHERE id=%s',
+               [body["id"]]) == [("note",)]
+
+
+@PG_ONLY
+def test_新增_link_单块正文与meta_不抓网页(kb):
+    """link = 标题 + URL + 摘要 存**一块**；meta 存可寻址的 url/summary。
+    🔴 不抓网页：库里不出现任何抓来的正文，只有调用方给的摘要。"""
+    body = create(kb.client, "PG 教程", "一篇讲 PG 的文章",
+                  content_type="link", url="https://example.com/pg")
+    assert body["content_type"] == "link" and body["chunks_count"] == 1
+    assert raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s ORDER BY ord',
+               [body["id"]]) == [("PG 教程\nhttps://example.com/pg\n一篇讲 PG 的文章",)]
+    assert raw(kb, 'SELECT meta FROM "{s}".documents WHERE id=%s',
+               [body["id"]]) == [({"origin": "console", "url": "https://example.com/pg",
+                                   "summary": "一篇讲 PG 的文章"},)]
+
+
+@PG_ONLY
+def test_新增_link_摘要可空_仍单块(kb):
+    body = create(kb.client, "空摘要卡", "", content_type="link", url="https://a.example")
+    assert body["chunks_count"] == 1
+    assert raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s',
+               [body["id"]]) == [("空摘要卡\nhttps://a.example",)]
+
+
+@PG_ONLY
+def test_同名同摘要_手记与链接不撞键不互相改型(kb):
+    """🔴 「类型创建后不可变」在**写路径**也要成立：手记与链接拿同一个
+    标题+摘要时，若内容键只按 `content` 算，两篇会算出同一个 `source_key`，
+    `ON CONFLICT` 撞上就把先建的那篇悄悄改成后建的类型（用户看着「新增成功」，
+    老那篇被改了型）。链接的键必须带上 URL。"""
+    note = create(kb.client, "同一篇", "同一段摘要")
+    link = create(kb.client, "同一篇", "同一段摘要",
+                  content_type="link", url="https://a.example")
+    assert note["id"] != link["id"]
+    got = raw(kb, 'SELECT title, content_type FROM "{s}".documents ORDER BY id')
+    assert got == [("同一篇", "note"), ("同一篇", "link")]
+    # 反过来：先建链接再建手记，同理两行
+    k2 = create(kb.client, "另一篇", "甲", content_type="link", url="https://b.example")
+    n2 = create(kb.client, "另一篇", "甲")
+    assert k2["id"] != n2["id"]
+
+
+@PG_ONLY
+@pytest.mark.parametrize("payload,error", [
+    ({"content_type": "link"}, "url_required"),
+    ({"content_type": "link", "url": "ftp://a.example"}, "bad_url"),
+    ({"content_type": "link", "url": "javascript:alert(1)"}, "bad_url"),
+    ({"content_type": "link", "url": "example.com/pg"}, "bad_url"),
+    ({"content_type": "image"}, "image_not_open"),
+    ({"content_type": "skill"}, "content_type_immutable"),
+    ({"content_type": "wat"}, "bad_content_type"),
+])
+def test_新增_类型与链接校验_400(kb, payload, error):
+    """link 必给合法 url；image 暂未开放；skill 归灌入器；未知类型 400。"""
+    r = kb.client.post(CREATE, json={"confirm": True, "title": "标题",
+                                     "content": "正文", **payload}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == error
+    assert docs(kb.client)["items"] == []          # 被拒的一条都不许落库
+
+
+@PG_ONLY
+def test_新增_link带非法url_正文不入库(kb):
+    r = kb.client.post(CREATE, json={"confirm": True, "title": "标题", "content": "正文",
+                                     "content_type": "link", "url": "http://ok"}, headers=AUTH)
+    assert r.status_code == 200
+    # http:// 是合法形态（只禁 https 之外的伪协议）
+    assert r.json()["content_type"] == "link"
+
+
+@PG_ONLY
+def test_列表按content_type过滤_只回本类型且计数同口径(kb):
+    """过滤口径与 source_type 同款：精确 `= %s`，count 走过滤后总数；
+    与 q 同时给 = AND。"""
+    create(kb.client, "手记一篇", "甲")
+    create(kb.client, "文章一篇", "乙", content_type="article")
+    create(kb.client, "链接一张", "丙", content_type="link", url="https://a.example")
+    seed_skill(kb)
+    notes = docs(kb.client, content_type="note")
+    assert [i["title"] for i in notes["items"]] == ["手记一篇"]
+    assert notes["count"] == 1                       # 不是全库 4
+    assert {i["title"] for i in docs(kb.client, content_type="skill")["items"]} == \
+        {"灌入器技能文档"}
+    assert [i["title"] for i in docs(kb.client, content_type="link")["items"]] == ["链接一张"]
+    # 与 q 同时给 = AND：q 走**标题**（列表接口的口径，不搜正文），
+    # 标题命中但类型不匹配 ⇒ 空
+    assert docs(kb.client, q="一篇", content_type="link")["items"] == []
+    assert [i["title"] for i in docs(kb.client, q="一篇", content_type="note")["items"]] == \
+        ["手记一篇"]
+
+
+@PG_ONLY
+def test_列表content_type过滤_未知值400不静默给全量(kb):
+    """枚举外的值 400（不静默当「全部」—— 那是假装筛过）。"""
+    r = kb.client.get("/api/v1/kb/documents?content_type=wat", headers=AUTH)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "bad_content_type"
+
+
+@PG_ONLY
+def test_类型计数接口_与库里同口径(kb):
+    """Tab 上的计数必须来自库里（前端不写死数字）。"""
+    create(kb.client, "手记一篇", "甲")
+    create(kb.client, "文章一篇", "乙", content_type="article")
+    seed_skill(kb)
+    body = kb.client.get("/api/v1/kb/type-counts", headers=AUTH)
+    assert body.status_code == 200, body.text
+    counts = body.json()["counts"]
+    assert counts == {"note": 1, "article": 1, "skill": 1}
+    assert sum(counts.values()) == docs(kb.client)["count"]
+
+
+@PG_ONLY
+def test_改_按文档自身类型重切_link改摘要仍单块(kb):
+    """🔴 重切分派读**库里那行**的类型，不读请求里的：link 改摘要仍是一块，
+    组合文本三行齐全（URL 不许被改没了）。"""
+    doc = create(kb.client, "PG 教程", "旧摘要",
+                 content_type="link", url="https://example.com/pg")
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update",
+                       json={"confirm": True, "content": "新摘要"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["chunks_count"] == 1 and r.json()["content_type"] == "link"
+    assert raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s',
+               [doc["id"]]) == [("PG 教程\nhttps://example.com/pg\n新摘要",)]
+    # meta 里的 url 保留（没传 url 就不能丢）
+    assert raw(kb, 'SELECT meta FROM "{s}".documents WHERE id=%s',
+               [doc["id"]]) == [({"origin": "console", "url": "https://example.com/pg",
+                                   "summary": "新摘要"},)]
+
+
+@PG_ONLY
+def test_改_link换url_组合文本与meta同步(kb):
+    doc = create(kb.client, "PG 教程", "摘要",
+                 content_type="link", url="https://old.example/pg")
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update",
+                       json={"confirm": True, "url": "https://new.example/pg"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["chunks_count"] == 1
+    assert raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s',
+               [doc["id"]]) == [("PG 教程\nhttps://new.example/pg\n摘要",)]
+    assert raw(kb, 'SELECT meta->>\'url\' FROM "{s}".documents WHERE id=%s',
+               [doc["id"]]) == [("https://new.example/pg",)]
+
+
+@PG_ONLY
+@pytest.mark.parametrize("payload,error", [
+    # 空 URL 串 = 想改 URL 却给不出 ⇒ 400，不许悄悄把地址清空
+    ({"url": "   "}, "url_required"),
+    ({"url": "nope"}, "bad_url"),
+    # 枚举外的类型与「换类型」是两回事，分别给两种错
+    ({"title": "x", "content_type": "wat"}, "bad_content_type"),
+    ({"title": "x", "content_type": "note"}, "content_type_immutable"),
+    # 只传 content_type 什么也没改 ⇒ nothing_to_update
+    ({"content_type": "link"}, "nothing_to_update"),
+])
+def test_改_link参数校验_400(kb, payload, error):
+    doc = create(kb.client, "PG 教程", "摘要",
+                 content_type="link", url="https://example.com/pg")
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update",
+                       json={"confirm": True, **payload}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == error
+    # 一条都不许改（正文块原封不动）
+    assert raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s',
+               [doc["id"]]) == [("PG 教程\nhttps://example.com/pg\n摘要",)]
+
+
+@PG_ONLY
+def test_改_note带url_400(kb):
+    """url 只对 link 有意义：手记上传 url ⇒ 400（不是静默忽略，那会让人以为改成了链接）。"""
+    doc = create(kb.client, "手记一篇", "甲")
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update",
+                       json={"confirm": True, "url": "https://a.example"}, headers=AUTH)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "url_not_allowed"
+
+
+@PG_ONLY
+@pytest.mark.parametrize("want", ["note", "article", "link", "skill", "image", ""])
+def test_改_带异类型400_类型创建后不可变(kb, want):
+    """🔴 类型双挡（后端这层）：请求带 content_type 且与库里不同 ⇒ 400。
+    静默改类型 = 让「这篇是链接」和「切片早已被当长文切过」并存。"""
+    doc = create(kb.client, "值班手册", "联系人是张三")
+    payload = {"confirm": True, "title": "值班手册（新）"}
+    if want:
+        payload["content_type"] = want
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update", json=payload, headers=AUTH)
+    if want in ("note", ""):
+        assert r.status_code == 200, r.text        # 同类型放行（前端编辑弹框回传同值）
+        assert r.json()["content_type"] == "note"
+    else:
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "content_type_immutable"
+        assert docs(kb.client)["items"][0]["title"] == "值班手册"   # 标题也没改
+
+
+@PG_ONLY
+def test_改_note正文_仍按split_chunks重切(kb):
+    """回归：分类不许顺手改切块粒度 —— 超长正文切块数与上期一致。"""
+    doc = create(kb.client, "长文", "# 值班\n" + "内容" * 2000)
+    assert doc["chunks_count"] > 1
+    r = kb.client.post(f"/api/v1/kb/documents/{doc['id']}/update",
+                       json={"confirm": True, "content": "# 值班\n" + "新内容" * 2000},
+                       headers=AUTH)
+    assert r.status_code == 200 and r.json()["chunks_count"] > 1
+    assert len(raw(kb, 'SELECT text FROM "{s}".chunks WHERE document_id=%s',
+                   [doc["id"]])) > 1
+
+
+@PG_ONLY
+def test_导入_条目可带type_默认note(kb):
+    items = [{"title": "A", "content": "正文甲"},
+             {"title": "B", "content": "正文乙", "type": "article"},
+             {"title": "卡", "content": "摘要丙", "type": "link", "url": "https://a.example"}]
+    r = kb.client.post(IMPORT, json={"items": items, "dry_run": False, "confirm": "3"},
+                       headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["added"] == 3
+    got = {i["title"]: i["content_type"] for i in docs(kb.client)["items"]}
+    assert got == {"A": "note", "B": "article", "卡": "link"}
+
+
+@PG_ONLY
+def test_导入_link单块且条目校验与创建同口径(kb):
+    kb.client.post(IMPORT, json={"items": [{"title": "卡", "content": "摘要",
+                                            "type": "link", "url": "https://a.example"}],
+                                 "dry_run": False, "confirm": "1"}, headers=AUTH)
+    rows = raw(kb, 'SELECT text FROM "{s}".chunks ORDER BY ord')
+    assert rows == [("卡\nhttps://a.example\n摘要",)]
+    # 缺 url / 非法 url / image 一律 400（口径与创建端点同款）
+    for item, error in (({"title": "x", "content": "y", "type": "link"}, "url_required"),
+                        ({"title": "x", "content": "y", "type": "link",
+                          "url": "ftp://a"}, "bad_url"),
+                        ({"title": "x", "content": "y", "type": "image"}, "image_not_open"),
+                        ({"title": "x", "content": "y", "type": "skill"},
+                         "content_type_immutable")):
+        r = kb.client.post(IMPORT, json={"items": [item]}, headers=AUTH)
+        assert r.status_code == 400, item
+        assert r.json()["detail"]["error"] == error
+
+
+@PG_ONLY
+def test_导出_每行带content_type(kb):
+    create(kb.client, "手记一篇", "甲")
+    create(kb.client, "链接一张", "摘要", content_type="link", url="https://a.example")
+    seed_skill(kb)
+    rows = [json.loads(line) for line in
+            kb.client.get(EXPORT, headers=AUTH).text.splitlines() if line.strip()]
+    got = {r["title"]: r["content_type"] for r in rows}
+    assert got == {"手记一篇": "note", "链接一张": "link", "灌入器技能文档": "skill"}
+
+
+@PG_ONLY
+def test_检索结果带content_type(kb):
+    """检索命中行要带得出类型（前端切片卡片渲染类型徽标靠它）。"""
+    create(kb.client, "链接一张", "讲讲分页", content_type="link", url="https://a.example")
+    item = next(i for i in search(kb.client, "分页")["items"])
+    assert item["content_type"] == "link"
+    assert item["snippet"].startswith("链接一张\nhttps://a.example")
+
+
+# ---------------------------------------------------------------- 迁移形状 / 缺列防御
+
+@PG_ONLY
+def test_测试DDL与生产迁移同形状_含content_type列(kb):
+    """测试库必须与生产**同形状**（含 NOT NULL + DEFAULT），否则测试是假绿：
+    生产那根列没有 DEFAULT 时，旧灌入器版本的 INSERT 会直接炸。"""
+    cols = raw(kb, "SELECT column_name, is_nullable, column_default"
+                   " FROM information_schema.columns"
+                   " WHERE table_schema='{s}' AND table_name='documents'"
+                   " AND column_name='content_type'")
+    assert cols == [("content_type", "NO", "'note'::text")]
+
+
+@PG_ONLY
+def test_迁移SQL_幂等且真能把老表迁起来(legacy_kb):
+    """🔴 迁移形状探针：隔离 schema 里造一张**没有 content_type 的老表** →
+    跑生产迁移 SQL → 列出现且存量行按来源回填（skill/skill_hk ⇒ skill，其余 ⇒ note）。
+    再跑一遍 ⇒ 幂等不炸。"""
+    assert not _has_ctype(legacy_kb)                       # 起点确实是老表
+    with psycopg.connect(legacy_kb.dsn, autocommit=True, connect_timeout=30) as conn, \
+            conn.cursor() as cur:
+        cur.execute(f'INSERT INTO "{legacy_kb.schema}".documents'
+                    "(source_type, source_key, title) VALUES"
+                    " ('skill','n/s/a.md','技能'),('skill_hk','n/s/b.md','技能手册'),"
+                    " ('manual','manual:x','我手写的')")
+        for stmt in MIGRATE_SQL:                           # 跑两遍：幂等
+            cur.execute(stmt.format(s=legacy_kb.schema))
+            cur.execute(stmt.format(s=legacy_kb.schema))
+    assert _has_ctype(legacy_kb)
+    got = raw(legacy_kb, 'SELECT title, content_type FROM "{s}".documents ORDER BY title')
+    assert got == [("我手写的", "note"), ("技能", "skill"), ("技能手册", "skill")]
+
+
+@PG_ONLY
+def test_缺列_写端点人话报错不裸崩(legacy_kb):
+    """🔴 防「主脑忘了先迁移」的窗口期：老库上新增/导入**不许**拿到 PG 的
+    `column "content_type" does not exist` 裸 500，要给带迁移 SQL 的人话 500。"""
+    for url, body in ((CREATE, {"confirm": True, "title": "t", "content": "c"}),
+                      (IMPORT, {"items": [{"title": "t", "content": "c"}]})):
+        r = legacy_kb.client.post(url, json=body, headers=AUTH)
+        assert r.status_code == 500, (url, r.status_code)
+        detail = r.json()["detail"]
+        assert detail["error"] == "kb_schema_unknown"
+        assert "content_type" in detail["message"] and "ALTER TABLE" in detail["message"]
+
+
+@PG_ONLY
+def test_缺列_读路径降级不炸(legacy_kb):
+    """🔴 老库上只读端点照常跑：列表/检索出参**不带** content_type 键（缺省不假装有值），
+    按类型过滤 400（筛不了就说筛不了），类型计数给空字典（前端不编数字）。"""
+    with psycopg.connect(legacy_kb.dsn, autocommit=True, connect_timeout=30) as conn, \
+            conn.cursor() as cur:
+        cur.execute(f'INSERT INTO "{legacy_kb.schema}".documents'
+                    "(source_type, source_key, title, meta, content_hash) VALUES"
+                    " ('manual','manual:abc','老库手记','{}'::jsonb,'sha:x')")
+        cur.execute(f'INSERT INTO "{legacy_kb.schema}".chunks(document_id, ord, text)'
+                    " VALUES (1, 0, '老库正文')")
+
+    body = docs(legacy_kb.client)
+    assert [i["title"] for i in body["items"]] == ["老库手记"]
+    assert "content_type" not in body["items"][0]          # 键缺席 ≠ 假装是 note
+    hits = search(legacy_kb.client, "老库正文")
+    assert hits["items"] and "content_type" not in hits["items"][0]
+
+    r = legacy_kb.client.get("/api/v1/kb/documents?content_type=note", headers=AUTH)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "kb_schema_unknown"
+    assert legacy_kb.client.get("/api/v1/kb/type-counts", headers=AUTH).json()["counts"] == {}
+
+
+@PG_ONLY
+def test_缺列_导出仍可用_content_type给空串(legacy_kb):
+    """导出不写内容、老库上不该整条端瘫掉（只读端点的降级口径与 source_type 同款）。"""
+    with psycopg.connect(legacy_kb.dsn, autocommit=True, connect_timeout=30) as conn, \
+            conn.cursor() as cur:
+        cur.execute(f'INSERT INTO "{legacy_kb.schema}".documents'
+                    "(source_type, source_key, title, meta, content_hash) VALUES"
+                    " ('manual','manual:abc','老库手记','{}'::jsonb,'sha:x')")
+    rows = [json.loads(line) for line in
+            legacy_kb.client.get(EXPORT, headers=AUTH).text.splitlines() if line.strip()]
+    assert [r["content_type"] for r in rows] == [""]

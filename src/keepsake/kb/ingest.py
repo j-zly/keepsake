@@ -5,6 +5,11 @@
 v3 口径，控制台的写端点（`api/routers/kb.py`）也走这里 —— 两处各切一次块，
 同一篇文档在页面上的切片数和检索命中就会对不上。
 
+**按内容类型切块**（`chunk_document` 注册表）：note/article/skill 逐字走
+`split_chunks`（分类只分池子，不改粒度），link 存单块 `标题\\nURL\\n摘要`
+（一张卡片一条记录，切碎会命中半截裸 URL）。类型分派与切块必须同一个函数，
+否则「link 被切碎」要等到检索命中才看得见。
+
 🔴 **本模块不碰连接、不碰事务、不碰驱动**：`upsert_document` 只往调用方给的
 游标上执行 SQL，提交/回滚由调用方持有（同事务里连带删 chunks 才靠得住）。
 列名/表名走 `names` 覆盖（生产表结构是默认口径；API 侧按探出来的真实列名传）。
@@ -20,6 +25,26 @@ from typing import Any, Dict, List, Optional, Tuple
 #: 手动文档的 source_type。**灌入器的死文档清理只碰 skill/skill_hk，永不碰它**
 #: —— 控制台新增/导入的东西不会被当晚那轮清理扫掉。
 MANUAL_SOURCE_TYPE = "manual"
+
+# --------------------------------------------------------------------------
+# 内容类型（content_type：**分内容类型**，与 source_type 分「来源」是两回事）
+# --------------------------------------------------------------------------
+# 统一一张 documents 表 + 一根 content_type 列：一把尺子切所有内容的后果是
+# 链接卡片被当长文硬切、技能文档与手记混在一个池子里互相淹没。列有 DEFAULT，
+# 存量行不补也能读；新增类型只改这里 + 注册表一行。
+
+CONTENT_TYPE_SKILL = "skill"        # 技能灌入（含 skill_hk 来源），仅灌入器能建
+CONTENT_TYPE_NOTE = "note"          # 手记/粘贴正文（现 manual 语义），界面缺省值
+CONTENT_TYPE_ARTICLE = "article"    # 长文章（结构预留，本期行为与 note 逐字相同）
+CONTENT_TYPE_LINK = "link"          # 链接卡片：URL + 摘要，**不切正文**
+CONTENT_TYPE_IMAGE = "image"        # 图文：枚举占位，创建端点 400（依赖向量路，后置）
+
+#: 全部合法枚举（写面校验与过滤白名单共用这一份）
+CONTENT_TYPES = (CONTENT_TYPE_SKILL, CONTENT_TYPE_NOTE, CONTENT_TYPE_ARTICLE,
+                 CONTENT_TYPE_LINK, CONTENT_TYPE_IMAGE)
+
+#: 缺省类型：存量行与不传 content_type 的调用方一律按手记处理
+DEFAULT_CONTENT_TYPE = CONTENT_TYPE_NOTE
 
 #: 单块字符上限（v3 同值）。中文按字符切，不是按字节。
 MAX_CHUNK_LEN = 1200
@@ -38,6 +63,7 @@ DEFAULT_NAMES: Dict[str, str] = {
     "doc_id": "id",
     "src_type": "source_type",
     "src_key": "source_key",
+    "ctype": "content_type",
     "title": "title",
     "meta": "meta",
     "hash": "content_hash",
@@ -87,6 +113,53 @@ def split_chunks(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
         if p:
             out.append(p)
     return out or [(text or "")[:max_len]]
+
+
+# --------------------------------------------------------------------------
+# 按类型切块（注册表分派）
+# --------------------------------------------------------------------------
+
+def link_body(title: str, url: str, summary: str = "") -> str:
+    """链接卡片的**唯一一块**正文：`标题\\nURL\\n摘要`（摘要可空 ⇒ 省略该行）。
+
+    🟡 **刻意为之**：链接不进 `split_chunks` 的标题分段/硬切 —— 一张卡片是
+    一条记录，硬切出来的后半截是断头链接（"## 标题" 段 + 裸 URL 段），
+    检索命中后 snippet 是半句话。摘要再长也不切（`ponytail:` 上限即调用方
+    应控的摘要长度；要放开就改成按 max_len 切并保留 URL 行作为每块前缀）。
+    """
+    return "\n".join(p for p in (title, url, summary) if p)
+
+
+def _chunker_text(text: str, *, title: str = "", url: str = "") -> List[str]:
+    """skill / note / article 共用：`split_chunks` 逐字不变（article 只是结构预留）。"""
+    return split_chunks(text)
+
+
+def _chunker_link(text: str, *, title: str = "", url: str = "") -> List[str]:
+    """link：单块组合文本，不切正文。"""
+    return [link_body(title, url, text)]
+
+
+#: content_type → 切块策略。新增类型只加一行 + 上面的枚举常量。
+#: 未登记的类型按「文本」处理（存量行/脏值不炸，切块永远有兜底）。
+CHUNK_REGISTRY = {
+    CONTENT_TYPE_SKILL: _chunker_text,
+    CONTENT_TYPE_NOTE: _chunker_text,
+    CONTENT_TYPE_ARTICLE: _chunker_text,
+    CONTENT_TYPE_LINK: _chunker_link,
+    CONTENT_TYPE_IMAGE: _chunker_text,
+}
+
+
+def chunk_document(text: str, content_type: str = DEFAULT_CONTENT_TYPE,
+                   *, title: str = "", url: str = "") -> List[str]:
+    """按内容类型切块（注册表分派）——**写路径唯一的切块入口**。
+
+    灌入器、控制台创建/编辑都走这里（`split_chunks` 只作为注册表里的文本策略
+    出现）：类型分派与切块必须同一个函数，否则「link 被切碎」这种偏差要等到
+    检索命中才看得见。
+    """
+    return CHUNK_REGISTRY.get(content_type, _chunker_text)(text, title=title, url=url)
 
 
 # --------------------------------------------------------------------------
@@ -147,16 +220,22 @@ def chunks_count(cur: Any, schema: str, doc_id: Any,
 
 def replace_chunks(cur: Any, schema: str, doc_id: Any, text: str,
                    *, names: Optional[Dict[str, str]] = None,
-                   source_path: str = "") -> int:
-    """删掉该文档的旧切片 + 按同一 `split_chunks` 整体重插，返回新切片条数。
+                   source_path: str = "",
+                   content_type: str = DEFAULT_CONTENT_TYPE,
+                   title: str = "", url: str = "") -> int:
+    """删掉该文档的旧切片 + 按 `content_type` 整体重插，返回新切片条数。
 
     必须在调用方的事务里（删+插要么都成要么都不成）；`source_path` 写回
     source_key（v3 同款，检索结果里看得出这块来自哪个 key）。
+
+    🔴 **切块走 `chunk_document`（按类型注册表）而不是直接 `split_chunks`**：
+    link 是单块，改文档时也必须仍按 link 单块重存，否则「改个摘要把 URL 切没了」。
     """
     n = _names(names)
     cur.execute(f"DELETE FROM {schema}.{n['chunks']} WHERE {n['chunk_doc']} = %s",
                 [doc_id])
-    rows = [(doc_id, i, c, source_path) for i, c in enumerate(split_chunks(text))]
+    rows = [(doc_id, i, c, source_path)
+            for i, c in enumerate(chunk_document(text, content_type, title=title, url=url))]
     for row in rows:
         cur.execute(f"INSERT INTO {schema}.{n['chunks']}"
                     f"({n['chunk_doc']}, {n['chunk_ord']}, {n['chunk_text']}, {n['chunk_path']}) "
@@ -166,8 +245,9 @@ def replace_chunks(cur: Any, schema: str, doc_id: Any, text: str,
 
 def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
                     title: str, meta: Optional[Dict[str, Any]], content_hash: str,
-                    text: str, names: Optional[Dict[str, str]] = None
-                    ) -> Tuple[str, Any, int]:
+                    text: str, names: Optional[Dict[str, str]] = None,
+                    content_type: str = DEFAULT_CONTENT_TYPE,
+                    url: str = "") -> Tuple[str, Any, int]:
     """按 `(source_type, source_key)` 幂等落一篇文档，返回 `(状态, doc_id, 切片数)`。
 
     状态判据与 v3 同款，三种：
@@ -177,6 +257,10 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     * `updated` ：键在但 hash 变了 ⇒ 改行 + 删旧 chunks + 重插。
 
     `meta` 序列化成 jsonb（v3 同款 `%s::jsonb`）；`updated_at` 交给库里的 `now()`。
+
+    🔴 `content_type` 显式随 INSERT 写死（不走列 DEFAULT）：DEFAULT 只保证
+    **存量/别的写入方**能落，本函数的值是调用方的判断（灌入器=skill、控制台按
+    用户选的类型），靠 DEFAULT 兜底等于把这判断丢掉。
     """
     n = _names(names)
     cur.execute(f"SELECT {n['doc_id']}, {n['hash']} FROM {schema}.{n['documents']} "
@@ -189,17 +273,19 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     cur.execute(
         f"INSERT INTO {schema}.{n['documents']}"
         f"({n['src_type']}, {n['src_key']}, {n['title']}, {n['meta']}, "
-        f"{n['hash']}, {n['updated']}) "
-        f"VALUES(%s, %s, %s, %s::jsonb, %s, now()) "
+        f"{n['hash']}, {n['ctype']}, {n['updated']}) "
+        f"VALUES(%s, %s, %s, %s::jsonb, %s, %s, now()) "
         f"ON CONFLICT ({n['src_type']}, {n['src_key']}) DO UPDATE "
         f"SET {n['title']} = EXCLUDED.{n['title']}, "
         f"{n['meta']} = EXCLUDED.{n['meta']}, "
-        f"{n['hash']} = EXCLUDED.{n['hash']}, {n['updated']} = now() "
+        f"{n['hash']} = EXCLUDED.{n['hash']}, "
+        f"{n['ctype']} = EXCLUDED.{n['ctype']}, {n['updated']} = now() "
         f"RETURNING {n['doc_id']}",
         [source_type, source_key, title,
-         json.dumps(meta or {}, ensure_ascii=False), content_hash])
+         json.dumps(meta or {}, ensure_ascii=False), content_hash, content_type])
     doc_id = _scalar(cur.fetchone())
-    count = replace_chunks(cur, schema, doc_id, text, names=names, source_path=source_key)
+    count = replace_chunks(cur, schema, doc_id, text, names=names, source_path=source_key,
+                           content_type=content_type, title=title, url=url)
     return ("updated" if row is not None else "added"), doc_id, count
 
 
@@ -244,10 +330,17 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
 def load_document(cur: Any, schema: str, doc_id: Any, *,
                   names: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """取一行文档，**返回逻辑键**（`id`/`source_type`/`source_key`/`title`/
-    `content_hash`），不存在 ⇒ None。调用方不用关心真实列名。"""
+    `content_hash`/`content_type`），不存在 ⇒ None。调用方不用关心真实列名。
+
+    🟡 `content_type` 是**可选投影**：`names["ctype"]` 为假值（调用方探到表里
+    没这列）时 SELECT `''` —— 老库未迁移时读路径照常返回，不裸炸（写路径另由
+    `_write_names` 的必需列判据挡住，见 `routers/kb.py`）。
+    """
     n = _names(names)
+    # 显式 AS：dict_row 拿的是列名，裸 `SELECT ''` 的键是 "?column?"，取不到
+    sel_ctype = f"{n['ctype']} AS content_type" if n.get("ctype") else "'' AS content_type"
     cur.execute(f"SELECT {n['doc_id']}, {n['src_type']}, {n['src_key']}, "
-                f"{n['title']}, {n['hash']} FROM {schema}.{n['documents']} "
+                f"{n['title']}, {n['hash']}, {sel_ctype} FROM {schema}.{n['documents']} "
                 f"WHERE {n['doc_id']} = %s", [doc_id])
     row = cur.fetchone()
     if row is None:
@@ -256,7 +349,8 @@ def load_document(cur: Any, schema: str, doc_id: Any, *,
             "source_type": _val(row, n["src_type"], 1),
             "source_key": _val(row, n["src_key"], 2),
             "title": _val(row, n["title"], 3),
-            "content_hash": _val(row, n["hash"], 4)}
+            "content_hash": _val(row, n["hash"], 4),
+            "content_type": _val(row, "content_type", 5) or DEFAULT_CONTENT_TYPE}
 
 
 def document_chunks(cur: Any, schema: str, doc_id: Any, *,

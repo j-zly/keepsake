@@ -90,6 +90,9 @@ export const api = {
   kbSearch: (params) => http.get('/api/v1/kb/search', { params }).then((r) => r.data),
   // P9 知识库列表：不输词也能看到文档（q 可选，带了才按标题/全文过滤）
   kbDocuments: (params) => http.get('/api/v1/kb/documents', { params }).then((r) => r.data),
+  // 分类 Tab 上的计数：content_type -> 文档数。**后端给，前端不写死数字**
+  // （老库未迁移该列时后端给 {}，页面按「无计数」渲染，不编）。
+  kbTypeCounts: () => http.get('/api/v1/kb/type-counts').then((r) => r.data),
   kbDocumentChunks: (docId, params) =>
     http.get(`/api/v1/kb/documents/${encodeURIComponent(docId)}/chunks`, { params }).then((r) => r.data),
   stats: () => http.get('/api/v1/stats').then((r) => r.data),
@@ -161,9 +164,12 @@ export const api = {
 
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
+  // 🆕 payload 可带 content_type（note/article/link，缺省 note）与 url（link 必填）：
+  // 原样透传，枚举校验与「类型创建后不可变」的口径全在后端。
   kbCreateDocument: (payload) =>
     http.post('/api/v1/kb/documents', { confirm: true, ...payload }).then((r) => r.data),
   // 改文档：title/content 至少给一个；改正文时后端同事务重切切片（只改 documents 行会召回旧片段）。
+  // 🔴 **不带 content_type**：类型创建后不可变（后端带异值 400），重切按文档自身类型走。
   kbUpdateDocument: (id, payload) =>
     http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/update`, { confirm: true, ...payload }).then((r) => r.data),
   // 真删：confirm 传文档标题全文（手输防手滑），删前备份由后端做；skill 域后端 409。

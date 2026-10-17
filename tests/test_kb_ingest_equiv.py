@@ -183,3 +183,23 @@ def test_源查询带ORDER_BY():
     import inspect
 
     assert "ORDER BY source_node, skill_name" in inspect.getsource(kb_ingest.ingest)
+
+
+def test_灌入器写content_type_skill():
+    """🔴 灌入器产出的**一律是技能类**（skill 与 skill_hk 都是技能内容 ——
+    source_type 分的是来源，不是内容类型）。
+
+    不显式写就落进列的 DEFAULT='note'：控制台「手记」Tab 里会混满几千条技能
+    文档，而「技能」Tab 永远是空的 —— 而且没人会发现（看起来都「正常」）。"""
+    import inspect
+
+    src = inspect.getsource(kb_ingest.ingest)
+    assert "content_type=CONTENT_TYPE_SKILL" in src
+    from keepsake.kb.ingest import CONTENT_TYPE_SKILL
+
+    assert CONTENT_TYPE_SKILL == "skill"
+    # 🔴 分类不许改切块粒度：skill 类型的切块与 split_chunks 逐字相同
+    from keepsake.kb.ingest import chunk_document, split_chunks
+
+    text = "## 甲\n内容一\n## 乙\n内容二\n"
+    assert chunk_document(text, CONTENT_TYPE_SKILL) == split_chunks(text)

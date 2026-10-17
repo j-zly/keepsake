@@ -97,12 +97,26 @@ class KbSummary(BaseModel):
     chunks: int
 
 
+class KbTypeCounts(BaseModel):
+    """各内容类型的文档数（界面 Tab 上的计数 —— **后端给，前端不写死**）。"""
+
+    counts: Dict[str, int] = Field(default_factory=dict,
+                                    description="content_type -> 文档数；老库未迁移 content_type "
+                                                "列时为空字典（前端按无计数渲染，不编数字）")
+
+
 class KbHit(BaseModel):
     chunk_id: str
     doc_id: str = ""
     title: str = ""
     snippet: str = Field("", description="命中片段（截断后的正文）")
     rank: float = 0.0
+    content_type: str = Field(
+        "",
+        exclude_if=lambda v: v == "",
+        description="所属文档的内容类型（skill/note/article/link/image）。"
+                    "空串（表里没这列）时不出这个键 —— 缺省不假装有值",
+    )
 
 
 class KbSearchResult(BaseModel):
@@ -126,6 +140,13 @@ class KbDocument(BaseModel):
         exclude_if=lambda v: v == "",
         description="来源类型：manual=控制台手动文档（可改/删），skill/skill_hk=灌入器维护（只读）。"
                     "空串（表里没这列）时**不出这个键** —— 缺省不假装有值，前端按「非 manual 即只读」保守渲染",
+    )
+    content_type: str = Field(
+        "",
+        exclude_if=lambda v: v == "",
+        description="内容类型：skill=技能灌入，note=手记（缺省），article=长文章，link=链接卡片，"
+                    "image=图文（枚举占位，创建端点暂拒）。与 source_type 正交："
+                    "空串（表里没这列）时**不出这个键**，前端按 note 缺省渲染",
     )
 
 

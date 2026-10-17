@@ -12,6 +12,13 @@
   手动域判定读列表接口真投影出来的 source_type，**严格判据**：字段缺席/未知一律
   按只读渲染（缺省放行会让 skill 文档看着也能改）。筛选区加了来源下拉，值原样
   透传后端 `source_type`（精确匹配，与导出端点同一套口径与校验）。
+
+  内容类型（content_type）：**分内容类型**的 Tab（全部/技能/手记/文章/链接），
+  选中即 GET /kb/documents?content_type=；每个 Tab 的计数来自 /kb/type-counts
+  （后端给的真实数字，**绝不写死** —— 写死就等于库一变数字就错）。
+  新增弹框可选类型：手记/文章（正文逐字切块）/链接（URL + 摘要，**单块不切**）。
+  🔴 **编辑弹框不带类型**：类型创建后不可变（后端带异值 400），重切按文档自身
+  类型走；前端这一层是「不给入口」，后端那一层是「给了也拒」，双挡。
 -->
 <template>
   <div>
@@ -29,9 +36,25 @@
     </div>
 
     <div class="filter-panel">
+      <!-- 内容类型 Tab：计数来自 /kb/type-counts（后端给的真实数字，不写死）；
+           选中即 GET /kb/documents?content_type=，与 q / source_type 三者取 AND -->
+      <div class="filter-title">内容类型</div>
+      <div class="tabs">
+        <button
+          v-for="t in TYPE_TABS"
+          :key="t.value"
+          class="tab"
+          :class="{ 'tab--on': contentType === t.value }"
+          :title="t.hint"
+          @click="onType(t.value)"
+        >
+          {{ t.label }}
+          <span v-if="typeCounts[t.value] !== undefined" class="tab-n">{{ typeCounts[t.value] }}</span>
+        </button>
+      </div>
       <div class="filter-title">检索</div>
       <p class="filter-desc">
-        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。来源下拉按来源类型精确筛选（手动 / 灌入器两档，另细分到 skill_hk）。
+        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。类型 Tab 按内容类型筛（与下面的来源下拉、检索词三者取 AND）。
       </p>
       <div class="filter-ctl">
         <el-input
@@ -100,6 +123,10 @@
 
           <template #tags>
             <span class="tag mono">{{ doc.doc_id }}</span>
+            <!-- 类型徽标：技能=灰描边、链接=描边带 ↗（点得进去的意思），其余同现有 tag -->
+            <span class="tag" :class="`tag--${typeOf(doc)}`">
+              {{ typeLabel(doc) }}<template v-if="typeOf(doc) === 'link'"> ↗</template>
+            </span>
             <span v-if="!isManual(doc)" class="tag">只读 · 灌入器维护</span>
           </template>
 
@@ -119,8 +146,8 @@
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
             <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
           </svg>
-          <p v-if="!sourceType"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
-          <p v-else><b>该来源下还没有文档</b>当前只列 source_type={{ sourceType }} 的文档，换个来源或选「全部来源」再看看。</p>
+          <p v-if="!sourceType && !contentType"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
+          <p v-else><b>该筛选下还没有文档</b>当前只列 {{ filterLabel }} 的文档，换个筛选或选「全部」再看看。</p>
         </div>
       </div>
 
@@ -145,6 +172,9 @@
 
             <template #tags>
               <span class="tag mono">{{ row.chunk_id }}</span>
+              <span class="tag" :class="`tag--${typeOf(row)}`">
+                {{ typeLabel(row) }}<template v-if="typeOf(row) === 'link'"> ↗</template>
+              </span>
             </template>
 
             <template #lead>复制 chunk_id ↗</template>
@@ -208,24 +238,43 @@
       append-to-body
     >
       <el-form label-position="top">
+        <el-form-item label="内容类型">
+          <el-select v-model="draftType" class="sel-full" title="内容类型（创建后不可改）">
+            <el-option
+              v-for="t in CREATE_TYPES"
+              :key="t.value"
+              :label="t.label"
+              :value="t.value"
+            />
+          </el-select>
+        </el-form-item>
         <el-form-item label="标题（必填）">
           <el-input v-model="draftTitle" placeholder="一句话说清这篇文档是什么" />
         </el-form-item>
-        <el-form-item label="正文（必填）">
+        <!-- 链接卡片：URL 必填 + 摘要（可空）。正文**不切**，整条存成一块 -->
+        <el-form-item v-if="draftType === 'link'" label="链接地址（必填）">
+          <el-input v-model="draftUrl" placeholder="https://example.com/page" />
+        </el-form-item>
+        <el-form-item :label="draftType === 'link' ? '摘要（可选）' : '正文（必填）'">
           <el-input
             v-model="draftContent"
             type="textarea"
             :rows="9"
-            placeholder="文档全文；保存时后端会切块并同事务落库"
+            :placeholder="
+              draftType === 'link'
+                ? '两三句话说清这篇链接讲什么；留空也行'
+                : '文档全文；保存时后端会切块并同事务落库'
+            "
           />
         </el-form-item>
       </el-form>
+      <p class="tip">内容类型创建后不可改（要换类型就删掉重建）。链接只存 URL 与摘要，不抓取网页。</p>
       <template #footer>
         <el-button :disabled="busyCreate" @click="creating = false">取消</el-button>
         <el-button
           type="primary"
           :loading="busyCreate"
-          :disabled="!draftTitle.trim() || !draftContent.trim()"
+          :disabled="!canCreate"
           @click="doCreate"
         >
           新增
@@ -246,10 +295,20 @@
       append-to-body
     >
       <el-form label-position="top">
+        <el-form-item label="内容类型（创建后不可改）">
+          <span class="fld-static">
+            {{ typeLabel(editDoc) }}
+            <span class="tag" :class="`tag--${typeOf(editDoc)}`">{{ typeOf(editDoc) }}</span>
+          </span>
+        </el-form-item>
         <el-form-item label="标题（必填）">
           <el-input v-model="editTitle" placeholder="标题" />
         </el-form-item>
-        <el-form-item label="正文（留空 = 只改标题）">
+        <!-- 链接卡片：改 URL 仍单块重存（后端拿库里 meta 里的原 URL 兜底，不会丢） -->
+        <el-form-item v-if="typeOf(editDoc) === 'link'" label="链接地址（留空 = 不改）">
+          <el-input v-model="editUrl" :placeholder="editUrlPlaceholder" />
+        </el-form-item>
+        <el-form-item :label="typeOf(editDoc) === 'link' ? '摘要（留空 = 不改）' : '正文（留空 = 只改标题）'">
           <el-input
             v-model="editContent"
             type="textarea"
@@ -260,7 +319,8 @@
       </el-form>
       <p class="tip">
         正文不回显：列表接口只返回标题，正文只存在于切片里（且读接口每条只给前 300 字），
-        拿截断的切片回显再保存会把原文截断。要改正文请粘贴完整全文。
+        拿截断的切片回显再保存会把原文截断。要改正文请粘贴完整全文。类型不可改 ——
+        换了类型就等于换了篇内容（切块策略都跟着变），要换请删掉重建。
       </p>
       <template #footer>
         <el-button :disabled="busyEdit" @click="editing = false">取消</el-button>
@@ -379,6 +439,47 @@ const hitPage = ref(1)
 const q = ref('')
 /** 来源筛选：''=全部（默认视图不变）；否则原样透传后端 `source_type`（精确匹配，同导出端点口径） */
 const sourceType = ref('')
+/** 内容类型筛选：''=全部；否则透传后端 `content_type`（精确枚举匹配，后端同一份白名单校验） */
+const contentType = ref('')
+/** 各类型的文档数（后端 /kb/type-counts 给的真数字）。**前端绝不写死计数** ——
+ *  老库未迁移该列时后端给 {}，Tab 上就不显示数字，而不是显示一个编出来的 0。 */
+const typeCounts = ref({})
+
+/** 类型 Tab（顺序即展示顺序）。count 取不到就不渲染那个数 */
+const TYPE_TABS = [
+  { value: '', label: '全部', hint: '不按内容类型筛' },
+  { value: 'skill', label: '技能', hint: '灌入器维护的技能文档（只读）' },
+  { value: 'note', label: '手记', hint: '手记/粘贴正文' },
+  { value: 'article', label: '文章', hint: '长文章' },
+  { value: 'link', label: '链接', hint: '链接卡片（URL + 摘要，单块不切）' },
+]
+
+/** 新增弹框可选的类型：**不含 skill**（归灌入器）与 image（后端暂未开放 400） */
+const CREATE_TYPES = [
+  { value: 'note', label: '手记（正文切块）' },
+  { value: 'article', label: '文章（正文切块）' },
+  { value: 'link', label: '链接（URL + 摘要，单块）' },
+]
+
+const TYPE_LABEL = {
+  skill: '技能', note: '手记', article: '文章', link: '链接', image: '图文',
+}
+
+/** 卡片/命中行的类型：🔴 字段缺席（旧库未迁移）时按 note 缺省，**不假装是技能** */
+function typeOf(row) {
+  return row?.content_type || 'note'
+}
+
+function typeLabel(row) {
+  return TYPE_LABEL[typeOf(row)] || typeOf(row)
+}
+
+/** 空态那句话里说清「当前筛的是啥」 */
+const filterLabel = computed(() => {
+  const t = contentType.value ? `content_type=${contentType.value}` : ''
+  const s = sourceType.value ? `source_type=${sourceType.value}` : ''
+  return [t, s].filter(Boolean).join(' · ')
+})
 const loading = ref(false)
 const error = ref('')
 /** 三分状态用：请求中（骨架屏）/ 成功且真的 0 条（空态）/ 失败（错误横幅）——「零文档」只在成功后出现 */
@@ -396,12 +497,17 @@ const creating = ref(false)
 const busyCreate = ref(false)
 const draftTitle = ref('')
 const draftContent = ref('')
+const draftType = ref('note')
+const draftUrl = ref('')
 
 const editing = ref(false)
 const busyEdit = ref(false)
 const editDoc = ref(null)
 const editTitle = ref('')
 const editContent = ref('')
+const editUrl = ref('')
+/** 编辑弹框里的 URL 占位：列表接口不投影 meta（读不到原值），就明说「留空 = 不改」 */
+const editUrlPlaceholder = computed(() => '留空则保留原链接；填 http(s) 开头的地址会替换')
 
 const deleting = ref(false)
 const deleteDoc = ref(null)
@@ -474,7 +580,7 @@ async function loadDocs() {
   const seq = ++reqSeq
   loading.value = true
   try {
-    const data = await api.kbDocuments({ source_type: sourceType.value, page: page.value, page_size: pageSize.value })
+    const data = await api.kbDocuments({ source_type: sourceType.value, content_type: contentType.value, page: page.value, page_size: pageSize.value })
     if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
@@ -501,7 +607,7 @@ async function loadBoth(term) {
   let docRes, hitRes
   try {
     [docRes, hitRes] = await Promise.all([
-      api.kbDocuments({ q: term, source_type: sourceType.value, page: page.value, page_size: pageSize.value }),
+      api.kbDocuments({ q: term, source_type: sourceType.value, content_type: contentType.value, page: page.value, page_size: pageSize.value }),
       api.kbSearch({ q: term, page: hitPage.value, page_size: hitSize.value }),
     ])
   } catch (e) {
@@ -543,6 +649,24 @@ function onSource() {
   page.value = 1
   hitPage.value = 1
   return search()
+}
+
+/** 换内容类型：与 onSource 同一条路（Tab 选中即 GET /kb/documents?content_type=） */
+function onType(v) {
+  contentType.value = v
+  page.value = 1
+  hitPage.value = 1
+  return search()
+}
+
+/** Tab 计数：老库未迁移 content_type 列时后端给 {} ⇒ 这里保持 {}，Tab 上不显示数字 */
+async function loadTypeCounts() {
+  try {
+    const r = await api.kbTypeCounts()
+    typeCounts.value = r?.counts || {}
+  } catch (e) {
+    typeCounts.value = {}
+  }
 }
 
 function onPage(p) {
@@ -608,6 +732,7 @@ async function doCopy(id) {
 /** 写操作之后刷新：计数与列表各走页面原有路径（检索态仍两路并行），防串序号照旧 */
 function refresh() {
   loadSummary()
+  loadTypeCounts()
   return searching.value ? loadBoth(q.value.trim()) : loadDocs()
 }
 
@@ -615,21 +740,33 @@ function refresh() {
 function openCreate() {
   draftTitle.value = ''
   draftContent.value = ''
+  draftType.value = 'note'
+  draftUrl.value = ''
   creating.value = true
 }
+
+/** 提交闸：标题必填；link 要 URL（摘要可空）；其余类型正文必填（口径与后端一致） */
+const canCreate = computed(() => {
+  if (!draftTitle.value.trim()) return false
+  return draftType.value === 'link'
+    ? !!draftUrl.value.trim()
+    : !!draftContent.value.trim()
+})
 
 async function doCreate() {
   const title = draftTitle.value.trim()
   const content = draftContent.value.trim()
-  if (!title || !content) return
+  if (!canCreate.value) return
   busyCreate.value = true
   try {
-    const r = await api.kbCreateDocument({ title, content })
+    const payload = { title, content, content_type: draftType.value }
+    if (draftType.value === 'link') payload.url = draftUrl.value.trim()
+    const r = await api.kbCreateDocument(payload)
     creating.value = false
     // 内容级幂等：同标题同内容提交后端判 unchanged（连 INSERT 都不发），别谎报新增
     showToast(r.status === 'unchanged'
       ? `已存在同名同内容的一篇，未重复新增：${title}`
-      : `已新增：${title}（${r.chunks_count} 块切片）`)
+      : `已新增：${title}（${typeLabel({ content_type: r.content_type })} · ${r.chunks_count} 块切片）`)
     refresh()
   } catch (e) {
     showError(`新增失败：${e.message}`)
@@ -639,11 +776,13 @@ async function doCreate() {
 }
 
 // ---- 编辑 ----
-/** 标题预填现值；正文不回显（切片读接口只给前 300 字，回显保存会把原文截断） */
+/** 标题预填现值；正文不回显（切片读接口只给前 300 字，回显保存会把原文截断）。
+ *  🔴 **类型不进表单**（创建后不可变，后端带异值 400），这里只把当前类型显示出来。 */
 function openEdit(doc) {
   editDoc.value = doc
   editTitle.value = doc.title || ''
   editContent.value = ''
+  editUrl.value = ''
   editing.value = true
 }
 
@@ -652,10 +791,14 @@ async function doEdit() {
   const title = editTitle.value.trim()
   if (!doc || !title) return
   const content = editContent.value.trim()
+  const url = editUrl.value.trim()
   busyEdit.value = true
   try {
-    // 正文留空 = 只改标题（后端 title/content 至少给一个）；填了才改正文并同事务重切切片
-    await api.kbUpdateDocument(doc.doc_id, content ? { title, content } : { title })
+    // 正文留空 = 只改标题（后端 title/content 至少给一个）；填了才改正文并同事务重切切片。
+    // link 文档多一个可换的 url；**不带 content_type**（后端按文档自身类型重切）。
+    const payload = content ? { title, content } : { title }
+    if (typeOf(doc) === 'link' && url) payload.url = url
+    await api.kbUpdateDocument(doc.doc_id, payload)
     editing.value = false
     showToast(`已保存：${title}`)
     refresh()
@@ -816,6 +959,7 @@ async function doExport() {
 
 onMounted(() => {
   loadSummary()
+  loadTypeCounts()
   loadDocs()
 })
 </script>
@@ -886,5 +1030,66 @@ onMounted(() => {
 }
 .tpl-link:hover {
   text-decoration: underline;
+}
+
+/* ---- 内容类型 Tab ----
+   配方取 tokens 里现成的原子类数值（chip 底色 / 10px 控件圆角 / 描边色），
+   不自创色值：--chip 底 + --border-2 描边，选中态换 --accent 描边与 --accent 字色。 */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  background: var(--chip);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-ctl);   /* 10 */
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.7;
+  cursor: pointer;
+}
+.tab:hover {
+  background: var(--panel-hover);
+}
+.tab--on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* 计数：后端给的真实数字。老库未迁移 ⇒ v-if 不渲染，而不是显示一个编出来的 0 */
+.tab-n {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.tab--on .tab-n {
+  color: var(--accent);
+}
+/* 类型徽标的变体：技能=灰描边（同现有 tag，只压低存在感）；链接=描边带 ↗（点得进去） */
+.tag--skill {
+  opacity: 0.85;
+}
+.tag--link {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* 弹框里的类型下拉：拉满一行（el-select 默认窄，放标题栏里会挤） */
+.sel-full {
+  width: 100%;
+}
+/* 编辑弹框里的静态字段（类型只读展示，不是可改控件） */
+.fld-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.7;
 }
 </style>

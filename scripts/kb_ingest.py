@@ -10,6 +10,8 @@ v3 逐字对齐，改任何一条都等于偏离生产：
 * 正文来源：`body` 是 jsonb，取 `body["files"]` 这个 dict，逐 `(文件名, 内容)`；
   非 str 的 value 跳过、`TEXT_EXT` 后缀之外的跳过、含 `\\x00` 的先去 NUL；
 * 分域：`source_type = 'skill' if category == 'main' else 'skill_hk'`；
+* **内容类型恒为 `content_type='skill'`**（skill/skill_hk 都是技能内容；分的是来源
+  不是内容类型），控制台的「按类型」Tab 与过滤靠这一列；
 * `key = "<source_node>/<skill_name>/<文件名>"`，
   `hash = "<sha256 列>:<文件名>"`（幂等判据，变了才重切 chunks）；
 * `title = <skill>`，只有非 `SKILL.md` 的文件才拼 ` · <文件名>`；
@@ -48,6 +50,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from keepsake.kb.ingest import (  # noqa: E402 —— 路径补齐后才能 import
+    CONTENT_TYPE_SKILL,
     INGEST_SOURCE_TYPES,
     DEFAULT_NAMES,
     split_chunks,
@@ -269,7 +272,11 @@ def ingest(args: argparse.Namespace) -> Dict[str, Any]:
                     source_key=source_key(node, skill, fname),
                     title=doc_title(skill, fname),
                     meta=build_meta(node, skill, fname, category, sha),
-                    content_hash=doc_hash(sha, fname), text=text)
+                    content_hash=doc_hash(sha, fname), text=text,
+                    # 🔴 灌入器产出的**一律是技能类**（skill 与 skill_hk 同属技能内容，
+                    # source_type 分的是来源不是内容类型）；不显式写就落进列的
+                    # DEFAULT='note'，界面 Tab 会把手记里混满技能文档。
+                    content_type=CONTENT_TYPE_SKILL)
                 stats[status] += 1
 
         dead = find_dead_docs(dcur, schema, live, names=names)

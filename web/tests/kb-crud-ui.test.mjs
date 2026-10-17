@@ -109,9 +109,12 @@ test('导出：fetch 带 Authorization 头拉 blob（后端只有 jsonl 一档�
 })
 
 test('新增/编辑：标题与正文都必填，错误文案原样透出', () => {
-  assert.match(KB, /:disabled="!draftTitle\.trim\(\) \|\| !draftContent\.trim\(\)"/, '新增两栏都必填')
-  assert.match(KB, /api\.kbCreateDocument\(\{ title, content \}\)/)
+  // 提交闸走 canCreate（note/article 要正文、link 要 URL，见 kb-content-type 护栏）；
+  // 标题三种类型下都必填，这里只钉「不再逐字段拼 disabled」这件事。
+  assert.match(KB, /:disabled="!canCreate"/, '新增按钮的禁用判据要走 canCreate')
+  assert.match(KB, /api\.kbCreateDocument\(payload\)/)
   // 改正文才带 content；留空 = 只改标题（后端 title/content 至少给一个）
-  assert.match(KB, /api\.kbUpdateDocument\(doc\.doc_id, content \? \{ title, content \} : \{ title \}\)/)
+  assert.match(KB, /const payload = content \? \{ title, content \} : \{ title \}/)
+  assert.match(KB, /api\.kbUpdateDocument\(doc\.doc_id, payload\)/)
   assert.match(KB, /showError\(`保存失败：\$\{e\.message\}`\)/, '后端文案原样透出，不吞')
 })

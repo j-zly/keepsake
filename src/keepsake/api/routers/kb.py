@@ -18,6 +18,13 @@
 3. `require_session` + `write_guard` 一条不落（审计落不下 ⇒ 宁可不写）；
 4. 真删 = 手输文档标题 + **删前把全文与切片落备份**（`audit.backup_document`），
    备份写不成功 ⇒ 一行都不删。
+
+**来源 vs 内容类型（两根列，别混）**：`source_type` 分「谁维护」（manual=控制台
+可改删；skill/skill_hk=灌入器只读）；`content_type` 分「这是个什么东西」
+（skill 技能 / note 手记 / article 长文 / link 链接卡片 / image 图文占位）。
+分类的作用是**按类型切块**（link 单块、其余逐字走 `split_chunks`）与**按类型过滤**，
+不改任何既有的域隔离与幂等判据。类型创建后不可变（双挡：前端不给入口 +
+后端带异值 400）。`image` 本期只占枚举位：创建端点 400（依赖向量路，后置）。
 """
 
 from __future__ import annotations
@@ -31,13 +38,13 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import）
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from keepsake.kb import ingest
 
 from .. import audit, config
 from ..deps import require_session
-from ..schemas import KbHit, KbSearchResult, KbSummary
+from ..schemas import KbHit, KbSearchResult, KbSummary, KbTypeCounts
 from ..schemas import KbChunkList, KbDocument, KbDocumentList
 from .ops import _need_flag, _need_text, _reject, write_guard
 
@@ -72,6 +79,22 @@ IMPORT_MAX_ITEMS = 2000
 
 #: 来源类型的合法形态（只作为 WHERE 参数值校验，挡住 `'; drop` 这类噪声）
 _SOURCE_TYPE_RE = _IDENT_RE
+
+#: 内容类型列（documents）。**可选探测**：老库未迁移时读路径 SELECT '' 降级
+#: （出参不带这个键），真要按类型筛/真要写类型时由 `_need_ctype` 给出人话 500。
+_CAND_CTYPE = ("content_type",)
+
+#: 老库未迁移 content_type 列时的修复 SQL —— **报给人看的，不自己跑**
+#: （生产迁移由主脑执行；代码擅自 ALTER 生产表不是本项目的活）。
+_CTYPE_MIGRATION_HINT = (
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_type text NOT NULL DEFAULT 'note'; "
+    "UPDATE documents SET content_type='skill' WHERE source_type IN ('skill','skill_hk'); "
+    "CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type);"
+)
+
+#: 链接卡片的 URL 形态：只放行 http/https，别的（file://、javascript:）一律 400。
+#: 🔴 **不抓取网页**（SSRF 与外网依赖都不要，抓取是接入方/助手的事）—— 这里只存字符串。
+_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 _COLS_CACHE: Dict[str, Dict[str, set]] = {}
 _COLS_LOCK = threading.Lock()
@@ -252,6 +275,8 @@ def kb_search(
               f"ON d.{d_id} = c.{c_doc}")
     d_title = next((_ident(t) for t in _CAND_TITLE if t in docs), None)
     select_doc = f"COALESCE(d.{d_title}, '')" if d_title else "''"
+    d_ctype = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
+    select_ctype = f"COALESCE(d.{d_ctype}, '')" if d_ctype else "''"
 
     if c_tsv:
         # 中文语料用 simple 分词（PG 默认 english 会把中文切成一坨）
@@ -265,6 +290,7 @@ def kb_search(
     sql = (
         f"SELECT c.{c_id} AS chunk_id, CAST(c.{c_doc} AS text) AS doc_id, "
         f"{select_doc} AS title, LEFT(c.{c_text}, 300) AS snippet, "
+        f"{select_ctype} AS content_type, "
         f"{rank} AS score {joined} WHERE {where} "
         f"ORDER BY score DESC, chunk_id ASC LIMIT %s OFFSET %s"
     )
@@ -275,6 +301,8 @@ def kb_search(
     items = [
         KbHit(chunk_id=str(r["chunk_id"]), doc_id=str(r["doc_id"] or ""),
               title=str(r["title"] or ""), snippet=str(r["snippet"] or ""),
+              # 老表没这列时投影是 '' ⇒ 出参按 schema 规则省略该键（与 source_type 同款）
+              content_type=str(r.get("content_type") or ""),
               rank=round(float(r["score"] or 0.0), 6))
         for r in rows
     ]
@@ -282,11 +310,38 @@ def kb_search(
                           page_size=page_size, mode=mode)
 
 
+@router.get("/api/v1/kb/type-counts", response_model=KbTypeCounts,
+            dependencies=[Depends(require_session)])
+def kb_type_counts() -> KbTypeCounts:
+    """各内容类型的文档数（界面 Tab 的计数来源；只读，一条 GROUP BY）。
+
+    🔴 **计数绝不写死在前端**：写死就等于库一变数字就错，而且没人会发现。
+    老库未迁移 content_type 列 ⇒ 返回空字典（前端按「无计数」渲染，不编数字）。
+    """
+    schema = _ident(config.pg_schema())
+    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS,))
+    d_ct = next((_ident(c) for c in _CAND_CTYPE if c in tabs[config.KB_TABLE_DOCUMENTS]),
+                None)
+    if not d_ct:
+        return KbTypeCounts(counts={})
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {d_ct} AS ct, COUNT(*) AS n "
+                        f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} GROUP BY {d_ct}")
+            rows = cur.fetchall()
+    return KbTypeCounts(counts={str(r["ct"] or ingest.DEFAULT_CONTENT_TYPE): int(r["n"] or 0)
+                                for r in rows})
+
+
 @router.get("/api/v1/kb/documents", response_model=KbDocumentList,
             dependencies=[Depends(require_session)])
 def kb_documents(
     q: Optional[str] = Query(None, description="标题模糊词，可选；不给就全量浏览"),
     source_type: str = Query("", description="只列某个来源类型（manual/skill/skill_hk）；空=全部"),
+    # 🟡 缺省值写裸串而不是 `Query("")`：有护栏测试是**直接调这个函数**（不经过
+    # FastAPI）来钉 WHERE 的拼装与参数顺序，`Query` 对象会 `.strip()` 炸掉。
+    # 标量类型 + 裸默认值 FastAPI 仍按 query 参数解析（与 page/page_size 之外的旧写法同款）。
+    content_type: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
 ) -> KbDocumentList:
@@ -302,11 +357,21 @@ def kb_documents(
     🔴 `source_type` 过滤口径与导出端点**完全一致**（精确 `= %s` + 同一套标识符
     校验），不在这里发明第二种前缀/模糊语义；与 q 同时给时是 AND 关系，
     `count` 走同一条 WHERE ⇒ 计数口径=过滤后总数。
+
+    🆕 `content_type` 过滤同理（精确 `= %s`），但**值走枚举白名单**而不是标识符
+    正则：类型是业务枚举（skill/note/article/link/image），正则放行 `'; drop`
+    之外的一切噪声串，枚举只放行真类型。老库未迁移（没这列）而调用方要按类型筛
+    ⇒ 400 `kb_schema_unknown`，不静默给全量（给全量等于假装筛过）。
     """
     st = (source_type or "").strip()
     if st and not _SOURCE_TYPE_RE.match(st):
         _reject(400, "bad_source_type",
                 f"source_type 只能是标识符（小写字母/数字/下划线）：{source_type}",
+                "kb.documents", "list")
+    ct = (content_type or "").strip()
+    if ct and ct not in ingest.CONTENT_TYPES:
+        _reject(400, "bad_content_type",
+                f"content_type 只能是：{', '.join(ingest.CONTENT_TYPES)}；收到 {content_type}",
                 "kb.documents", "list")
     schema = _ident(config.pg_schema())
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
@@ -324,6 +389,7 @@ def kb_documents(
     d_time = next((_ident(t) for t in _CAND_TIME if t in docs), None)
     d_tsv = next((_ident(c) for c in _CAND_TSV if c in docs), None)
     d_src = next((_ident(c) for c in _CAND_SRC_TYPE if c in docs), None)
+    d_ct = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
 
     keyword = (q or "").strip()
     if keyword and d_tsv:
@@ -341,6 +407,14 @@ def kb_documents(
         _reject(400, "kb_schema_unknown",
                 f"{config.KB_TABLE_DOCUMENTS} 表未找到 source_type 列，无法按来源过滤",
                 "kb.documents", "list")
+    if ct and d_ct:
+        where, params = f"{where} AND d.{d_ct} = %s", [*params, ct]
+    elif ct:
+        # 同上：老库未迁移 content_type 列时，筛不了就说筛不了
+        _reject(400, "kb_schema_unknown",
+                f"{config.KB_TABLE_DOCUMENTS} 表未找到 content_type 列，无法按内容类型过滤"
+                f"（请先执行迁移：{_CTYPE_MIGRATION_HINT}）",
+                "kb.documents", "list")
 
     src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
     chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
@@ -350,9 +424,11 @@ def kb_documents(
     sel_title = f"d.{d_title}" if d_title else "''"
     sel_time = f"d.{d_time}" if d_time else "''"
     sel_src = f"d.{d_src}" if d_src else "''"
+    sel_ct = f"d.{d_ct}" if d_ct else "''"
 
     sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
            f"{sel_time} AS updated_at, {sel_src} AS source_type, "
+           f"{sel_ct} AS content_type, "
            f"{chunk_ct} {src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -366,7 +442,10 @@ def kb_documents(
                    updated_at=str(r["updated_at"] or ""), chunk_count=int(r["chunk_count"] or 0),
                    # `get` 与本文件「探不到就降级」同款：行里没这根键（老表/别的驱动投影）
                    # 时给空串，出参按 schema 规则省略该键，而不是 KeyError 把整个列表带崩
-                   source_type=str(r.get("source_type") or ""))
+                   source_type=str(r.get("source_type") or ""),
+                   # 同款降级：老表没这列时行里没这根键 ⇒ 空串，出参省略该键，
+                   # 前端按 note 缺省渲染（不假装每篇都是技能）
+                   content_type=str(r.get("content_type") or ""))
         for r in rows
     ]
     return KbDocumentList(items=items, count=total, page=page, page_size=page_size)
@@ -430,19 +509,32 @@ def kb_document_chunks(
 # --------------------------------------------------------------------------
 
 class KbCreateBody(BaseModel):
-    """`{"confirm": true, "title": "...", "content": "..."}` —— 新增知识库文档。"""
+    """`{"confirm": true, "title": "...", "content": "..."}` —— 新增知识库文档。
+
+    🆕 `content_type`（缺省 note）与 `url`（**仅 link 需要**）：内容类型创建后
+    不可变（见 `KbUpdateBody`），link 走「标题 + URL + 摘要」单块卡片，正文不切。
+    """
 
     confirm: bool = False
     title: str = ""
     content: str = ""
+    content_type: str = Field("", description="内容类型；空=note（手记）")
+    url: str = Field("", description="链接地址；仅 content_type=link 时必填")
 
 
 class KbUpdateBody(BaseModel):
-    """`{"confirm": true, "title": "...", "content": "..."}` —— 两者都可省，但不许都不给。"""
+    """`{"confirm": true, "title": "...", "content": "..."}` —— 两者都可省，但不许都不给。
+
+    🆕 `content_type`：🔴 **只能与文档自身类型相同**（创建后不可变），不同值 400 ——
+    类型变了等于换了一篇内容（切块策略、来源域、灌入器归属都跟着变），静默改会让
+    「这篇是链接」和「切片被当长文切过」并存。`url` 仅 link 文档用（改 URL 仍单块重存）。
+    """
 
     confirm: bool = False
     title: Optional[str] = None
     content: Optional[str] = None
+    content_type: Optional[str] = None
+    url: Optional[str] = None
 
 
 class KbDeleteBody(BaseModel):
@@ -452,16 +544,21 @@ class KbDeleteBody(BaseModel):
 
 
 class KbImportItem(BaseModel):
-    """导入的单条：`{"title": "...", "content": "..."}`。
+    """导入的单条：`{"title": "...", "content": "..."}`（可带 `"type": "note|article|link"`）。
 
     🔴 `extra="forbid"`：带 `source_type`（或任何多余字段）直接 422 —— 导入
     **只进手动域**，让调用方指定来源类型等于开一条往 skill 域灌脏数据的路。
+
+    🆕 `type` 就是 `content_type`（缺省 note，命名短一点贴合 JSONL 手写场景），
+    `url` 仅 `type="link"` 时用；取值口径与创建端点同一份枚举校验。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     title: str = ""
     content: str = ""
+    type: str = Field("", description="内容类型；空=note（手记）。与 content_type 同义，取短名")
+    url: str = Field("", description="链接地址；仅 type=link 时必填")
 
 
 class KbImportBody(BaseModel):
@@ -502,6 +599,11 @@ def _write_names(schema: str) -> Dict[str, str]:
 
     写路径**没有降级余地**：缺哪根列都 500 `kb_schema_unknown`，
     不许「这根列探不到就少写一个字段」—— 那会静默丢内容还报成功。
+
+    🆕 `ctype`（content_type）是**唯一例外：探不到就给空串**。老库未迁移时，
+    不写内容的端点（导出、真删）仍能跑；真要写类型的端点（新增/改/导入）由
+    `_need_ctype()` 给出**人话 500**（提示跑迁移），而不是让 PG 抛
+    `column "content_type" does not exist` 的裸 500。
     """
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
     gone = _missing(tabs)
@@ -516,6 +618,7 @@ def _write_names(schema: str) -> Dict[str, str]:
         "doc_id": _pick(docs, _CAND_ID, d, "主键"),
         "src_type": _pick(docs, _CAND_SRC_TYPE, d, "来源类型"),
         "src_key": _pick(docs, _CAND_SRC_KEY, d, "来源键"),
+        "ctype": next((_ident(x) for x in _CAND_CTYPE if x in docs), ""),
         "title": _pick(docs, _CAND_TITLE, d, "标题"),
         "meta": _pick(docs, _CAND_META, d, "元数据"),
         "hash": _pick(docs, _CAND_HASH, d, "内容哈希"),
@@ -525,6 +628,100 @@ def _write_names(schema: str) -> Dict[str, str]:
         "chunk_text": _pick(chunks, _CAND_TEXT, c, "正文"),
         "chunk_path": _pick(chunks, _CAND_SRC_PATH, c, "来源路径"),
     }
+
+
+def _need_ctype(names: Dict[str, str], action: str, target: str) -> str:
+    """写 content_type 前必须确认这根列在（老库未迁移 ⇒ 人话报错，不裸崩）。"""
+    if not names.get("ctype"):
+        _reject(500, "kb_schema_unknown",
+                f"{config.KB_TABLE_DOCUMENTS} 表未找到 content_type 列，无法写入内容类型；"
+                f"请先执行迁移：{_CTYPE_MIGRATION_HINT}",
+                action, target)
+    return names["ctype"]
+
+
+def _check_content_type(raw: str, action: str, target: str) -> str:
+    """创建端点的类型校验：枚举内 + 界面可建（skill 归灌入器、image 尚未开放）。"""
+    ct = (raw or "").strip() or ingest.DEFAULT_CONTENT_TYPE
+    if ct not in ingest.CONTENT_TYPES:
+        _reject(400, "bad_content_type",
+                f"content_type 只能是：{', '.join(ingest.CONTENT_TYPES)}；收到 {raw}",
+                action, target)
+    if ct == ingest.CONTENT_TYPE_IMAGE:
+        _reject(400, "image_not_open", "image 类型暂未开放", action, target)
+    if ct == ingest.CONTENT_TYPE_SKILL:
+        _reject(400, "content_type_immutable",
+                "skill 类型只能由灌入器写入，控制台不能创建（改类型请删掉重建）",
+                action, target)
+    return ct
+
+
+def _doc_basis(title: str, content: str, ctype: str, url: str) -> str:
+    """`source_key` 与 `content_hash` 的**判据文本** = 真正存进切片的那一串。
+
+    🔴 link 必须用组合文本而不是 `content`（摘要）：否则一篇 note（标题+摘要甲）
+    与一篇 link（标题+摘要甲、地址不同）会算出**同一个键**，`ON CONFLICT` 撞上就把
+    已有那篇的 content_type 悄悄改成 link —— 正好是「类型创建后不可变」要防的那件事。
+    键跟内容走（而不是跟类型走）也让「同内容重复提交 = unchanged」的老判据一字不变。
+    """
+    if ctype == ingest.CONTENT_TYPE_LINK:
+        return ingest.link_body(title, url, content)
+    return content or ""
+
+
+def _check_url(url: str, action: str, target: str) -> str:
+    """链接卡片的 URL：必填 + 必须 `^https?://`。**不抓取网页**（SSRF 与外网依赖都不要）。"""
+    u = (url or "").strip()
+    if not u:
+        _reject(400, "url_required", "content_type=link 时 url 必填（http:// 或 https:// 开头）",
+                action, target)
+    if not _URL_RE.match(u):
+        _reject(400, "bad_url", f"url 必须以 http:// 或 https:// 开头：{u}", action, target)
+    return u
+
+
+def _check_type_unchanged(want: Optional[str], actual: str, action: str, target: str) -> None:
+    """🔴 类型创建后不可变：请求带了且与库里不同 ⇒ 400（不给「静默换类型」的口子）。
+
+    枚举外的值先按 `bad_content_type` 拒（口径与创建端点同款），别混成
+    「不可变」—— 那是两回事：一个是类型不存在，一个是不许改。
+    """
+    if want is None or not str(want).strip():
+        return
+    if str(want).strip() not in ingest.CONTENT_TYPES:
+        _reject(400, "bad_content_type",
+                f"content_type 只能是：{', '.join(ingest.CONTENT_TYPES)}；收到 {want}",
+                action, target)
+    if str(want).strip() != actual:
+        _reject(400, "content_type_immutable",
+                f"内容类型创建后不可变（本篇是 {actual}，请求要改成 {want}）；"
+                "要换类型请删掉重建", action, target)
+
+
+def _doc_meta_field(cur: Any, schema: str, doc_id: Any, names: Dict[str, str],
+                    key: str) -> str:
+    """取 link 文档 meta 里的某个键（`url` / `summary`）。
+
+    🔴 **改一项不能把另一项丢了**：只换 URL 时摘要得从库里原样取回，
+    否则组合文本第三行整条消失（卡片只剩标题和地址，摘要找不回来了）。
+    `key` 走参数（`->>%s`），不拼进 SQL 文本。
+    """
+    cur.execute(f"SELECT {names['meta']}->>%s AS v FROM {schema}.{names['documents']} "
+                f"WHERE {names['doc_id']} = %s", [key, doc_id])
+    row = cur.fetchone()
+    return str(row["v"] or "") if row else ""
+
+
+def _doc_set_link_meta(cur: Any, schema: str, doc_id: Any, url: str, summary: str,
+                       names: Dict[str, str]) -> None:
+    """改 link 文档时同步 `meta` 里的 url/summary（正文是组合文本，meta 才是可寻址的真源）。
+
+    🔴 参数必须写 `%s::text`：PG 推不出 `jsonb_build_object(..., %s)` 里那个未定型
+    参数的类型（`could not determine data type of parameter $1`）。
+    """
+    cur.execute(f"UPDATE {schema}.{names['documents']} SET {names['meta']} = "
+                f"jsonb_build_object('origin','console','url',%s::text,'summary',%s::text) "
+                f"WHERE {names['doc_id']} = %s", [url, summary, doc_id])
 
 
 def _doc_id(raw: str, action: str) -> int:
@@ -563,26 +760,45 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
 
     `source_key='manual:<sha256(title+content)[:12]>'` ⇒ 同内容重复提交是
     `unchanged` 而不是新插一条。chunks 与 documents 同一事务落库，
-    切块走 `keepsake.kb.ingest.split_chunks`（与灌入器同一个函数）。
+    切块走 `keepsake.kb.ingest.chunk_document`（与灌入器同一个函数，按类型注册表分派）。
+
+    🆕 **按 `content_type` 分派**：
+    * `note`/`article`：`content` 就是正文，逐字走 `split_chunks`（与上期一致）；
+    * `link`：`content` 视为**摘要**（可空），`url` 必填且 `^https?://`；入库
+      `meta={url, summary}`，正文列存单块 `标题\\nURL\\n摘要`（**不抓取网页** ——
+      SSRF 与外网依赖都不要，抓取是接入方/助手的事）；
+    * `image`：400（枚举占位，依赖向量路，后置）；`skill`：400（仅灌入器能建）。
     """
     action = "kb.document.create"
     _need_flag(body.confirm, action, "-", '新增知识库文档必须显式传 {"confirm": true}')
     title = (body.title or "").strip()
     content = (body.content or "").strip()
-    if not title or not content:
+    ctype = _check_content_type(body.content_type, action, title or "-")
+    is_link = ctype == ingest.CONTENT_TYPE_LINK
+    url = _check_url(body.url, action, title or "-") if is_link else ""
+    # link 的摘要可空；其余类型 content 必填（与上期 empty_document 口径一字不变）
+    if not title or (not is_link and not content):
         _reject(400, "empty_document", "title 与 content 都不能为空", action, "-")
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
-    key = ingest.manual_source_key(title, content)
+    _need_ctype(names, action, title or "-")
+    basis = _doc_basis(title, content, ctype, url)
+    key = ingest.manual_source_key(title, basis)
+    meta = {"origin": "console"}
+    if is_link:
+        meta["url"] = url
+        meta["summary"] = content
     with _write_conn() as conn:
         with conn.cursor() as cur:
             status, doc_id, count = ingest.upsert_document(
                 cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE, source_key=key,
-                title=title, meta={"origin": "console"}, text=content, names=names,
-                content_hash=ingest.content_hash(title, content))
-    audit.record(action, key, ok=True, reason=f"status={status}; chunks={count}")
+                title=title, meta=meta, text=content, names=names,
+                content_hash=ingest.content_hash(title, basis),
+                content_type=ctype, url=url)
+    audit.record(action, key, ok=True,
+                reason=f"status={status}; chunks={count}; content_type={ctype}")
     return {"ok": True, "action": action, "id": str(doc_id), "source_key": key,
-            "status": status, "chunks_count": count}
+            "status": status, "chunks_count": count, "content_type": ctype}
 
 
 @router.post("/api/v1/kb/documents/{id}/update",
@@ -596,17 +812,20 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
     🟡 **只改标题时不动 `source_key`**：键是文档身份（备份文件、切片
     `source_path` 都按它索引），而改标题时库里没有原文可重算 hash，重算会把
     「内容级幂等」的键对不上。
+
+    🆕 **按文档自身类型重切**（`content_type` 取库里那行，不取请求里的）：
+    link 改摘要/URL 仍存**单块** `标题\\nURL\\n摘要`，别被当长文切碎；
+    请求里带了且与库里的不同 ⇒ 400（类型创建后不可变，前后端双挡）。
     """
     action = "kb.document.update"
     _need_flag(body.confirm, action, str(id),
                '改知识库文档必须显式传 {"confirm": true}')
     doc_id = _doc_id(id, action)
-    if body.title is None and body.content is None:
-        _reject(400, "nothing_to_update", "title 与 content 不能都不传", action, str(id))
+    if body.title is None and body.content is None and body.url is None:
+        _reject(400, "nothing_to_update",
+                "title 与 content 不能都不传（link 文档可只传 url）", action, str(id))
     if body.title is not None and not body.title.strip():
         _reject(400, "empty_document", "title 不能为空（要清空请删掉重写）", action, str(id))
-    if body.content is not None and not body.content.strip():
-        _reject(400, "empty_document", "content 不能为空（要清空请删掉重写）", action, str(id))
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     try:
@@ -616,20 +835,46 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                 if doc is None:
                     _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
                 _manual_only(doc, str(id), action)
+                ctype = str(doc.get("content_type") or ingest.DEFAULT_CONTENT_TYPE)
+                _check_type_unchanged(body.content_type, ctype, action, str(id))
+                is_link = ctype == ingest.CONTENT_TYPE_LINK
+                if body.url is not None and not is_link:
+                    _reject(400, "url_not_allowed",
+                            f"url 只对 content_type=link 的文档有意义（本篇是 {ctype}）",
+                            action, str(id))
+                # link 的「摘要」就是 content，且**允许清空**（留空即只改标题/URL）
+                if body.content is not None and not is_link and not body.content.strip():
+                    _reject(400, "empty_document", "content 不能为空（要清空请删掉重写）",
+                            action, str(id))
+                # link 的 URL/摘要：改了给新的；**没给的从库里 meta 取回原值**（不能丢）
+                url, summary = "", ""
+                if is_link:
+                    url = _check_url(body.url, action, str(id)) if body.url is not None \
+                        else _doc_meta_field(cur, schema, doc_id, names, "url")
+                    summary = body.content.strip() if body.content is not None \
+                        else _doc_meta_field(cur, schema, doc_id, names, "summary")
                 title = body.title.strip() if body.title is not None else str(doc["title"])
-                if body.content is None:
+                if body.content is None and body.url is None:
                     ingest.update_document(cur, schema, doc_id, title=title,
                                            source_key=str(doc["source_key"]), names=names)
                     count = ingest.chunks_count(cur, schema, doc_id, names=names)
                     key = str(doc["source_key"])
                 else:
-                    content = body.content.strip()
-                    key = ingest.manual_source_key(title, content)
+                    # link 的内容键用「标题 + URL + 摘要」三件（摘要空时退化到 URL，
+                    # 别让两篇同标题不同地址的链接撞成同一行）
+                    content = summary if is_link else (
+                        body.content.strip() if body.content is not None else "")
+                    basis = _doc_basis(title, content, ctype, url)
+                    key = ingest.manual_source_key(title, basis)
                     ingest.update_document(cur, schema, doc_id, title=title, source_key=key,
-                                           content_hash=ingest.content_hash(title, content),
+                                           content_hash=ingest.content_hash(title, basis),
                                            names=names)
+                    if is_link:
+                        _doc_set_link_meta(cur, schema, doc_id, url, summary, names)
+                    # 🔴 重切按**文档自身类型**分派：link 仍是单块
                     count = ingest.replace_chunks(cur, schema, doc_id, content,
-                                                  names=names, source_path=key)
+                                                  names=names, source_path=key,
+                                                  content_type=ctype, title=title, url=url)
     except HTTPException:
         raise
     except Exception as e:                    # noqa: BLE001 —— 唯一约束撞车 → 409
@@ -637,9 +882,10 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
             _reject(409, "kb_source_key_taken",
                     f"已有文档占用了这个内容键（同名同内容已存在）：{id}", action, str(id))
         raise
-    audit.record(action, str(id), ok=True, reason=f"source_key={key}; chunks={count}")
+    audit.record(action, str(id), ok=True,
+                reason=f"source_key={key}; chunks={count}; content_type={ctype}")
     return {"ok": True, "action": action, "id": str(id), "source_key": key,
-            "title": title, "chunks_count": count}
+            "title": title, "chunks_count": count, "content_type": ctype}
 
 
 @router.post("/api/v1/kb/documents/{id}/delete",
@@ -684,9 +930,13 @@ def _export_lines(schema: str, names: Dict[str, str], source_type: str,
         where, params = f"{names['src_type']} = %s", [source_type]
     with _connect() as conn:
         with conn.cursor() as cur:
+            # 🆕 content_type 进导出行（老的导入/其它系统能按它分流）。
+            # 老库未迁移时这根列探不到 ⇒ 投影空串，导出行给 ""（不假装有类型）。
+            sel_ct = f"{names['ctype']}" if names.get("ctype") else "''"
             cur.execute(
                 f"SELECT CAST({names['doc_id']} AS text) AS id, {names['src_type']} AS source_type, "
                 f"{names['src_key']} AS source_key, {names['title']} AS title, "
+                f"{sel_ct} AS content_type, "
                 f"{names['meta']} AS meta FROM {schema}.{names['documents']} "
                 f"WHERE {where} ORDER BY {names['doc_id']} ASC LIMIT %s",
                 [*params, limit])
@@ -713,6 +963,8 @@ def _export_lines(schema: str, names: Dict[str, str], source_type: str,
         yield (json.dumps({
             "id": str(r["id"]), "source_type": str(r["source_type"] or ""),
             "source_key": str(r["source_key"] or ""), "title": str(r["title"] or ""),
+            # 空串 = 老库未迁移探不到这根列（不假装每篇都是手记，缺省就是缺省）
+            "content_type": str(r.get("content_type") or ""),
             # meta 是 jsonb：psycopg3 已解析成对象，psycopg2 给字符串，两种都能出参
             "meta": _jsonable(meta),
             "chunks": by_doc.get(str(r["id"]), []),
@@ -761,6 +1013,8 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
     与记忆导入同款）。去重是**内容级**：`source_key=sha256(title+content)`，
     同键同 hash ⇒ `unchanged`，不重复入库。
     🟡 **只进手动域**：条目里的 `source_type` 一律 422（见 `KbImportItem`）。
+    🆕 条目可带 `"type"`（内容类型，缺省 note）与 `"url"`（type=link 时必填），
+    口径与创建端点同一份枚举校验；link 条目按单块卡片入库。
     """
     action, target = "kb.import", "batch"
     if len(body.items) > IMPORT_MAX_ITEMS:
@@ -769,35 +1023,47 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
                 action, target)
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
+    _need_ctype(names, action, target)
     counts = {"total": len(body.items), "would_add": 0, "unchanged": 0,
               "rejected_empty": 0}
-    plan: List[Tuple[str, str, str, str]] = []      # (title, content, source_key, hash)
+    # (title, content, source_key, hash, content_type, url)
+    plan: List[Tuple[str, str, str, str, str, str]] = []
     written: List[str] = []
     with _write_conn() as conn:
         with conn.cursor() as cur:
             for item in body.items:
                 title = (item.title or "").strip()
                 content = (item.content or "").strip()
-                if not title or not content:
+                ctype = _check_content_type(item.type, action, title or target)
+                is_link = ctype == ingest.CONTENT_TYPE_LINK
+                url = _check_url(item.url, action, title or target) if is_link else ""
+                # link 的摘要可空；其余类型正文必填（口径与创建端点一致）
+                if not title or (not is_link and not content):
                     counts["rejected_empty"] += 1
                     continue
-                key = ingest.manual_source_key(title, content)
-                h = ingest.content_hash(title, content)
+                basis = _doc_basis(title, content, ctype, url)
+                key = ingest.manual_source_key(title, basis)
+                h = ingest.content_hash(title, basis)
                 if ingest.lookup_content_hash(
                         cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE,
                         source_key=key, names=names) == h:
                     counts["unchanged"] += 1
                     continue
-                plan.append((title, content, key, h))
+                plan.append((title, content, key, h, ctype, url))
             counts["would_add"] = len(plan)
             if not body.dry_run:
                 _need_text(body.confirm or "", str(counts["would_add"]), action, target,
                            f"本次将新增 {counts['would_add']} 篇（先跑 dry-run 拿 confirm_required）")
-                for title, content, key, h in plan:
+                for title, content, key, h, ctype, url in plan:
+                    meta = {"origin": "console-import"}
+                    if ctype == ingest.CONTENT_TYPE_LINK:
+                        meta["url"] = url
+                        meta["summary"] = content
                     status, doc_id, _n = ingest.upsert_document(
                         cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE,
-                        source_key=key, title=title, meta={"origin": "console-import"},
-                        text=content, names=names, content_hash=h)
+                        source_key=key, title=title, meta=meta,
+                        text=content, names=names, content_hash=h,
+                        content_type=ctype, url=url)
                     counts[status] = counts.get(status, 0) + 1
                     written.append(str(doc_id))
     # dry-run 走完上面那条连接里只有 SELECT（提交一个只读事务不产生写入）
