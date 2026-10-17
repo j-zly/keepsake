@@ -29,7 +29,9 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: keepsake_memory_crud_be 起再加 3 条业务 POST（增 / 真删 / 导入），
 #: keepsake_kb_crud_be 起再加 4 条知识库写端点（新增 / 改 / 真删 / 导入），
 #: keepsake_bulk_ops 起再加 2 条勾选批量端点（bulk 改数据 / bulk-export 纯读），
-#: keepsake_cron_manage 起再加 3 条定时任务管理端点（暂停 / 恢复 / 改调度）。
+#: keepsake_cron_manage 起再加 3 条定时任务管理端点（暂停 / 恢复 / 改调度），
+#: keepsake_agent_registry（agent_registry 治理中心化）起再加 4 条代理治理端点
+#: （批准 / 吊销 / 改角色 / 上下文排除开关）。
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
@@ -57,6 +59,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",
+    "/api/v1/agents/{agent_id}/approve",
+    "/api/v1/agents/{agent_id}/revoke",
+    "/api/v1/agents/{agent_id}/role",
+    "/api/v1/agents/{agent_id}/exclude",
 } | AUTH_POST_PATHS
 
 #: fixture 语料：一部分常驻、一部分普通、一条待归档
@@ -134,7 +140,11 @@ def test_所有写端点都要求token(client):
              ("/api/v1/fragments/memory%3Afrag%3Aaaa/delete", {"confirm": "frag:aaa"}),
              ("/api/v1/import", {"items": [{"content": "x"}]}),
              ("/api/v1/ops/merge", {"dry_run": True}),
-             ("/api/v1/ops/forget", {"dry_run": True})]
+             ("/api/v1/ops/forget", {"dry_run": True}),
+             ("/api/v1/agents/agent-aaa/approve", {"confirm": True}),
+             ("/api/v1/agents/agent-aaa/revoke", {"confirm": "agent-a"}),
+             ("/api/v1/agents/agent-aaa/role", {"role": "sub", "confirm": "agent-aaa"}),
+             ("/api/v1/agents/agent-aaa/exclude", {"confirm": True, "exclude": True})]
     for url, body in cases:
         r = client.post(url, json=body)
         assert r.status_code == 401, (url, r.status_code)
@@ -458,13 +468,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有十九条业务写端点加三条认证POST():
+def test_写面只有二十三条业务写端点加三条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 23
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 20
+    assert len(ALLOWED_POST_PATHS) == 27
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 24
 
 
 def test_P1只读路由未被写面影响(client):

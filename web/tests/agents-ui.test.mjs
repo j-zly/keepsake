@@ -11,8 +11,14 @@
  *   3) **待审醒目**：pending > 0 时顶部必须有 banner，且它的读写正被拒，
  *      静默地把它排在网格里等于没提示。
  *   4) **自动刷新要收干净**：10s 定时器不 clearInterval，离开这页还在打接口。
- *   5) **主代理行不给「设为主代理」**：防的是把自己降了、还没人批。
- *   6) 无裸 alert / confirm，提示一律走 utils/dialog。
+ *   5) **主代理行一个动作都不给**：不只是「不给设为主代理」—— 吊销 / 排除 /
+ *      批准同样不给。吊销主脑 = 写闸 fail-closed 把它降成 sub，常驻写入全降级、
+ *      候选审批链瘫痪；排除对它本就没有意义。四钮必须整块收在 v-else 里，
+ *      漏挂一个钮就等于自锁洞还开着。
+ *   6) **搜索 + 服务端分页**：filter-panel 三件套（回车查 / 清空回全量 /
+ *      seq 防串）与 PagerBar 接线；q/page/page_size 全部透传，前端不切片。
+ *   7) **pending_count 全量口径**：红条上的待审数不许被搜索词或分页吞掉。
+ *   8) 无裸 alert / confirm，提示一律走 utils/dialog。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -49,7 +55,8 @@ test('凭据展示：全文 + 复制 + 一次性红色提醒', () => {
 })
 
 test('五条 API 齐全，且 confirm 口径与后端逐字一致', () => {
-  assert.match(API, /listAgents: \(\) => http\.get\('\/api\/v1\/agents'\)/)
+  // 列表端点收 q/page/page_size（服务端过滤+分页），匹配语义在服务端
+  assert.match(API, /listAgents: \(params\) => http\.get\('\/api\/v1\/agents', \{ params \}\)/)
   assert.match(API, /approveAgent: \(agentId\) =>\s*http\.post\(`\/api\/v1\/agents\/\$\{encodeURIComponent\(agentId\)\}\/approve`, \{ confirm: true \}\)/)
   assert.match(API, /revokeAgent: \(agentId, confirm\) =>\s*http\.post\(`\/api\/v1\/agents\/\$\{encodeURIComponent\(agentId\)\}\/revoke`, \{ confirm \}\)/)
   assert.match(API, /setAgentRole: \(agentId, role, confirm\) =>\s*http\.post\(`\/api\/v1\/agents\/\$\{encodeURIComponent\(agentId\)\}\/role`, \{ role, confirm \}\)/)
@@ -81,6 +88,95 @@ test('主代理行不给「设为主代理」按钮', () => {
   )
 })
 
+// ---------------------------------------------------------------------------
+// 自锁洞：primary 行必须**一个动作按钮都不给**
+// ---------------------------------------------------------------------------
+
+/** 取 `<template #actions>` 那一段（到下一个 `<template #` 或 `</ItemCard>` 为止）。 */
+function actionsBlock() {
+  const start = VIEW.indexOf('<template #actions>')
+  const rest = VIEW.slice(start)
+  const end = Math.min(
+    ...['<template #tags>', '</ItemCard>', '<!-- 四个动作共用']
+      .map((m) => {
+        const i = rest.indexOf(m)
+        return i === -1 ? Infinity : i
+      }),
+  )
+  return rest.slice(0, end)
+}
+
+test('primary 行只留一句话：吊销 / 排除 / 设主 / 批准一个都不给', () => {
+  const actions = actionsBlock()
+  // 外层按 role 分流：primary 走说明，**其余全部包在 v-else 里**
+  assert.match(actions, /<span v-if="a\.role === 'primary'" class="act-note">/, 'primary 行要有那句说明')
+  assert.match(actions, /主代理 · 不可吊销 \/ 不可排除/, '要说清为什么没有按钮（人话，不是空白）')
+  // 🔴 逐个点名 primary 分支（分流点之前）：一个动作调用都不许有
+  const primaryBranch = actions.slice(0, actions.indexOf('<template v-else>'))
+  assert.doesNotMatch(primaryBranch, /ask\('revoke'/, 'primary 行不许出现吊销入口')
+  assert.doesNotMatch(primaryBranch, /ask\('exclude'/, 'primary 行不许出现上下文排除入口')
+  assert.doesNotMatch(primaryBranch, /ask\('role'/, 'primary 行不许出现改角色入口')
+  assert.doesNotMatch(primaryBranch, /ask\('approve'/, 'primary 行不许出现批准入口')
+  assert.doesNotMatch(primaryBranch, /act-btn/, 'primary 行不许有任何按钮样式残留')
+})
+
+test('四个动作都收在 primary 的 v-else 分支里', () => {
+  const actions = actionsBlock()
+  const elseAt = actions.indexOf('<template v-else>')
+  assert.ok(elseAt !== -1, '缺少 v-else 分支')
+  // 非 primary 分支里四个动作齐全（改口径时不能顺手删掉一个）
+  for (const kind of ['approve', 'role', 'exclude', 'revoke']) {
+    assert.ok(
+      actions.indexOf(`ask('${kind}', a)`, elseAt) !== -1,
+      `${kind} 动作应当存在于非 primary 分支`,
+    )
+  }
+  // 分流点之前不得有任何动作调用
+  assert.doesNotMatch(actions.slice(0, elseAt), /ask\('/, '分流点之前不许有动作调用')
+})
+
+test('搜索 + 服务端分页：filter-panel 三件套 + PagerBar 接线', () => {
+  // 搜索框（回车查 / 清空回全量 / 状态三分支）
+  assert.match(VIEW, /class="filter-panel"/, '搜索面板走全站统一的 filter-panel')
+  assert.match(VIEW, /v-model="q"/, '输入框绑 q')
+  assert.match(VIEW, /@keyup\.enter="search"/, '回车即查')
+  assert.match(VIEW, /@clear="onClear"/, '清空 ✕ 回全量')
+  assert.match(VIEW, /placeholder="搜索 agent_id 或名称（清空回全量）"/, '占位符说清搜什么')
+  assert.match(VIEW, /<button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选<\/button>/, '有「清除筛选」')
+  // seq 防串：连着改词/翻页时旧响应必须丢弃
+  assert.match(VIEW, /let reqSeq = 0/, '有请求序号')
+  assert.match(VIEW, /const seq = \+\+reqSeq/, '每次请求领号')
+  assert.match(VIEW, /if \(isStale\(seq, reqSeq\)\) return/, '过期响应只丢弃不覆盖')
+  assert.match(VIEW, /import \{ isStale \} from '\.\.\/utils\/kb'/, '复用现成的 isStale，不重写')
+  // 空态三分支：筛选无结果 vs 全库为空
+  assert.match(VIEW, /<p v-if="dirty">\s*\n\s*<b>没有匹配到这个词<\/b>/, '筛选无结果说人话')
+  assert.match(VIEW, /<p v-else>\s*\n\s*<b>还没有代理接入过<\/b>/, '全库为空是另一套话')
+})
+
+test('分页：PagerBar 复用，q/page/page_size 全部透传给后端', () => {
+  assert.match(VIEW, /import PagerBar from '\.\.\/components\/PagerBar\.vue'/, '复用现成的 PagerBar')
+  assert.match(VIEW, /<PagerBar[\s\S]*?:total="count"/, '总数取后端的 count（过滤后总数）')
+  assert.match(VIEW, /:page="page"/, '当前页')
+  assert.match(VIEW, /:page-size="pageSize"/, '每页条数')
+  assert.match(VIEW, /@update:page="onPage"/, '翻页接线')
+  assert.match(VIEW, /@update:page-size="onSize"/, '改每页条数接线')
+  // 服务端分页：三个参数都透传（不在前端切片）
+  const body = VIEW.slice(VIEW.indexOf('async function load'))
+  assert.match(body.slice(0, 700), /q: \(q\.value \|\| ''\)\.trim\(\) \|\| undefined/, 'q 透传（空即 undefined）')
+  assert.match(body.slice(0, 700), /page: page\.value/, 'page 透传')
+  assert.match(body.slice(0, 700), /page_size: pageSize\.value/, 'page_size 透传')
+  // 改词/改条数一律回第 1 页（在第 5 页搜词却停在第 5 页 = 空列表）
+  assert.match(VIEW, /function search\(\) \{\s*\n\s*page\.value = 1/, '改词回第 1 页')
+  assert.match(VIEW, /function onSize\(s\) \{\s*\n\s*pageSize\.value = s\s*\n\s*page\.value = 1/, '改条数回第 1 页')
+})
+
+test('pending_count 是全量口径：红条不能被搜索词吞掉', () => {
+  // 后端保证不随 q 变（pending_count 走注册表原始计数）；前端只负责照原样显示
+  assert.match(VIEW, /const pendingCount = computed\(\(\) => data\.value\?\.pending_count \|\| 0\)/, '直接用后端的全量待审数')
+  assert.doesNotMatch(VIEW, /pendingCount = computed\(\(\) => agents\.value\.filter/, '待审数不许在前端按当前页过滤后数（分页下一屏就少一个）')
+  assert.match(VIEW, /v-if="pendingCount > 0" class="banner banner--danger"/, '红条仍由它驱动')
+})
+
 test('待审醒目：pending_count>0 走 banner--danger', () => {
   assert.match(VIEW, /v-if="pendingCount > 0" class="banner banner--danger"/, '待审数 > 0 时顶部必须红条')
   assert.match(VIEW, /个代理待审核/, '红条要说清「几个待审核」')
@@ -97,7 +193,8 @@ test('自动刷新：10s 静默重拉，卸载必须清定时器', () => {
 
 test('刷新失败保留旧数据不清屏', () => {
   const body = VIEW.slice(VIEW.indexOf('async function load'))
-  assert.match(body.slice(0, 700), /data\.value = await api\.listAgents\(\)/, '成功才整份替换')
+  assert.match(body.slice(0, 700), /const list = await api\.listAgents\(\{/, '列表按 q/page 透传')
+  assert.match(body.slice(0, 700), /data\.value = list/, '成功才整份替换')
   assert.doesNotMatch(body.slice(0, 700), /agents\.value = \[\]/, '失败路径不许把列表清空')
   assert.match(body.slice(0, 700), /error\.value = `读取代理列表失败/, '失败要有可见提示')
   assert.match(body.slice(0, 700), /if \(lastErr !== error\.value\) showError/, '连着失败只报一次，不刷屏')
