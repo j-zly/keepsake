@@ -25,6 +25,13 @@
   点选即按该标筛、再点取消；库里一个标签都没有时**整行隐藏**（不编 chip）。
   新增/编辑弹框里逗号或回车成一个 chip，超 12 个 / 单项超 32 字**即时提示**。
   标签与内容类型、来源三者取 AND；后端 update 是整体替换（不给 tags 就不动）。
+
+  审核队列（批2）：**子代理**（非主代理）写进来的知识文档先进待审队列 —— 顶上一颗
+  「待审 N」chip（计数来自 GET /kb/pending 的 pending_count，**前端零写死数字**，
+  为 0 时整行隐藏），点开是待审列表面板（标题/类型/来源代理/时间/正文预览/同名重复
+  警示）。批准 = 此刻才切块进检索；驳回 = 只标状态不删正文（必填理由），两者都走
+  ConfirmDialog 二次确认（与「记忆维护 › 常驻候选」审核同款，不造第三种交互）。
+  🔴 站内手建与主代理写入**不经过这一关** —— 后端按「谁在写」判，前端不设第二道闸。
 -->
 <template>
   <div>
@@ -42,6 +49,15 @@
     </div>
 
     <div class="filter-panel">
+      <!-- 审核队列 chip（批2）：计数来自 /kb/pending 的 pending_count（后端给的真实数字，
+           **前端零写死**）；库里没有待审文档时整行隐藏（不编一个「待审 0」）。
+           点开 = 待审列表面板，批准/驳回都在那儿，与「记忆维护 › 常驻候选」审核区同款。 -->
+      <div v-if="pendCount > 0" class="filter-title">审核</div>
+      <div v-if="pendCount > 0" class="tabs">
+        <button class="tab" :class="{ 'tab--on': pendingOpen }" @click="togglePending">
+          待审 {{ pendCount }}
+        </button>
+      </div>
       <!-- 内容类型 Tab：计数来自 /kb/type-counts（后端给的真实数字，不写死）；
            选中即 GET /kb/documents?content_type=，与 q / source_type 三者取 AND -->
       <div class="filter-title">内容类型</div>
@@ -119,6 +135,69 @@
         <span>{{ mergeCounts(docCount, hitCount) }}</span>
       </div>
     </div>
+
+    <!-- 待审面板（批2）：子代理写进来的知识文档先审后用。样式与「记忆维护 › 常驻候选」
+         审核区同款（同一份 .panel/.card-grid/PagerBar 配方，零新色）。
+         🔴 pending 文档此刻**一块切片都没有**，正文只能看 review_meta 的预览 ——
+         这也是「未审正文不进检索索引」的另一面：它连自己都搜不到。 -->
+    <section v-if="pendingOpen" class="panel pad">
+      <div class="filter-title">待审队列（共 {{ pendTotal }} 条，其中待审 {{ pendCount }}）</div>
+      <p class="filter-desc">
+        子代理（非主代理）提交的知识文档一律先进这里，批准之后才切块进检索；驳回只标状态、不删正文，随时可以再审。站内手建与主代理写入不经过这一关。
+      </p>
+      <div v-if="pendError" class="banner banner--danger">{{ pendError }}</div>
+      <div v-if="pendLoading && !pendRows.length" class="pad">
+        <el-skeleton :rows="2" animated />
+      </div>
+      <div v-else-if="!pendError && !pendRows.length" class="empty">
+        <p><b>没有待审的文档</b>子代理提交的知识文档会出现在这里。</p>
+      </div>
+      <div v-else class="card-grid">
+        <ItemCard v-for="row in pendRows" :key="row.doc_id" chip-tone="accent">
+          <template #tag>{{ row.status === 'rejected' ? '已驳回' : '待审' }}</template>
+          <template v-if="row.submitted_at" #time>{{ toLocal(row.submitted_at) }}</template>
+
+          <p class="card-title" :title="row.title">{{ row.title || '（无标题）' }}</p>
+          <p class="card-body" :title="row.preview">{{ row.preview || '（没有提交正文）' }}</p>
+
+          <template #tags>
+            <span class="tag mono">{{ row.doc_id }}</span>
+            <span class="tag" :class="`tag--${typeOf(row)}`">
+              {{ typeLabel(row) }}<template v-if="typeOf(row) === 'link'"> ↗</template>
+            </span>
+            <span v-for="t in tagsOf(row)" :key="t" class="tag" :title="`标签：${t}`">{{ t }}</span>
+            <span class="tag">来源 {{ row.submitted_by || '未知' }}</span>
+            <!-- 查重提示：同名/近重复不拒收，但这篇得让人看见 -->
+            <span v-if="row.dup_of" class="tag tag--link" :title="`与《${row.dup_of_title}》重复`">
+              {{ row.dup_exact ? '同名重复' : '近重复' }} · {{ row.dup_of_title }}
+            </span>
+            <span v-if="row.reject_reason" class="tag">驳回理由：{{ row.reject_reason }}</span>
+          </template>
+
+          <template #actions>
+            <button class="act-btn" :disabled="busyReview" @click="askApprove(row)">
+              {{ row.status === 'rejected' ? '重新批准' : '批准入库' }}
+            </button>
+            <button
+              v-if="row.status !== 'rejected'"
+              class="act-btn act-btn--danger"
+              :disabled="busyReview"
+              @click="openReject(row)"
+            >
+              驳回
+            </button>
+          </template>
+        </ItemCard>
+      </div>
+      <PagerBar
+        v-if="pendRows.length"
+        :total="pendTotal"
+        :page="pendPage"
+        :page-size="pendSize"
+        @update:page="onPendPage"
+        @update:page-size="onPendSize"
+      />
+    </section>
 
     <div v-if="loading" class="panel pad">
       <el-skeleton :rows="4" animated />
@@ -466,6 +545,55 @@
       tone="primary"
       @confirm="doImportRun"
     />
+
+    <!-- 驳回理由：必填（后端同样 400 reason_required）。驳回不删正文，理由是日后
+         重新审核的唯一线索 —— 所以这里不给「跳过」，只能取消。 -->
+    <el-dialog
+      v-model="rejectAsk"
+      title="驳回这篇待审文档？"
+      width="520px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busyReview"
+      :show-close="!busyReview"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="驳回理由（必填）">
+          <el-input
+            v-model="rejectReason"
+            type="textarea"
+            :rows="4"
+            placeholder="为什么这篇不能进知识库？（例如：与已有手册重复、来源不可信、没有出处）"
+          />
+        </el-form-item>
+      </el-form>
+      <p class="tip">
+        驳回只是把它标成「已驳回」，正文不删（子代理随时能改好重提，你也能在面板里重新批准）。
+        理由会记进该文档的审核台账。
+      </p>
+      <template #footer>
+        <el-button :disabled="busyReview" @click="rejectAsk = false">取消</el-button>
+        <el-button
+          type="danger"
+          :disabled="!rejectReason.trim()"
+          @click="askRejectConfirm"
+        >
+          下一步：确认驳回
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 审核动作二次确认：批准/驳回共用一个实例（与常驻候选审核同款，不造第三种交互） -->
+    <ConfirmDialog
+      v-model="reviewOpen"
+      :title="reviewTitle"
+      :consequences="reviewConsequences"
+      :confirm-text="reviewConfirmText"
+      :tone="reviewKind === 'reject' ? 'danger' : 'primary'"
+      :busy="busyReview"
+      @confirm="doReview"
+    />
   </div>
 </template>
 
@@ -635,6 +763,130 @@ const importConsequences = computed(() =>
 )
 
 const busyExport = ref(false)
+
+// ---- 审核队列（批2）：子代理提交的知识文档先审后用 ----
+/** 待审面板是否展开（chip 上点开/收起） */
+const pendingOpen = ref(false)
+/** 队列里的行（pending + rejected 一起给；pending_count 是 chip 上那个数） */
+const pendRows = ref([])
+const pendCount = ref(0)
+const pendTotal = ref(0)
+const pendPage = ref(1)
+const pendSize = ref(20)
+const pendLoading = ref(false)
+const pendError = ref('')
+/** 批准/驳回共用一个确认框实例（与「常驻候选」审核同款） */
+const reviewOpen = ref(false)
+const reviewKind = ref('')
+const reviewRow = ref(null)
+const busyReview = ref(false)
+/** 驳回理由：先在弹框里填（必填），再走 ConfirmDialog 二次确认 */
+const rejectAsk = ref(false)
+const rejectReason = ref('')
+
+const reviewTitle = computed(() =>
+  reviewKind.value === 'reject'
+    ? '确认驳回这篇知识库文档？'
+    : (reviewRow.value?.status === 'rejected' ? '重新批准已驳回的文档？' : '批准这篇知识库文档？'))
+const reviewConfirmText = computed(() => (reviewKind.value === 'reject' ? '驳回' : '批准入库'))
+const reviewConsequences = computed(() => {
+  const row = reviewRow.value
+  if (!row) return []
+  if (reviewKind.value === 'reject') {
+    return [
+      `《${row.title}》标记为「已驳回」，立刻从待审队列沉底，并从列表/检索/导出里继续不可见。`,
+      `驳回理由会记进审核台账：${rejectReason.value.trim()}`,
+      '正文不删 —— 子代理可以改好重提，你也可以稍后在面板里重新批准。',
+    ]
+  }
+  return [
+    `《${row.title}》标记为已生效，按内容类型（${typeLabel(row)}）切块后落进 chunks。`,
+    '此刻起它才会出现在下方文档列表、被 /kb/search 检索到、也进入导出文件。',
+    '切块与状态改动在同一个事务里：要么都成，要么都不成。',
+    row.dup_of ? `注意：库里已有一篇同名/近重复的《${row.dup_of_title}》（#${row.dup_of}），批准后两篇都会留在检索里。` : '',
+  ].filter(Boolean)
+})
+
+/** 点 chip：开/收面板。展开时拉第一页（收起不清数据，再点开直接显示，不重复请求）。 */
+function togglePending() {
+  pendingOpen.value = !pendingOpen.value
+  if (pendingOpen.value && !pendRows.value.length) loadPending()
+}
+
+/** 队列：计数全部来自后端（前端零写死）；出错清空，不拿上一次的旧队列冒充现状。 */
+async function loadPending() {
+  pendLoading.value = true
+  try {
+    const r = await api.kbPending({ page: pendPage.value, page_size: pendSize.value })
+    pendRows.value = Array.isArray(r?.items) ? r.items : []
+    pendTotal.value = Number(r?.count) || 0
+    pendCount.value = Number(r?.pending_count) || 0
+    pendError.value = ''
+  } catch (e) {
+    pendRows.value = []
+    pendTotal.value = 0
+    pendCount.value = 0
+    pendError.value = `读取待审队列失败：${e.message}`
+  } finally {
+    pendLoading.value = false
+  }
+}
+
+function onPendPage(p) {
+  pendPage.value = p
+  loadPending()
+}
+
+function onPendSize(s) {
+  pendSize.value = Number(s)
+  pendPage.value = 1
+  loadPending()
+}
+
+function askApprove(row) {
+  reviewRow.value = row
+  reviewKind.value = 'approve'
+  reviewOpen.value = true
+}
+
+/** 驳回第一步：先填理由（必填），填完才进二次确认 */
+function openReject(row) {
+  reviewRow.value = row
+  reviewKind.value = 'reject'
+  rejectReason.value = ''
+  rejectAsk.value = true
+}
+
+function askRejectConfirm() {
+  if (!rejectReason.value.trim()) return
+  rejectAsk.value = false
+  reviewOpen.value = true
+}
+
+async function doReview() {
+  const row = reviewRow.value
+  if (!row) return
+  const reject = reviewKind.value === 'reject'
+  busyReview.value = true
+  try {
+    if (reject) {
+      await api.kbRejectDocument(row.doc_id, rejectReason.value.trim())
+      showToast(`已驳回：${row.title}（正文保留，可再审）`)
+    } else {
+      const r = await api.kbApproveDocument(row.doc_id)
+      showToast(`已批准：${row.title}（切成 ${r.chunks_count} 块切片，已进检索）`)
+    }
+    reviewOpen.value = false
+    rejectReason.value = ''
+    await loadPending()
+    // 批准过的那篇已经进了主列表 ⇒ 计数、列表、标签 chip 一起刷
+    refresh()
+  } catch (e) {
+    showError(`${reject ? '驳回' : '批准'}失败：${e.message}`)
+  } finally {
+    busyReview.value = false
+  }
+}
 
 /**
  * 只有手动域（source_type='manual'）的文档能改/删 —— skill/skill_hk 域归灌入器，
@@ -845,6 +1097,8 @@ function refresh() {
   loadSummary()
   loadTypeCounts()
   loadTags()
+  // 待审 chip 的数字也要跟着走（审核动作本身已经单独拉过一次队列，这里只更新 chip）
+  if (pendingOpen.value) loadPending()
   return searching.value ? loadBoth(q.value.trim()) : loadDocs()
 }
 
@@ -1093,6 +1347,8 @@ onMounted(() => {
   loadSummary()
   loadTypeCounts()
   loadTags()
+  // 待审 chip 的计数（面板关着也拉：chip 上那个「待审 N」不能等点开才知道）
+  loadPending()
   loadDocs()
 })
 </script>

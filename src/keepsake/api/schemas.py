@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+# 缺省内容类型取共用层那份（drift 到两处就会出「列表标手记、库里其实是链接」）
+from keepsake.kb.ingest import DEFAULT_CONTENT_TYPE
+
 
 # --------------------------------------------------------------------------
 # 常驻核心层
@@ -196,6 +199,41 @@ class KbChunkList(BaseModel):
     count: int
     page: int
     page_size: int
+
+
+class KbPendingItem(BaseModel):
+    """待审队列的一行（pending + rejected 都在这里，只读）。
+
+    🔴 **待审文档此刻一块切片都没有**（未审正文不进检索索引），所以正文预览只能
+    从 `review_meta.body` 里取 —— 那是提交时的原文，`preview` 截到后端定的
+    `PENDING_PREVIEW_LEN` 字（前端照抄那个数，别自己定另一档）。
+    """
+
+    doc_id: str
+    title: str = ""
+    status: str = Field("pending", description="pending=待审；rejected=已驳回（台账，仍可再审）")
+    submitted_by: str = Field("", description="提交这条的代理 agent_id（站内手建不会有）")
+    submitted_at: str = Field("", description="提交时间（表里探不到时间列时为空串，不编一个）")
+    content_type: str = Field(DEFAULT_CONTENT_TYPE, description="内容类型（按它切块）")
+    source_key: str = ""
+    tags: List[str] = Field(default_factory=list, description="自由标签（与 content_type 正交）")
+    preview: str = Field("", description="正文预览（提交原文的前若干字；pending 阶段无切片可读）")
+    dup_of: str = Field("", description="同标题/近重复的既有文档 id（空=没查到重复）")
+    dup_of_title: str = Field("", description="那一篇的标题（审核页显示警示用）")
+    dup_exact: bool = Field(False, description="True=标题完全相同；False=仅近重复（标题互相包含）")
+    reject_reason: str = Field("", description="驳回理由（已驳回的行才有；正文未删，可再审）")
+
+
+class KbPendingList(BaseModel):
+    """待审面板一页。`pending_count` 是**全量口径**（顶部「待审 N」chip 的唯一来源，
+    不受分页影响）；`count` 是面板总数（pending + rejected）。老库未迁移 status 列
+    ⇒ 两个数都是 0（缺列 = 全 effective，队列恒空，不编数字）。"""
+
+    items: List[KbPendingItem] = Field(default_factory=list)
+    count: int = 0
+    pending_count: int = 0
+    page: int = 1
+    page_size: int = 20
 
 
 # --------------------------------------------------------------------------

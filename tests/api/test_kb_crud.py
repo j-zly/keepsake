@@ -53,16 +53,22 @@ psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 #: NOT NULL 保证 GROUP BY 出来的类型集合是全集而不是一堆 NULL）。
 #: 🆕 `tags text[] NOT NULL DEFAULT '{}'` + GIN 索引 —— 自由标签列，同形状
 #: （DEFAULT '{}' 让灌入器那种「不带这列」的 INSERT 照样落得下去）。
+#: 🆕 `status text NOT NULL DEFAULT 'effective'` + `review_meta jsonb NOT NULL
+#: DEFAULT '{}'` —— 审核两件套（批2），同形状。DEFAULT 'effective' 是承重的那一环：
+#: 灌入器与站内会话一个字都不往这根列写，全靠 DEFAULT 落成已生效。
 DDL = (
     'CREATE SCHEMA "{s}"',
     'CREATE TABLE "{s}".documents ('
     ' id bigserial PRIMARY KEY, source_type text NOT NULL, source_key text NOT NULL,'
     ' content_type text NOT NULL DEFAULT \'note\','
     ' tags text[] NOT NULL DEFAULT \'{{}}\','
+    ' status text NOT NULL DEFAULT \'effective\','
+    ' review_meta jsonb NOT NULL DEFAULT \'{{}}\','   # ⚠️ 双花括号：下面要 .format(s=schema)
     ' title text, meta jsonb, content_hash text,'
     ' updated_at timestamptz NOT NULL DEFAULT now(),'
     ' UNIQUE (source_type, source_key))',
     'CREATE INDEX idx_documents_tags_gin ON "{s}".documents USING gin(tags)',
+    'CREATE INDEX idx_documents_status ON "{s}".documents(status)',
     'CREATE TABLE "{s}".chunks ('
     ' id bigserial PRIMARY KEY, document_id bigint NOT NULL'
     ' REFERENCES "{s}".documents(id), ord int NOT NULL, text text, source_path text)',
@@ -263,13 +269,24 @@ def test_四个写端点都要会话(kb):
 
 
 def test_写端点守卫齐():
-    """🔴 静态判据：4 条 POST 挂 write_guard，导出（只读）只挂 require_session。"""
+    """🔴 静态判据：4 条 POST 挂 write_guard，导出（只读）只挂 require_session。
+
+    🆕 批2 审核：`create` / `update` 的认证依赖从 `require_session` 换成了
+    `writer_identity`（**站内会话照旧放行，代理身份另判**，站内路径体验零变化）；
+    仍然必须挂一个**认会话**的依赖 —— 换成什么都行，漏了不行。
+    `delete` / `import` / 审核两端点（approve/reject）不接受代理身份，仍是纯
+    `require_session`（审核动作只能由控制台的人做）。
+    """
     app = create_app()
     want = {CREATE: ("POST", True),
             "/api/v1/kb/documents/{id}/update": ("POST", True),
             "/api/v1/kb/documents/{id}/delete": ("POST", True),
             IMPORT: ("POST", True),
             EXPORT: ("GET", False)}
+    session_dep = ("require_session", "writer_identity")
+    console_only = ("/api/v1/kb/documents/{id}/delete", IMPORT,
+                    "/api/v1/kb/documents/{id}/approve",
+                    "/api/v1/kb/documents/{id}/reject", EXPORT)
     seen = set()
     for r in app.routes:
         path = getattr(r, "path", "")
@@ -279,7 +296,11 @@ def test_写端点守卫齐():
         if method not in (getattr(r, "methods", set()) or ()):
             continue          # 同路径的另一个方法（GET /kb/documents）不算
         names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
-        assert any("require_session" in n for n in names), path
+        assert any(any(k in n for k in session_dep) for n in names), path
+        if path in console_only:
+            # 审核面与批量工具**不接代理身份**：只能控制台会话
+            assert any("require_session" in n for n in names), path
+            assert not any("writer_identity" in n for n in names), path
         assert any("write_guard" in n for n in names) is need_guard, (path, names)
         seen.add(path)
     assert seen == set(want), f"有端点没注册：{set(want) - seen}"

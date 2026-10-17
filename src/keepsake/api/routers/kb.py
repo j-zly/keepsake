@@ -30,7 +30,17 @@
 校验白名单），标签是开放维度（一篇可挂多个、随时可改、只影响筛选）。标签**不进**
 `source_key`/`content_hash`（进了就等于「改个标签变成换一篇文档」），也**不碰**切块与
 来源域；skill 文档标签恒空 —— 灌入器一个字都不往那根列写，界面也不给它开打标入口
-（沿用 isManual 那套 409 纪律）。审核/状态语义是批2的事，本期不碰。
+（沿用 isManual 那套 409 纪律）。
+
+**审核状态**（批2）：`status` ∈ pending/effective/rejected + `review_meta` jsonb。
+判据只有一条 —— **谁在写**：站内会话（require_session 的界面路径）与灌入器是可信
+来源，直进 `effective`（现行为零变化，手建零审核）；**代理身份**（请求头带 `ksk_`
+凭据、注册表核出来不是 primary）写进来的落 `pending`，进控制台待审队列，且
+**pending 阶段不切块**（正文存 `review_meta.body`，批准时才 `chunk_document` 落
+chunks —— 先切块就是让未审正文先污染检索索引，而审核动作只是事后洗白）。
+待审/已驳回的文档对列表、检索、导出**一律不可见**（`status='effective'` 谓词），
+只有审核视图 `/kb/pending` 看得见。老库未迁移这两根列 ⇒ **读路径一律当全
+effective**（与 content_type / tags 同款降级），写路径由 `_need_status()` 人话 500。
 """
 
 from __future__ import annotations
@@ -39,19 +49,22 @@ import json
 import re
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import）
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from keepsake.govern.registry import CREDENTIAL_PREFIX, ROLE_PRIMARY, Registry
 from keepsake.kb import ingest
 
 from .. import audit, config
-from ..deps import require_session
+from ..deps import get_storage, require_session
 from ..schemas import KbHit, KbSearchResult, KbSummary, KbTagCount, KbTagCounts, KbTypeCounts
 from ..schemas import KbChunkList, KbDocument, KbDocumentList
+from ..schemas import KbPendingItem, KbPendingList
 from .ops import _need_flag, _need_text, _reject, write_guard
 
 router = APIRouter(tags=["kb"])
@@ -127,6 +140,33 @@ TAG_MAX_LEN = 32
 #: 控制字符（含 `\n` `\r` `\t` `\0`）—— 一律 400：标签要渲成 chip、还要进导出文件，
 #: 串进换行/制表能把版面和 JSONL 行一起搞坏。
 _TAG_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# --------------------------------------------------------------------------
+# 审核状态（documents.status + documents.review_meta）
+# --------------------------------------------------------------------------
+# 与 tags/content_type 同款纪律：**可选列**。老库未迁移时读路径一律当「全
+# effective」（存量行照常可见、照常可检索，与迁移前一字不差），真要写审核状态的
+# 路径（代理提交 / 批准 / 驳回）由 `_need_status()` 给人话 500 带迁移 SQL。
+# 状态常量本体在 `ingest`（写路径的唯一判据来源），这里只放探列候选与提示文案。
+
+_CAND_STATUS = ("status",)
+_CAND_RMETA = ("review_meta",)
+
+_STATUS_MIGRATION_HINT = (
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'effective'; "
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS review_meta jsonb NOT NULL DEFAULT '{}'; "
+    "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);"
+)
+
+#: 待审面板的正文预览长度（前端照抄这个数，别自己定另一档）
+PENDING_PREVIEW_LEN = 500
+
+#: 代理写入被拒时的文案（与 `mcp_server.server.GATE_DENIED` 同款口径：只说身份与
+#: 去处，**不回显任何凭据内容**）。未批准/已吊销的代理连队列都不进。
+AGENT_DENIED_NOTE = (
+    "代理 {agent_id} 未批准/已吊销（或凭据无效），知识库写入一律拒绝 —— "
+    "请到控制台代理治理页批准该代理并领取 ksk_ 凭据后重试"
+)
 
 _COLS_CACHE: Dict[str, Dict[str, set]] = {}
 _COLS_LOCK = threading.Lock()
@@ -313,6 +353,10 @@ def kb_search(
     # 老库没有 tags 列 ⇒ 投影**空数组**（不是 NULL、不是缺键）：出参据此省掉 tags 键，
     # 前端按「没打标」渲染，而不是把 NULL 当成一个标签。
     select_tags = f"COALESCE(d.{d_tags}, '{{}}'::text[])" if d_tags else "'{}'::text[]"
+    # 🆕 审核过滤：**待审/已驳回的文档检索一律不可见**（pending 阶段压根没切块，
+    # 这里仍要带上谓词 —— 防的是「批准前的行被人绕过写面塞了块」与已驳回行残留的旧块）。
+    # 老库没有 status 列 ⇒ 不加这个谓词（存量行照常可检索，与迁移前一字不差）。
+    d_status = next((_ident(c) for c in _CAND_STATUS if c in docs), None)
 
     if c_tsv:
         # 中文语料用 simple 分词（PG 默认 english 会把中文切成一坨）
@@ -322,6 +366,8 @@ def kb_search(
     else:
         mode, where, params = "ilike", f"c.{c_text} ILIKE %s", [f"%{q}%"]
         rank, rank_params = "0.0::float8", []
+    if d_status:
+        where, params = f"{where} AND d.{d_status} = %s", [*params, ingest.STATUS_EFFECTIVE]
 
     sql = (
         f"SELECT c.{c_id} AS chunk_id, CAST(c.{c_doc} AS text) AS doc_id, "
@@ -469,6 +515,7 @@ def kb_documents(
     d_src = next((_ident(c) for c in _CAND_SRC_TYPE if c in docs), None)
     d_ct = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
     d_tags = next((_ident(c) for c in _CAND_TAGS if c in docs), None)
+    d_status = next((_ident(c) for c in _CAND_STATUS if c in docs), None)
 
     keyword = (q or "").strip()
     if keyword and d_tsv:
@@ -503,6 +550,11 @@ def kb_documents(
                     f"{config.KB_TABLE_DOCUMENTS} 表未找到 tags 列，无法按标签过滤"
                     f"（请先执行迁移：{_TAGS_MIGRATION_HINT}）",
                     "kb.documents", "list")
+    if d_status:
+        # 🆕 审核过滤：默认列表**只列已生效的**（待审/已驳回的去审核面板看），
+        # 与检索/导出同一口径。放在最后 ⇒ 与 q / source_type / content_type / tag 取 AND。
+        # 老库没有 status 列 ⇒ 不加这个谓词（存量行照常可见，与迁移前一字不差）。
+        where, params = f"{where} AND d.{d_status} = %s", [*params, ingest.STATUS_EFFECTIVE]
 
     src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
     chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
@@ -697,6 +749,145 @@ def _write_conn() -> Iterator[Any]:
         conn.close()
 
 
+def _now_iso() -> str:
+    """审核痕迹里的时间戳（UTC ISO，与注册表 `Registry._now_iso` 同款口径）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------
+# 写入方身份（可信来源 vs 待审来源）
+# --------------------------------------------------------------------------
+# 🔴 **判据是「谁在写」，不是「调用方自称是谁」**：请求头带 `ksk_` 凭据 ⇒ 走注册表
+# `verify_any` 反查身份（与 `mcp_server.server.AgentGate` 的 http 路径**同一个函数**，
+# 不发明第二条身份链）；否则按站内会话 `require_session` 放行。
+# 结论只有三种：站内会话/主代理 = 可信（直进 effective）、子代理 = 待审（pending）、
+# 未批准/已吊销/凭据无效 = 403（连队列都不进，与 agent_gate 同一 fail-closed 方向）。
+
+def _agent_registry(storage: Any) -> Registry:
+    """按控制台的存储后端装配注册表（与 `routers/agents.py` 同一份口径）。"""
+    registry = Registry(storage)
+    registry.ensure_schema()
+    return registry
+
+
+def _bearer(raw: Optional[str]) -> str:
+    """取 `Authorization: Bearer x` 里的 x；不是这种形态给空串（不抛）。"""
+    s = str(raw or "").strip()
+    return s[len("Bearer "):].strip() if s.startswith("Bearer ") else ""
+
+
+def writer_identity(authorization: Optional[str] = Header(default=None),
+                    storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """写端点的**调用方身份**（认证 + 「这条写入要不要审」的判据，一处判完）。
+
+    * 站内会话（控制台 token / 登录会话）⇒ `kind=console`、`status=effective`：
+      **站内人工路径零变化，不给手建加审核**；
+    * 主代理凭据（`role=primary`）⇒ `kind=agent`、`status=effective`：可信来源；
+    * 子代理凭据（`role=sub`）⇒ `status=pending`：进待审队列，**服务端判定、
+      不信调用方自称**（请求体里没有任何「我要不要审」的字段）；
+    * 凭据无效 / 未批准 / 已吊销 ⇒ 403（`_reject` 先审计再抛，与闸门同一方向）。
+
+    🟡 `storage` 依赖只在代理凭据那条路上真的用到（`get_storage` 是进程级单例，
+    站内会话不碰它）；注册表装不出来（存储不可达）也按**拒绝**处理 —— 核不了身份
+    就放行，等于把闸门关着。
+    """
+    credential = _bearer(authorization)
+    if not credential.startswith(CREDENTIAL_PREFIX):
+        require_session(authorization)          # 站内会话：原样抛 401，判据一字不改
+        return {"kind": "console", "agent_id": "", "role": "",
+                "status": ingest.STATUS_EFFECTIVE}
+    try:
+        res = dict(_agent_registry(storage).verify_any(credential))
+    except Exception as e:                       # noqa: BLE001 —— 核不了身份 ⇒ 拒（不放行）
+        _reject(403, "agent_denied",
+                f"代理身份核验失败（{e.__class__.__name__}），知识库写入一律拒绝",
+                "kb.write", "agent")
+    if not res.get("ok"):
+        _reject(403, "agent_denied",
+                AGENT_DENIED_NOTE.format(agent_id=res.get("agent_id") or "未知"),
+                "kb.write", str(res.get("agent_id") or "unknown"))
+    role = str(res.get("role") or "")
+    agent_id = str(res.get("agent_id") or "")
+    return {"kind": "agent", "agent_id": agent_id, "role": role,
+            "status": (ingest.STATUS_EFFECTIVE if role == ROLE_PRIMARY
+                       else ingest.STATUS_PENDING)}
+
+
+def _pending_of(writer: Dict[str, Any]) -> bool:
+    """这次写入要不要进待审队列（只有非主代理写入为真）。"""
+    return str((writer or {}).get("status") or "") == ingest.STATUS_PENDING
+
+
+def _need_status(names: Dict[str, str], action: str, target: str) -> str:
+    """写 status / review_meta 前必须确认这两根列在（老库未迁移 ⇒ 人话 500 不裸崩）。"""
+    if not names.get("status") or not names.get("rmeta"):
+        _reject(500, "kb_schema_unknown",
+                f"{config.KB_TABLE_DOCUMENTS} 表未找到 status / review_meta 列，"
+                f"无法写入审核状态；请先执行迁移：{_STATUS_MIGRATION_HINT}",
+                action, target)
+    return names["status"]
+
+
+def _rmeta_out(raw: Any) -> Dict[str, Any]:
+    """review_meta 出参归一：jsonb 可能是对象、字符串（psycopg2/别的客户端），
+    或 NULL（列刚建、老行没填）—— 一律成 `dict[str, Any]`，解析不了给空字典。"""
+    val = _jsonable(raw)
+    return val if isinstance(val, dict) else {}
+
+
+def _rmeta_of(cur: Any, schema: str, doc_id: Any, names: Dict[str, str]) -> Dict[str, Any]:
+    """取该文档的 review_meta（老库没这列 ⇒ 空字典，调用方按「没有审核痕迹」处理）。"""
+    if not names.get("rmeta"):
+        return {}
+    cur.execute(f"SELECT {names['rmeta']} AS rmeta FROM {schema}.{names['documents']} "
+                f"WHERE {names['doc_id']} = %s", [doc_id])
+    row = cur.fetchone()
+    return _rmeta_out(row.get("rmeta")) if isinstance(row, dict) else {}
+
+
+def _need_effective(doc: Dict[str, Any], doc_id: str, action: str) -> str:
+    """改 / 删只对**已生效**的文档开放：待审与已驳回的归审核面板管。
+
+    不挡的话，控制台照 id 改一篇待审文档就会把新正文切进 chunks，而 review_meta.body
+    还是旧的 —— 批准时切出来的块与正文对不上，且没人看得见（待审文档检索不到）。
+    """
+    st = str((doc or {}).get("status") or ingest.STATUS_EFFECTIVE)
+    if st != ingest.STATUS_EFFECTIVE:
+        _reject(409, "kb_doc_not_effective",
+                f"知识库文档还在审核队列里（status={st}），改/删请到待审面板批准或驳回："
+                f"{doc_id}", action, doc_id)
+    return st
+
+
+def _dup_of(cur: Any, schema: str, names: Dict[str, str], title: str,
+            source_key: str) -> Dict[str, Any]:
+    """代理提交前的**查重提示**（title 相同即记一笔，**不拒收**）。
+
+    🔴 为什么记而不是拒：子代理批量提交同名文档是常态（同一套模板多篇），直接拒
+    等于让它改标题绕过，反而更脏。审核的人看见「这篇与 #12 同名」才是有用的信息。
+    查重范围含近重复（标题被对方包含 / 包含对方），最多 3 条，够提示即可。
+
+    排除自己那行（按 `source_key`）：重复提交同一篇不该把自己当成重复。
+    """
+    if not title or not names.get("title"):
+        return {}
+    cur.execute(f"SELECT CAST({names['doc_id']} AS text) AS id, {names['title']} AS title "
+                f"FROM {schema}.{names['documents']} "
+                f"WHERE {names['src_key']} <> %s AND {names['title']} IS NOT NULL "
+                f"AND ({names['title']} = %s OR {names['title']} ILIKE %s "
+                f"     OR %s ILIKE {names['title']}) "
+                f"ORDER BY {names['doc_id']} ASC LIMIT 3",
+                [source_key, title, f"%{title}%", f"%{title}%"])
+    rows = cur.fetchall() or []
+    exact = [r for r in rows if str(r.get("title") or "") == title]
+    hit = exact[0] if exact else (rows[0] if rows else None)
+    if hit is None:
+        return {}
+    return {"dup_of": str(hit.get("id") or ""),
+            "dup_of_title": str(hit.get("title") or ""),
+            "dup_exact": bool(exact)}
+
+
 def _write_names(schema: str) -> Dict[str, str]:
     """写端点要的表名/列名（复用读端点那套进程级探列缓存 + 标识符白名单）。
 
@@ -723,6 +914,11 @@ def _write_names(schema: str) -> Dict[str, str]:
         "src_key": _pick(docs, _CAND_SRC_KEY, d, "来源键"),
         "ctype": next((_ident(x) for x in _CAND_CTYPE if x in docs), ""),
         "tags": next((_ident(x) for x in _CAND_TAGS if x in docs), ""),
+        # 审核两件套与 ctype/tags 同款降级纪律：**探不到就给空串**，
+        # 不写审核状态的端点（站内会话的增改、导出）照样跑；真要写的由
+        # `_need_status()` 给人话 500（带迁移 SQL）。
+        "status": next((_ident(x) for x in _CAND_STATUS if x in docs), ""),
+        "rmeta": next((_ident(x) for x in _CAND_RMETA if x in docs), ""),
         "title": _pick(docs, _CAND_TITLE, d, "标题"),
         "meta": _pick(docs, _CAND_META, d, "元数据"),
         "hash": _pick(docs, _CAND_HASH, d, "内容哈希"),
@@ -932,8 +1128,9 @@ def _manual_only(doc: Dict[str, Any], doc_id: str, action: str) -> None:
 
 
 @router.post("/api/v1/kb/documents",
-             dependencies=[Depends(require_session), Depends(write_guard)])
-def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
+             dependencies=[Depends(writer_identity), Depends(write_guard)])
+def kb_create_document(body: KbCreateBody,
+                       writer: Dict[str, Any] = Depends(writer_identity)) -> Dict[str, Any]:
     """新增一篇**手动文档**（`source_type='manual'`）。
 
     `source_key='manual:<sha256(title+content)[:12]>'` ⇒ 同内容重复提交是
@@ -950,6 +1147,11 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
     🆕 `tags`（自由标签，可多个）：净化走 `_clean_tags`（strip/去空/去重保序/限长/
     限数/拒控制字符，违规 400），**不参与** source_key 与 content_hash ——
     标签是可随时改的检索维度，进了幂等键就等于「改个标签变成换一篇文档」。
+
+    🆕 **子代理写入 = 进待审队列**（`writer_identity` 判，调用方自称不算数）：
+    落 `status='pending'`、正文存 `review_meta.body`、**不切块**（批准时才切），
+    并记一条同标题查重提示（`review_meta.dup_of`，不拒收）。站内会话与主代理
+    走现路径：`status` 根本不碰（靠列 DEFAULT）、照旧切块入库 —— **零变化**。
     """
     action = "kb.document.create"
     _need_flag(body.confirm, action, "-", '新增知识库文档必须显式传 {"confirm": true}')
@@ -966,9 +1168,12 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
     names = _write_names(schema)
     _need_ctype(names, action, title or "-")
     _need_tags(names, action, title or "-")
+    pending = _pending_of(writer)
+    if pending:
+        _need_status(names, action, title or "-")
     basis = _doc_basis(title, content, ctype, url)
     key = ingest.manual_source_key(title, basis)
-    meta = {"origin": "console"}
+    meta = {"origin": "console" if not pending else "agent"}
     if is_link:
         meta["url"] = url
         meta["summary"] = content
@@ -978,16 +1183,38 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
                 cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE, source_key=key,
                 title=title, meta=meta, text=content, names=names,
                 content_hash=ingest.content_hash(title, basis),
-                content_type=ctype, url=url, tags=tags)
+                content_type=ctype, url=url, tags=tags,
+                # 🔴 待审时**不切块**（chunk=False）：正文改存 review_meta.body，
+                # 等批准时才 replace_chunks —— 未审正文不进检索索引。
+                status=ingest.STATUS_PENDING if pending else None,
+                chunk=not pending)
+            # `unchanged` = 同键同 hash，一行都没动 ⇒ 这次提交没进队列，也**不许**往
+            # 已生效那篇的 review_meta 里塞「待审正文」（那会把一篇在用的文档搅进审核
+            # 台账；它已经审过了 —— 键同就意味着内容与被批准的那次逐字相同）。
+            staged = pending and status != "unchanged"
+            if staged:
+                ingest.patch_review_meta(cur, schema, doc_id, {
+                    "submitted_by": str(writer.get("agent_id") or ""),
+                    "submitted_at": _now_iso(),
+                    # 正文只此一份：pending 阶段没切块，documents 又没有正文列，
+                    # 不存这儿批准时就无从切块（等审核动作就变成了「空文档入库」）。
+                    "body": content,
+                    **_dup_of(cur, schema, names, title, key),
+                }, names=names)
     audit.record(action, key, ok=True,
-                reason=f"status={status}; chunks={count}; content_type={ctype}")
+                reason=f"status={status}; chunks={count}; content_type={ctype}"
+                       + (f"; review=pending; by={writer.get('agent_id') or ''}"
+                          if staged else ""))
     return {"ok": True, "action": action, "id": str(doc_id), "source_key": key,
-            "status": status, "chunks_count": count, "content_type": ctype}
+            "status": status, "chunks_count": count, "content_type": ctype,
+            "review": ingest.STATUS_PENDING if staged
+                      else (status if pending else ingest.STATUS_EFFECTIVE)}
 
 
 @router.post("/api/v1/kb/documents/{id}/update",
-             dependencies=[Depends(require_session), Depends(write_guard)])
-def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
+             dependencies=[Depends(writer_identity), Depends(write_guard)])
+def kb_update_document(id: str, body: KbUpdateBody,
+                       writer: Dict[str, Any] = Depends(writer_identity)) -> Dict[str, Any]:
     """改手动文档的标题 / 正文（两者至少给一个）。
 
     🔴 **改正文必须重切 chunks 且同事务**（DELETE 旧 + INSERT 新）：只改
@@ -1005,6 +1232,12 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
     （给空数组即「清空所有标签」）。净化与新增端点同一个 `_clean_tags`。
     🟡 标签与切片无关：只改标签**不重切 chunks**（重切是把没变的正文再切一遍，
     徒增 `updated_at` 抖动与写放大）。
+
+    🆕 **子代理改正文 = 打回待审**（`writer_identity` 判）：`status='pending'`、
+    新正文存 `review_meta.body`、**不重切 chunks**（旧块随 status 被检索过滤掉，
+    批准时才 `replace_chunks`）。只改标题/标签不改正文则不算新内容，不进审核。
+    🟡 站内会话改**已生效**的文档完全照旧；改还在审核队列里的文档 ⇒ 409
+    （`_need_effective`，那条路归审核面板：批准或驳回，不许从底下偷改）。
     """
     action = "kb.document.update"
     _need_flag(body.confirm, action, str(id),
@@ -1020,6 +1253,10 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
     names = _write_names(schema)
     if tags is not None:
         _need_tags(names, action, str(id))
+    pending = _pending_of(writer)
+    # 这次改「正文」吗（只改标题/标签不算新内容，不进审核）：在事务外先落定，
+    # 审计与回包都在事务外用它。
+    re_review = pending and (body.content is not None or body.url is not None)
     try:
         with _write_conn() as conn:
             with conn.cursor() as cur:
@@ -1027,6 +1264,7 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                 if doc is None:
                     _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
                 _manual_only(doc, str(id), action)
+                _need_effective(doc, str(id), action)
                 ctype = str(doc.get("content_type") or ingest.DEFAULT_CONTENT_TYPE)
                 _check_type_unchanged(body.content_type, ctype, action, str(id))
                 is_link = ctype == ingest.CONTENT_TYPE_LINK
@@ -1059,15 +1297,29 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                         body.content.strip() if body.content is not None else "")
                     basis = _doc_basis(title, content, ctype, url)
                     key = ingest.manual_source_key(title, basis)
+                    # 子代理改了正文 ⇒ 这一行重新进待审（status 写 pending），且**不重切**：
+                    # 旧块留着但被检索的 status 谓词挡住，批准时才 replace_chunks。
+                    if re_review:
+                        _need_status(names, action, str(id))
                     ingest.update_document(cur, schema, doc_id, title=title, source_key=key,
                                            content_hash=ingest.content_hash(title, basis),
-                                           names=names, tags=tags)
+                                           names=names, tags=tags,
+                                           status=ingest.STATUS_PENDING if re_review else None)
                     if is_link:
                         _doc_set_link_meta(cur, schema, doc_id, url, summary, names)
-                    # 🔴 重切按**文档自身类型**分派：link 仍是单块
-                    count = ingest.replace_chunks(cur, schema, doc_id, content,
-                                                  names=names, source_path=key,
-                                                  content_type=ctype, title=title, url=url)
+                    if re_review:
+                        ingest.patch_review_meta(cur, schema, doc_id, {
+                            "submitted_by": str(writer.get("agent_id") or ""),
+                            "submitted_at": _now_iso(),
+                            "body": summary if is_link else content,
+                            **_dup_of(cur, schema, names, title, key),
+                        }, names=names)
+                        count = ingest.chunks_count(cur, schema, doc_id, names=names)
+                    else:
+                        # 🔴 重切按**文档自身类型**分派：link 仍是单块
+                        count = ingest.replace_chunks(cur, schema, doc_id, content,
+                                                      names=names, source_path=key,
+                                                      content_type=ctype, title=title, url=url)
     except HTTPException:
         raise
     except Exception as e:                    # noqa: BLE001 —— 唯一约束撞车 → 409
@@ -1077,9 +1329,11 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
         raise
     audit.record(action, str(id), ok=True,
                 reason=f"source_key={key}; chunks={count}; content_type={ctype}"
-                       + ("" if tags is None else f"; tags={len(tags)}"))
+                       + ("" if tags is None else f"; tags={len(tags)}")
+                       + ("; review=pending" if re_review else ""))
     return {"ok": True, "action": action, "id": str(id), "source_key": key,
-            "title": title, "chunks_count": count, "content_type": ctype}
+            "title": title, "chunks_count": count, "content_type": ctype,
+            "review": ingest.STATUS_PENDING if re_review else ingest.STATUS_EFFECTIVE}
 
 
 @router.post("/api/v1/kb/documents/{id}/delete",
@@ -1101,6 +1355,9 @@ def kb_delete_document(id: str, body: KbDeleteBody) -> Dict[str, Any]:
             if doc is None:
                 _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
             _manual_only(doc, str(id), action)
+            # 🔴 待审/已驳回的不许从这里删：那是审核队列的条目，删了就绕过审核动作
+            # （驳回是**标记**不是删行，正文还在 review_meta 里，改主意还能再批）。
+            _need_effective(doc, str(id), action)
             _need_text(body.confirm, str(doc["title"]), action, str(id), "文档标题")
             snapshot = {"document": dict(doc),
                         "chunks": ingest.document_chunks(cur, schema, doc_id, names=names)}
@@ -1115,6 +1372,227 @@ def kb_delete_document(id: str, body: KbDeleteBody) -> Dict[str, Any]:
             "source_key": str(doc["source_key"]), "backup": backup}
 
 
+# --------------------------------------------------------------------------
+# 审核队列（批2）：待审列表面板 + 批准 / 驳回
+# --------------------------------------------------------------------------
+
+class KbApproveBody(BaseModel):
+    """`{"confirm": true}` —— 批准一篇子代理提交的知识文档。
+
+    🔴 `confirm` 是**布尔**而不是手输串：批准/驳回与「常驻候选」那套审核同档防
+    （记忆维护页的批准/驳回也是点一下确认），而这里的破坏性比真删小得多 ——
+    驳回不删正文（只标 rejected，改主意还能再批），批准随时能删。
+    """
+
+    confirm: bool = False
+
+
+class KbRejectBody(BaseModel):
+    """`{"confirm": true, "reason": "..."}` —— 驳回；**reason 必填**。
+
+    🔴 reason 不能省：驳回不删正文（只标 rejected，可再审），所以「为什么不收」
+    这句话是日后重新审的唯一线索，空理由的驳回等于把一篇文档永久卡在队列里
+    还不说缘由。
+    """
+
+    confirm: bool = False
+    reason: str = ""
+
+
+def _pending_item(row: Dict[str, Any]) -> KbPendingItem:
+    """待审队列的一行（review_meta 只解一次：正文预览 + 来源代理 + 查重提示）。"""
+    rmeta = _rmeta_out(row.get("review_meta"))
+    return KbPendingItem(
+        doc_id=str(row.get("doc_id") or ""),
+        title=str(row.get("title") or ""),
+        # 老库/别的驱动给不出时间列时给空串（前端按「没时间」渲染，不编一个）
+        submitted_at=str(row.get("submitted_at") or ""),
+        status=str(row.get("status") or ingest.STATUS_PENDING),
+        content_type=str(row.get("content_type") or ingest.DEFAULT_CONTENT_TYPE),
+        source_key=str(row.get("source_key") or ""),
+        tags=_tags_out(row.get("tags")),
+        # 正文预览：pending 阶段正文在 review_meta.body 里（压根没切块），
+        # 截到前 500 字够审核的人判「这篇到底在讲什么」。
+        preview=str(rmeta.get("body") or "")[:PENDING_PREVIEW_LEN],
+        submitted_by=str(rmeta.get("submitted_by") or ""),
+        dup_of=str(rmeta.get("dup_of") or ""),
+        dup_of_title=str(rmeta.get("dup_of_title") or ""),
+        dup_exact=bool(rmeta.get("dup_exact")),
+        reject_reason=str(rmeta.get("reject_reason") or ""),
+    )
+
+
+@router.get("/api/v1/kb/pending", response_model=KbPendingList,
+            dependencies=[Depends(require_session)])
+def kb_pending(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
+) -> KbPendingList:
+    """待审队列（**非 effective 的文档** = pending + rejected，只读）。
+
+    面板一次拉完两类：pending 是要审的，rejected 是留个台账的（让审核的人看得见
+    「这篇被驳回了、原因是这句」，而不是文档凭空消失）。排序把 pending 排在前面
+    （status 字典序 `pending` < `rejected`），已驳回的自然沉底。
+
+    `pending_count` 恒为**全量 pending 数**，不受分页影响 —— 顶部那个「待审 N」
+    chip 必须永远等于全库待审数（同 `routers/agents.list_agents` 的纪律）。
+    🔴 老库未迁移 status 列 ⇒ 队列恒空（缺列 = 全 effective），不编一个假队列。
+    """
+    schema = _ident(config.pg_schema())
+    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS,))
+    docs = tabs[config.KB_TABLE_DOCUMENTS]
+    if not docs:
+        raise HTTPException(status_code=500,
+                            detail={"error": "kb_table_missing",
+                                    "message": f"知识库表不存在：{config.KB_TABLE_DOCUMENTS}"})
+    d_status = next((_ident(x) for x in _CAND_STATUS if x in docs), None)
+    if not d_status:
+        return KbPendingList(items=[], count=0, pending_count=0,
+                             page=page, page_size=page_size)
+    d_id = _pick(docs, _CAND_ID, config.KB_TABLE_DOCUMENTS, "主键")
+    d_title = next((_ident(t) for t in _CAND_TITLE if t in docs), None)
+    d_time = next((_ident(t) for t in _CAND_TIME if t in docs), None)
+    d_ct = next((_ident(x) for x in _CAND_CTYPE if x in docs), None)
+    d_tags = next((_ident(x) for x in _CAND_TAGS if x in docs), None)
+    d_rmeta = next((_ident(x) for x in _CAND_RMETA if x in docs), "")
+    d_src_key = next((_ident(x) for x in _CAND_SRC_KEY if x in docs), None)
+
+    where = f"d.{d_status} <> %s"
+    src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
+    order = (f"d.{d_status} ASC, " + (f"d.{d_time} DESC NULLS LAST, " if d_time else "")
+             + f"d.{d_id} ASC")
+    sel_title = f"d.{d_title}" if d_title else "''"
+    sel_time = f"d.{d_time}" if d_time else "''"
+    sel_ct = f"d.{d_ct}" if d_ct else "''"
+    sel_tags = f"COALESCE(d.{d_tags}, '{{}}'::text[])" if d_tags else "'{}'::text[]"
+    sel_key = f"d.{d_src_key}" if d_src_key else "''"
+    sel_rmeta = f"d.{_ident(d_rmeta)}" if d_rmeta else "'{}'::jsonb"
+
+    sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
+           f"{sel_time} AS submitted_at, {sel_ct} AS content_type, "
+           f"{sel_tags} AS tags, {sel_key} AS source_key, "
+           f"d.{d_status} AS status, {sel_rmeta} AS review_meta "
+           f"{src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [ingest.STATUS_EFFECTIVE, page_size, (page - 1) * page_size])
+            rows = cur.fetchall()
+            # 面板总数与 chip 计数：一条 SELECT 出两个数（FILTER 参数在 WHERE 之前）
+            cur.execute(f"SELECT COUNT(*) AS n, "
+                        f"COUNT(*) FILTER (WHERE d.{d_status} = %s) AS pend "
+                        f"{src} WHERE {where}",
+                        [ingest.STATUS_PENDING, ingest.STATUS_EFFECTIVE])
+            row = cur.fetchone() or {}
+    items = [_pending_item(r) for r in rows]
+    return KbPendingList(items=items, count=int(row.get("n") or 0),
+                         pending_count=int(row.get("pend") or 0),
+                         page=page, page_size=page_size)
+
+
+@router.post("/api/v1/kb/documents/{id}/approve",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def kb_approve_document(id: str, body: KbApproveBody,
+                        session: Dict[str, Any] = Depends(require_session)) -> Dict[str, Any]:
+    """**批准**一篇待审文档：同事务内 改 effective + 按类型切块落 chunks + 记批准痕迹。
+
+    🔴 **切块就发生在这一刻**（pending 阶段一行 chunks 都没有）：审核动作之前
+    未审正文不进检索索引，批准之后才按 `content_type` 走 `chunk_document` 落库。
+    正文取 `review_meta.body`（提交时存的那份原文），link 的 URL/摘要从 `meta` 取回。
+    🟡 已生效的文档再点批准 ⇒ 409（不重复切块、不改 updated_at）。
+    🟡 已驳回的**可以再批**（驳回只是标记，不删正文，改主意就重新批一次）。
+    """
+    action = "kb.document.approve"
+    _need_flag(body.confirm, action, str(id), '批准知识库文档必须显式传 {"confirm": true}')
+    doc_id = _doc_id(id, action)
+    who = str(session.get("username") or "console")
+    schema = _ident(config.pg_schema())
+    names = _write_names(schema)
+    _need_status(names, action, str(id))
+    with _write_conn() as conn:
+        with conn.cursor() as cur:
+            doc = ingest.load_document(cur, schema, doc_id, names=names)
+            if doc is None:
+                _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
+            _manual_only(doc, str(id), action)
+            st = str(doc.get("status") or ingest.STATUS_EFFECTIVE)
+            if st == ingest.STATUS_EFFECTIVE:
+                _reject(409, "kb_doc_not_pending",
+                        f"这篇已经生效了（status={st}），不用再批准：{id}", action, str(id))
+            body_text = _rmeta_of(cur, schema, doc_id, names).get("body")
+            if not isinstance(body_text, str) or not body_text:
+                _reject(409, "kb_review_no_body",
+                        f"这篇没有可入库的提交正文（review_meta.body 为空），"
+                        f"多半是审核元数据被人手改过，请让提交方重发：{id}", action, str(id))
+            ctype = str(doc.get("content_type") or ingest.DEFAULT_CONTENT_TYPE)
+            title = str(doc.get("title") or "")
+            is_link = ctype == ingest.CONTENT_TYPE_LINK
+            # link 的正文是组合文本：URL/摘要的真源在 meta，body 里存的只是摘要
+            url = _doc_meta_field(cur, schema, doc_id, names, "url") if is_link else ""
+            content = _doc_meta_field(cur, schema, doc_id, names, "summary") if is_link \
+                else body_text
+            key = str(doc.get("source_key") or "")
+            cur.execute(f"UPDATE {schema}.{names['documents']} SET {names['status']} = %s, "
+                        f"{names['updated']} = now() WHERE {names['doc_id']} = %s",
+                        [ingest.STATUS_EFFECTIVE, doc_id])
+            count = ingest.replace_chunks(cur, schema, doc_id, content, names=names,
+                                          source_path=key, content_type=ctype,
+                                          title=title, url=url)
+            ingest.patch_review_meta(cur, schema, doc_id, {
+                "approved_by": who, "approved_at": _now_iso(),
+            }, names=names)
+    audit.record(action, str(id), ok=True,
+                reason=f"chunks={count}; content_type={ctype}; by={who}; was={st}")
+    return {"ok": True, "action": action, "id": str(id), "status": ingest.STATUS_EFFECTIVE,
+            "chunks_count": count, "content_type": ctype, "title": title}
+
+
+@router.post("/api/v1/kb/documents/{id}/reject",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def kb_reject_document(id: str, body: KbRejectBody,
+                       session: Dict[str, Any] = Depends(require_session)) -> Dict[str, Any]:
+    """**驳回**一篇待审文档：`status='rejected'` + 记理由。**不删正文**。
+
+    🔴 标记而不是删行：正文还在 `review_meta.body` 里，审核的人改主意就能再批
+    （子代理的提交被一次误驳回整个丢掉，才是真丢数据）。理由必填 ——
+    驳回之后唯一的线索就是这句。
+    🟡 已生效的文档**不许驳回**（那是删除该干的事，走真删端点）：把在用的文档
+    悄悄标成 rejected 等于让它从检索里消失，而没人批准过这件事。
+    """
+    action = "kb.document.reject"
+    _need_flag(body.confirm, action, str(id), '驳回知识库文档必须显式传 {"confirm": true}')
+    reason = (body.reason or "").strip()
+    if not reason:
+        _reject(400, "reason_required",
+                "驳回必须写理由（review_meta.reject_reason）—— 驳回不删正文，"
+                "日后重新审核时这句是唯一的线索", action, str(id))
+    doc_id = _doc_id(id, action)
+    who = str(session.get("username") or "console")
+    schema = _ident(config.pg_schema())
+    names = _write_names(schema)
+    _need_status(names, action, str(id))
+    with _write_conn() as conn:
+        with conn.cursor() as cur:
+            doc = ingest.load_document(cur, schema, doc_id, names=names)
+            if doc is None:
+                _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
+            _manual_only(doc, str(id), action)
+            st = str(doc.get("status") or ingest.STATUS_EFFECTIVE)
+            if st == ingest.STATUS_EFFECTIVE:
+                _reject(409, "kb_doc_not_pending",
+                        f"这篇已经生效（status={st}），驳回会让它从检索里消失 —— "
+                        f"要下架请走真删端点：{id}", action, str(id))
+            cur.execute(f"UPDATE {schema}.{names['documents']} SET {names['status']} = %s, "
+                        f"{names['updated']} = now() WHERE {names['doc_id']} = %s",
+                        [ingest.STATUS_REJECTED, doc_id])
+            ingest.patch_review_meta(cur, schema, doc_id, {
+                "reject_reason": reason, "rejected_by": who, "rejected_at": _now_iso(),
+            }, names=names)
+    audit.record(action, str(id), ok=True,
+                reason=f"reason={reason[:80]}; by={who}; was={st}")
+    return {"ok": True, "action": action, "id": str(id), "status": ingest.STATUS_REJECTED,
+            "title": str(doc.get("title") or ""), "reason": reason}
+
+
 def _export_lines(schema: str, names: Dict[str, str], source_type: str,
                   limit: int) -> Iterator[bytes]:
     """把导出内容逐篇吐成 JSONL 行（流式：不在内存里拼整个文件）。"""
@@ -1122,6 +1600,10 @@ def _export_lines(schema: str, names: Dict[str, str], source_type: str,
     params: List[Any] = []
     if source_type:
         where, params = f"{names['src_type']} = %s", [source_type]
+    # 🆕 审核过滤：导出**只导已生效的**（与列表/检索同口径 —— 「导出的就是屏幕上
+    # 看到的」这条纪律不许因为导出就破功）。老库没 status 列 ⇒ 不加谓词。
+    if names.get("status"):
+        where, params = f"{where} AND {names['status']} = %s", [*params, ingest.STATUS_EFFECTIVE]
     with _connect() as conn:
         with conn.cursor() as cur:
             # 🆕 content_type 进导出行（老的导入/其它系统能按它分流）。

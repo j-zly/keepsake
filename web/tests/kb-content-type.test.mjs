@@ -87,17 +87,18 @@ test('编辑：类型只读展示、保存请求不带 content_type', () => {
 })
 
 test('类型徽标：按 content_type 渲染，字段缺席按 note 缺省', () => {
-  // 文档卡 / 切片命中卡 / 编辑弹框的静态展示，三处都挂同一个判据
-  assert.equal((KB.match(/tag--\$\{typeOf\(/g) || []).length, 3,
-    '文档卡、切片命中卡、编辑弹框都要有类型徽标')
+  // 文档卡 / 切片命中卡 / 编辑弹框 / 待审卡，四处都挂同一个判据
+  // （批2 加了待审面板那张卡 —— 它也要说清这篇是什么类型，批准后才按类型切块）
+  assert.equal((KB.match(/tag--\$\{typeOf\(/g) || []).length, 4,
+    '文档卡、切片命中卡、编辑弹框、待审卡都要有类型徽标')
   // 🔴 严格判据：字段缺席按 note 缺省，**不许**「没有就是技能/按 source_type 猜」
   assert.match(KB, /function typeOf\(row\) \{\s*\n\s*return row\?\.content_type \|\| 'note'/,
     'typeOf 必须读 content_type 且缺席按 note')
   assert.ok(!/content_type \|\| 'skill'/.test(KB), '缺席不许默认成 skill')
   // 链接徽标带 ↗（点得进去的意思），技能压低存在感
   assert.match(KB, /\.tag--link \{[^}]*--accent/)
-  assert.equal((KB.match(/typeOf\((doc|row)\) === 'link'"> ↗/g) || []).length, 2,
-    '文档卡与切片命中卡的链接徽标都要带 ↗')
+  assert.equal((KB.match(/typeOf\((doc|row)\) === 'link'"> ↗/g) || []).length, 3,
+    '文档卡、切片命中卡、待审卡的链接徽标都要带 ↗')
 })
 
 test('读路径：老库未迁移时按 note 渲染、不编计数、不假装筛过', () => {

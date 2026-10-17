@@ -57,6 +57,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/{id}/update",
     "/api/v1/kb/documents/{id}/delete",
     "/api/v1/kb/import",
+    "/api/v1/kb/documents/{id}/approve",
+    "/api/v1/kb/documents/{id}/reject",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
     "/api/v1/crons/{job_id}/pause",
@@ -188,14 +190,15 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
-    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 23 条 + 认证 4 条，不多不少。
+    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 25 条 + 认证 4 条，不多不少。
 
     P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点，
     keepsake_memory_crud_be 再加 增/真删/导入 三条，keepsake_kb_crud_be 再加
     KB 四条，keepsake_budget_io_templates 再加 PUT 预算设置，
     keepsake_cron_manage 再加 定时任务 暂停/恢复/改调度 三条，
     keepsake_agent_registry 再加 代理治理 批准/吊销/改角色/排除开关 四条，
-    keepsake_change_password 再加 改口令 一条 ——
+    keepsake_change_password 再加 改口令 一条，
+    keepsake_kb_review 再加 审核 批准/驳回 两条 ——
     多一条（比如漏加 require_session 依赖的临时端点）同样会被这里抓住。
     """
     app = create_app()
@@ -205,21 +208,26 @@ def test_只读路由断言():
     paths = {getattr(r, "path", "") for r in app.routes}
     assert {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
             "/api/v1/fragments/{key}", "/api/v1/kb/summary", "/api/v1/kb/search",
-            "/api/v1/stats", "/api/v1/crons", "/api/v1/hits/stats"} <= paths
+            "/api/v1/kb/pending", "/api/v1/stats", "/api/v1/crons",
+            "/api/v1/hits/stats"} <= paths
     assert len([p for p in paths if p.startswith("/api/v1/")]) >= 8
 
 
 def test_写路由全部需要token():
-    """写面 POST 一条都不许免认证 —— 少挂一个 require_session 就红。
+    """写面 POST 一条都不许免认证 —— 少挂一个认证依赖就红。
 
     认证的 3 条不在此列：setup / login 本来就公开（P3 硬要求），
     logout 的会话校验由 tests/api/test_auth.py 单独逐条打。
+    🔴 `writer_identity` 也算「认会话的依赖」：站内会话原样走 require_session，
+    代理凭据另走注册表核验（同样是先认证再判身份）—— 判据是「有没有那道闸」，
+    不是依赖函数叫什么名字。
     """
     app = create_app()
     for r in app.routes:
         if getattr(r, "path", "") in (ALLOWED_POST_PATHS - AUTH_POST_PATHS):
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
-            assert any("require_session" in n for n in names), r.path
+            assert any("require_session" in n or "writer_identity" in n
+                       for n in names), r.path
 
 
 # ---------------------------------------------------------------- core

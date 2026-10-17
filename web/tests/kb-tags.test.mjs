@@ -61,9 +61,10 @@ test('chip 计数来自后端、前端零写死数字', () => {
 })
 
 test('卡片渲染 tags chip：复用现有 .tag，零新色', () => {
-  // 文档卡与切片命中卡各一处；字段缺席（老库未迁移）⇒ 空数组（当「没打标」）
-  assert.equal((KB.match(/v-for="t in tagsOf\((doc|row)\)"/g) || []).length, 2,
-    '文档卡与切片命中卡都要渲染标签 chip')
+  // 文档卡 / 切片命中卡 / 待审卡各一处（批2 的待审面板那张卡也要渲染标签）；
+  // 字段缺席（老库未迁移）⇒ 空数组（当「没打标」）
+  assert.equal((KB.match(/v-for="t in tagsOf\((doc|row)\)"/g) || []).length, 3,
+    '文档卡、切片命中卡、待审卡都要渲染标签 chip')
   assert.match(KB, /function tagsOf\(row\) \{\s*\n\s*return Array\.isArray\(row\?\.tags\) \? row\.tags : \[\]/,
     'tagsOf 必须守住「字段缺席 = 没打标」，不能把 undefined 渲成标签')
   // 样式只用现成的 .tag（tokens.css 里那份），不许为标签另造一套颜色

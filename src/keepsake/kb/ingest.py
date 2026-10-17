@@ -13,6 +13,10 @@ v3 口径，控制台的写端点（`api/routers/kb.py`）也走这里 —— �
 🔴 **本模块不碰连接、不碰事务、不碰驱动**：`upsert_document` 只往调用方给的
 游标上执行 SQL，提交/回滚由调用方持有（同事务里连带删 chunks 才靠得住）。
 列名/表名走 `names` 覆盖（生产表结构是默认口径；API 侧按探出来的真实列名传）。
+
+**审核状态**（status/review_meta）：状态判据与「什么时候切块」都在这里
+（`upsert_document(chunk=...)` + `patch_review_meta`），控制台端点只负责判定
+「这条写入是谁发起的」并翻译 HTTP 语义 —— 与切块/幂等同一口径，不另起一套。
 """
 
 from __future__ import annotations
@@ -43,6 +47,28 @@ CONTENT_TYPE_IMAGE = "image"        # 图文：枚举占位，创建端点 400�
 CONTENT_TYPES = (CONTENT_TYPE_SKILL, CONTENT_TYPE_NOTE, CONTENT_TYPE_ARTICLE,
                  CONTENT_TYPE_LINK, CONTENT_TYPE_IMAGE)
 
+# --------------------------------------------------------------------------
+# 审核状态（status：非可信来源写入的知识文档先审后用）
+# --------------------------------------------------------------------------
+# 判据与列定义：status ∈ pending / effective / rejected，review_meta 存审核痕迹
+# （submitted_by / submitted_at / body / dup_of / reject_reason / approved_by…）。
+# 灌入器与站内会话写进来的直接 `effective`（可信来源，不劳审）；**代理身份**写进来的
+# 落 `pending`，进控制台待审队列。
+#
+# 🔴 **pending 阶段不切块**：正文存在 review_meta.body 里，等批准时才 chunk_document
+# 落 chunks —— 「先入库再等审核」等于让未经审的正文先污染检索索引，等审核人的动作
+# 只是事后洗白（而 pending 的文档又被检索过滤掉了，切出来的那堆块永远没人看）。
+# 代价是 documents 没有正文列这件事必须靠 review_meta 兜住（见 `patch_review_meta`）。
+
+STATUS_PENDING = "pending"
+STATUS_EFFECTIVE = "effective"
+STATUS_REJECTED = "rejected"
+STATUSES = (STATUS_PENDING, STATUS_EFFECTIVE, STATUS_REJECTED)
+
+#: 缺省状态：存量行与不显式给 status 的调用方一律按「已生效」处理（老库无该列时
+#: 读路径也按这个口径兜底 —— 缺列即「全 effective」）。
+DEFAULT_STATUS = STATUS_EFFECTIVE
+
 #: 缺省类型：存量行与不传 content_type 的调用方一律按手记处理
 DEFAULT_CONTENT_TYPE = CONTENT_TYPE_NOTE
 
@@ -68,6 +94,11 @@ DEFAULT_NAMES: Dict[str, str] = {
     # 读路径降级、写路径由调用方先确认（API 侧 `_need_tags()` 给人话 500）。
     # 灌入器不传 tags ⇒ 压根不往这根列写（技能文档恒为 '{}'，界面上不给它开打标入口）。
     "tags": "tags",
+    # 审核状态与审核痕迹。🟡 同样是可选列，但**灌入器一个字都不往这两根写**
+    # （不传 status ⇒ 靠列的 DEFAULT 'effective'），老库未迁移时控制台写路径
+    # 由 `_need_status()` 给人话 500，读路径按「缺列 = 全 effective」降级。
+    "status": "status",
+    "rmeta": "review_meta",
     "title": "title",
     "meta": "meta",
     "hash": "content_hash",
@@ -211,6 +242,31 @@ def _tags_col(n: Dict[str, str]) -> str:
     return n["tags"]
 
 
+def _status_col(n: Dict[str, str]) -> str:
+    """要写 status / review_meta 就必须确认这两根列在：不在 ⇒ 抛，**不静默跳过审核**。
+
+    「保存成功但文档其实没进待审队列」是最坏的那种坏（审核面板永远看不到它，
+    而它又确实被检索过滤掉了 ⇒ 等于凭空消失）。API 侧先用 `_need_status()` 给人话
+    500（带迁移 SQL），这里只是共用层的兜底断言（与 `_tags_col` 同款）。
+    """
+    if not n.get("status"):
+        raise RuntimeError(
+            "documents 表未找到 status 列，拒绝把待审文档写成「已生效」；"
+            "请先执行迁移：ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+            "status text NOT NULL DEFAULT 'effective'")
+    return n["status"]
+
+
+def _rmeta_col(n: Dict[str, str]) -> str:
+    """review_meta 列（提交正文与审核痕迹都存这儿；没有它 pending 文档就没正文）。"""
+    if not n.get("rmeta"):
+        raise RuntimeError(
+            "documents 表未找到 review_meta 列，拒绝静默丢掉审核痕迹；"
+            "请先执行迁移：ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+            "review_meta jsonb NOT NULL DEFAULT '{}'")
+    return n["rmeta"]
+
+
 def _scalar(row: Any) -> Any:
     """一行取第一列（`dict_row` / `RealDictCursor` 回字典，默认游标回元组）。"""
     if isinstance(row, dict):
@@ -265,7 +321,8 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
                     title: str, meta: Optional[Dict[str, Any]], content_hash: str,
                     text: str, names: Optional[Dict[str, str]] = None,
                     content_type: str = DEFAULT_CONTENT_TYPE,
-                    url: str = "", tags: Optional[Sequence[str]] = None) -> Tuple[str, Any, int]:
+                    url: str = "", tags: Optional[Sequence[str]] = None,
+                    status: Optional[str] = None, chunk: bool = True) -> Tuple[str, Any, int]:
     """按 `(source_type, source_key)` 幂等落一篇文档，返回 `(状态, doc_id, 切片数)`。
 
     状态判据与 v3 同款，三种：
@@ -285,8 +342,19 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     （**替换不是追加**，净化已在上游做完）。`%s::text[]` 显式 cast：PG 推不出
     Python 列表的类型，不写 cast 要么驱动乱适配、要么 `could not determine
     data type of parameter`。
+
+    🆕 `status`（审核状态）：**`None` = 不碰这根列**（灌入器与站内会话都走这条 ——
+    可信来源直进 effective，不劳审；老库未迁移时它们照样能写）。给了就整列写死，
+    并参与 ON CONFLICT 的 SET：**内容变了的代理重提交会把这一行重新打回 pending**
+    （新正文还没人看过，不能沿用旧正文的批准）。取值非法直接抛，不写进库里。
+
+    🆕 `chunk=False`：**不切块**（pending 阶段的专用姿势）。返回的切片数是 0，
+    正文改由调用方存进 review_meta.body，等批准时才 `replace_chunks` ——
+    未经审的正文不落 chunks，检索索引就不会被它污染。
     """
     n = _names(names)
+    if status is not None and status not in STATUSES:
+        raise RuntimeError(f"非法 status：{status!r}（只能是 {list(STATUSES)}）")
     cur.execute(f"SELECT {n['doc_id']}, {n['hash']} FROM {schema}.{n['documents']} "
                 f"WHERE {n['src_type']} = %s AND {n['src_key']} = %s",
                 [source_type, source_key])
@@ -310,6 +378,12 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
         vals += ", %s::text[]"
         params.append(list(tags))
         sets.append(f"{tcol} = EXCLUDED.{tcol}")
+    if status is not None:
+        scol = _status_col(n)
+        cols.append(scol)
+        vals += ", %s::text"
+        params.append(status)
+        sets.append(f"{scol} = EXCLUDED.{scol}")
     cur.execute(
         f"INSERT INTO {schema}.{n['documents']}"
         f"({', '.join(cols)}) VALUES({vals}) "
@@ -317,9 +391,26 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
         f"SET {', '.join(sets)} "
         f"RETURNING {n['doc_id']}", params)
     doc_id = _scalar(cur.fetchone())
+    if not chunk:
+        return ("updated" if row is not None else "added"), doc_id, 0
     count = replace_chunks(cur, schema, doc_id, text, names=names, source_path=source_key,
                            content_type=content_type, title=title, url=url)
     return ("updated" if row is not None else "added"), doc_id, count
+
+
+def patch_review_meta(cur: Any, schema: str, doc_id: Any,
+                      patch: Dict[str, Any], *, names: Optional[Dict[str, str]] = None) -> None:
+    """把 `patch` **合并**进该文档的 `review_meta`（jsonb `||`，不覆盖已有键）。
+
+    合并而不是整列替换：审核痕迹是**累积**的（谁提交、什么时候、驳回理由、谁批准），
+    整列覆盖会在第二次动作时把第一次的痕迹抹掉 —— 台账就成了一条。
+    必须与状态改动同事务（调用方的连接持有提交权）。
+    """
+    n = _names(names)
+    cur.execute(f"UPDATE {schema}.{n['documents']} SET {_rmeta_col(n)} = "
+                f"COALESCE({_rmeta_col(n)}, '{{}}'::jsonb) || %s::jsonb "
+                f"WHERE {n['doc_id']} = %s",
+                [json.dumps(patch or {}, ensure_ascii=False), doc_id])
 
 
 def lookup_content_hash(cur: Any, schema: str, *, source_type: str, source_key: str,
@@ -339,7 +430,8 @@ def lookup_content_hash(cur: Any, schema: str, *, source_type: str, source_key: 
 def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
                     source_key: str, content_hash: Optional[str] = None,
                     names: Optional[Dict[str, str]] = None,
-                    tags: Optional[Sequence[str]] = None) -> None:
+                    tags: Optional[Sequence[str]] = None,
+                    status: Optional[str] = None) -> None:
     """按 **id** 改文档行（控制台改文档走这条，不走 `upsert_document`）。
 
     🔴 **必须按 id 改**：手动域的 `source_key` 是 `sha256(title+content)` 派生，
@@ -352,8 +444,13 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
 
     🆕 `tags=None` 表示**不动标签**（只改标题/正文时零影响）；给了列表就是
     **整体替换**（不是追加 —— 见 `upsert_document` 同款语义）。
+
+    🆕 `status=None` 表示**不动审核状态**（站内会话改文档：现行为零变化）；
+    代理改了正文才给 `pending`，把这一行打回待审队列。
     """
     n = _names(names)
+    if status is not None and status not in STATUSES:
+        raise RuntimeError(f"非法 status：{status!r}（只能是 {list(STATUSES)}）")
     sets = [f"{n['title']} = %s", f"{n['src_key']} = %s", f"{n['updated']} = now()"]
     params: List[Any] = [title, source_key]
     if content_hash is not None:
@@ -362,6 +459,9 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
     if tags is not None:
         sets.append(f"{_tags_col(n)} = %s::text[]")
         params.append(list(tags))
+    if status is not None:
+        sets.append(f"{_status_col(n)} = %s::text")
+        params.append(status)
     params.append(doc_id)
     cur.execute(f"UPDATE {schema}.{n['documents']} SET {', '.join(sets)} "
                 f"WHERE {n['doc_id']} = %s", params)
@@ -370,18 +470,21 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
 def load_document(cur: Any, schema: str, doc_id: Any, *,
                   names: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """取一行文档，**返回逻辑键**（`id`/`source_type`/`source_key`/`title`/
-    `content_hash`/`content_type`），不存在 ⇒ None。调用方不用关心真实列名。
+    `content_hash`/`content_type`/`status`），不存在 ⇒ None。调用方不用关心真实列名。
 
-    🟡 `content_type` 是**可选投影**：`names["ctype"]` 为假值（调用方探到表里
-    没这列）时 SELECT `''` —— 老库未迁移时读路径照常返回，不裸炸（写路径另由
-    `_write_names` 的必需列判据挡住，见 `routers/kb.py`）。
+    🟡 `content_type` / `status` 是**可选投影**：`names["ctype"]` / `names["status"]`
+    为假值（调用方探到表里没这列）时 SELECT `''` —— 老库未迁移时读路径照常返回，
+    不裸炸（写路径另由 `_write_names` 的必需列判据挡住，见 `routers/kb.py`）。
+    🔴 缺 status 列时这里给 `effective`：**缺列 = 全 effective**（存量行全可见，
+    与未迁移时的既有行为一字不差）。
     """
     n = _names(names)
     # 显式 AS：dict_row 拿的是列名，裸 `SELECT ''` 的键是 "?column?"，取不到
     sel_ctype = f"{n['ctype']} AS content_type" if n.get("ctype") else "'' AS content_type"
+    sel_status = f"{n['status']} AS status" if n.get("status") else "'' AS status"
     cur.execute(f"SELECT {n['doc_id']}, {n['src_type']}, {n['src_key']}, "
-                f"{n['title']}, {n['hash']}, {sel_ctype} FROM {schema}.{n['documents']} "
-                f"WHERE {n['doc_id']} = %s", [doc_id])
+                f"{n['title']}, {n['hash']}, {sel_ctype}, {sel_status} "
+                f"FROM {schema}.{n['documents']} WHERE {n['doc_id']} = %s", [doc_id])
     row = cur.fetchone()
     if row is None:
         return None
@@ -390,7 +493,8 @@ def load_document(cur: Any, schema: str, doc_id: Any, *,
             "source_key": _val(row, n["src_key"], 2),
             "title": _val(row, n["title"], 3),
             "content_hash": _val(row, n["hash"], 4),
-            "content_type": _val(row, "content_type", 5) or DEFAULT_CONTENT_TYPE}
+            "content_type": _val(row, "content_type", 5) or DEFAULT_CONTENT_TYPE,
+            "status": _val(row, "status", 6) or DEFAULT_STATUS}
 
 
 def document_chunks(cur: Any, schema: str, doc_id: Any, *,

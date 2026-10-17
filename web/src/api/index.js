@@ -183,6 +183,20 @@ export const api = {
     http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/delete`, { confirm }).then((r) => r.data),
   // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
   kbImportDocuments: (payload) => http.post('/api/v1/kb/import', payload).then((r) => r.data),
+
+  // ---- 知识库审核队列（批2）：子代理提交的知识文档先审后用 ----
+  // 待审面板（pending + rejected 一起给，pending_count 是全量 pending 数）：
+  // 🔴 **计数绝不写死在前端**（与 type-counts / tags 同纪律），老库未迁移 status 列
+  // 时后端给 0，页面就不显示「待审」chip。
+  kbPending: (params) => http.get('/api/v1/kb/pending', { params }).then((r) => r.data),
+  // 批准：confirm 传 true（与代理治理 approve 同档防）；后端在同一事务里改 effective
+  // + **此刻才切块**落 chunks + 记批准痕迹。
+  kbApproveDocument: (id) =>
+    http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/approve`, { confirm: true }).then((r) => r.data),
+  // 驳回：reason **必填**（后端 400 reason_required）—— 驳回不删正文，理由是日后
+  // 重新审核的唯一线索。原样透传，错误文案由后端说了算。
+  kbRejectDocument: (id, reason) =>
+    http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/reject`, { confirm: true, reason }).then((r) => r.data),
 }
 
 export default http
