@@ -56,7 +56,7 @@
 
     <h3 class="section-title">记忆类定时任务</h3>
     <div class="sched-line">
-      <span class="sched-k">调度器</span>
+      <span class="sched-k">调度器：</span>
       <span class="sched-v">{{ schedulerStatus || '未知' }}</span>
     </div>
     <div v-if="cronError" class="banner banner--danger">{{ cronError }}</div>
@@ -259,21 +259,20 @@ const kb = computed(() => ({
 /**
  * 调度器那一行的显示值。
  *
- * 后端给的是 `hermes cron status` 的**最后一行自由文本**（形如
- * `Next run 2026-10-17T04:30:00.123456+08:00`），原样渲染就是一串带 +08:00
- * 尾巴的机器串。把里面认得出的那个时间戳摘出来过 toLocal 显示成本地时间，
- * 前缀/后缀的说明文字照旧跟在后面；认不出时间戳就原样透传 —— 宁可丑，
- * 也不静默吞掉调度器的状态。
+ * 后端已经把 `hermes cron status` 末行拆成结构化两段（{text, next_run}，
+ * 见 crons.py `_parse_scheduler_status`）：`text` 是人话，`next_run` 是 ISO
+ * 串。这里只做「把 ISO 显示成本地时间」这一件事 —— 时间戳曾经以
+ * `Next run: 2026-10-17T04:30:00.123456+08:00` 混在自由文本里一路透传，
+ * 界面上渲成「调度器：下次 X · Next run:」，同一件事说两遍。
+ * 两段都空才退「未知」，缺哪段都只显示有的那半边。
  */
-const SCHED_ISO_RE = /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})?/
-
 function schedLabel(raw) {
-  const s = (raw || '').trim()
-  if (!s) return ''
-  const m = s.match(SCHED_ISO_RE)
-  if (!m) return s
-  const rest = (s.slice(0, m.index) + s.slice(m.index + m[0].length)).trim()
-  return ['下次 ' + toLocal(m[0]), rest].filter(Boolean).join(' · ')
+  // 兼容旧实例回的还是裸字符串（发版错配时不至于整行变「未知」）
+  const o = typeof raw === 'string' ? { text: raw, next_run: '' } : (raw || {})
+  const bits = []
+  if (o.text) bits.push(o.text)
+  if (o.next_run) bits.push(`下次 ${toLocal(o.next_run)}`)
+  return bits.join(' · ') || '未知'
 }
 
 async function load() {

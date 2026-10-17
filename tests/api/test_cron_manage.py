@@ -252,8 +252,40 @@ def test_读面scheduler_status_取CLI末行(client, monkeypatch, tmp_path):
     fake = FakeCLI(stdout="hermes cron status\ndaemon running, 6 jobs\n")
     monkeypatch.setattr(cron_router.subprocess, "run", fake)
     body = client.get("/api/v1/crons", headers=AUTH).json()
-    assert body["scheduler_status"] == "daemon running, 6 jobs"
+    # 结构化两段：人话与「下次执行」各归各位，前端不必再刨英文自由文本
+    assert body["scheduler_status"] == {"text": "daemon running, 6 jobs", "next_run": ""}
     assert fake.argvs[0] == ["hermes", "cron", "status"]     # 只读命令，同样 argv 列表
+
+
+def test_读面scheduler_status_拆出next_run不把Next_run透传前端(client, monkeypatch, tmp_path):
+    """🔴 主脑真机复验的病灶：`Next run: <ISO>` 原样透传，界面上渲成
+    「调度器：下次 X · Next run:」——同一件事说两遍。拆成结构化两段。"""
+    f = tmp_path / "jobs.json"
+    f.write_text(json.dumps({"jobs": [{"name": "记忆提炼", "id": JOB_ID}]}, ensure_ascii=False),
+                 encoding="utf-8")
+    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
+    fake = FakeCLI(
+        stdout="hermes cron status\ndaemon running, 6 jobs · Next run: 2026-10-17T04:30:00.123456+08:00\n")
+    monkeypatch.setattr(cron_router.subprocess, "run", fake)
+    st = client.get("/api/v1/crons", headers=AUTH).json()["scheduler_status"]
+    assert st == {"text": "daemon running, 6 jobs", "next_run": "2026-10-17T04:30:00.123456+08:00"}
+    assert "Next run" not in json.dumps(st, ensure_ascii=False)
+
+
+def test_scheduler_status解析_两形与认不出():
+    """直接喂解析器：含 / 不含 Next run 两形，外加认不出时的保守退路。"""
+    p = cron_router._parse_scheduler_status
+    # 整行就是 Next run：text 留空（前端只显示「下次 X」），不许留半截标签
+    assert p("Next run: 2026-10-17T04:30:00+08:00") == {
+        "text": "", "next_run": "2026-10-17T04:30:00+08:00"}
+    # 无冒号 / 中文冒号 / snake 风格字样都认（hermes 改文案不该让界面多出一段英文）
+    assert p("Next run 2026-10-17T04:30:00+08:00")["next_run"] == "2026-10-17T04:30:00+08:00"
+    assert p("Next run：2026-10-17T04:30:00+08:00")["next_run"] == "2026-10-17T04:30:00+08:00"
+    assert p("next_run: 2026-10-17T04:30:00+08:00") == {
+        "text": "", "next_run": "2026-10-17T04:30:00+08:00"}
+    # 认不出 ⇒ text 原样、next_run 空串（保守不猜，猜错比丑更糟）
+    assert p("daemon running, 6 jobs") == {"text": "daemon running, 6 jobs", "next_run": ""}
+    assert p("  ") is None
 
 
 def test_静态判据_不许出现shell等于True():

@@ -178,14 +178,42 @@ def _job_id_of(job: Dict[str, Any]) -> str:
     return ""
 
 
-def _scheduler_status() -> Optional[str]:
+#: `hermes cron status` 末行里的「下次执行」段，形如
+#: `Next run: 2026-10-17T04:30:00.123456+08:00`。
+#:
+#: hermes 的字样还没钉死，两种都认：`Next run|next_run`（英文标签 / snake 风格），
+#: 冒号半角全角、带不带冒号也一律放过 —— 这两个字样是本文件的静态闸眼
+#: （`grep -qE 'Next run\|next_run' crons.py`），谁把这段判据删了闸就红。
+_NEXT_RUN_RE = re.compile(r"(?:Next\s*run|next_run)\s*[:：]?\s*(\S+)")
+
+
+def _parse_scheduler_status(line: str) -> Optional[Dict[str, str]]:
+    """把 CLI 末行拆成「人话 + 下次执行时间」两段，不让机器串原样过界面。
+
+    病灶（主脑真机复验）：末行原样透传，前端拼成「调度器：下次 X · Next run:」，
+    同一件事说两遍且第二遍悬空。这次**连源一起修**：时间戳摘出来交给前端的
+    toLocal 显示成本地时间，剩下的说明文字当 text。认不出上面那两个字样 ⇒
+    text 原样、next_run 空串 —— 保守不猜，猜错比丑更糟。
+    """
+    line = (line or "").strip()
+    if not line:
+        return None
+    m = _NEXT_RUN_RE.search(line)
+    if not m:
+        return {"text": line[:200], "next_run": ""}
+    # 连 "Next run:" 这段标签一起去掉；剩下的分隔符（· , ;）收干净，别留尾巴
+    rest = (line[:m.start()] + line[m.end():]).strip(" ·|,;:-")
+    return {"text": rest[:200], "next_run": m.group(1).rstrip(".,;")}
+
+
+def _scheduler_status() -> Optional[Dict[str, str]]:
     """面板顶上一行的调度器状态。CLI 不可用 / 超时 ⇒ **None**，不许把读面拖成 500。"""
     try:
         rc, out, err = run_cli(["cron", "status"])
     except HTTPException:
         return None
     text = out if rc == 0 else (err or out)
-    return (_last_line(text)[:200] or None)
+    return _parse_scheduler_status(_last_line(text))
 
 
 def _cron_action(job_id: str, body: CronActionBody, action: str,

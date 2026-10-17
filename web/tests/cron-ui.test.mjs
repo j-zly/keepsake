@@ -9,7 +9,8 @@
  *   4) 无脚本名时出灰字占位并收起复制钮（脚本行不许只剩一个悬空图标）；
  *   5) 标签区固定成「cron 起头 + 状态紧随」的一行，状态标签不再各按各的长度跑；
  *   6) 操作行文字链接与 28px 描边钮同高；
- *   7) 调度器行走 toLocal，任务区模板里**不许出现裸 ISO**（带 +08:00 尾巴那种）。
+ *   7) 调度器行走 toLocal，任务区模板里**不许出现裸 ISO**（带 +08:00 尾巴那种），
+ *      且不许在本地时间后面再挂一段没值的英文标签（`Next run` 那种）。
  *
  * 范围：本单只改 StatsView 的卡内类，ItemCard / tokens.css 是共享面 —— 这里
  * 顺带钉一句「别把共享组件当自家后院」，免得下次图省事去改全局。
@@ -91,27 +92,39 @@ test('调度器行走 toLocal，模板里不出现裸 ISO', () => {
   const fn = STATS.slice(STATS.indexOf('function schedLabel'), STATS.indexOf('async function load'))
   assert.match(fn, /toLocal\(/, 'schedLabel 里要走 toLocal，不许裸 new Date')
   assert.doesNotMatch(fn, /new Date\(/, '时区交给 toLocal，别自己造')
+  assert.match(TEMPLATE, /class="sched-v">\{\{ schedulerStatus \|\| '未知' \}\}/,
+    '显示值 = 规整后的调度器状态（schedLabel 已在 load 里算好）')
   assert.match(STATS, /schedulerStatus\.value = schedLabel\(schedulerStatus\.value\)/,
-    '显示值 = 规整后的调度器状态')
+    '后端给的结构化两段必须过 schedLabel 才进模板')
   // 裸 ISO（`04:30:00.123456+08:00` 这种）不许写死在模板里
   assert.doesNotMatch(TEMPLATE, /\d{2}:\d{2}:\d{2}\.\d+\+/, '模板里不许出现裸 ISO 串')
+  // 🔴 主脑真机复验的病灶：`Next run` 段是后端原样透传过来的重复标签，
+  // 界面这一侧只准消费结构化的 next_run，不许再拼一段出来
+  assert.doesNotMatch(fn, /Next run/, '渲染路径不许再拼 Next run 标签')
+  assert.doesNotMatch(TEMPLATE, /Next run/, '调度器行模板里不出现 Next run')
 })
 
-test('schedLabel 真跑一遍：裸 ISO 转本地时间，无时间戳原样透传', async () => {
+test('schedLabel 真跑一遍：结构化两段各归各位，Next run 不再漏进界面', async () => {
   const { toLocal } = await import(`${ROOT}src/utils/format.js`)
   // 从 SFC 里原样抠出这段逻辑再执行 —— 纯静态断言盯不住「摘错了一段」的活
-  const from = STATS.indexOf('const SCHED_ISO_RE')
-  const src = STATS.slice(from, STATS.indexOf('async function load')).trim()
+  const src = STATS.slice(STATS.indexOf('function schedLabel'),
+    STATS.indexOf('async function load')).trim()
   // eslint-disable-next-line no-new-func
   const schedLabel = new Function('toLocal', `${src}\nreturn schedLabel`)(toLocal)
 
-  // 截图里那串：微秒 + 时区尾巴，原样渲染就是一长条机器串
-  assert.equal(schedLabel('Next run 2026-10-17T04:30:00.123456+08:00'),
-    `下次 ${toLocal('2026-10-17T04:30:00.123456+08:00')} · Next run`, '裸 ISO 要换成本地时间')
-  assert.doesNotMatch(schedLabel('Next run 2026-10-17T04:30:00.123456+08:00'), /\d{2}:\d{2}:\d{2}\.\d+\+/,
-    '回显里不许再漏出裸 ISO')
-  assert.equal(schedLabel('cron daemon running'), 'cron daemon running', '认不出时间戳就原样透传')
-  assert.equal(schedLabel(''), '', '空串仍是空串，模板兜成「未知」')
+  const ISO = '2026-10-17T04:30:00.123456+08:00'
+  // 后端拆好的两段：人话 + ISO。ISO 过 toLocal，绝不再与英文标签重复
+  assert.equal(schedLabel({ text: 'daemon running, 6 jobs', next_run: ISO }),
+    `daemon running, 6 jobs · 下次 ${toLocal(ISO)}`, '两段各归各位')
+  // 整行就是个 Next run 的场合：只剩「下次 X」，不许留半截悬空标签
+  assert.equal(schedLabel({ text: '', next_run: ISO }), `下次 ${toLocal(ISO)}`)
+  const one = schedLabel({ text: 'daemon running, 6 jobs', next_run: ISO })
+  assert.doesNotMatch(one, /Next run/, '语义重复的英文标签不许再出现')
+  assert.doesNotMatch(one, /\d{2}:\d{2}:\d{2}\.\d+\+/, '回显里不许漏出裸 ISO')
+  assert.equal(schedLabel(null), '未知', '没 CLI 时后端给 null')
+  assert.equal(schedLabel({ text: '', next_run: '' }), '未知', '两段都空也是「未知」')
+  assert.equal(schedLabel('cron daemon running'), 'cron daemon running',
+    '旧实例回裸字符串时原样透传，不至于整行变「未知」')
 })
 
 test('共享面不许动：修复只落在 StatsView 的卡内类上', () => {

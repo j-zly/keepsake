@@ -184,12 +184,25 @@ class CronJob(BaseModel):
     job_id: str = ""
 
 
+class SchedulerStatus(BaseModel):
+    """`hermes cron status` 末行拆出来的两段（源码侧 `_parse_scheduler_status`）。
+
+    结构化而非裸字符串：那一行的末段常是 `Next run: <ISO+08:00>`，原样透传
+    会在界面上渲成「调度器：下次 X · Next run:」—— 同一件事说两遍。时间戳
+    摘出来给前端 toLocal 显示成本地时间，界面就不必再从英文自由文本里刨。
+    """
+    #: 去掉 Next run 段之后剩下的人话（认不出该形状时就是原文）
+    text: str = ""
+    #: 下次执行的 ISO 串（前端 toLocal 渲染）；认不出 / 没有 ⇒ 空串
+    next_run: str = ""
+
+
 class CronList(BaseModel):
     jobs: List[CronJob]
     count: int
     source: str = Field(..., description="读到的 jobs.json 路径（不存在时也回显，便于定位）")
-    #: 调度器状态一行（`hermes cron status`）；本机无 CLI ⇒ null，前端显示「未知」
-    scheduler_status: Optional[str] = None
+    #: 调度器状态（`hermes cron status`）；本机无 CLI ⇒ null，前端显示「未知」
+    scheduler_status: Optional[SchedulerStatus] = None
 
 
 class CronActionBody(BaseModel):
