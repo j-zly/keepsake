@@ -51,20 +51,25 @@ psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 #: 🆕 `content_type text NOT NULL DEFAULT 'note'` —— 与生产迁移后的列**同形状**
 #: （DEFAULT + NOT NULL 都要有：DEFAULT 保证存量 INSERT 不带这列也能落，
 #: NOT NULL 保证 GROUP BY 出来的类型集合是全集而不是一堆 NULL）。
+#: 🆕 `tags text[] NOT NULL DEFAULT '{}'` + GIN 索引 —— 自由标签列，同形状
+#: （DEFAULT '{}' 让灌入器那种「不带这列」的 INSERT 照样落得下去）。
 DDL = (
     'CREATE SCHEMA "{s}"',
     'CREATE TABLE "{s}".documents ('
     ' id bigserial PRIMARY KEY, source_type text NOT NULL, source_key text NOT NULL,'
     ' content_type text NOT NULL DEFAULT \'note\','
+    ' tags text[] NOT NULL DEFAULT \'{{}}\','
     ' title text, meta jsonb, content_hash text,'
     ' updated_at timestamptz NOT NULL DEFAULT now(),'
     ' UNIQUE (source_type, source_key))',
+    'CREATE INDEX idx_documents_tags_gin ON "{s}".documents USING gin(tags)',
     'CREATE TABLE "{s}".chunks ('
     ' id bigserial PRIMARY KEY, document_id bigint NOT NULL'
     ' REFERENCES "{s}".documents(id), ord int NOT NULL, text text, source_path text)',
 )
 
-#: 迁移**之前**的老表形状（没有 content_type 列）—— 用来钉「缺列时人话报错不裸崩」
+#: 迁移**之前**的老表形状（既没有 content_type 也没有 tags 列）——
+#: 用来钉「缺列时人话报错不裸崩 / 读路径降级不炸」
 DDL_NO_CTYPE = (
     'CREATE SCHEMA "{s}"',
     'CREATE TABLE "{s}".documents ('
@@ -220,10 +225,11 @@ def create(client: TestClient, title: str, content: str, **kw: Any) -> Dict[str,
 
 
 def docs(client: TestClient, q: str = "", source_type: str = "",
-         content_type: str = "") -> Dict[str, Any]:
+         content_type: str = "", tag: str = "") -> Dict[str, Any]:
     r = client.get(f"/api/v1/kb/documents?page_size=100" + (f"&q={q}" if q else "")
                    + (f"&source_type={source_type}" if source_type else "")
-                   + (f"&content_type={content_type}" if content_type else ""),
+                   + (f"&content_type={content_type}" if content_type else "")
+                   + (f"&tag={tag}" if tag else ""),
                    headers=AUTH)
     assert r.status_code == 200, r.text
     return r.json()

@@ -19,6 +19,12 @@
   新增弹框可选类型：手记/文章（正文逐字切块）/链接（URL + 摘要，**单块不切**）。
   🔴 **编辑弹框不带类型**：类型创建后不可变（后端带异值 400），重切按文档自身
   类型走；前端这一层是「不给入口」，后端那一层是「给了也拒」，双挡。
+
+  自由标签（tags）是**第三个维度**（content_type 是封闭枚举，标签是开放维度）：
+  类型 Tab 下面一整行 chip 来自 GET /kb/tags（计数后端给，**前端零写死数字**），
+  点选即按该标筛、再点取消；库里一个标签都没有时**整行隐藏**（不编 chip）。
+  新增/编辑弹框里逗号或回车成一个 chip，超 12 个 / 单项超 32 字**即时提示**。
+  标签与内容类型、来源三者取 AND；后端 update 是整体替换（不给 tags 就不动）。
 -->
 <template>
   <div>
@@ -52,9 +58,28 @@
           <span v-if="typeCounts[t.value] !== undefined" class="tab-n">{{ typeCounts[t.value] }}</span>
         </button>
       </div>
+      <!-- 标签 chip 行：数据来自 /kb/tags（后端给的真实计数，前端零写死）。
+           点选 = 按该标筛，再点取消；库里没标签时整行隐藏（v-if，不编 chip）。
+           选中态复用 .tab--on 这套（零新色），与上方内容类型 Tab 同一份配方。 -->
+      <template v-if="tagRows.length">
+        <div class="filter-title">标签</div>
+        <div class="tabs">
+          <button
+            v-for="row in tagRows"
+            :key="row.tag"
+            class="tab"
+            :class="{ 'tab--on': activeTag === row.tag }"
+            :title="`只列带「${row.tag}」标签的文档`"
+            @click="onTag(row.tag)"
+          >
+            {{ row.tag }}
+            <span class="tab-n">{{ row.count }}</span>
+          </button>
+        </div>
+      </template>
       <div class="filter-title">检索</div>
       <p class="filter-desc">
-        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。类型 Tab 按内容类型筛（与下面的来源下拉、检索词三者取 AND）。
+        一个词两路同时查：下面的文档列表按标题过滤，切片区按正文命中；任一有结果就算找得到。清空即回到全量文档列表。类型 Tab 与标签 chip 按内容类型 / 标签筛（与下面的来源下拉、检索词四者取 AND）。
       </p>
       <div class="filter-ctl">
         <el-input
@@ -127,6 +152,8 @@
             <span class="tag" :class="`tag--${typeOf(doc)}`">
               {{ typeLabel(doc) }}<template v-if="typeOf(doc) === 'link'"> ↗</template>
             </span>
+            <!-- 自由标签：复用现有 .tag 配方（零新色）。字段缺席（老库未迁移）= 没打标 -->
+            <span v-for="t in tagsOf(doc)" :key="t" class="tag" :title="`标签：${t}`">{{ t }}</span>
             <span v-if="!isManual(doc)" class="tag">只读 · 灌入器维护</span>
           </template>
 
@@ -146,7 +173,7 @@
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
             <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
           </svg>
-          <p v-if="!sourceType && !contentType"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
+          <p v-if="!sourceType && !contentType && !activeTag"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
           <p v-else><b>该筛选下还没有文档</b>当前只列 {{ filterLabel }} 的文档，换个筛选或选「全部」再看看。</p>
         </div>
       </div>
@@ -175,6 +202,7 @@
               <span class="tag" :class="`tag--${typeOf(row)}`">
                 {{ typeLabel(row) }}<template v-if="typeOf(row) === 'link'"> ↗</template>
               </span>
+              <span v-for="t in tagsOf(row)" :key="t" class="tag" :title="`标签：${t}`">{{ t }}</span>
             </template>
 
             <template #lead>复制 chunk_id ↗</template>
@@ -267,8 +295,23 @@
             "
           />
         </el-form-item>
+        <!-- 自由标签（可选）：逗号或回车各成一个 chip。超限即时提示，别等后端 400 -->
+        <el-form-item label="标签（可选）">
+          <el-select
+            v-model="draftTags"
+            class="sel-full"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="true"
+            placeholder="逗号或回车成一个：如 量化、部署、投资"
+          />
+        </el-form-item>
       </el-form>
-      <p class="tip">内容类型创建后不可改（要换类型就删掉重建）。链接只存 URL 与摘要，不抓取网页。</p>
+      <p v-if="tagsInvalid(draftTags)" class="banner banner--danger">{{ tagsHint(draftTags) }}</p>
+      <p v-else class="tip">{{ tagsHint(draftTags) }}</p>
+      <p class="tip">内容类型创建后不可改（要换类型就删掉重建）。链接只存 URL 与摘要，不抓取网页。标签只影响筛选，不参与内容判据（改标签不会把文档变成另一篇）。</p>
       <template #footer>
         <el-button :disabled="busyCreate" @click="creating = false">取消</el-button>
         <el-button
@@ -316,7 +359,22 @@
             placeholder="要改正文就粘贴完整原文；留空只改标题。改正文时后端会删旧切片重切。"
           />
         </el-form-item>
+        <!-- 标签：预填现值（列表接口投影出来了）。保存是**整体替换**：删一个 chip 再存就真删 -->
+        <el-form-item label="标签">
+          <el-select
+            v-model="editTags"
+            class="sel-full"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="true"
+            placeholder="逗号或回车成一个"
+          />
+        </el-form-item>
       </el-form>
+      <p v-if="tagsInvalid(editTags)" class="banner banner--danger">{{ tagsHint(editTags) }}</p>
+      <p v-else class="tip">{{ tagsHint(editTags) }}</p>
       <p class="tip">
         正文不回显：列表接口只返回标题，正文只存在于切片里（且读接口每条只给前 300 字），
         拿截断的切片回显再保存会把原文截断。要改正文请粘贴完整全文。类型不可改 ——
@@ -327,7 +385,7 @@
         <el-button
           type="primary"
           :loading="busyEdit"
-          :disabled="!editTitle.trim()"
+          :disabled="!editTitle.trim() || tagsInvalid(editTags)"
           @click="doEdit"
         >
           保存
@@ -349,14 +407,14 @@
       <el-form label-position="top">
         <el-form-item>
           <span class="fld">
-            每行一篇 {title, content}
+            每行一篇 {title, content, tags}
             <a class="tpl-link" href="#" @click.prevent="getTemplate">下载模板</a>
           </span>
           <el-input
             v-model="importText"
             type="textarea"
             :rows="7"
-            placeholder='{"title": "文档标题", "content": "文档全文"}'
+            placeholder='{"title": "文档标题", "content": "文档全文", "tags": ["量化", "部署"]}'
           />
         </el-form-item>
       </el-form>
@@ -364,7 +422,7 @@
         有 {{ importParse.broken }} 行不是合法的 {"title", "content"}（缺标题/缺正文/不是 JSON），未计入下方条目 —— 不静默丢行，请修正后重试。
       </p>
       <p v-else-if="importParse.items.length" class="tip">
-        已解析 {{ importParse.items.length }} 篇，点「预演」后端会按内容去重并回显将新增多少篇；导入**只进手动域**。
+        已解析 {{ importParse.items.length }} 篇（其中 {{ importParse.items.filter((i) => i.tags.length).length }} 篇带标签），点「预演」后端会按内容去重并回显将新增多少篇；导入**只进手动域**。
       </p>
       <p v-if="importPlan" class="tip">
         预演结果：将新增 {{ importPlan.would_add }} 篇 · 已存在跳过 {{ importPlan.unchanged }} 篇 ·
@@ -444,6 +502,10 @@ const contentType = ref('')
 /** 各类型的文档数（后端 /kb/type-counts 给的真数字）。**前端绝不写死计数** ——
  *  老库未迁移该列时后端给 {}，Tab 上就不显示数字，而不是显示一个编出来的 0。 */
 const typeCounts = ref({})
+/** 标签筛选：tagRows = /kb/tags 给的 [{tag,count}]（**计数绝不写死**；空列表 ⇒ chip 行整行隐藏）；
+ *  activeTag = 当前选中的那一个（再点一次取消）。与 q / source_type / content_type 取 AND。 */
+const tagRows = ref([])
+const activeTag = ref('')
 
 /** 类型 Tab（顺序即展示顺序）。count 取不到就不渲染那个数 */
 const TYPE_TABS = [
@@ -474,11 +536,37 @@ function typeLabel(row) {
   return TYPE_LABEL[typeOf(row)] || typeOf(row)
 }
 
+/** 卡上的标签 chip：字段缺席（老库未迁移）或空数组 ⇒ 空数组（当「没打标」，不编标签） */
+function tagsOf(row) {
+  return Array.isArray(row?.tags) ? row.tags : []
+}
+
+// 标签的硬上限：**抄后端 `TAG_MAX_ITEMS` / `TAG_MAX_LEN`**（kb.py 的 _clean_tags）。
+// 前端只是提前把话说出来，判据仍在后端（前端能被绕过，前端不能是唯一那道闸）。
+const TAG_MAX_ITEMS = 12
+const TAG_MAX_LEN = 32
+
+/** 标签即时提示：超限说清超在哪（最多 12 个 / 单项 ≤32 字），合规时只报口径 */
+function tagsHint(list) {
+  const arr = Array.isArray(list) ? list : []
+  const long = arr.find((t) => String(t).trim().length > TAG_MAX_LEN)
+  if (long) return `「${String(long).trim()}」超过 ${TAG_MAX_LEN} 字了，标签要能一眼看完`
+  if (arr.length > TAG_MAX_ITEMS) return `已 ${arr.length} 个，最多 ${TAG_MAX_ITEMS} 个标签`
+  return `逗号或回车成一个标签；最多 ${TAG_MAX_ITEMS} 个、单项 ≤${TAG_MAX_LEN} 字`
+}
+
+/** 超限 = 不让提交（与后端同一套判据，别让用户填完再吃 400） */
+function tagsInvalid(list) {
+  const arr = Array.isArray(list) ? list : []
+  return arr.length > TAG_MAX_ITEMS || arr.some((t) => String(t).trim().length > TAG_MAX_LEN)
+}
+
 /** 空态那句话里说清「当前筛的是啥」 */
 const filterLabel = computed(() => {
   const t = contentType.value ? `content_type=${contentType.value}` : ''
   const s = sourceType.value ? `source_type=${sourceType.value}` : ''
-  return [t, s].filter(Boolean).join(' · ')
+  const g = activeTag.value ? `tag=${activeTag.value}` : ''
+  return [t, s, g].filter(Boolean).join(' · ')
 })
 const loading = ref(false)
 const error = ref('')
@@ -499,6 +587,8 @@ const draftTitle = ref('')
 const draftContent = ref('')
 const draftType = ref('note')
 const draftUrl = ref('')
+/** 新增弹框里的标签 chip 列表（逗号/回车由 el-select 自己变成一项） */
+const draftTags = ref([])
 
 const editing = ref(false)
 const busyEdit = ref(false)
@@ -506,6 +596,8 @@ const editDoc = ref(null)
 const editTitle = ref('')
 const editContent = ref('')
 const editUrl = ref('')
+/** 编辑弹框里的标签 chip：预填现值，保存时**整体替换**（后端语义，不追加） */
+const editTags = ref([])
 /** 编辑弹框里的 URL 占位：列表接口不投影 meta（读不到原值），就明说「留空 = 不改」 */
 const editUrlPlaceholder = computed(() => '留空则保留原链接；填 http(s) 开头的地址会替换')
 
@@ -580,7 +672,7 @@ async function loadDocs() {
   const seq = ++reqSeq
   loading.value = true
   try {
-    const data = await api.kbDocuments({ source_type: sourceType.value, content_type: contentType.value, page: page.value, page_size: pageSize.value })
+    const data = await api.kbDocuments({ source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, page: page.value, page_size: pageSize.value })
     if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
@@ -607,7 +699,7 @@ async function loadBoth(term) {
   let docRes, hitRes
   try {
     [docRes, hitRes] = await Promise.all([
-      api.kbDocuments({ q: term, source_type: sourceType.value, content_type: contentType.value, page: page.value, page_size: pageSize.value }),
+      api.kbDocuments({ q: term, source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, page: page.value, page_size: pageSize.value }),
       api.kbSearch({ q: term, page: hitPage.value, page_size: hitSize.value }),
     ])
   } catch (e) {
@@ -667,6 +759,25 @@ async function loadTypeCounts() {
   } catch (e) {
     typeCounts.value = {}
   }
+}
+
+/** 标签 chip 行：只有 /kb/tags 给了的标签才渲染（老库未迁移 ⇒ 空列表 ⇒ 整行隐藏）。
+ *  出错时清空（不拿上一个库的旧标签冒充现状）。 */
+async function loadTags() {
+  try {
+    const r = await api.kbTags()
+    tagRows.value = Array.isArray(r?.items) ? r.items : []
+  } catch (e) {
+    tagRows.value = []
+  }
+}
+
+/** 点 chip = 按该标筛，**再点同一个 = 取消**（页码各回第 1 页，与 onType/onSource 同款） */
+function onTag(t) {
+  activeTag.value = activeTag.value === t ? '' : t
+  page.value = 1
+  hitPage.value = 1
+  return search()
 }
 
 function onPage(p) {
@@ -733,6 +844,7 @@ async function doCopy(id) {
 function refresh() {
   loadSummary()
   loadTypeCounts()
+  loadTags()
   return searching.value ? loadBoth(q.value.trim()) : loadDocs()
 }
 
@@ -742,12 +854,16 @@ function openCreate() {
   draftContent.value = ''
   draftType.value = 'note'
   draftUrl.value = ''
+  draftTags.value = []
   creating.value = true
 }
 
-/** 提交闸：标题必填；link 要 URL（摘要可空）；其余类型正文必填（口径与后端一致） */
+/** 提交闸：标题必填；link 要 URL（摘要可空）；其余类型正文必填（口径与后端一致）；
+ *  标签超限（>12 个 / 单项 >32 字）也不让提交 —— 与后端同一套判据，不让用户
+ *  填完再吃一个 400。 */
 const canCreate = computed(() => {
   if (!draftTitle.value.trim()) return false
+  if (tagsInvalid(draftTags.value)) return false
   return draftType.value === 'link'
     ? !!draftUrl.value.trim()
     : !!draftContent.value.trim()
@@ -761,6 +877,7 @@ async function doCreate() {
   try {
     const payload = { title, content, content_type: draftType.value }
     if (draftType.value === 'link') payload.url = draftUrl.value.trim()
+    if (draftTags.value.length) payload.tags = [...draftTags.value]
     const r = await api.kbCreateDocument(payload)
     creating.value = false
     // 内容级幂等：同标题同内容提交后端判 unchanged（连 INSERT 都不发），别谎报新增
@@ -777,12 +894,14 @@ async function doCreate() {
 
 // ---- 编辑 ----
 /** 标题预填现值；正文不回显（切片读接口只给前 300 字，回显保存会把原文截断）。
- *  🔴 **类型不进表单**（创建后不可变，后端带异值 400），这里只把当前类型显示出来。 */
+ *  🔴 **类型不进表单**（创建后不可变，后端带异值 400），这里只把当前类型显示出来。
+ *  🆕 标签**要**进表单（自由维度，可改）：预填现值，保存整体替换。 */
 function openEdit(doc) {
   editDoc.value = doc
   editTitle.value = doc.title || ''
   editContent.value = ''
   editUrl.value = ''
+  editTags.value = [...tagsOf(doc)]
   editing.value = true
 }
 
@@ -798,6 +917,9 @@ async function doEdit() {
     // link 文档多一个可换的 url；**不带 content_type**（后端按文档自身类型重切）。
     const payload = content ? { title, content } : { title }
     if (typeOf(doc) === 'link' && url) payload.url = url
+    // 🔴 **总是**带 tags（哪怕空数组）：后端语义是「给了就整体替换」，
+    // 不带 = 不动 —— 那就删不掉标签了（用户摘掉的 chip 会自己长回来）。
+    payload.tags = [...editTags.value]
     await api.kbUpdateDocument(doc.doc_id, payload)
     editing.value = false
     showToast(`已保存：${title}`)
@@ -836,6 +958,10 @@ async function doDelete(typed) {
  * JSONL 逐行解析成 items；坏行**计数返回**，绝不静默丢。
  * KB 条目必须有 title：缺标题/缺正文/不是 JSON 都算坏行（前端先挡一道，
  * 后端也会把空的计入 rejected_empty，但那时说不清是哪一种）。
+ *
+ * 🆕 `tags` 可选，与后端导出的行**同形**（数组，导出的 JSONL 原样改两处就能回灌）：
+ * 手写时也接受逗号串（`"量化,部署"`）—— 前端顺手归一成数组，净化仍在后端
+ * （前端不是唯一那道闸）。非字符串项直接丢掉，不把类型噪声送到后端。
  */
 function parseJsonl(text) {
   const items = []
@@ -847,7 +973,13 @@ function parseJsonl(text) {
       const o = JSON.parse(s)
       if (o && typeof o.title === 'string' && o.title.trim()
           && typeof o.content === 'string' && o.content.trim()) {
-        items.push({ title: o.title.trim(), content: o.content })
+        const raw = Array.isArray(o.tags) ? o.tags
+          : (typeof o.tags === 'string' ? o.tags.split(/[,，]/) : [])
+        items.push({
+          title: o.title.trim(),
+          content: o.content,
+          tags: raw.filter((t) => typeof t === 'string').map((t) => t.trim()).filter(Boolean),
+        })
       } else broken += 1
     } catch {
       broken += 1
@@ -960,6 +1092,7 @@ async function doExport() {
 onMounted(() => {
   loadSummary()
   loadTypeCounts()
+  loadTags()
   loadDocs()
 })
 </script>

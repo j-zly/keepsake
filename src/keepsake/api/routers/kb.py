@@ -25,6 +25,12 @@
 分类的作用是**按类型切块**（link 单块、其余逐字走 `split_chunks`）与**按类型过滤**，
 不改任何既有的域隔离与幂等判据。类型创建后不可变（双挡：前端不给入口 +
 后端带异值 400）。`image` 本期只占枚举位：创建端点 400（依赖向量路，后置）。
+
+**自由标签（tags）是第三个维度，不是第二个类型**：content_type 是封闭枚举（写面
+校验白名单），标签是开放维度（一篇可挂多个、随时可改、只影响筛选）。标签**不进**
+`source_key`/`content_hash`（进了就等于「改个标签变成换一篇文档」），也**不碰**切块与
+来源域；skill 文档标签恒空 —— 灌入器一个字都不往那根列写，界面也不给它开打标入口
+（沿用 isManual 那套 409 纪律）。审核/状态语义是批2的事，本期不碰。
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from keepsake.kb import ingest
 
 from .. import audit, config
 from ..deps import require_session
-from ..schemas import KbHit, KbSearchResult, KbSummary, KbTypeCounts
+from ..schemas import KbHit, KbSearchResult, KbSummary, KbTagCount, KbTagCounts, KbTypeCounts
 from ..schemas import KbChunkList, KbDocument, KbDocumentList
 from .ops import _need_flag, _need_text, _reject, write_guard
 
@@ -95,6 +101,32 @@ _CTYPE_MIGRATION_HINT = (
 #: 链接卡片的 URL 形态：只放行 http/https，别的（file://、javascript:）一律 400。
 #: 🔴 **不抓取网页**（SSRF 与外网依赖都不要，抓取是接入方/助手的事）—— 这里只存字符串。
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+# --------------------------------------------------------------------------
+# 自由标签（documents.tags text[] + GIN）
+# --------------------------------------------------------------------------
+# 自由维度：content_type 是封闭枚举（五个），自由标签是开放维度（量化/部署/投资…），
+# 一篇可挂多个。与 content_type **不是一回事**：不改切块、不改来源域、不改幂等判据，
+# 只多一根可筛选的列（`'tag' = ANY(tags)` 走 GIN 索引，与 Dify metadata filtering
+# 同一套做法）。审核队列是批2另单，本期不碰。
+
+#: 标签列（documents）。兼容纪律与 content_type **一字同款**：读路径缺列降级成
+#: 空数组（出参不带 tags 键，不假装每篇都打了标），写路径由 `_need_tags` 给人话 500。
+_CAND_TAGS = ("tags",)
+
+#: 老库未迁移 tags 列时的修复 SQL —— **报给人看的，不自己跑**（与 ctype 同款）
+_TAGS_MIGRATION_HINT = (
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}'; "
+    "CREATE INDEX IF NOT EXISTS idx_documents_tags_gin ON documents USING gin(tags);"
+)
+
+#: 标签净化后的硬上限（前端即时提示引的就是这两个数 —— 一处定、两处抄，勿各自写死）
+TAG_MAX_ITEMS = 12
+TAG_MAX_LEN = 32
+
+#: 控制字符（含 `\n` `\r` `\t` `\0`）—— 一律 400：标签要渲成 chip、还要进导出文件，
+#: 串进换行/制表能把版面和 JSONL 行一起搞坏。
+_TAG_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _COLS_CACHE: Dict[str, Dict[str, set]] = {}
 _COLS_LOCK = threading.Lock()
@@ -277,6 +309,10 @@ def kb_search(
     select_doc = f"COALESCE(d.{d_title}, '')" if d_title else "''"
     d_ctype = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
     select_ctype = f"COALESCE(d.{d_ctype}, '')" if d_ctype else "''"
+    d_tags = next((_ident(c) for c in _CAND_TAGS if c in docs), None)
+    # 老库没有 tags 列 ⇒ 投影**空数组**（不是 NULL、不是缺键）：出参据此省掉 tags 键，
+    # 前端按「没打标」渲染，而不是把 NULL 当成一个标签。
+    select_tags = f"COALESCE(d.{d_tags}, '{{}}'::text[])" if d_tags else "'{}'::text[]"
 
     if c_tsv:
         # 中文语料用 simple 分词（PG 默认 english 会把中文切成一坨）
@@ -290,7 +326,7 @@ def kb_search(
     sql = (
         f"SELECT c.{c_id} AS chunk_id, CAST(c.{c_doc} AS text) AS doc_id, "
         f"{select_doc} AS title, LEFT(c.{c_text}, 300) AS snippet, "
-        f"{select_ctype} AS content_type, "
+        f"{select_ctype} AS content_type, {select_tags} AS tags, "
         f"{rank} AS score {joined} WHERE {where} "
         f"ORDER BY score DESC, chunk_id ASC LIMIT %s OFFSET %s"
     )
@@ -303,6 +339,7 @@ def kb_search(
               title=str(r["title"] or ""), snippet=str(r["snippet"] or ""),
               # 老表没这列时投影是 '' ⇒ 出参按 schema 规则省略该键（与 source_type 同款）
               content_type=str(r.get("content_type") or ""),
+              tags=_tags_out(r.get("tags")),
               rank=round(float(r["score"] or 0.0), 6))
         for r in rows
     ]
@@ -333,6 +370,39 @@ def kb_type_counts() -> KbTypeCounts:
                                 for r in rows})
 
 
+@router.get("/api/v1/kb/tags", response_model=KbTagCounts,
+            dependencies=[Depends(require_session)])
+def kb_tags() -> KbTagCounts:
+    """全部标签 + 各有多少篇文档挂着（界面筛选 chip 行的唯一来源，只读）。
+
+    🔴 **计数绝不写死在前端**（与 `/kb/type-counts` 同款纪律）：写死就等于库一变
+    数字就错，而且没人会发现。老库未迁移 tags 列 ⇒ 返回空列表（前端整行隐藏，
+    不编一个假 chip）。
+
+    🟡 **口径 = 全部文档**（含 skill 域）：skill 文档本期恒空标签，不影响结果；
+    真要把 skill 排除掉得在这里加 WHERE，那是另一件事（用户能看见 chip 行里
+    出现「只有 1 篇」的标签时，至少知道那篇是什么）。
+    计数用 `COUNT(DISTINCT d.id)`：同一篇里同一个标签重复出现（存量脏数据）也只算一篇。
+    """
+    schema = _ident(config.pg_schema())
+    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS,))
+    d_tags = next((_ident(c) for c in _CAND_TAGS
+                   if c in tabs[config.KB_TABLE_DOCUMENTS]), None)
+    if not d_tags:
+        return KbTagCounts(items=[])
+    d_id = _pick(tabs[config.KB_TABLE_DOCUMENTS], _CAND_ID,
+                 config.KB_TABLE_DOCUMENTS, "主键")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT t AS tag, COUNT(DISTINCT d.{d_id}) AS n "
+                        f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d, "
+                        f"unnest(d.{d_tags}) AS t "
+                        f"GROUP BY t ORDER BY n DESC, t ASC")
+            rows = cur.fetchall()
+    return KbTagCounts(items=[KbTagCount(tag=str(r["tag"] or ""), count=int(r["n"] or 0))
+                              for r in rows if str(r["tag"] or "").strip()])
+
+
 @router.get("/api/v1/kb/documents", response_model=KbDocumentList,
             dependencies=[Depends(require_session)])
 def kb_documents(
@@ -342,6 +412,8 @@ def kb_documents(
     # FastAPI）来钉 WHERE 的拼装与参数顺序，`Query` 对象会 `.strip()` 炸掉。
     # 标量类型 + 裸默认值 FastAPI 仍按 query 参数解析（与 page/page_size 之外的旧写法同款）。
     content_type: str = "",
+    # 🔴 同上（`Query` 对象会让直接调本函数的护栏测试炸）：裸串默认值 + 参数化取值
+    tag: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
 ) -> KbDocumentList:
@@ -362,6 +434,11 @@ def kb_documents(
     正则：类型是业务枚举（skill/note/article/link/image），正则放行 `'; drop`
     之外的一切噪声串，枚举只放行真类型。老库未迁移（没这列）而调用方要按类型筛
     ⇒ 400 `kb_schema_unknown`，不静默给全量（给全量等于假装筛过）。
+
+    🆕 `tag` 是**自由标签**的精确过滤（`'量化' = ANY(d.tags)`，值走参数不拼串 ——
+    拼串就等于把库里内容当代码解释）。与 q / source_type / content_type 取 AND。
+    值不查枚举（标签是开放维度，没有白名单可查），所以只 `strip()` 后原样当参数；
+    老库没有 tags 列而调用方要按标签筛 ⇒ 400（筛不了就说筛不了）。
     """
     st = (source_type or "").strip()
     if st and not _SOURCE_TYPE_RE.match(st):
@@ -373,6 +450,7 @@ def kb_documents(
         _reject(400, "bad_content_type",
                 f"content_type 只能是：{', '.join(ingest.CONTENT_TYPES)}；收到 {content_type}",
                 "kb.documents", "list")
+    tg = (tag or "").strip()
     schema = _ident(config.pg_schema())
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
     gone = _missing(tabs)
@@ -390,6 +468,7 @@ def kb_documents(
     d_tsv = next((_ident(c) for c in _CAND_TSV if c in docs), None)
     d_src = next((_ident(c) for c in _CAND_SRC_TYPE if c in docs), None)
     d_ct = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
+    d_tags = next((_ident(c) for c in _CAND_TAGS if c in docs), None)
 
     keyword = (q or "").strip()
     if keyword and d_tsv:
@@ -415,6 +494,15 @@ def kb_documents(
                 f"{config.KB_TABLE_DOCUMENTS} 表未找到 content_type 列，无法按内容类型过滤"
                 f"（请先执行迁移：{_CTYPE_MIGRATION_HINT}）",
                 "kb.documents", "list")
+    if tg:
+        # 🔴 参数化：值走 `%s::text`，不拼进 SQL 文本（标签来自用户输入的自由文本）
+        if d_tags:
+            where, params = f"{where} AND %s::text = ANY(d.{d_tags})", [*params, tg]
+        else:
+            _reject(400, "kb_schema_unknown",
+                    f"{config.KB_TABLE_DOCUMENTS} 表未找到 tags 列，无法按标签过滤"
+                    f"（请先执行迁移：{_TAGS_MIGRATION_HINT}）",
+                    "kb.documents", "list")
 
     src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
     chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
@@ -425,10 +513,12 @@ def kb_documents(
     sel_time = f"d.{d_time}" if d_time else "''"
     sel_src = f"d.{d_src}" if d_src else "''"
     sel_ct = f"d.{d_ct}" if d_ct else "''"
+    # 老库没 tags 列 ⇒ 投影空数组（出参按 schema 规则省略 tags 键，不假装每篇都打了标）
+    sel_tags = f"d.{d_tags}" if d_tags else "'{}'::text[]"
 
     sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
            f"{sel_time} AS updated_at, {sel_src} AS source_type, "
-           f"{sel_ct} AS content_type, "
+           f"{sel_ct} AS content_type, {sel_tags} AS tags, "
            f"{chunk_ct} {src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -445,7 +535,9 @@ def kb_documents(
                    source_type=str(r.get("source_type") or ""),
                    # 同款降级：老表没这列时行里没这根键 ⇒ 空串，出参省略该键，
                    # 前端按 note 缺省渲染（不假装每篇都是技能）
-                   content_type=str(r.get("content_type") or ""))
+                   content_type=str(r.get("content_type") or ""),
+                   # 同款降级：老表没这列 ⇒ 行里给的是空数组 ⇒ 出参省略该键
+                   tags=_tags_out(r.get("tags")))
         for r in rows
     ]
     return KbDocumentList(items=items, count=total, page=page, page_size=page_size)
@@ -520,6 +612,9 @@ class KbCreateBody(BaseModel):
     content: str = ""
     content_type: str = Field("", description="内容类型；空=note（手记）")
     url: str = Field("", description="链接地址；仅 content_type=link 时必填")
+    tags: List[str] = Field(default_factory=list,
+                             description=f"自由标签（可多个）；净化规则见 `_clean_tags`，"
+                                         f"最多 {TAG_MAX_ITEMS} 个、单项 ≤{TAG_MAX_LEN} 字")
 
 
 class KbUpdateBody(BaseModel):
@@ -528,6 +623,10 @@ class KbUpdateBody(BaseModel):
     🆕 `content_type`：🔴 **只能与文档自身类型相同**（创建后不可变），不同值 400 ——
     类型变了等于换了一篇内容（切块策略、来源域、灌入器归属都跟着变），静默改会让
     「这篇是链接」和「切片被当长文切过」并存。`url` 仅 link 文档用（改 URL 仍单块重存）。
+
+    🆕 `tags`：🔴 **给了就整体替换，不是追加**（`None` = 这次不动标签）。
+    追加语义会让「删掉一个标签」变成删不掉（前端每次提交都是全量 chip），
+    且库里旧标签会越攒越多、筛选 chip 行最后长到没法看。
     """
 
     confirm: bool = False
@@ -535,6 +634,7 @@ class KbUpdateBody(BaseModel):
     content: Optional[str] = None
     content_type: Optional[str] = None
     url: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class KbDeleteBody(BaseModel):
@@ -551,6 +651,8 @@ class KbImportItem(BaseModel):
 
     🆕 `type` 就是 `content_type`（缺省 note，命名短一点贴合 JSONL 手写场景），
     `url` 仅 `type="link"` 时用；取值口径与创建端点同一份枚举校验。
+    `tags` 可选，走与创建端点**同一个** `_clean_tags` 净化函数（别处再写一份口径
+    就会漂：导入能塞进界面打不出来的标签）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -559,6 +661,7 @@ class KbImportItem(BaseModel):
     content: str = ""
     type: str = Field("", description="内容类型；空=note（手记）。与 content_type 同义，取短名")
     url: str = Field("", description="链接地址；仅 type=link 时必填")
+    tags: List[str] = Field(default_factory=list, description="自由标签（可多个），可省")
 
 
 class KbImportBody(BaseModel):
@@ -600,10 +703,10 @@ def _write_names(schema: str) -> Dict[str, str]:
     写路径**没有降级余地**：缺哪根列都 500 `kb_schema_unknown`，
     不许「这根列探不到就少写一个字段」—— 那会静默丢内容还报成功。
 
-    🆕 `ctype`（content_type）是**唯一例外：探不到就给空串**。老库未迁移时，
-    不写内容的端点（导出、真删）仍能跑；真要写类型的端点（新增/改/导入）由
-    `_need_ctype()` 给出**人话 500**（提示跑迁移），而不是让 PG 抛
-    `column "content_type" does not exist` 的裸 500。
+    🆕 `ctype`（content_type）与 `tags`（自由标签）是**仅有的两个例外：探不到就给
+    空串**。老库未迁移时，不写这两样的端点（导出、真删）仍能跑；真要写类型的/
+    标签的端点（新增/改/导入）由 `_need_ctype()` / `_need_tags()` 给出**人话 500**
+    （提示跑迁移），而不是让 PG 抛 `column "content_type" does not exist` 的裸 500。
     """
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
     gone = _missing(tabs)
@@ -619,6 +722,7 @@ def _write_names(schema: str) -> Dict[str, str]:
         "src_type": _pick(docs, _CAND_SRC_TYPE, d, "来源类型"),
         "src_key": _pick(docs, _CAND_SRC_KEY, d, "来源键"),
         "ctype": next((_ident(x) for x in _CAND_CTYPE if x in docs), ""),
+        "tags": next((_ident(x) for x in _CAND_TAGS if x in docs), ""),
         "title": _pick(docs, _CAND_TITLE, d, "标题"),
         "meta": _pick(docs, _CAND_META, d, "元数据"),
         "hash": _pick(docs, _CAND_HASH, d, "内容哈希"),
@@ -678,6 +782,80 @@ def _check_url(url: str, action: str, target: str) -> str:
     if not _URL_RE.match(u):
         _reject(400, "bad_url", f"url 必须以 http:// 或 https:// 开头：{u}", action, target)
     return u
+
+
+def _clean_tags(raw: Any, action: str, target: str) -> List[str]:
+    """自由标签的**唯一净化入口**（新增 / 改 / 导入三处共用，一处一个口径）。
+
+    规则按序执行，违规一律 400 人话（**不静默截断**：用户打了 13 个标却被悄悄
+    砍掉一个，回头按那个标筛会以为「标签坏了」）：
+
+    1. 非列表（None / 标量）⇒ 当作没给；元素必须都是字符串（非字符串 400）；
+    2. 逐项 `strip()`，空串直接丢（`["量化", ""]` 与 `["量化"]` 等价）；
+    3. 含控制字符（含换行 / 制表 / 回车）⇒ 400 `bad_tag`；
+    4. 单项 > `TAG_MAX_LEN` 字符 ⇒ 400 `bad_tag`（超长标签在 chip 行里必然折行）；
+    5. 去重**保序**（先出现的赢 ⇒ 卡片上的顺序与用户输入一致，可预期）；
+    6. 去重后 > `TAG_MAX_ITEMS` 项 ⇒ 400 `too_many_tags`。
+
+    🟡 **长度按字符数**（中文按字算，不是字节）：限的是「chip 行看不看得下」。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        _reject(400, "bad_tag", f"tags 必须是字符串数组：收到 {type(raw).__name__}",
+                action, target)
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str):
+            _reject(400, "bad_tag", f"tags 里每一项都必须是字符串：收到 {type(item).__name__}",
+                    action, target)
+        t = item.strip()
+        if not t:
+            continue                       # 空串不是「一个空标签」，直接丢
+        if _TAG_CTRL_RE.search(t):
+            _reject(400, "bad_tag",
+                    f"标签不许含换行/制表等控制字符：{t[:40]!r}", action, target)
+        if len(t) > TAG_MAX_LEN:
+            _reject(400, "bad_tag",
+                    f"单个标签最多 {TAG_MAX_LEN} 字（收到 {len(t)} 字）：{t[:40]!r}",
+                    action, target)
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    if len(out) > TAG_MAX_ITEMS:
+        _reject(400, "too_many_tags",
+                f"每篇最多 {TAG_MAX_ITEMS} 个标签，本次 {len(out)} 个：请先摘掉几个",
+                action, target)
+    return out
+
+
+def _tags_out(raw: Any) -> List[str]:
+    """出参归一：库里/驱动给回来的 text[] 一律成 `list[str]`。
+
+    NULL（LEFT JOIN 没匹上文档）、`'{}'`、PG 文本形态 `'{a,b}'`（假驱动/别的客户端
+    可能给这种串）都收成空数组或拆开的列表 —— **绝不把内部形态漏给前端**。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        body = raw.strip().lstrip("{").rstrip("}").strip()
+        return [x.strip().strip('"') for x in body.split(",") if x.strip()] if body else []
+    try:
+        return [str(x) for x in raw]
+    except TypeError:                                # 既不是 str 也不是序列 ⇒ 当没打标
+        return []
+
+
+def _need_tags(names: Dict[str, str], action: str, target: str) -> str:
+    """写 tags 前必须确认这根列在（老库未迁移 ⇒ 人话 500 带迁移 SQL，不裸崩）。"""
+    if not names.get("tags"):
+        _reject(500, "kb_schema_unknown",
+                f"{config.KB_TABLE_DOCUMENTS} 表未找到 tags 列，无法写入标签；"
+                f"请先执行迁移：{_TAGS_MIGRATION_HINT}",
+                action, target)
+    return names["tags"]
 
 
 def _check_type_unchanged(want: Optional[str], actual: str, action: str, target: str) -> None:
@@ -768,6 +946,10 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
       `meta={url, summary}`，正文列存单块 `标题\\nURL\\n摘要`（**不抓取网页** ——
       SSRF 与外网依赖都不要，抓取是接入方/助手的事）；
     * `image`：400（枚举占位，依赖向量路，后置）；`skill`：400（仅灌入器能建）。
+
+    🆕 `tags`（自由标签，可多个）：净化走 `_clean_tags`（strip/去空/去重保序/限长/
+    限数/拒控制字符，违规 400），**不参与** source_key 与 content_hash ——
+    标签是可随时改的检索维度，进了幂等键就等于「改个标签变成换一篇文档」。
     """
     action = "kb.document.create"
     _need_flag(body.confirm, action, "-", '新增知识库文档必须显式传 {"confirm": true}')
@@ -776,12 +958,14 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
     ctype = _check_content_type(body.content_type, action, title or "-")
     is_link = ctype == ingest.CONTENT_TYPE_LINK
     url = _check_url(body.url, action, title or "-") if is_link else ""
+    tags = _clean_tags(body.tags, action, title or "-")
     # link 的摘要可空；其余类型 content 必填（与上期 empty_document 口径一字不变）
     if not title or (not is_link and not content):
         _reject(400, "empty_document", "title 与 content 都不能为空", action, "-")
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     _need_ctype(names, action, title or "-")
+    _need_tags(names, action, title or "-")
     basis = _doc_basis(title, content, ctype, url)
     key = ingest.manual_source_key(title, basis)
     meta = {"origin": "console"}
@@ -794,7 +978,7 @@ def kb_create_document(body: KbCreateBody) -> Dict[str, Any]:
                 cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE, source_key=key,
                 title=title, meta=meta, text=content, names=names,
                 content_hash=ingest.content_hash(title, basis),
-                content_type=ctype, url=url)
+                content_type=ctype, url=url, tags=tags)
     audit.record(action, key, ok=True,
                 reason=f"status={status}; chunks={count}; content_type={ctype}")
     return {"ok": True, "action": action, "id": str(doc_id), "source_key": key,
@@ -816,18 +1000,26 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
     🆕 **按文档自身类型重切**（`content_type` 取库里那行，不取请求里的）：
     link 改摘要/URL 仍存**单块** `标题\\nURL\\n摘要`，别被当长文切碎；
     请求里带了且与库里的不同 ⇒ 400（类型创建后不可变，前后端双挡）。
+
+    🆕 `tags`：**不带 = 不动**（只改标题/正文时零影响）；带了就是**整体替换**
+    （给空数组即「清空所有标签」）。净化与新增端点同一个 `_clean_tags`。
+    🟡 标签与切片无关：只改标签**不重切 chunks**（重切是把没变的正文再切一遍，
+    徒增 `updated_at` 抖动与写放大）。
     """
     action = "kb.document.update"
     _need_flag(body.confirm, action, str(id),
                '改知识库文档必须显式传 {"confirm": true}')
     doc_id = _doc_id(id, action)
-    if body.title is None and body.content is None and body.url is None:
+    tags = None if body.tags is None else _clean_tags(body.tags, action, str(id))
+    if body.title is None and body.content is None and body.url is None and tags is None:
         _reject(400, "nothing_to_update",
-                "title 与 content 不能都不传（link 文档可只传 url）", action, str(id))
+                "title / content / tags 不能都不传（link 文档可只传 url）", action, str(id))
     if body.title is not None and not body.title.strip():
         _reject(400, "empty_document", "title 不能为空（要清空请删掉重写）", action, str(id))
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
+    if tags is not None:
+        _need_tags(names, action, str(id))
     try:
         with _write_conn() as conn:
             with conn.cursor() as cur:
@@ -856,7 +1048,8 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                 title = body.title.strip() if body.title is not None else str(doc["title"])
                 if body.content is None and body.url is None:
                     ingest.update_document(cur, schema, doc_id, title=title,
-                                           source_key=str(doc["source_key"]), names=names)
+                                           source_key=str(doc["source_key"]), names=names,
+                                           tags=tags)
                     count = ingest.chunks_count(cur, schema, doc_id, names=names)
                     key = str(doc["source_key"])
                 else:
@@ -868,7 +1061,7 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                     key = ingest.manual_source_key(title, basis)
                     ingest.update_document(cur, schema, doc_id, title=title, source_key=key,
                                            content_hash=ingest.content_hash(title, basis),
-                                           names=names)
+                                           names=names, tags=tags)
                     if is_link:
                         _doc_set_link_meta(cur, schema, doc_id, url, summary, names)
                     # 🔴 重切按**文档自身类型**分派：link 仍是单块
@@ -883,7 +1076,8 @@ def kb_update_document(id: str, body: KbUpdateBody) -> Dict[str, Any]:
                     f"已有文档占用了这个内容键（同名同内容已存在）：{id}", action, str(id))
         raise
     audit.record(action, str(id), ok=True,
-                reason=f"source_key={key}; chunks={count}; content_type={ctype}")
+                reason=f"source_key={key}; chunks={count}; content_type={ctype}"
+                       + ("" if tags is None else f"; tags={len(tags)}"))
     return {"ok": True, "action": action, "id": str(id), "source_key": key,
             "title": title, "chunks_count": count, "content_type": ctype}
 
@@ -933,10 +1127,16 @@ def _export_lines(schema: str, names: Dict[str, str], source_type: str,
             # 🆕 content_type 进导出行（老的导入/其它系统能按它分流）。
             # 老库未迁移时这根列探不到 ⇒ 投影空串，导出行给 ""（不假装有类型）。
             sel_ct = f"{names['ctype']}" if names.get("ctype") else "''"
+            # 🆕 tags 同款：导出行带**数组**（JSONL 原生形态，导入端直接回灌同一份
+            # 净化规则）；老库未迁移 ⇒ 空数组（不假装每篇都打了标）。
+            # 🔴 本端点只有 JSONL 一档（`kb/export` 不接 format 参数），所以「CSV 分号
+            # 连接」那档没有调用方 —— 不为此新造一个格式。
+            sel_tags = f"COALESCE({names['tags']}, '{{}}'::text[])" if names.get("tags") \
+                else "'{}'::text[]"
             cur.execute(
                 f"SELECT CAST({names['doc_id']} AS text) AS id, {names['src_type']} AS source_type, "
                 f"{names['src_key']} AS source_key, {names['title']} AS title, "
-                f"{sel_ct} AS content_type, "
+                f"{sel_ct} AS content_type, {sel_tags} AS tags, "
                 f"{names['meta']} AS meta FROM {schema}.{names['documents']} "
                 f"WHERE {where} ORDER BY {names['doc_id']} ASC LIMIT %s",
                 [*params, limit])
@@ -965,6 +1165,8 @@ def _export_lines(schema: str, names: Dict[str, str], source_type: str,
             "source_key": str(r["source_key"] or ""), "title": str(r["title"] or ""),
             # 空串 = 老库未迁移探不到这根列（不假装每篇都是手记，缺省就是缺省）
             "content_type": str(r.get("content_type") or ""),
+            # 标签：数组形态，空数组 = 没打标（老库未迁移时也是空数组，不假装有值）
+            "tags": _tags_out(r.get("tags")),
             # meta 是 jsonb：psycopg3 已解析成对象，psycopg2 给字符串，两种都能出参
             "meta": _jsonable(meta),
             "chunks": by_doc.get(str(r["id"]), []),
@@ -1015,6 +1217,8 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
     🟡 **只进手动域**：条目里的 `source_type` 一律 422（见 `KbImportItem`）。
     🆕 条目可带 `"type"`（内容类型，缺省 note）与 `"url"`（type=link 时必填），
     口径与创建端点同一份枚举校验；link 条目按单块卡片入库。
+    条目还可带 `"tags"`（自由标签数组，走同一个 `_clean_tags`：导出的行原样回灌
+    就能往返一致，而另写一份口径迟早漂成「导入能塞进界面打不出来的标签」）。
     """
     action, target = "kb.import", "batch"
     if len(body.items) > IMPORT_MAX_ITEMS:
@@ -1024,10 +1228,11 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     _need_ctype(names, action, target)
+    _need_tags(names, action, target)
     counts = {"total": len(body.items), "would_add": 0, "unchanged": 0,
               "rejected_empty": 0}
-    # (title, content, source_key, hash, content_type, url)
-    plan: List[Tuple[str, str, str, str, str, str]] = []
+    # (title, content, source_key, hash, content_type, url, tags)
+    plan: List[Tuple[str, str, str, str, str, str, List[str]]] = []
     written: List[str] = []
     with _write_conn() as conn:
         with conn.cursor() as cur:
@@ -1037,6 +1242,7 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
                 ctype = _check_content_type(item.type, action, title or target)
                 is_link = ctype == ingest.CONTENT_TYPE_LINK
                 url = _check_url(item.url, action, title or target) if is_link else ""
+                tags = _clean_tags(item.tags, action, title or target)
                 # link 的摘要可空；其余类型正文必填（口径与创建端点一致）
                 if not title or (not is_link and not content):
                     counts["rejected_empty"] += 1
@@ -1049,12 +1255,12 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
                         source_key=key, names=names) == h:
                     counts["unchanged"] += 1
                     continue
-                plan.append((title, content, key, h, ctype, url))
+                plan.append((title, content, key, h, ctype, url, tags))
             counts["would_add"] = len(plan)
             if not body.dry_run:
                 _need_text(body.confirm or "", str(counts["would_add"]), action, target,
                            f"本次将新增 {counts['would_add']} 篇（先跑 dry-run 拿 confirm_required）")
-                for title, content, key, h, ctype, url in plan:
+                for title, content, key, h, ctype, url, tags in plan:
                     meta = {"origin": "console-import"}
                     if ctype == ingest.CONTENT_TYPE_LINK:
                         meta["url"] = url
@@ -1063,7 +1269,7 @@ def kb_import(body: KbImportBody) -> Dict[str, Any]:
                         cur, schema, source_type=ingest.MANUAL_SOURCE_TYPE,
                         source_key=key, title=title, meta=meta,
                         text=content, names=names, content_hash=h,
-                        content_type=ctype, url=url)
+                        content_type=ctype, url=url, tags=tags)
                     counts[status] = counts.get(status, 0) + 1
                     written.append(str(doc_id))
     # dry-run 走完上面那条连接里只有 SELECT（提交一个只读事务不产生写入）

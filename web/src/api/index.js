@@ -93,6 +93,10 @@ export const api = {
   // 分类 Tab 上的计数：content_type -> 文档数。**后端给，前端不写死数字**
   // （老库未迁移该列时后端给 {}，页面按「无计数」渲染，不编）。
   kbTypeCounts: () => http.get('/api/v1/kb/type-counts').then((r) => r.data),
+  // 自由标签筛选 chip 行：{items:[{tag,count}]}，按计数倒序。**计数同样来自后端**
+  // （与 Tab 计数同纪律：写死就等于库一变数字就错）；老库未迁移 tags 列时后端给
+  // 空列表，页面整行隐藏，不编 chip。
+  kbTags: () => http.get('/api/v1/kb/tags').then((r) => r.data),
   kbDocumentChunks: (docId, params) =>
     http.get(`/api/v1/kb/documents/${encodeURIComponent(docId)}/chunks`, { params }).then((r) => r.data),
   stats: () => http.get('/api/v1/stats').then((r) => r.data),
@@ -166,10 +170,12 @@ export const api = {
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
   // 🆕 payload 可带 content_type（note/article/link，缺省 note）与 url（link 必填）：
   // 原样透传，枚举校验与「类型创建后不可变」的口径全在后端。
+  // 可带 tags（自由标签数组）：净化口径（去重/限长/限数/拒控制字符）也在后端。
   kbCreateDocument: (payload) =>
     http.post('/api/v1/kb/documents', { confirm: true, ...payload }).then((r) => r.data),
   // 改文档：title/content 至少给一个；改正文时后端同事务重切切片（只改 documents 行会召回旧片段）。
   // 🔴 **不带 content_type**：类型创建后不可变（后端带异值 400），重切按文档自身类型走。
+  // 🆕 带 tags 时是**整体替换**（给空数组 = 清空所有标签），后端语义见 KbUpdateBody。
   kbUpdateDocument: (id, payload) =>
     http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/update`, { confirm: true, ...payload }).then((r) => r.data),
   // 真删：confirm 传文档标题全文（手输防手滑），删前备份由后端做；skill 域后端 409。

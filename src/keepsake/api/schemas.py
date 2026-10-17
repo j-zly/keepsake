@@ -105,6 +105,24 @@ class KbTypeCounts(BaseModel):
                                                 "列时为空字典（前端按无计数渲染，不编数字）")
 
 
+class KbTagCount(BaseModel):
+    """一个标签 + 挂着它的文档数（筛选 chip 行的一格）。"""
+
+    tag: str
+    count: int = 0
+
+
+class KbTagCounts(BaseModel):
+    """全部自由标签及计数（**后端给，前端不写死数字**）。
+
+    按计数倒序、同数按标签名排序（老库未迁移 tags 列时为空列表，前端整行隐藏）。
+    """
+
+    items: List[KbTagCount] = Field(default_factory=list,
+                                    description="按计数倒序、同数按标签名排序；"
+                                                "老库未迁移 tags 列时为空列表")
+
+
 class KbHit(BaseModel):
     chunk_id: str
     doc_id: str = ""
@@ -116,6 +134,12 @@ class KbHit(BaseModel):
         exclude_if=lambda v: v == "",
         description="所属文档的内容类型（skill/note/article/link/image）。"
                     "空串（表里没这列）时不出这个键 —— 缺省不假装有值",
+    )
+    tags: List[str] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description="所属文档的自由标签（开放维度，一篇可多个）。"
+                    "空数组（没打标 / 表里没这列）时不出这个键 —— 缺省不假装有值",
     )
 
 
@@ -147,6 +171,13 @@ class KbDocument(BaseModel):
         description="内容类型：skill=技能灌入，note=手记（缺省），article=长文章，link=链接卡片，"
                     "image=图文（枚举占位，创建端点暂拒）。与 source_type 正交："
                     "空串（表里没这列）时**不出这个键**，前端按 note 缺省渲染",
+    )
+    tags: List[str] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description="自由标签（开放维度，与 content_type 正交）：card 上渲成 chip、"
+                    "`GET /kb/documents?tag=` 按它精确筛。空数组（没打标 / 表里没这列）"
+                    "时**不出这个键**，前端当「没打标」渲染",
     )
 
 

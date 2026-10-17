@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: 手动文档的 source_type。**灌入器的死文档清理只碰 skill/skill_hk，永不碰它**
 #: —— 控制台新增/导入的东西不会被当晚那轮清理扫掉。
@@ -64,6 +64,10 @@ DEFAULT_NAMES: Dict[str, str] = {
     "src_type": "source_type",
     "src_key": "source_key",
     "ctype": "content_type",
+    # 自由标签列。🟡 **可选列**（与 ctype 同款纪律）：老库未迁移时这根键探不到，
+    # 读路径降级、写路径由调用方先确认（API 侧 `_need_tags()` 给人话 500）。
+    # 灌入器不传 tags ⇒ 压根不往这根列写（技能文档恒为 '{}'，界面上不给它开打标入口）。
+    "tags": "tags",
     "title": "title",
     "meta": "meta",
     "hash": "content_hash",
@@ -193,6 +197,20 @@ def _names(names: Optional[Dict[str, str]]) -> Dict[str, str]:
     return {**DEFAULT_NAMES, **(names or {})}
 
 
+def _tags_col(n: Dict[str, str]) -> str:
+    """要写 tags 就必须确认这根列在：不在 ⇒ 抛，**不静默丢标签**。
+
+    「保存成功但标签没存上」是最坏的那种坏（用户以为打了标，筛的时候找不到）。
+    API 侧先用 `_need_tags()` 给人话 500（带迁移 SQL），这里只是共用层的兜底断言。
+    """
+    if not n.get("tags"):
+        raise RuntimeError(
+            "documents 表未找到 tags 列，拒绝静默丢标签；"
+            "请先执行迁移：ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+            "tags text[] NOT NULL DEFAULT '{}'")
+    return n["tags"]
+
+
 def _scalar(row: Any) -> Any:
     """一行取第一列（`dict_row` / `RealDictCursor` 回字典，默认游标回元组）。"""
     if isinstance(row, dict):
@@ -247,7 +265,7 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
                     title: str, meta: Optional[Dict[str, Any]], content_hash: str,
                     text: str, names: Optional[Dict[str, str]] = None,
                     content_type: str = DEFAULT_CONTENT_TYPE,
-                    url: str = "") -> Tuple[str, Any, int]:
+                    url: str = "", tags: Optional[Sequence[str]] = None) -> Tuple[str, Any, int]:
     """按 `(source_type, source_key)` 幂等落一篇文档，返回 `(状态, doc_id, 切片数)`。
 
     状态判据与 v3 同款，三种：
@@ -261,6 +279,12 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     🔴 `content_type` 显式随 INSERT 写死（不走列 DEFAULT）：DEFAULT 只保证
     **存量/别的写入方**能落，本函数的值是调用方的判断（灌入器=skill、控制台按
     用户选的类型），靠 DEFAULT 兜底等于把这判断丢掉。
+
+    🆕 `tags`：🔴 **`None` = 不碰这根列**（灌入器口径：技能文档恒为 `{}`，
+    灌入器一个字都不往这写，界面上也不给它开打标入口）；给了列表才整列覆盖写
+    （**替换不是追加**，净化已在上游做完）。`%s::text[]` 显式 cast：PG 推不出
+    Python 列表的类型，不写 cast 要么驱动乱适配、要么 `could not determine
+    data type of parameter`。
     """
     n = _names(names)
     cur.execute(f"SELECT {n['doc_id']}, {n['hash']} FROM {schema}.{n['documents']} "
@@ -270,19 +294,28 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     if row is not None and _val(row, n["hash"], 1) == content_hash:
         return ("unchanged", _val(row, n["doc_id"], 0),
                 _count_chunks(cur, schema, n, _val(row, n["doc_id"], 0)))
+    cols = [n["src_type"], n["src_key"], n["title"], n["meta"],
+            n["hash"], n["ctype"], n["updated"]]
+    vals = "%s, %s, %s, %s::jsonb, %s, %s, now()"
+    params: List[Any] = [source_type, source_key, title,
+                         json.dumps(meta or {}, ensure_ascii=False), content_hash, content_type]
+    sets = [f"{n['title']} = EXCLUDED.{n['title']}",
+            f"{n['meta']} = EXCLUDED.{n['meta']}",
+            f"{n['hash']} = EXCLUDED.{n['hash']}",
+            f"{n['ctype']} = EXCLUDED.{n['ctype']}",
+            f"{n['updated']} = now()"]
+    if tags is not None:
+        tcol = _tags_col(n)
+        cols.append(tcol)
+        vals += ", %s::text[]"
+        params.append(list(tags))
+        sets.append(f"{tcol} = EXCLUDED.{tcol}")
     cur.execute(
         f"INSERT INTO {schema}.{n['documents']}"
-        f"({n['src_type']}, {n['src_key']}, {n['title']}, {n['meta']}, "
-        f"{n['hash']}, {n['ctype']}, {n['updated']}) "
-        f"VALUES(%s, %s, %s, %s::jsonb, %s, %s, now()) "
+        f"({', '.join(cols)}) VALUES({vals}) "
         f"ON CONFLICT ({n['src_type']}, {n['src_key']}) DO UPDATE "
-        f"SET {n['title']} = EXCLUDED.{n['title']}, "
-        f"{n['meta']} = EXCLUDED.{n['meta']}, "
-        f"{n['hash']} = EXCLUDED.{n['hash']}, "
-        f"{n['ctype']} = EXCLUDED.{n['ctype']}, {n['updated']} = now() "
-        f"RETURNING {n['doc_id']}",
-        [source_type, source_key, title,
-         json.dumps(meta or {}, ensure_ascii=False), content_hash, content_type])
+        f"SET {', '.join(sets)} "
+        f"RETURNING {n['doc_id']}", params)
     doc_id = _scalar(cur.fetchone())
     count = replace_chunks(cur, schema, doc_id, text, names=names, source_path=source_key,
                            content_type=content_type, title=title, url=url)
@@ -305,7 +338,8 @@ def lookup_content_hash(cur: Any, schema: str, *, source_type: str, source_key: 
 
 def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
                     source_key: str, content_hash: Optional[str] = None,
-                    names: Optional[Dict[str, str]] = None) -> None:
+                    names: Optional[Dict[str, str]] = None,
+                    tags: Optional[Sequence[str]] = None) -> None:
     """按 **id** 改文档行（控制台改文档走这条，不走 `upsert_document`）。
 
     🔴 **必须按 id 改**：手动域的 `source_key` 是 `sha256(title+content)` 派生，
@@ -315,6 +349,9 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
 
     撞上已存在的键 ⇒ 驱动抛 UniqueViolation，**由调用方翻译成 409**
     （别在这里吞成「更新成功」，那会静默把两篇合成一篇）。
+
+    🆕 `tags=None` 表示**不动标签**（只改标题/正文时零影响）；给了列表就是
+    **整体替换**（不是追加 —— 见 `upsert_document` 同款语义）。
     """
     n = _names(names)
     sets = [f"{n['title']} = %s", f"{n['src_key']} = %s", f"{n['updated']} = now()"]
@@ -322,6 +359,9 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
     if content_hash is not None:
         sets.append(f"{n['hash']} = %s")
         params.append(content_hash)
+    if tags is not None:
+        sets.append(f"{_tags_col(n)} = %s::text[]")
+        params.append(list(tags))
     params.append(doc_id)
     cur.execute(f"UPDATE {schema}.{n['documents']} SET {', '.join(sets)} "
                 f"WHERE {n['doc_id']} = %s", params)
