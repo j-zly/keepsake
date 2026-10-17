@@ -649,3 +649,48 @@ def test_没装配注册表时不记也不崩():
     p._registry = None
     p._agent_id = "main-brain"
     p._touch("read")      # 不抛即通过
+
+
+class _TouchSpy:
+    """只记 `touch()` 调用的注册表替身 —— 绕开 60s 限频，能逐次断言。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def touch(self, agent_id, kind="read"):
+        self.calls.append((agent_id, kind))
+        return True
+
+
+def test_prefetch真检索记read而skip路径不记(tmp_path):
+    """🔴 主脑每轮注入走 `prefetch()`，它**不经** `self.search()` 直调存储层 ——
+    D 单只挂 search()/get() 时，主脑 reads 实测恒 0（面板「主代理 0/0」）。
+
+    两条判据一起守：真检索要记；被 `_should_search` 挡掉的问题**不许**记
+    （skip 是没发生检索，不是检索了没结果）。用 spy 而非真注册表，
+    否则 60s 限频会把「误挂在 skip 路径上」这个 bug 吃掉。
+    """
+    from keepsake.adapters.hermes.provider import KeepsakeProvider
+    from keepsake.core.sqlite import SqliteStorage
+
+    st = SqliteStorage(path=str(tmp_path / "prefetch.db"))
+    assert st.ensure_index() is True
+    spy = _TouchSpy()
+    p = KeepsakeProvider()
+    p._storage = st
+    p._registry = spy
+    p._agent_id = "main-brain"
+    p._skip_min_length = 2
+    p._skip_patterns = set()
+    p._tag_filter = ""
+    p._exclude_tags = ()
+    try:
+        st.store("主脑写入的一条记忆")
+        p.prefetch("主脑")
+        assert spy.calls == [("main-brain", "read")], "prefetch 真检索没有打 read 计数"
+
+        spy.calls.clear()
+        assert p.prefetch("") == ""          # 长度不足 ⇒ skip
+        assert spy.calls == [], "skip 掉的问题不该记检索活动"
+    finally:
+        st.close()

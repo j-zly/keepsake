@@ -873,6 +873,10 @@ class KeepsakeProvider(MemoryProvider):
             tag_filter=self._tag_filter,
         )
         elapsed = _time.time() - start
+        # 活动计数：🔴 主脑每轮注入走的是 prefetch 而不是 self.search()
+        # （判完 skip 就直调存储层），只挂 search()/get() 时 reads 恒为 0。
+        # 挂点放在**真正发起检索之后**：被 skip 掉的问题没检索过，不记。
+        self._touch("read")
 
         # core 碎片由 system_prompt_block 无条件全量注入，这里必须排除 ——
         # 否则同一条记忆每轮出现两次（一次全量、一次检索），且两份可能不同版本。
