@@ -51,6 +51,15 @@
           </button>
         </div>
 
+        <!-- 改密码入口：放在 nav-foot（不进 GROUPS —— 它不是页面，是个动作） -->
+        <button class="foot-btn" @click="pwdOpen = true">
+          <span class="ico" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor"
+              stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" v-html="ICON.key" />
+          </span>
+          <span class="txt">修改密码</span>
+        </button>
+
         <div class="brand-card">
           <span class="ico" aria-hidden="true">
             <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor"
@@ -93,6 +102,9 @@
       :busy="signingOut"
       @confirm="onSignOutConfirm"
     />
+
+    <!-- 改密码：旧 / 新 / 确认三字段，零新色（走全局 token 样式） -->
+    <ChangePasswordDialog v-model="pwdOpen" />
   </div>
   <router-view v-else />
 </template>
@@ -101,6 +113,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import ChangePasswordDialog from './components/ChangePasswordDialog.vue'
 import { api, getToken, setToken } from './api'
 import { showToast } from './utils/dialog'
 import { readTheme, setTheme } from './utils/theme'
@@ -125,6 +138,8 @@ const ICON = {
     '<circle cx="6.1" cy="5.3" r="2.5"/><path d="M2.1 13.4a4.1 4.1 0 0 1 8 0"/><path d="M10.7 3.3a2.5 2.5 0 0 1 0 4.9"/><path d="M11.7 9.7a4.1 4.1 0 0 1 2.2 3.4"/>',
   logout:
     '<path d="M6.4 2.9H3.6a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.8"/><path d="M10.2 5.5 13.1 8l-2.9 2.5"/><path d="M13.1 8H6.6"/>',
+  key:
+    '<circle cx="5.4" cy="10.6" r="2.9"/><path d="M7.6 8.4 13.4 2.6"/><path d="M11.2 4.8 12.6 6.2"/><path d="M9.8 6.2 11.2 7.6"/>',
 }
 
 // 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（知识库）
@@ -167,6 +182,9 @@ const theme = ref(readTheme())
 function pick(t) {
   theme.value = setTheme(t)
 }
+
+/** 改密码：侧栏底部一个动作入口（不是页面，所以不进 GROUPS）。 */
+const pwdOpen = ref(false)
 
 /** 退出登录是误点代价最高的一下（直接退到登录页），所以先弹 ConfirmDialog。 */
 const confirmSignOut = ref(false)
@@ -329,6 +347,33 @@ async function onSignOutConfirm() {
   color: var(--text);
   font-weight: 500;
 }
+/* 改密码：与分段控件同宽的幽灵按钮，悬停才出色（动作，不是当前页） */
+.foot-btn {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-ctl);
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.foot-btn:hover {
+  background: var(--panel-hover);
+  border-color: var(--border);
+  color: var(--text);
+}
+.foot-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* 品牌小卡片：白底 + 蓝色图标 + 一句短语 */
 .brand-card {
   display: flex;

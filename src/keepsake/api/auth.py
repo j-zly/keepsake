@@ -118,6 +118,27 @@ def admin_exists() -> bool:
     return load_admin() is not None
 
 
+def _atomic_json(path, payload: Any) -> None:
+    """把 payload 原子写进 path，权限 0600 —— **本文件所有凭据/会话落盘的唯一入口**。
+
+    🔴 顺序是刻意的：`chmod` 打在临时文件上、`os.replace` 之前 ——
+    落地的瞬间就是 0600，中间不存在「文件已可见但还是 644」那半秒
+    （凭据文件可读窗口 = 别的账号把 PBKDF2 拿去离线爆破）。
+    tmp 与目标同目录 ⇒ `os.replace` 是同分区的原子改名，不存在写坏一半的中间态。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def create_admin(username: str, password: str) -> Dict[str, Any]:
     """建管理员并落盘（0600）。
 
@@ -176,6 +197,28 @@ def check_password(username: str, password: str) -> bool:
                                              str(rec["hash"]).encode("ascii"))
 
 
+def set_password(username: str, password: str) -> Dict[str, Any]:
+    """改口令：换新 salt 重算哈希，原子写回 0600（username / created 原样保留）。
+
+    🔴 **调用方必须先 `check_password` 通过** —— 本函数不校验旧口令，
+    它是「校验」与「落盘」之间的那道纯写入闸。放在这层是为了让「改密」只有
+    一条落盘路径，不会出现 setup 与改密两套写文件的口径。
+    🔴 落盘前**必须先备份旧文件**（`audit.backup_json`）—— 口令哈希丢了，
+    管理员就再也登不进了，而这不是任何一条撤销操作能救回来的。
+    """
+    with _FILE_LOCK:
+        rec = load_admin()
+        if rec is None:
+            raise FileNotFoundError("管理员尚未初始化，无法改口令")
+        salt = secrets.token_bytes(16)
+        new_rec = dict(rec)
+        new_rec["salt"] = _b64(salt)
+        new_rec["hash"] = hash_password(password, salt, PBKDF2_ITERS)
+        new_rec["iters"] = PBKDF2_ITERS
+        _atomic_json(config.admin_file(), new_rec)
+    return new_rec
+
+
 # --------------------------------------------------------------------------
 # 会话
 # --------------------------------------------------------------------------
@@ -199,13 +242,7 @@ def _read_sessions() -> Dict[str, Dict[str, Any]]:
 
 
 def _write_sessions(sessions: Dict[str, Dict[str, Any]]) -> None:
-    path = config.session_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump({"sessions": list(sessions.values())}, fh, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_json(config.session_file(), {"sessions": list(sessions.values())})
 
 
 def _purge_expired(sessions: Dict[str, Dict[str, Any]]) -> bool:
@@ -271,6 +308,26 @@ def revoke_session(token: str) -> bool:
             return False
         _write_sessions(sessions)
     return True
+
+
+def revoke_other_sessions(keep_token: str) -> int:
+    """作废**除 `keep_token` 外**的全部会话，返回被作废的条数。
+
+    改口令时用：口令泄露的处置语义是「别的设备上的会话一律作废」，
+    但**改密的那一次不能把自己踢出登录页**（否则用户改完得重新输一遍新口令，
+    还不知道是哪一步错了）。所以这里保留当前 token、清掉其余全部。
+
+    `keep_token` 空 ⇒ 一条都不留（没有「当前会话」这个概念时不该默认全放行）。
+    """
+    with _FILE_LOCK:
+        sessions = _read_sessions()
+        keep = token_hash(keep_token) if keep_token else ""
+        others = [h for h in sessions if h != keep]
+        for h in others:
+            sessions.pop(h, None)
+        if others:
+            _write_sessions(sessions)
+        return len(others)
 
 
 # --------------------------------------------------------------------------

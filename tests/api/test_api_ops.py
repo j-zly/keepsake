@@ -31,11 +31,13 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: keepsake_bulk_ops 起再加 2 条勾选批量端点（bulk 改数据 / bulk-export 纯读），
 #: keepsake_cron_manage 起再加 3 条定时任务管理端点（暂停 / 恢复 / 改调度），
 #: keepsake_agent_registry（agent_registry 治理中心化）起再加 4 条代理治理端点
-#: （批准 / 吊销 / 改角色 / 上下文排除开关）。
+#: （批准 / 吊销 / 改角色 / 上下文排除开关），keepsake_change_password 起再加
+#: 1 条认证写端点（改口令）。
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
     "/api/v1/auth/logout",
+    "/api/v1/auth/change_password",
 }
 
 ALLOWED_POST_PATHS = {
@@ -468,12 +470,12 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面只有二十三条业务写端点加三条认证POST():
+def test_写面只有二十三条业务写端点加四条认证POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 27
+    assert len(ALLOWED_POST_PATHS) == 28
     assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 24
 
 

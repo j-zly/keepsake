@@ -13,6 +13,10 @@ import axios from 'axios'
  *
  * P3：token 是**登录换来的会话 token**（记住我 = 30 天），不再是手贴的静态串。
  * 登录三连：authStatus（首屏决定去 /setup 还是 /login）、setup、login / logout。
+ *
+ * 🔴 拦截器把后端 detail.message 装进 Error，另挂一个 `status`：
+ * 调用方要区分 403（旧密码不对）与 400（新密码太弱）时靠状态码，
+ * 别去匹配中文文案 —— 文案一改，字符串匹配就跟着烂。
  */
 const TOKEN_KEY = 'keepsake.console.token'
 
@@ -54,7 +58,9 @@ http.interceptors.response.use(
       setToken('')
       location.hash = '#/login'
     }
-    return Promise.reject(new Error(message))
+    const out = new Error(message)
+    out.status = status
+    return Promise.reject(out)
   },
 )
 
@@ -67,6 +73,15 @@ export const api = {
     http.post('/api/v1/auth/login', { username, password, remember }).then((r) => r.data),
   logout: () => http.post('/api/v1/auth/logout').then((r) => r.data),
   me: () => http.get('/api/v1/auth/me').then((r) => r.data),
+  // 改口令：三个字段全走 POST body —— 口令绝不能进 URL（浏览器历史 / 访问日志 / Referer）
+  changePassword: (oldPassword, newPassword) =>
+    http
+      .post('/api/v1/auth/change_password', {
+        old_password: oldPassword,
+        new_password: newPassword,
+        confirm: true,
+      })
+      .then((r) => r.data),
   coreList: (params) => http.get('/api/v1/core', { params }).then((r) => r.data),
   coreStats: () => http.get('/api/v1/core/stats').then((r) => r.data),
   fragments: (params) => http.get('/api/v1/fragments', { params }).then((r) => r.data),

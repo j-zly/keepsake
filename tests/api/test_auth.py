@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from pathlib import Path
 from typing import Any, Dict
 
 import pytest
@@ -463,14 +464,226 @@ def test_me_过期时间与登录回包一致(client):
     assert me["expires_at"] == login_body["expires_at"]
 
 
+# ---------------------------------------------------------------- change_password
+
+#: 新口令；同样是测试夹具，不是凭据
+NEW_PWD = "brand new secret"
+
+
+@pytest.fixture()
+def audit_dirs(tmp_path, monkeypatch):
+    """审计 / 备份目录指到 tmp —— 否则这几例会去写 /root/.hermes/backup/。
+
+    两条都指（审计与备份），别只清一条。
+    """
+    monkeypatch.setenv("CONSOLE_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setenv("CONSOLE_BACKUP_DIR", str(tmp_path / "bak"))
+
+
+@pytest.fixture()
+def cp(client, audit_dirs):
+    """改密用例的公共起点：**已初始化 + 一个已登录会话**。
+
+    单独一个 fixture 而不是每例自己 `do_setup`：漏掉 setup 的改密用例会安静地
+    401（签不出会话），看着像「改密功能坏了」，实则是用例自己没搭好现场。
+    返回 `(client, 当前会话 token)`。
+    """
+    do_setup(client)
+    return client, do_login(client).json()["token"]
+
+
+def do_change(c, token: str, old: str = PWD, new: str = NEW_PWD, confirm: bool = True):
+    return c.post("/api/v1/auth/change_password",
+                  json={"old_password": old, "new_password": new, "confirm": confirm},
+                  headers=bearer(token))
+
+
+def audit_lines(tmp_path) -> list:
+    """把当日审计文件读成 dict 列表（按天分区，所以直接找唯一的那个文件）。"""
+    files = sorted((tmp_path / "audit").glob("audit-*.jsonl"))
+    assert files, "审计文件没落盘"
+    return [json.loads(l) for l in files[-1].read_text("utf-8").splitlines() if l.strip()]
+
+
+def test_改口令_正确旧口令_改成功且当前会话仍活(cp):
+    c, token = cp
+    r = do_change(c, token)
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True and r.json()["username"] == USER
+    # 🔴 改完密不能把自己踢回登录页（用户还得靠当前会话继续用）
+    assert c.get("/api/v1/auth/me", headers=bearer(token)).status_code == 200
+
+
+def test_改口令_其余会话全部作废(cp):
+    c, keep = cp
+    others = [do_login(c).json()["token"] for _ in range(3)]
+    r = do_change(c, keep)
+    # 4 = setup 自动登录那条 + 上面 3 条（setup 那条也是别人的会话，一样得死）
+    assert r.json()["revoked_sessions"] == 4
+    for t in others:
+        assert c.get("/api/v1/auth/me", headers=bearer(t)).status_code == 401
+    assert c.get("/api/v1/auth/me", headers=bearer(keep)).status_code == 200
+
+
+def test_改口令_会话文件里只剩当前那条(cp):
+    from keepsake.api import config as cfg
+
+    c, keep = cp
+    do_login(c)
+    do_change(c, keep)
+    left = json.loads(cfg.session_file().read_text("utf-8"))["sessions"]
+    assert [s["token_hash"] for s in left] == [auth_mod.token_hash(keep)]
+
+
+def test_改口令_凭据文件权限仍600(cp):
+    from keepsake.api import config as cfg
+
+    c, token = cp
+    do_change(c, token)
+    mode = stat.S_IMODE(os.stat(cfg.admin_file()).st_mode)
+    assert mode == 0o600, oct(mode)
+
+
+def test_改口令_写前备份存在且是旧记录(cp):
+    from keepsake.api import config as cfg
+
+    c, token = cp
+    before = json.loads(cfg.admin_file().read_text("utf-8"))
+    body = do_change(c, token).json()
+    saved = json.loads(Path(body["backup"]).read_text("utf-8"))
+    # 备份里是**改前**那份（salt/hash 还是旧的），人工回退就靠它
+    assert saved["hash"] == before["hash"] and saved["salt"] == before["salt"]
+    assert saved["username"] == USER
+
+
+def test_改口令_审计留一行且不含口令明文(cp, tmp_path):
+    c, token = cp
+    do_change(c, token)
+    lines = [x for x in audit_lines(tmp_path) if x["action"] == "auth.change_password"]
+    assert len(lines) == 1
+    assert lines[0]["ok"] is True and lines[0]["target"] == USER
+    assert "revoked_others=" in lines[0]["reason"]
+    # 🔴 明文口令不许出现在审计里（新旧都算）
+    blob = json.dumps(lines[0], ensure_ascii=False)
+    assert PWD not in blob and NEW_PWD not in blob
+
+
+def test_改口令_回包不回显口令(cp):
+    c, token = cp
+    r = do_change(c, token)
+    assert PWD not in r.text and NEW_PWD not in r.text and token not in r.text
+
+
+def test_改口令_磁盘上仍只有哈希(cp):
+    from keepsake.api import config as cfg
+
+    c, token = cp
+    do_change(c, token)
+    raw = cfg.admin_file().read_text("utf-8")
+    assert NEW_PWD not in raw and PWD not in raw
+    assert json.loads(raw)["username"] == USER      # username / created 不被改掉
+
+
+def test_改口令_错旧口令_403且文件没动(cp):
+    from keepsake.api import config as cfg
+
+    c, token = cp
+    before = cfg.admin_file().read_text("utf-8")
+    r = do_change(c, token, old="wrong password")
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "wrong_password"
+    assert cfg.admin_file().read_text("utf-8") == before
+    assert do_login(c, password=PWD).status_code == 200
+
+
+def test_改口令_错旧口令的响应不回显口令(cp):
+    c, token = cp
+    r = do_change(c, token, old="wrong password")
+    assert "wrong password" not in r.text and PWD not in r.text
+
+
+def test_改口令_弱新口令_400且旧口令仍有效(cp):
+    """新口令没过强度 ⇒ 连旧口令都不必校验（不消耗 PBKDF2），也不写盘。"""
+    c, token = cp
+    r = do_change(c, token, new=SHORT_PWD)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "password_too_short"
+    assert do_login(c, password=PWD).status_code == 200
+
+
+def test_改口令_缺confirm_400且不动数据(cp):
+    c, token = cp
+    r = do_change(c, token, confirm=False)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
+    assert do_login(c, password=PWD).status_code == 200
+
+
+def test_改口令_限速_第6次错旧口令_429(cp):
+    """与 login 共用同一个 (IP, 用户名) 桶 —— 爆破旧口令的天花板和爆破登录一样。"""
+    c, token = cp
+    codes = [do_change(c, token, old="wrong password").status_code for _ in range(5)]
+    assert codes == [403] * 5
+    assert do_change(c, token, old="wrong password").status_code == 429
+
+
+def test_改口令_限速_被限速时正确旧口令也不放行(cp):
+    c, token = cp
+    for _ in range(5):
+        do_change(c, token, old="wrong password")
+    assert do_change(c, token).status_code == 429
+
+
+def test_改口令_限速_改密成功清零后仍能再试(cp):
+    c, token = cp
+    for _ in range(4):
+        do_change(c, token, old="wrong password")
+    assert do_change(c, token).status_code == 200
+    assert do_change(c, token, old="wrong password").status_code == 403
+
+
+def test_改口令_改后新口令能登录旧口令不能(cp):
+    c, token = cp
+    do_change(c, token)
+    assert do_login(c, password=NEW_PWD).status_code == 200
+    assert do_login(c, password=PWD).status_code == 401
+
+
+def test_改口令_无会话_401(client, audit_dirs):
+    r = client.post("/api/v1/auth/change_password",
+                    json={"old_password": PWD, "new_password": NEW_PWD, "confirm": True})
+    assert r.status_code == 401 and r.json()["detail"]["error"] == "missing_token"
+
+
+def test_改口令_静态token改不了口令(cp):
+    """🔴 脚本/MCP 通道那条静态 token 不具备换管理员口令的能力。"""
+    c, _ = cp
+    r = do_change(c, LEGACY_TOKEN)
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "wrong_password"
+    assert do_login(c, password=PWD).status_code == 200
+
+
+def test_改口令_旧静态token改密后仍可用(cp):
+    """改的是管理员口令，不是脚本令牌 —— 静态 token 不受影响。"""
+    c, token = cp
+    do_change(c, token)
+    assert c.get("/api/v1/auth/me", headers=LEGACY).status_code == 200
+
+
+def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
+    """没有管理员 ⇒ 签不出会话 ⇒ 要会话的改密端点 401（而不是 500）。"""
+    assert TestClient(create_app()).post(
+        "/api/v1/auth/change_password",
+        json={"old_password": PWD, "new_password": NEW_PWD, "confirm": True},
+    ).status_code == 401
+
+
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是二十三条业务写端点加三条auth_POST():
+def test_写面仍是二十三条业务写端点加四条auth_POST():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == {
         "/api/v1/auth/setup", "/api/v1/auth/login", "/api/v1/auth/logout",
+        "/api/v1/auth/change_password",
         "/api/v1/core/{key}/promote", "/api/v1/core/{key}/demote",
         "/api/v1/fragments", "/api/v1/fragments/{key}/update",
         "/api/v1/fragments/{key}/archive", "/api/v1/fragments/{key}/delete",
@@ -502,6 +715,7 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
                  "/api/v1/tiering/status", "/api/v1/import/template",
                  "/api/v1/ops/bulk", "/api/v1/ops/bulk-export",
+                 "/api/v1/auth/change_password",
                  "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
                  "/api/v1/crons/{job_id}/edit",
                  "/api/v1/agents/{agent_id}/approve", "/api/v1/agents/{agent_id}/revoke",
@@ -520,6 +734,9 @@ def test_公开端点只有三条且确实公开(client):
     assert client.post("/api/v1/auth/setup",
                        json={"username": "x", "password": SHORT_PWD}).status_code == 400
     assert client.post("/api/v1/auth/logout").status_code == 401
+    assert client.post("/api/v1/auth/change_password",
+                       json={"old_password": "x", "new_password": "12345678",
+                             "confirm": True}).status_code == 401
     assert client.get("/api/v1/auth/me").status_code == 401
 
 

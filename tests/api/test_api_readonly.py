@@ -28,6 +28,7 @@ AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
     "/api/v1/auth/login",
     "/api/v1/auth/logout",
+    "/api/v1/auth/change_password",
 }
 
 #: 写面白名单（P2 + keepsake_memory_crud_be + keepsake_kb_crud_be +
@@ -35,8 +36,9 @@ AUTH_POST_PATHS = {
 #: **恰好**是这 23 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
 #: kb_crud 单新增，PUT 预算设置与勾选批量 bulk / bulk-export 为 budget 单新增，
 #: 定时任务暂停/恢复/改调度 3 条为 cron_manage 单新增，代理治理 4 条
-#: approve / revoke / role / exclude 为 agent_registry 单新增，其余 6 条为 P2）
-#: + 3 条认证，其余一律不许出现。
+#: approve / revoke / role / exclude 为 agent_registry 单新增，change_password
+#: 为 keepsake_change_password 单新增，其余 6 条为 P2）
+#: + 4 条认证，其余一律不许出现。
 #: 新增写端点时**只许往这份白名单里加，不许改成子集断言** ——
 #: 白名单是「写面没有悄悄长出第四条入口」的唯一凭据，宽松一分它就废了。
 ALLOWED_POST_PATHS = {
@@ -186,13 +188,14 @@ def test_畸形Authorization头_401而不是500(client):
 # ---------------------------------------------------------------- 只读
 
 def test_只读路由断言():
-    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 23 条 + 认证 3 条，不多不少。
+    """🔴 P3 后断言升级：非 GET 路由**恰好**是写面 23 条 + 认证 4 条，不多不少。
 
     P1 时这里是「一条非 GET 都不能有」；P2 加了写端点，P3 又加了认证端点，
     keepsake_memory_crud_be 再加 增/真删/导入 三条，keepsake_kb_crud_be 再加
     KB 四条，keepsake_budget_io_templates 再加 PUT 预算设置，
     keepsake_cron_manage 再加 定时任务 暂停/恢复/改调度 三条，
-    keepsake_agent_registry 再加 代理治理 批准/吊销/改角色/排除开关 四条 ——
+    keepsake_agent_registry 再加 代理治理 批准/吊销/改角色/排除开关 四条，
+    keepsake_change_password 再加 改口令 一条 ——
     多一条（比如漏加 require_session 依赖的临时端点）同样会被这里抓住。
     """
     app = create_app()
