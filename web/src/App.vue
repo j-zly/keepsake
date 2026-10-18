@@ -27,7 +27,7 @@
             </span>
             <span class="txt">{{ m.label }}</span>
             <!-- 待审徽标：>0 才显示；数字复用 reviewCounts 全库口径。
-                 审核项=晋升候选+退居建议之和；知识库项=kb_pending。
+                 审核项=晋升候选+退居建议之和；知识库›审核项=kb_pending。
                  样式零新色：底色/文字全走既有 token（与 .chip--danger 同款）。 -->
             <span v-if="badgeFor(m.path)" class="item-badge"
               :aria-label="`待审 ${badgeFor(m.path)}`">{{ badgeFor(m.path) }}</span>
@@ -149,7 +149,7 @@ const ICON = {
     '<circle cx="5.4" cy="10.6" r="2.9"/><path d="M7.6 8.4 13.4 2.6"/><path d="M11.2 4.8 12.6 6.2"/><path d="M9.8 6.2 11.2 7.6"/>',
 }
 
-// 侧栏分组：总览（看板）· 记忆（审核 / 常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（知识库）
+// 侧栏分组：总览（看板）· 记忆（审核 / 常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（审核 / 知识库）
 // 看板是总览入口，业界惯例 Overview 置顶，所以它单独成组排第一。
 // 面包屑也从这份结构取，所以两处永远说同一句话（看板页：总览 › 看板）。
 // 审核排记忆组第一：它是「有东西要处理」的高频动作，不该埋在分组深处（候选量一多
@@ -171,7 +171,12 @@ const GROUPS = [
   },
   {
     title: '知识库',
-    items: [{ path: '/kb', label: '知识库', icon: ICON.book }],
+    items: [
+      // 审核排知识库组第一：与记忆组同一个道理（待审是高频动作，不该埋在浏览页深处），
+      // 而且徽标挂在这儿，用户一眼就能看到「有几篇等着我判」
+      { path: '/kb-review', label: '审核', icon: ICON.check },
+      { path: '/kb', label: '知识库', icon: ICON.book },
+    ],
   },
 ]
 
@@ -186,7 +191,8 @@ const crumb = computed(() => {
 // 数据源：`GET /api/v1/review/counts`（侧栏常驻，不随路由改而重拉）。
 // - 审核项徽标 = promote + demote 合计（晋升候选 + 退居建议均在 ReviewView
 //   「记忆审核」页里审）；
-// - 知识库项徽标 = kb_pending（子代理提交待批的知识文档数）。
+// - 知识库›审核项徽标 = kb_pending（子代理提交待批的知识文档数，在 KbReviewView
+//   「知识库审核」页里审）。「知识库」浏览页不再挂徽标 —— 待审数不是浏览页的事。
 // 拉一次 + 每 60s 静默刷新（与 AgentsView 的 10s 节奏同款但更宽：徽标是
 // 「记得处理一下」的提示，秒级滞后也能接受，省流量）。登录页/初始化页免拉
 // —— 那两页连壳都套不上，轮询纯属自扰。
@@ -206,7 +212,7 @@ function kbBadge() {
 /** 给定路径返回 0 / 数字（与模板的 `v-if` 配套）。null/undefined 与负数都退 0。 */
 function badgeFor(path) {
   if (path === '/review') return reviewBadge()
-  if (path === '/kb') return kbBadge()
+  if (path === '/kb-review') return kbBadge()
   return 0
 }
 

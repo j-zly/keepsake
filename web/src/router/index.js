@@ -4,6 +4,7 @@ import { api, getToken } from '../api'
 import AgentsView from '../views/AgentsView.vue'
 import CoreView from '../views/CoreView.vue'
 import FragmentsView from '../views/FragmentsView.vue'
+import KbReviewView from '../views/KbReviewView.vue'
 import KbView from '../views/KbView.vue'
 import LoginView from '../views/LoginView.vue'
 import MaintenanceView from '../views/MaintenanceView.vue'
@@ -24,6 +25,9 @@ const routes = [
   { path: '/review', name: 'review', component: ReviewView, meta: { title: '记忆审核' } },
   { path: '/maintenance', name: 'maintenance', component: MaintenanceView, meta: { title: '记忆维护' } },
   { path: '/kb', name: 'kb', component: KbView, meta: { title: '知识库' } },
+  // 知识库审核独立成页（原来挤在 KbView 里、要点顶部那颗 chip 才展开）：待审队列要逐条判，
+  // 铺在文档浏览页的抽屉里既看不清也翻不动。配方与 /review 记忆审核同款
+  { path: '/kb-review', name: 'kb-review', component: KbReviewView, meta: { title: '知识库审核' } },
   { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理治理' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]

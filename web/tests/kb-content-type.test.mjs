@@ -16,6 +16,8 @@ const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
 
 const KB = read('views/KbView.vue')
+/** 待审卡已搬到独立审核页，类型徽标跟着走 —— 两页合起来统计「有几张卡挂了这个判据」 */
+const KBCARDS = KB + read('views/KbReviewView.vue')
 const API = read('api/index.js')
 
 test('类型 Tab 接线：选中即带 content_type 重查，且两路都带', () => {
@@ -87,9 +89,9 @@ test('编辑：类型只读展示、保存请求不带 content_type', () => {
 })
 
 test('类型徽标：按 content_type 渲染，字段缺席按 note 缺省', () => {
-  // 文档卡 / 切片命中卡 / 编辑弹框 / 待审卡，四处都挂同一个判据
-  // （批2 加了待审面板那张卡 —— 它也要说清这篇是什么类型，批准后才按类型切块）
-  assert.equal((KB.match(/tag--\$\{typeOf\(/g) || []).length, 4,
+  // 文档卡 / 切片命中卡 / 编辑弹框（KbView）+ 待审卡（KbReviewView），四处都挂同一个判据
+  // （待审卡跟着审核队列搬到独立页了 —— 它也要说清这篇是什么类型，批准后才按类型切块）
+  assert.equal((KBCARDS.match(/tag--\$\{typeOf\(/g) || []).length, 4,
     '文档卡、切片命中卡、编辑弹框、待审卡都要有类型徽标')
   // 🔴 严格判据：字段缺席按 note 缺省，**不许**「没有就是技能/按 source_type 猜」
   assert.match(KB, /function typeOf\(row\) \{\s*\n\s*return row\?\.content_type \|\| 'note'/,
@@ -97,7 +99,7 @@ test('类型徽标：按 content_type 渲染，字段缺席按 note 缺省', () 
   assert.ok(!/content_type \|\| 'skill'/.test(KB), '缺席不许默认成 skill')
   // 链接徽标带 ↗（点得进去的意思），技能压低存在感
   assert.match(KB, /\.tag--link \{[^}]*--accent/)
-  assert.equal((KB.match(/typeOf\((doc|row)\) === 'link'"> ↗/g) || []).length, 3,
+  assert.equal((KBCARDS.match(/typeOf\((doc|row)\) === 'link'"> ↗/g) || []).length, 3,
     '文档卡、切片命中卡、待审卡的链接徽标都要带 ↗')
 })
 

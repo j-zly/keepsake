@@ -18,7 +18,7 @@ const groups = [...APP.matchAll(/title: '([^']+)',\s*\n\s*items: \[([\s\S]*?)\]\
   (m) => ({ title: m[1], items: [...m[2].matchAll(/label: '([^']+)'/g)].map((x) => x[1]) }),
 )
 
-test('侧栏：看板在第一组「总览」，共三组，七个入口', () => {
+test('侧栏：看板在第一组「总览」，共三组，八个入口', () => {
   assert.deepEqual(
     groups.map((g) => g.title),
     ['总览', '记忆', '知识库'],
@@ -26,8 +26,9 @@ test('侧栏：看板在第一组「总览」，共三组，七个入口', () =>
   assert.deepEqual(groups[0].items, ['看板'])
   // 审核排记忆组第一位：它是「有东西要处理」的高频动作，不该埋在分组深处
   assert.deepEqual(groups[1].items, ['审核', '常驻层', '记忆条目', '记忆维护', '代理治理'])
-  assert.deepEqual(groups[2].items, ['知识库'])
-  assert.equal(groups.flatMap((g) => g.items).length, 7)
+  // 知识库组：审核排第一（待审是高频动作），知识库浏览页在后
+  assert.deepEqual(groups[2].items, ['审核', '知识库'])
+  assert.equal(groups.flatMap((g) => g.items).length, 8)
 })
 
 test('面包屑：随分组走（看板页 总览 › 看板），旧的「知识库与运维」措辞已消失', () => {

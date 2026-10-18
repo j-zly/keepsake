@@ -18,6 +18,8 @@ const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
 
 const KB = read('views/KbView.vue')
+/** 待审卡已搬到独立审核页，标签 chip 跟着走 —— 两页合起来统计有几张卡渲染了 tags */
+const KBCARDS = KB + read('views/KbReviewView.vue')
 const API = read('api/index.js')
 
 test('chip 行接线：数据来自 /kb/tags，两路列表请求都带 tag=', () => {
@@ -61,9 +63,9 @@ test('chip 计数来自后端、前端零写死数字', () => {
 })
 
 test('卡片渲染 tags chip：复用现有 .tag，零新色', () => {
-  // 文档卡 / 切片命中卡 / 待审卡各一处（批2 的待审面板那张卡也要渲染标签）；
-  // 字段缺席（老库未迁移）⇒ 空数组（当「没打标」）
-  assert.equal((KB.match(/v-for="t in tagsOf\((doc|row)\)"/g) || []).length, 3,
+  // 文档卡 / 切片命中卡（KbView）+ 待审卡（KbReviewView）各一处
+  // （待审卡跟着审核队列搬到独立页了）；字段缺席（老库未迁移）⇒ 空数组（当「没打标」）
+  assert.equal((KBCARDS.match(/v-for="t in tagsOf\((doc|row)\)"/g) || []).length, 3,
     '文档卡、切片命中卡、待审卡都要渲染标签 chip')
   assert.match(KB, /function tagsOf\(row\) \{\s*\n\s*return Array\.isArray\(row\?\.tags\) \? row\.tags : \[\]/,
     'tagsOf 必须守住「字段缺席 = 没打标」，不能把 undefined 渲成标签')

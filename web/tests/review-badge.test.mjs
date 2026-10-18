@@ -58,9 +58,12 @@ test('App.vue：侧栏徽标渲染 + 审核/知识库徽标计算', () => {
   assert.match(APP, /promote_candidates[\s\S]*?demote_candidates/)
   // 知识库徽标 = kb_pending（属性名即可）
   assert.match(APP, /\.kb_pending\b/)
-  // 路径守门：仅这两个路径有徽标（徽标从记忆维护迁到了审核项）
+  // 路径守门：仅这两个路径有徽标（徽标从记忆维护迁到了审核项；知识库那枚从
+  // /kb 浏览页迁到了 /kb-review 审核页 —— 待审不是浏览页的事）
   assert.match(APP, /['"]\/review['"]\)\s*return\s+reviewBadge\(\)/)
-  assert.match(APP, /['"]\/kb['"]\)\s*return\s+kbBadge\(\)/)
+  assert.match(APP, /['"]\/kb-review['"]\)\s*return\s+kbBadge\(\)/)
+  assert.doesNotMatch(APP, /['"]\/kb['"]\)\s*return\s+kbBadge\(\)/,
+    '「知识库」浏览页不该再挂待审徽标（它已挂到「知识库 › 审核」项上）')
 })
 
 test('App.vue：60s 静默刷新 + onUnmounted 清定时器（不留定时炸弹）', () => {
