@@ -1,8 +1,9 @@
 /**
  * P11 信息架构护栏（纯静态扫描，node --test 直接跑）：
- *   侧栏三组「总览 / 记忆 / 知识库」，看板是总览入口排第一；
+ *   侧栏三组「总览 / 记忆 / 知识库」，看板是总览入口排第一，
+ *   记忆组第一项是「审核」（审核独立成页后排在最前，常驻层之前）；
  *   面包屑从 GROUPS 取，所以分组名一改这里就红。
- * （代理治理入组后记忆组四项、总入口六个。）
+ * （代理治理入组后记忆组四项、总入口六个；审核独立成页后记忆组五项、总入口七个。）
  * 这类「顺序错了也编译得过」的事，钉在源码上。
  */
 import test from 'node:test'
@@ -17,15 +18,16 @@ const groups = [...APP.matchAll(/title: '([^']+)',\s*\n\s*items: \[([\s\S]*?)\]\
   (m) => ({ title: m[1], items: [...m[2].matchAll(/label: '([^']+)'/g)].map((x) => x[1]) }),
 )
 
-test('侧栏：看板在第一组「总览」，共三组，六个入口', () => {
+test('侧栏：看板在第一组「总览」，共三组，七个入口', () => {
   assert.deepEqual(
     groups.map((g) => g.title),
     ['总览', '记忆', '知识库'],
   )
   assert.deepEqual(groups[0].items, ['看板'])
-  assert.deepEqual(groups[1].items, ['常驻层', '记忆条目', '记忆维护', '代理治理'])
+  // 审核排记忆组第一位：它是「有东西要处理」的高频动作，不该埋在分组深处
+  assert.deepEqual(groups[1].items, ['审核', '常驻层', '记忆条目', '记忆维护', '代理治理'])
   assert.deepEqual(groups[2].items, ['知识库'])
-  assert.equal(groups.flatMap((g) => g.items).length, 6)
+  assert.equal(groups.flatMap((g) => g.items).length, 7)
 })
 
 test('面包屑：随分组走（看板页 总览 › 看板），旧的「知识库与运维」措辞已消失', () => {

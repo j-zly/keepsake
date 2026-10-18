@@ -1,21 +1,21 @@
 /**
  * 控制台审核入口显性化（待审计数徽标 + 首页审核卡）的前端护栏。
  *
- * 用户痛点：「看不到需要审核的界面」——候选审核区其实在 MaintenanceView 里，
- * 但入口太深。把「有东西要审」这件事推到眼前，**审核语义本身不动**：
+ * 用户痛点：「看不到需要审核的界面」——候选审核区太深（现在已独立成 ReviewView），
+ * 但入口不显。把「有东西要审」这件事推到眼前，**审核语义本身不动**：
  * 批准 / 驳回仍走既有端点，这里只把徽标 / 待审核卡 + 取数口接通。
  *
  * 钉死的事（每条都是「编译能过 + 不接对也会过」的隐形漏接）：
  *   1) 取数口 = `api.reviewCounts()` ⇒ `GET /api/v1/review/counts`：
  *      路径必须字符串一致（与后端一字对得上，否则 404）。
  *   2) App.vue 侧栏徽标：
- *      - 维护项 badge = promote + demote 合计；
+ *      - 审核项 badge = promote + demote 合计（审核独立成页后从维护项迁过来）；
  *      - 知识库项 badge = kb_pending；
  *      - > 0 才渲染（v-if）；
  *      - 60s 静默刷新 + onUnmounted 清定时器（离开页面继续打接口 = 隐形泄漏）。
  *   3) StatsView.vue 顶部「待审核 N 条」卡：
  *      - 渲染（reviewTotal computed）；
- *      - 点击 → `router.push('/maintenance')`（三类待审都跳到那一页）。
+ *      - 点击 → `router.push('/review')`（记忆类待审跳审核页）。
  *   4) ops.py 含 `"/api/v1/review/counts"` 且挂 `require_session`
  *      （与 G4 端点存在 + G5 不漏认证的守门员）。
  *   5) 新增的 4 个文件**零硬编码色值**：不允许引入 `#[0-9a-fA-F]{3,8}`
@@ -48,18 +48,18 @@ test('API 层：reviewCounts 方法 + 路径字符串一致', () => {
   )
 })
 
-test('App.vue：侧栏徽标渲染 + 维护/知识库徽标计算', () => {
+test('App.vue：侧栏徽标渲染 + 审核/知识库徽标计算', () => {
   // 数据源：ref + 拉取
   assert.match(APP, /\breviewCounts\s*=\s*ref\(/, '需要一个 reviewCounts ref 装取到的三个数')
   assert.match(APP, /api\.reviewCounts\(\)/, '必须显式调 api.reviewCounts()，不许另发明接口')
   // >0 才渲染
   assert.match(APP, /v-if="badgeFor\(m\.path\)"/, '徽标 v-if 守门：>0 才显示');
-  // 维护项徽标 = promote+demote 合计（多行可）
+  // 审核项徽标 = promote+demote 合计（多行可）
   assert.match(APP, /promote_candidates[\s\S]*?demote_candidates/)
   // 知识库徽标 = kb_pending（属性名即可）
   assert.match(APP, /\.kb_pending\b/)
-  // 路径守门：仅这两个路径有徽标
-  assert.match(APP, /['"]\/maintenance['"]\)\s*return\s+maintenanceBadge\(\)/)
+  // 路径守门：仅这两个路径有徽标（徽标从记忆维护迁到了审核项）
+  assert.match(APP, /['"]\/review['"]\)\s*return\s+reviewBadge\(\)/)
   assert.match(APP, /['"]\/kb['"]\)\s*return\s+kbBadge\(\)/)
 })
 
@@ -75,13 +75,13 @@ test('App.vue：60s 静默刷新 + onUnmounted 清定时器（不留定时炸弹
   assert.match(APP, /clearInterval\(reviewTimer\)/, '卸载必须 clearInterval')
 })
 
-test('StatsView：顶部待审核卡 + 跳转 /maintenance', () => {
+test('StatsView：顶部待审核卡 + 跳转 /review', () => {
   // reviewTotal 汇总三个数（>0 → display）
   assert.match(STATS, /reviewTotal/, '需要 reviewTotal 汇总数')
   assert.match(STATS, /promote_candidates[\s\S]*?demote_candidates[\s\S]*?kb_pending/,
                'reviewTotal 必须包含 promote + demote + kb_pending 三项')
   // 跳转
-  assert.match(STATS, /router\.push\(['"]\/maintenance['"]\)/, '点击卡必须跳 /maintenance')
+  assert.match(STATS, /router\.push\(['"]\/review['"]\)/, '点击卡必须跳 /review')
   // reviewCounts 卡片存在（DOM 锚点："待审核"）
   assert.match(STATS, /待审核/, '模板里必须出现"待审核"字样')
 })

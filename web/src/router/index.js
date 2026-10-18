@@ -7,6 +7,7 @@ import FragmentsView from '../views/FragmentsView.vue'
 import KbView from '../views/KbView.vue'
 import LoginView from '../views/LoginView.vue'
 import MaintenanceView from '../views/MaintenanceView.vue'
+import ReviewView from '../views/ReviewView.vue'
 import SetupView from '../views/SetupView.vue'
 import StatsView from '../views/StatsView.vue'
 import TokenView from '../views/TokenView.vue'
@@ -19,6 +20,8 @@ const routes = [
   { path: '/', redirect: '/core' },
   { path: '/core', name: 'core', component: CoreView, meta: { title: '常驻层' } },
   { path: '/fragments', name: 'fragments', component: FragmentsView, meta: { title: '检索层' } },
+  // 审核独立成页（原来挤在记忆维护页里）：候选 70+ 条时整页很长，动线被危险操作淹没
+  { path: '/review', name: 'review', component: ReviewView, meta: { title: '记忆审核' } },
   { path: '/maintenance', name: 'maintenance', component: MaintenanceView, meta: { title: '记忆维护' } },
   { path: '/kb', name: 'kb', component: KbView, meta: { title: '知识库' } },
   { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理治理' } },

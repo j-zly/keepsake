@@ -27,7 +27,7 @@
             </span>
             <span class="txt">{{ m.label }}</span>
             <!-- 待审徽标：>0 才显示；数字复用 reviewCounts 全库口径。
-                 维护项=晋升候选+退居建议之和；知识库项=kb_pending。
+                 审核项=晋升候选+退居建议之和；知识库项=kb_pending。
                  样式零新色：底色/文字全走既有 token（与 .chip--danger 同款）。 -->
             <span v-if="badgeFor(m.path)" class="item-badge"
               :aria-label="`待审 ${badgeFor(m.path)}`">{{ badgeFor(m.path) }}</span>
@@ -141,15 +141,19 @@ const ICON = {
     '<path d="M10.4 2.9 13.1 5.6 8.6 10.1 5.9 7.4Z"/><path d="m6.7 8.2-3.4 3.4 2.4 2.4 3.4-3.4"/><path d="M4.6 13.4h6.8"/>',
   users:
     '<circle cx="6.1" cy="5.3" r="2.5"/><path d="M2.1 13.4a4.1 4.1 0 0 1 8 0"/><path d="M10.7 3.3a2.5 2.5 0 0 1 0 4.9"/><path d="M11.7 9.7a4.1 4.1 0 0 1 2.2 3.4"/>',
+  check:
+    '<path d="M8 1.9 14.3 4.6v3.9c0 3.2-2.5 6.1-6.3 7.4-3.8-1.3-6.3-4.2-6.3-7.4V4.6Z"/><path d="m5.5 8.3 1.8 1.8 3.4-3.6"/>',
   logout:
     '<path d="M6.4 2.9H3.6a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.8"/><path d="M10.2 5.5 13.1 8l-2.9 2.5"/><path d="M13.1 8H6.6"/>',
   key:
     '<circle cx="5.4" cy="10.6" r="2.9"/><path d="M7.6 8.4 13.4 2.6"/><path d="M11.2 4.8 12.6 6.2"/><path d="M9.8 6.2 11.2 7.6"/>',
 }
 
-// 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（知识库）
+// 侧栏分组：总览（看板）· 记忆（审核 / 常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（知识库）
 // 看板是总览入口，业界惯例 Overview 置顶，所以它单独成组排第一。
 // 面包屑也从这份结构取，所以两处永远说同一句话（看板页：总览 › 看板）。
+// 审核排记忆组第一：它是「有东西要处理」的高频动作，不该埋在分组深处（候选量一多
+// 记忆维护页太长，审核入口也被合并/遗忘这些危险操作淹没）。
 const GROUPS = [
   {
     title: '总览',
@@ -158,6 +162,7 @@ const GROUPS = [
   {
     title: '记忆',
     items: [
+      { path: '/review', label: '审核', icon: ICON.check },
       { path: '/core', label: '常驻层', icon: ICON.layers },
       { path: '/fragments', label: '记忆条目', icon: ICON.search },
       { path: '/maintenance', label: '记忆维护', icon: ICON.broom },
@@ -179,8 +184,8 @@ const crumb = computed(() => {
 })
 // ===== 待审数（侧栏徽标）===========================================
 // 数据源：`GET /api/v1/review/counts`（侧栏常驻，不随路由改而重拉）。
-// - 维护项徽标 = promote + demote 合计（晋升候选 + 退居建议均在 MaintenanceView
-//   「常驻候选」面板里审）；
+// - 审核项徽标 = promote + demote 合计（晋升候选 + 退居建议均在 ReviewView
+//   「记忆审核」页里审）；
 // - 知识库项徽标 = kb_pending（子代理提交待批的知识文档数）。
 // 拉一次 + 每 60s 静默刷新（与 AgentsView 的 10s 节奏同款但更宽：徽标是
 // 「记得处理一下」的提示，秒级滞后也能接受，省流量）。登录页/初始化页免拉
@@ -189,7 +194,7 @@ const REVIEW_POLL_MS = 60000
 const reviewCounts = ref({ promote_candidates: 0, demote_candidates: 0, kb_pending: 0 })
 let reviewTimer = null
 
-function maintenanceBadge() {
+function reviewBadge() {
   const n = (reviewCounts.value?.promote_candidates || 0)
           + (reviewCounts.value?.demote_candidates || 0)
   return n > 0 ? n : 0
@@ -200,7 +205,7 @@ function kbBadge() {
 }
 /** 给定路径返回 0 / 数字（与模板的 `v-if` 配套）。null/undefined 与负数都退 0。 */
 function badgeFor(path) {
-  if (path === '/maintenance') return maintenanceBadge()
+  if (path === '/review') return reviewBadge()
   if (path === '/kb') return kbBadge()
   return 0
 }

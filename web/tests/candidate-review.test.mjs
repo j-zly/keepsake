@@ -1,5 +1,5 @@
 /**
- * 「记忆维护 › 常驻候选」审核区的护栏。
+ * 「记忆审核 › 常驻候选」审核区的护栏（审核独立成页后，代码整段从 MaintenanceView 搬到这里）。
  *
  * 这块区要做的事只有三件，全是「不做就静默出错」的：
  *   1) **接线**：三个动作都打在**既有接口**上（拉候选 / 批准 / 驳回），
@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const VIEW = readFileSync(fileURLToPath(new URL('../src/views/MaintenanceView.vue', import.meta.url)), 'utf8')
+const VIEW = readFileSync(fileURLToPath(new URL('../src/views/ReviewView.vue', import.meta.url)), 'utf8')
 
 /**
  * 把页面里那段「标签串纯函数」原样抽出来真跑一遍。
@@ -34,7 +34,7 @@ const { splitTags, dropTag, agentOf } = new Function(
 
 test('审核区接的是三个既有接口，没有自造第四个', () => {
   for (const call of ['api.fragments(', 'api.promote(', 'api.updateFragment(']) {
-    assert.ok(VIEW.includes(call), `MaintenanceView 里没有 ${call}`)
+    assert.ok(VIEW.includes(call), `ReviewView 里没有 ${call}`)
   }
   // 候选数据源必须是按标签列（tag 取自当前审核方向），不是全文检索。
   // 分级批次加了「方向」后 tag 由 dirTag 决定（promote=core_candidate /
@@ -55,9 +55,12 @@ test('候选列表走分页：PagerBar 接线 + 写死的那一拉到底已经�
   assert.match(VIEW, /@update:page-size="onCandSize"/, '每页条数事件没接线')
   // 写死页的判据：page: 1, page_size: 50 曾经是一把梭 50 条，必须拆掉
   assert.doesNotMatch(VIEW, /page:\s*1,\s*page_size:\s*50/, '还在写死第一页 50 条')
-  // 页码/每页条数是响应式的，默认与 PagerBar 的 SIZES 选项对齐（20）
+  // 页码/每页条数是响应式的。审核页默认 10 条/页（一屏看不完 20 张卡），
+  // 档位 10/20/50 摆在页面上那个「每页」分段控件里 —— 用户明确要「审核要分页」。
   assert.match(VIEW, /const candPage = ref\(1\)/)
-  assert.match(VIEW, /const candPageSize = ref\(20\)/)
+  assert.match(VIEW, /const PAGE_SIZES = \[10, 20, 50\]/)
+  assert.match(VIEW, /const candPageSize = ref\(10\)/)
+  assert.match(VIEW, /v-for="n in PAGE_SIZES"/, '每页条数选择器必须渲染 PAGE_SIZES 那三档')
   assert.match(VIEW, /page:\s*candPage\.value,\s*page_size:\s*candPageSize\.value/)
   // total 口径与 FragmentsView 同源：有 count 用 count，has_more 时撑出下一页
   assert.match(

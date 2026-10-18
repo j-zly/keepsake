@@ -10,7 +10,8 @@
  *      证据标必须**跟着一起摘**（方向标一摘，证据标就成了列表永远不显示的孤儿）。
  *      两条路径（驳回用列表行的 tags、批准用 demote 返回的 tags）都钉住。
  *
- * 纯函数照旧从 MaintenanceView 里**原样抽出来**真跑（不是抄一份）——
+ * 纯函数照旧从 ReviewView（审核独立成页后从 MaintenanceView 搬过来）里
+ * **原样抽出来**真跑（不是抄一份）——
  * 抽取窗口（`/** 逗号串 → 标签数组` … `const cands = ref(`）是既有约定。
  */
 import test from 'node:test'
@@ -18,7 +19,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const VIEW = readFileSync(fileURLToPath(new URL('../src/views/MaintenanceView.vue', import.meta.url)), 'utf8')
+const VIEW = readFileSync(fileURLToPath(new URL('../src/views/ReviewView.vue', import.meta.url)), 'utf8')
 
 const { splitTags, dropTag, evidKeysOf } = new Function(
   VIEW.slice(

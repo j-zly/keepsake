@@ -7,18 +7,18 @@
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
-    <!-- 待审核卡：置顶，作为「有东西要处理」的强提示。点击跳 /maintenance。
+    <!-- 待审核卡：置顶，作为「有东西要处理」的强提示。点击跳 /review。
          0 时显示无待审（绿色 ok），不是把卡藏起来 —— 隐藏了用户找不到入口。
          失败时降级为「-」，跟其它卡同款处理，不让一行失败拖红整张看板。 -->
     <div class="stat-grid stat-grid--review">
       <button type="button" class="review-card-btn"
               :class="{ 'review-card-btn--zero': reviewTotal === 0 }"
               @click="gotoReview"
-              :aria-label="reviewTotal === 0 ? '无待审，点击进入记忆维护' : `待审 ${reviewTotal} 条，点击进入记忆维护`">
+              :aria-label="reviewTotal === 0 ? '无待审，点击进入记忆审核' : `待审 ${reviewTotal} 条，点击进入记忆审核`">
         <div class="review-card">
           <div class="review-card-label">
             待审核
-            <span class="review-card-hint">点击进入记忆维护 ›</span>
+            <span class="review-card-hint">点击进入记忆审核 ›</span>
           </div>
           <div class="review-card-value num" :class="reviewTotal > 0 ? 'tone-danger' : 'tone-ok'">
             {{ reviewTotal === 0 && !reviewError ? '无待审' : (reviewError ? '-' : reviewTotal) }}
@@ -235,8 +235,8 @@ const reviewTone = computed(() => (reviewTotal.value > 0 ? 'danger' : 'ok'))
 // 「无匹配任务」走空态同款 —— 总归有个说法）。
 const router = useRouter()
 function gotoReview() {
-  // 整页只有这一个 chip；点哪都跳同一个目标：/maintenance（晋升 + 退居都在那）。
-  router.push('/maintenance')
+  // 整页只有这一个 chip；点哪都跳同一个目标：/review（晋升 + 退居都在那）。
+  router.push('/review')
 }
 
 /* ---------------------------------------------------------------- 定时任务管理
