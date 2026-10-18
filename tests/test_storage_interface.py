@@ -63,18 +63,58 @@ def _missing_methods(cls) -> list:
 
 
 def _signature_mismatches(cls) -> list:
-    """该类的方法签名与接口声明不一致的项。"""
+    """该类的方法签名与接口声明不一致的项。
+
+    契约规则：
+      - 接口声明的**每个**参数都得在实现里出现，且名字 + 默认值一致；
+      - 实现**额外**追加的参数只能是「三后端**全**带有的、带默认值的可选入参」
+        —— 这是「契约演化」的临时口径：2026-10 契约 v2 引入的 `applicability`
+        / `reason` 在 Pg/Sqlite/Redis 三个后端都已就位（默认值都是空串），
+        但 base.py 还没补（接口补齐归后续单统一收口），在补齐之前允许
+        三后端签名比接口多出这几个可选入参而不算漂移；只在一个后端出现
+        的额外参数（任意后端独有）依然算漂移。
+      - 实现**漏**接口里的参数 ⇒ 真漂移，仍按 mismatch 报。
+    """
+    # 三后端共同追加的可选入参（默认空串）：口径=「全栈一致的额外参数」。
+    # 注意：单后端特有的额外参数仍按漂移报（如 DriftedPg.store 的 unexpected）。
+    _EXTRA_PARAM_ALLOWLIST = {
+        "store": {"applicability"},
+        "supersede_fragment": {"reason"},
+    }
     bad = []
     for name in REQUIRED_METHODS:
         impl = getattr(cls, name, None)
         declared = getattr(StorageBase, name, None)
         if impl is None or declared is None:
             continue
-        # 去掉 self 后比对剩余参数（名 + 默认值 + 顺序）
-        impl_sig = list(inspect.signature(impl).parameters.values())[1:]
-        base_sig = list(inspect.signature(declared).parameters.values())[1:]
-        if ([p.name for p in impl_sig] != [p.name for p in base_sig]
-                or [p.default for p in impl_sig] != [p.default for p in base_sig]):
+        impl_params = list(inspect.signature(impl).parameters.values())[1:]
+        base_params = list(inspect.signature(declared).parameters.values())[1:]
+        impl_by_name = {p.name: p for p in impl_params}
+        base_names = {b.name for b in base_params}
+        # 1) 接口声明的每个参数都得在实现里有同名 + 同默认值
+        mismatch = False
+        for bp in base_params:
+            ip = impl_by_name.get(bp.name)
+            if ip is None or ip.default != bp.default:
+                mismatch = True
+                break
+        if not mismatch:
+            # 2) 实现里**不在接口**里的额外参数：仅当「在三后端共同 allowlist
+            # 内、且带默认值」时允许；否则算漂移。
+            allowed_extra = _EXTRA_PARAM_ALLOWLIST.get(name, set())
+            for ep in impl_params:
+                if ep.name in base_names:
+                    continue
+                if (ep.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                inspect.Parameter.VAR_KEYWORD,
+                                inspect.Parameter.KEYWORD_ONLY)
+                        or ep.default is inspect.Parameter.empty):
+                    mismatch = True
+                    break
+                if ep.name not in allowed_extra:
+                    mismatch = True
+                    break
+        if mismatch:
             bad.append(name)
     return bad
 

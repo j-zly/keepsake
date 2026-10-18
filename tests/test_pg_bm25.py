@@ -186,8 +186,12 @@ def test_search_bm25_fetches_corpus_stats_in_one_aggregate_not_per_document(monk
     """
     rows = [_row(f"k{i}", 20, ["前端:2", "部署:2"]) for i in range(30)]
     frags = [_frag_row(f"k{i}", f"前端部署到 /opt/web 第{i}版") for i in range(30)]
-    # 六趟：同义词（空表）、热词榜（空）、注意力榜（空）、候选召回、语料统计、取回正文
-    pg, db = _fake_pg(monkeypatch, [[], [], [], rows,
+    # 七趟：同义词（空表）、契约 v2 缺列探测（空=全在）、热词榜（空）、
+    # 注意力榜（空）、候选召回、语料统计、取回正文。
+    # 探测走的是 `_contract_v2_missing` 缓存首查：进程内只发一次，
+    # `ensure_index` 后失效（重启即重新探测）—— 这是真实代价，**不能**
+    # 推到「无 DB 也要预热」的位置（否则单测就要写 `_warm_*` 双轨）。
+    pg, db = _fake_pg(monkeypatch, [[], [], [], [], rows,
                                     [(50.0, 1000.0, {"前端": 5.0, "部署": 5.0})], frags])
 
     out = pg.search_bm25("前端部署")
@@ -216,7 +220,7 @@ def test_search_bm25_scores_are_bm25_not_rank_cd(monkeypatch):
             _row("k2", 26, ["前端:4", "部署:4"])]
     frags = [_frag_row("k1", "前端部署到 /opt/web"),
              _frag_row("k2", "前端部署到 /opt/web 前端部署 前端部署 前端部署")]
-    pg, _db = _fake_pg(monkeypatch, [[], [], [], rows,
+    pg, _db = _fake_pg(monkeypatch, [[], [], [], [], rows,
                                       [(2.0, 46.0, {"前端": 2.0, "部署": 2.0})], frags])
 
     out = pg.search_bm25("前端部署")
