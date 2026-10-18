@@ -26,6 +26,11 @@
                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" v-html="m.icon" />
             </span>
             <span class="txt">{{ m.label }}</span>
+            <!-- 待审徽标：>0 才显示；数字复用 reviewCounts 全库口径。
+                 维护项=晋升候选+退居建议之和；知识库项=kb_pending。
+                 样式零新色：底色/文字全走既有 token（与 .chip--danger 同款）。 -->
+            <span v-if="badgeFor(m.path)" class="item-badge"
+              :aria-label="`待审 ${badgeFor(m.path)}`">{{ badgeFor(m.path) }}</span>
           </RouterLink>
         </div>
       </div>
@@ -110,7 +115,7 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ChangePasswordDialog from './components/ChangePasswordDialog.vue'
@@ -172,6 +177,61 @@ const crumb = computed(() => {
   }
   return { group: '控制台', item: route.meta.title || '' }
 })
+// ===== 待审数（侧栏徽标）===========================================
+// 数据源：`GET /api/v1/review/counts`（侧栏常驻，不随路由改而重拉）。
+// - 维护项徽标 = promote + demote 合计（晋升候选 + 退居建议均在 MaintenanceView
+//   「常驻候选」面板里审）；
+// - 知识库项徽标 = kb_pending（子代理提交待批的知识文档数）。
+// 拉一次 + 每 60s 静默刷新（与 AgentsView 的 10s 节奏同款但更宽：徽标是
+// 「记得处理一下」的提示，秒级滞后也能接受，省流量）。登录页/初始化页免拉
+// —— 那两页连壳都套不上，轮询纯属自扰。
+const REVIEW_POLL_MS = 60000
+const reviewCounts = ref({ promote_candidates: 0, demote_candidates: 0, kb_pending: 0 })
+let reviewTimer = null
+
+function maintenanceBadge() {
+  const n = (reviewCounts.value?.promote_candidates || 0)
+          + (reviewCounts.value?.demote_candidates || 0)
+  return n > 0 ? n : 0
+}
+function kbBadge() {
+  const n = reviewCounts.value?.kb_pending || 0
+  return n > 0 ? n : 0
+}
+/** 给定路径返回 0 / 数字（与模板的 `v-if` 配套）。null/undefined 与负数都退 0。 */
+function badgeFor(path) {
+  if (path === '/maintenance') return maintenanceBadge()
+  if (path === '/kb') return kbBadge()
+  return 0
+}
+
+async function loadReviewCounts() {
+  // 登录后才需要（未登录 401 已经在 api 拦截器里处理；这里静默吞，保证轮询不污染）
+  if (!showShell.value) return
+  try {
+    const data = await api.reviewCounts()
+    reviewCounts.value = {
+      promote_candidates: Number(data?.promote_candidates || 0),
+      demote_candidates: Number(data?.demote_candidates || 0),
+      kb_pending: Number(data?.kb_pending || 0),
+    }
+  } catch (_) {
+    // 失败保持旧值（避免一次抖动把 `N` 清成 `0`，用户以为已清空）
+  }
+}
+
+if (typeof window !== 'undefined') {
+  onMounted(() => {
+    loadReviewCounts()
+    if (reviewTimer) clearInterval(reviewTimer)
+    reviewTimer = setInterval(loadReviewCounts, REVIEW_POLL_MS)
+  })
+  onUnmounted(() => {
+    if (reviewTimer) clearInterval(reviewTimer)
+    reviewTimer = null
+  })
+}
+// ===== /待审数 =====================================================
 
 // 登录 / 初始化 / token 三页不套外壳，否则套一个空侧边栏没意义
 const BARE_PAGES = ['token', 'login', 'setup']
@@ -309,6 +369,33 @@ async function onSignOutConfirm() {
 .ico {
   display: inline-flex;
   flex: none;
+}
+
+/* ---------------------------------------------------------------- 待审徽标
+ * 侧栏 .item 右侧的小红点+数字；零新色（仅复用既有 danger / on-accent token）：
+ *   未选中行：底=--danger, 字=--on-accent；
+ *   选中行：整行已是 --accent 蓝胶囊，反白为底=--on-accent, 字=--danger。
+ * margin-left:auto 把它推到行末（gap 不动，避免没徽标的行也受 layout 影响）。 */
+.item-badge {
+  margin-left: auto;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--danger);
+  color: var(--on-accent);
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;          /* 徽标只装饰，点穿透到 RouterLink */
+}
+.item.on .item-badge {
+  background: var(--on-accent);
+  color: var(--danger);
 }
 
 .nav-foot {

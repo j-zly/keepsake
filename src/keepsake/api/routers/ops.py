@@ -1166,3 +1166,72 @@ def import_template(
             "Cache-Control": "no-store",
         },
     )
+
+
+# --------------------------------------------------------------------------
+# 待审条目计数（read-only · 控制台侧栏徽标的唯一取数口）
+# --------------------------------------------------------------------------
+
+@router.get("/api/v1/review/counts", dependencies=[Depends(require_session)])
+def review_counts(storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """待审条目的全量计数（**只读端点**：不挂 `write_guard`，零写动作）。
+
+    返回 `{promote_candidates, demote_candidates, kb_pending}`：
+      * `promote_candidates` = 检索层条目打着 `core_candidate`（人工升常驻 / 班车
+        提名）的待审条数；
+      * `demote_candidates`  = 班车压力轨提名退位的待审条数（挂着
+        `tier:demote-candidate`）；
+      * `kb_pending`         = 知识库 `documents.status='pending'`
+        （子代理经 MCP/通用接口提交等审核）。
+
+    三类都是**全库口径**（顶部徽标的数必须永远等于库里实际待审数），
+    与既有的 `fragments?tag=core_candidate` / `tier:demote-candidate` 列表
+    与 `kb/pending` 端点的口径一字一致 —— 一边动口径、另一边不跟上 =
+    看见和动手的数对不上。
+
+    缺列降级（与 `kb_router.kb_type_counts` 同款）：
+      * 记忆库缺 `core_candidate` / `tier:demote-candidate` 标签 ⇒ 对应值为 0
+        （list_by_tag 本就返回 []，无需特判）；
+      * 知识库未配置 / 库缺 `documents` 表 / `status` 列 ⇒ `kb_pending=0`，**不**
+        让整页 500 ——
+        🔴 单点失败不许把记忆侧的徽标也拖没（侧栏常驻指望的是 promote/demote
+        那两个数，知识库挂就挂知识库那颗）。
+
+    复用 `storage.list_by_tag` 这一个原语：三后端（PG / SQLite / Redis）的标签
+    计数就是它，不在 ops 层另发明 SQL 方言分支。
+    """
+    from keepsake.core import tiering as tiering_mod
+    from . import kb as kb_mod
+
+    promote = len(list(storage.list_by_tag(tiering_mod.CANDIDATE_TAG) or []))
+    demote = len(list(storage.list_by_tag(tiering_mod.DEMOTE_CANDIDATE_TAG) or []))
+    kb_pending = 0
+    # 🔴 知识库未配置 / 缺列 / 不存在文档表：单点降级，不波及 promote/demote。
+    # 与 `kb_router.kb_pending` 行为不同是因为后者是页面入口（KB 真有问题就该
+    # 给白话 500），这里只是侧栏计数（一行字挂了 ≠ 整页炸）。
+    try:
+        tabs = kb_mod._table_columns(kb_mod._ident(config.pg_schema()),
+                                     (config.KB_TABLE_DOCUMENTS,))
+        docs_cols = tabs.get(config.KB_TABLE_DOCUMENTS) or set()
+        d_status = next((kb_mod._ident(c) for c in ("status",) if c in docs_cols), None)
+        if d_status:
+            with kb_mod._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) AS n "
+                        f"FROM {kb_mod._ident(config.pg_schema())}.{config.KB_TABLE_DOCUMENTS} "
+                        f"WHERE {d_status} = %s",
+                        [kb_mod.ingest.STATUS_PENDING],
+                    )
+                    row = cur.fetchone() or {}
+            kb_pending = int(row.get("n") or 0)
+    except Exception:
+        # 包括 HTTPException（如 KB 未配置/Schema 不存在）—— 这里是侧栏计数
+        # 的一个差分，KB 真有错写由 /kb/pending 端点负责给白话 500，
+        # 这里挂 = 整页红，不值。
+        kb_pending = 0
+    return {
+        "promote_candidates": promote,
+        "demote_candidates": demote,
+        "kb_pending": kb_pending,
+    }

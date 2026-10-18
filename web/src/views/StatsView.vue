@@ -7,6 +7,34 @@
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
+    <!-- 待审核卡：置顶，作为「有东西要处理」的强提示。点击跳 /maintenance。
+         0 时显示无待审（绿色 ok），不是把卡藏起来 —— 隐藏了用户找不到入口。
+         失败时降级为「-」，跟其它卡同款处理，不让一行失败拖红整张看板。 -->
+    <div class="stat-grid stat-grid--review">
+      <button type="button" class="review-card-btn"
+              :class="{ 'review-card-btn--zero': reviewTotal === 0 }"
+              @click="gotoReview"
+              :aria-label="reviewTotal === 0 ? '无待审，点击进入记忆维护' : `待审 ${reviewTotal} 条，点击进入记忆维护`">
+        <div class="review-card">
+          <div class="review-card-label">
+            待审核
+            <span class="review-card-hint">点击进入记忆维护 ›</span>
+          </div>
+          <div class="review-card-value num" :class="reviewTotal > 0 ? 'tone-danger' : 'tone-ok'">
+            {{ reviewTotal === 0 && !reviewError ? '无待审' : (reviewError ? '-' : reviewTotal) }}
+            <span v-if="reviewTotal > 0 && !reviewError" class="unit">条</span>
+          </div>
+          <div class="review-card-foot">
+            <span class="review-card-pill"
+                  :class="reviewTotal > 0 ? 'tone-danger-pill' : 'tone-ok-pill'">
+              晋升 {{ reviewCounts.promote_candidates || 0 }} · 退居 {{ reviewCounts.demote_candidates || 0 }} · 知识库 {{ reviewCounts.kb_pending || 0 }}
+            </span>
+            <span v-if="reviewError" class="review-card-err">{{ reviewError }}</span>
+          </div>
+        </div>
+      </button>
+    </div>
+
     <div class="stat-grid">
       <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" />
       <StatCard label="常驻层字符" :value="data?.core?.chars ?? '-'" unit="字符" />
@@ -172,6 +200,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import StatCard from '../components/StatCard.vue'
@@ -189,6 +218,26 @@ const error = ref('')
 const cronError = ref('')
 const tiering = ref(null)
 const tieringError = ref('')
+
+// 待审条目计数（侧栏同一份数据，独立 fetch 让这页不至于因 review 端点挂了而红）
+// — 顶部「待审核 N 条」卡专用。三个数全库口径，与 GET /api/v1/review/counts 一致。
+const reviewCounts = ref({ promote_candidates: 0, demote_candidates: 0, kb_pending: 0 })
+const reviewError = ref('')
+/** 待审总数 = 晋升候选 + 退居建议 + 知识库待批（与侧栏徽标汇总口径一致）。
+ *  0 时给绿色「无待审」正向反馈（不是隐藏 —— 用户会以为是 bug）；>0 走 danger。 */
+const reviewTotal = computed(() =>
+    (reviewCounts.value?.promote_candidates || 0)
+  + (reviewCounts.value?.demote_candidates || 0)
+  + (reviewCounts.value?.kb_pending || 0)
+)
+const reviewTone = computed(() => (reviewTotal.value > 0 ? 'danger' : 'ok'))
+// 0 时也展示卡面：徽标是「记得处理一下」的提示，无事也让人安心（与 cron 那排
+// 「无匹配任务」走空态同款 —— 总归有个说法）。
+const router = useRouter()
+function gotoReview() {
+  // 整页只有这一个 chip；点哪都跳同一个目标：/maintenance（晋升 + 退居都在那）。
+  router.push('/maintenance')
+}
 
 /* ---------------------------------------------------------------- 定时任务管理
  * 三条操作（暂停 / 恢复 / 改调度）都改的是网关那份 jobs.json —— 本端只发请求，
@@ -283,6 +332,8 @@ async function load() {
   } catch (e) {
     error.value = `读取总览失败：${e.message}`
   }
+  // 待审数并行拿，timeout 与看板 stat 分离
+  await loadReview()
   try {
     const c = await api.crons()
     crons.value = c.jobs
@@ -303,6 +354,21 @@ async function load() {
     tieringError.value = `读取分级班车状态失败：${e.message}`
   } finally {
     loading.value = false
+  }
+}
+
+async function loadReview() {
+  // 单独 fetch：失败不让整张看板翻红（侧栏徽标挂了就挂，这页「待审核」卡退成「-」即可）
+  try {
+    const data = await api.reviewCounts()
+    reviewCounts.value = {
+      promote_candidates: Number(data?.promote_candidates || 0),
+      demote_candidates: Number(data?.demote_candidates || 0),
+      kb_pending: Number(data?.kb_pending || 0),
+    }
+    reviewError.value = ''
+  } catch (e) {
+    reviewError.value = `读取待审数失败：${e.message}`
   }
 }
 
@@ -440,6 +506,99 @@ onMounted(load)
   color: var(--text-faint);
   font-size: 12px;
 }
+/* 待审核卡：自成一类（不是普通 StatCard —— 整卡可点击跳转 + 三色分项 pill）。
+   零新色：danger / on-accent / ok / chip 全部走既有 token。 */
+.review-card-btn {
+  width: 100%;
+  text-align: left;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.review-card-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-card);
+}
+.review-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 20px;
+  border-radius: var(--r-card);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+  transition: box-shadow 0.12s, transform 0.12s;
+}
+.review-card-btn:hover .review-card {
+  box-shadow: var(--shadow-hover);
+  transform: translateY(-1px);
+}
+.review-card-btn--zero .review-card {
+  border-color: var(--border);
+}
+.review-card-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.review-card-hint {
+  color: var(--accent);
+  font-size: 12px;
+}
+.review-card-value {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  line-height: 1.1;
+}
+.review-card-value.tone-danger {
+  color: var(--danger);
+}
+.review-card-value.tone-ok {
+  color: var(--ok);
+}
+.review-card-value .unit {
+  font-size: 14px;
+  font-weight: 500;
+  margin-left: 4px;
+  color: var(--text-faint);
+}
+.review-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.review-card-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--r-chip);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.review-card-pill.tone-danger-pill {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.review-card-pill.tone-ok-pill {
+  background: var(--chip);
+  color: var(--text-dim);
+}
+.review-card-err {
+  font-size: 12px;
+  color: var(--danger);
+}
+
 /* 调度器状态一行：与 stat-grid 同色板，不新造颜色 */
 .sched-line {
   display: flex;

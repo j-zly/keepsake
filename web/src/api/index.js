@@ -189,6 +189,10 @@ export const api = {
   // 🔴 **计数绝不写死在前端**（与 type-counts / tags 同纪律），老库未迁移 status 列
   // 时后端给 0，页面就不显示「待审」chip。
   kbPending: (params) => http.get('/api/v1/kb/pending', { params }).then((r) => r.data),
+  // 待审条目计数（侧栏徽标的唯一取数口）：{promote_candidates, demote_candidates, kb_pending}。
+  // 三个数全是全库口径，**后端给，前端不写死数字**：lib 一变数字就错。
+  // KB 未配置 / status 列缺失时 kb_pending 退 0（与 kb_type_counts 同款降级）。
+  reviewCounts: () => http.get('/api/v1/review/counts').then((r) => r.data),
   // 批准：confirm 传 true（与代理治理 approve 同档防）；后端在同一事务里改 effective
   // + **此刻才切块**落 chunks + 记批准痕迹。
   kbApproveDocument: (id) =>
