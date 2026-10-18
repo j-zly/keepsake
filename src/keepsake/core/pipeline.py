@@ -67,6 +67,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 # 单向；tiering 不 import 本模块，没有环）。理由是 G5 那条单点闸：同一个标在两个
 # 模块各写一份字面量，漂移之后的表现是「班车提了名、审核页按另一半前缀过滤」，
 # 建议凭空消失而没人发现。**依赖方向别反过来**：tiering 反向依赖 pipeline 才是环。
+from .shared import VOID_KEY as _VOID_KEY
 from .tiering import CORE_TAG, DEMOTE_CANDIDATE_TAG, EVID_PREFIX, tag_list
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
@@ -93,7 +94,10 @@ DEFAULT_PIPELINE_CONFIG: Dict[str, Any] = {
 
 VALID_KINDS = frozenset({"fact", "decision", "preference", "pending", "state_change"})
 
-VOID_KEY = "__void__"  # DELETE 路径专用 sentinel
+#: DELETE 路径专用 sentinel。唯一定义处在 `storage_shared`（契约 v2 起）——
+#: 三个存储后端判「这条是不是作废封边」用的是**同一个对象**，字面量分头写一遍
+#: 早晚会漂一处，而漂了的后果是 DELETE 封边被当成普通 UPDATE 封边。
+VOID_KEY = _VOID_KEY
 
 
 # ---------------------------------------------------------------------------
