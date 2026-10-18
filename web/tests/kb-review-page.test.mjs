@@ -41,12 +41,8 @@ test('路由：/kb-review 有页、有标题，且不是公开页', () => {
   assert.doesNotMatch(ROUTER, /path: '\/kb-review'[^}]*public: true/)
 })
 
-test('侧栏：审核是知识库组第一项，kb_pending 徽标跟着它走', () => {
+test('侧栏：kb_pending 徽标挂审核项、浏览页不挂（顺序以 nav-order.test.mjs 为唯一锁）', () => {
   assert.match(APP, /\{ path: '\/kb-review', label: '审核', icon: ICON\.\w+ \}/)
-  assert.ok(
-    APP.indexOf("path: '/kb-review'") < APP.indexOf("path: '/kb', label"),
-    '审核必须排在知识库浏览之前（高频动作不埋深）',
-  )
   assert.match(APP, /if \(path === '\/kb-review'\) return kbBadge\(\)/)
   // 浏览页不再挂徽标：待审不是浏览页的事，而且两处挂同一枚徽标会让人以为重复了
   assert.doesNotMatch(APP, /if \(path === '\/kb'\) return/,

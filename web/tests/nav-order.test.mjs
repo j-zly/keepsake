@@ -26,8 +26,8 @@ test('侧栏：看板在第一组「总览」，共三组，八个入口', () =>
   assert.deepEqual(groups[0].items, ['看板'])
   // 审核排记忆组第一位：它是「有东西要处理」的高频动作，不该埋在分组深处
   assert.deepEqual(groups[1].items, ['审核', '常驻层', '记忆条目', '记忆维护', '代理治理'])
-  // 知识库组：审核排第一（待审是高频动作），知识库浏览页在后
-  assert.deepEqual(groups[2].items, ['审核', '知识库'])
+  // 知识库组：知识库浏览在前、审核在后（用户指定顺序，2026-10-18）
+  assert.deepEqual(groups[2].items, ['知识库', '审核'])
   assert.equal(groups.flatMap((g) => g.items).length, 8)
 })
 

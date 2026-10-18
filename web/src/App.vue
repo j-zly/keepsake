@@ -172,10 +172,9 @@ const GROUPS = [
   {
     title: '知识库',
     items: [
-      // 审核排知识库组第一：与记忆组同一个道理（待审是高频动作，不该埋在浏览页深处），
-      // 而且徽标挂在这儿，用户一眼就能看到「有几篇等着我判」
-      { path: '/kb-review', label: '审核', icon: ICON.check },
+      // 知识库浏览是日常主入口排第一，审核紧随其后（用户指定顺序；徽标随项走，不受排位影响）
       { path: '/kb', label: '知识库', icon: ICON.book },
+      { path: '/kb-review', label: '审核', icon: ICON.check },
     ],
   },
 ]
