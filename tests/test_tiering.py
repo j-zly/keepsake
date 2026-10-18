@@ -57,13 +57,18 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 # ---------------------------------------------------------------------------
 
 def _cfg(**overrides: Any) -> Dict[str, Any]:
-    """默认启用 + 缺省阈值的 config dict；`overrides` 按 `__` 分层覆盖。"""
+    """默认启用 + 缺省阈值的 config dict；`overrides` 按 `__` 分层覆盖。
+
+    🟡 测试意图：本文件的用例想验证「阈值边界」「满窗 vs 不满窗」等**判据**，
+    而不是「3000 vs 5000」这个具体数字。所以测试里通常会把 `nominate_min_hits` /
+    `promote_approve_hits` 显式覆盖成 5 之类的小值，再用现成种子数据驱动 —
+    边界靠「±1」这种判据钉死，而不是靠大量打点数据。
+    """
     base: Dict[str, Any] = {
         "tiering": {
             "enabled": True,
-            "promote_nominate": {"window_days": 7, "min_hits": 5},
-            "promote_auto": {"age_days": 15, "recent_window_days": 7,
-                             "recent_min_hits": 2},
+            "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+            "promote_auto": {"review_window_days": 7, "promote_approve_hits": 5000},
             "demote_pressure": {"warn_ratio": 0.90, "release_ratio": 0.80,
                                 "force_at_full": True},
             "demote_exempt": {"explicit_core": True},
@@ -137,13 +142,22 @@ def _core_keys(storage) -> List[str]:
 # 规则一：升提名
 # ---------------------------------------------------------------------------
 
-def test_规则一_窗口内五次命中才提名(storage):
+def test_规则一_阈值内命中才提名(storage):
+    """降阈值到 5（沿用原用例意图）：5 命中提名，4 命中不提名。
+
+    边界 2999/3000 是另一个独立用例（test_规则一_默认阈值边界）—— 本条专注
+    「数据差 1 ⇒ 不提名」的反向钉死，阈值的「5」只是显式覆盖（默认 3000 是
+    真实生产值，不该让用例打 3000 次点把 IO 撑爆）。
+    """
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10, "tags": "demo"},
                     {"key": "memory:frag:lukewarm", "content": "差一点" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:hot", 5)
     _seed_hits(storage, "memory:frag:lukewarm", 4)      # 差一次 ⇒ 不该提名
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
 
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
 
     assert stats["nominate"]["count"] == 1
     assert stats["nominate"]["keys"] == ["memory:frag:hot"]
@@ -151,10 +165,34 @@ def test_规则一_窗口内五次命中才提名(storage):
     assert CANDIDATE_TAG not in _tags(storage, "memory:frag:lukewarm")
 
 
+def test_规则一_默认阈值边界_2999不提名_3000提名(storage):
+    """默认 3000 是用户在带流量时拍板的口径（口语碎片高频打点也能进的旧值
+    已被淘汰），本条钉死边界：
+      * 2999 次 ⇒ 不提名（差 1）
+      * 3000 次 ⇒ 提名（刚好等于）
+    """
+    _seed(storage, [{"key": "memory:frag:edge_below", "content": "差一点" * 10,
+                     "tags": "demo"},
+                    {"key": "memory:frag:edge_on", "content": "刚好" * 10,
+                     "tags": "demo"}])
+    _seed_hits(storage, "memory:frag:edge_below", 2999)
+    _seed_hits(storage, "memory:frag:edge_on", 3000)
+
+    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+
+    assert stats["nominate"]["count"] == 1
+    assert stats["nominate"]["keys"] == ["memory:frag:edge_on"]
+    assert CANDIDATE_TAG in _tags(storage, "memory:frag:edge_on")
+    assert CANDIDATE_TAG not in _tags(storage, "memory:frag:edge_below")
+
+
 def test_规则一_提名标带来源与提名日(storage):
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:hot", 6)
-    run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    run_tiering(storage, cfg, dry_run=False, now=NOW)
     tags = _tags(storage, "memory:frag:hot")
     assert f"{AUTO_HOT_PREFIX}:2026-10-16" in tags, "提名标必须带提名日（挂多久了全靠它）"
 
@@ -163,10 +201,13 @@ def test_规则一_已是候选的不重复打(storage):
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10,
                      "tags": f"demo,{CANDIDATE_TAG}"}])
     _seed_hits(storage, "memory:frag:hot", 9)
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
     assert stats["nominate"]["count"] == 0
     assert stats["nominate"]["already"] == 1
-    # 已在候选的**不重打提名日**（否则挂的天数每天被刷新，永远长不满 age_days）
+    # 已在候选的**不重打提名日**（否则挂的天数每天被刷新，永远长不满 review_window_days）
     assert not any(t.startswith(AUTO_HOT_PREFIX) for t in _tags(storage, "memory:frag:hot"))
 
 
@@ -174,7 +215,10 @@ def test_规则一_常驻条目不提名(storage):
     _seed(storage, [{"key": "memory:frag:core", "content": "常驻条目" * 10,
                      "tags": f"{CORE_TAG},shared"}])
     _seed_hits(storage, "memory:frag:core", 20)
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
     assert stats["nominate"]["count"] == 0
     assert CANDIDATE_TAG not in _tags(storage, "memory:frag:core")
 
@@ -182,16 +226,19 @@ def test_规则一_常驻条目不提名(storage):
 def test_规则一_窗口与阈值可注入(storage):
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:hot", 3)
-    # 缺省 min_hits=5 ⇒ 3 次不够；把阈值降到 3（同一份数据）就够
-    assert run_tiering(storage, _cfg(), dry_run=True, now=NOW)["nominate"]["count"] == 0
-    tiering = {"promote_nominate": {"window_days": 7, "min_hits": 3}}
+    # 显式把 nominate_min_hits 设成 10 ⇒ 3 次不够
+    high = {"tiering": {"enabled": True,
+                        "promote_nominate": {"window_days": 7, "nominate_min_hits": 10}},
+            "retrieval": {"core_char_budget": 1000}}
+    assert run_tiering(storage, high, dry_run=True, now=NOW)["nominate"]["count"] == 0
+    tiering = {"promote_nominate": {"window_days": 7, "nominate_min_hits": 3}}
     stats = run_tiering(storage, _set(tiering, "enabled", True), dry_run=False, now=NOW)
     assert stats["nominate"]["count"] == 1
-    # 窗口收窄到 0 天 ⇒ 窗口外的命中（NOW 当天打的，还在窗口内）…… 用 400 天前打的事件验
+    # 窗口收窄到 7 天：400 天前的事件不算
     _seed_hits(storage, "memory:frag:late", 5, days_ago=400)
     _seed(storage, [{"key": "memory:frag:late", "content": "很久以前的热门" * 10,
                      "tags": "demo"}])
-    narrow = {"promote_nominate": {"window_days": 7, "min_hits": 5}}
+    narrow = {"promote_nominate": {"window_days": 7, "nominate_min_hits": 5}}
     out = run_tiering(storage, _set(narrow, "enabled", True), dry_run=False, now=NOW)
     assert "memory:frag:late" not in out["nominate"]["keys"], "窗口外的事件不该提名"
 
@@ -202,14 +249,16 @@ def test_规则一_batch_cap封顶(storage):
     _seed(storage, rows)
     for r in rows:
         _seed_hits(storage, r["key"], 5)
-    tiering = {"batch_cap": 2}
-    stats = run_tiering(storage, _set(tiering, "enabled", True), dry_run=False, now=NOW)
+    cfg = {"tiering": {"enabled": True, "batch_cap": 2,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
     assert stats["nominate"]["count"] == 2
     assert sum(1 for r in rows if CANDIDATE_TAG in _tags(storage, r["key"])) == 2
 
 
 # ---------------------------------------------------------------------------
-# 规则二：升自动通过（预算护栏）
+# 规则二：自动审核（候选满 review_window_days → 通过/驳回 二选一）
 # ---------------------------------------------------------------------------
 
 def _candidate_row(key: str, *, nominated_days_ago: float, content: str = "候选条目" * 10,
@@ -227,50 +276,174 @@ def _candidate_row(key: str, *, nominated_days_ago: float, content: str = "候�
     }
 
 
-def test_规则二_挂够天数且最近够热才自动升(storage):
-    _seed(storage, [_candidate_row("memory:frag:old", nominated_days_ago=16),
-                    _candidate_row("memory:frag:young", nominated_days_ago=14)])
-    _seed_hits(storage, "memory:frag:old", 2)
-    _seed_hits(storage, "memory:frag:young", 2)
+def test_规则二_满窗且命中足自动通过(storage):
+    """默认 review_window_days=7、promote_approve_hits=5000：
 
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    旧用例沿用小数据：把阈值显式降到 3 ⇒ 提名 8 天前 + 命中 3 ⇒ 自动通过；
+    提名 6 天前 + 命中 3 ⇒ 未满窗，仍待审。
+    """
+    _seed(storage, [_candidate_row("memory:frag:old", nominated_days_ago=8),
+                    _candidate_row("memory:frag:young", nominated_days_ago=6)])
+    _seed_hits(storage, "memory:frag:old", 3)
+    _seed_hits(storage, "memory:frag:young", 3)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
 
-    assert stats["auto_promote"]["count"] == 1
-    assert stats["auto_promote"]["keys"] == ["memory:frag:old"]
-    assert "memory:frag:old" in _core_keys(storage)          # 常驻列表可见
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["auto_review"]["approved_count"] == 1
+    assert stats["auto_review"]["approved"] == ["memory:frag:old"]
+    assert stats["auto_review"]["still_pending"] == 1
+    assert "memory:frag:old" in _core_keys(storage)
     tags = _tags(storage, "memory:frag:old")
     assert CORE_TAG in tags and AUTO_PROMOTED_TAG in tags
-    assert CANDIDATE_TAG not in tags, "自动升完必须摘候选标"
-    # 未满 15 天的那条原地不动
+    assert CANDIDATE_TAG not in tags, "自动批准必须摘候选标"
+    # 未满窗的那条原地不动
     assert "memory:frag:young" not in _core_keys(storage)
     assert CANDIDATE_TAG in _tags(storage, "memory:frag:young")
 
 
-def test_规则二_最近窗口命中不够不动(storage):
-    _seed(storage, [_candidate_row("memory:frag:cold", nominated_days_ago=40)])
-    _seed_hits(storage, "memory:frag:cold", 1)              # 差一次
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
-    assert stats["auto_promote"]["count"] == 0
-    assert CANDIDATE_TAG in _tags(storage, "memory:frag:cold")
+def test_规则二_满窗但命中不够自动驳回(storage):
+    """满窗 + 命中不足 ⇒ 自动驳回：摘 core_candidate、加 tier:auto-rejected:<日期>，
+    条目留检索层（不在 demote 队列、不打 demote_candidate）。
+    """
+    from keepsake.core.tiering import AUTO_REJECTED_PREFIX
+
+    _seed(storage, [_candidate_row("memory:frag:weak", nominated_days_ago=10)])
+    _seed_hits(storage, "memory:frag:weak", 2)         # 阈值 3 ⇒ 差 1
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["auto_review"]["approved_count"] == 0
+    assert stats["auto_review"]["rejected_count"] == 1
+    assert stats["auto_review"]["rejected"] == ["memory:frag:weak"]
+    tags = _tags(storage, "memory:frag:weak")
+    assert CANDIDATE_TAG not in tags, "驳回必须摘候选标"
+    assert f"{AUTO_REJECTED_PREFIX}:{NOW:%Y-%m-%d}" in tags, "驳回必须带短戳"
+    # auto-hot 历史戳保留（哪条提的、什么时候提的）
+    assert any(t.startswith(AUTO_HOT_PREFIX) for t in tags), "驳回不动 auto-hot 历史戳"
+    # 驳回 ≠ 降级：不进 demote 队列
+    assert DEMOTE_CANDIDATE_TAG not in tags
+    # 条目留在检索层（不是 archive / delete）
+    assert storage.get_fragment("memory:frag:weak") is not None
 
 
-def test_规则二_预算不足留队列不硬塞(storage):
-    # 预算 100，正文各 60 字符：升第一条（60）后再升第二条会超 ⇒ 第二条留队列
-    _seed(storage, [_candidate_row("memory:frag:a", nominated_days_ago=30,
+def test_规则二_未满窗不动仍待审(storage):
+    """提名 6 天（< review_window_days=7）⇒ 不动：approved=0, rejected=0, pending≥1。"""
+    _seed(storage, [_candidate_row("memory:frag:young", nominated_days_ago=6)])
+    _seed_hits(storage, "memory:frag:young", 100)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["auto_review"]["approved_count"] == 0
+    assert stats["auto_review"]["rejected_count"] == 0
+    assert stats["auto_review"]["still_pending"] == 1
+    assert CANDIDATE_TAG in _tags(storage, "memory:frag:young")
+
+
+def test_规则二_驳回幂等_二次跑不重复打戳(storage):
+    """已驳回的条目（无 core_candidate）天然不进 list_by_tag(CANDIDATE_TAG)
+    ⇒ 二次跑 stats["auto_review"] 全 0、不打新戳、auto-hot 历史戳仍在。
+    """
+    from keepsake.core.tiering import AUTO_REJECTED_PREFIX
+
+    _seed(storage, [_candidate_row("memory:frag:r1", nominated_days_ago=10)])
+    _seed_hits(storage, "memory:frag:r1", 0)         # 0 命中 ⇒ 一定驳回
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    first = run_tiering(storage, cfg, dry_run=False, now=NOW)
+    second = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert first["auto_review"]["rejected_count"] == 1
+    assert second["auto_review"]["rejected_count"] == 0
+    tags = _tags(storage, "memory:frag:r1")
+    assert tags.count(f"{AUTO_REJECTED_PREFIX}:{NOW:%Y-%m-%d}") == 1, "驳回戳不许重复"
+    assert CANDIDATE_TAG not in tags
+
+
+def test_规则二_预算不足_批准留队列不硬塞(storage):
+    """自动批准也吃预算护栏；驳回不耗预算、不受护栏约束。
+
+    预算 100，正文各 60 字符：批准第一条（60）后再批第二条会超 ⇒ 第二条留队列；
+    但第一条如果命中不够会被驳回，不占预算，第三条正常批准。
+    """
+    _seed(storage, [_candidate_row("memory:frag:a", nominated_days_ago=10,
                                    content="候" * 60),
-                    _candidate_row("memory:frag:b", nominated_days_ago=30,
+                    _candidate_row("memory:frag:b", nominated_days_ago=10,
                                    content="候" * 60)])
     _seed_hits(storage, "memory:frag:a", 5)
     _seed_hits(storage, "memory:frag:b", 5)
-
-    cfg = {"tiering": {"enabled": True, "batch_cap": 50},
+    cfg = {"tiering": {"enabled": True, "batch_cap": 50,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
            "retrieval": {"core_char_budget": 100}}
+
     stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
 
-    assert stats["auto_promote"]["count"] == 1
-    assert stats["auto_promote"]["held_for_budget"] == 1
+    assert stats["auto_review"]["approved_count"] == 1
+    assert stats["auto_review"]["held_count"] == 1
     assert CANDIDATE_TAG in _tags(storage, "memory:frag:b"), "预算不足必须留队列"
     assert "memory:frag:b" not in _core_keys(storage)
+
+
+def test_规则二_默认阈值边界_4999驳回_5000通过(storage):
+    """默认 promote_approve_hits=5000 是用户在带流量时拍板的通过阈值，
+    本条钉死边界：4999 ⇒ 驳回，5000 ⇒ 通过。
+    """
+    _seed(storage, [_candidate_row("memory:frag:edge_below", nominated_days_ago=10),
+                    _candidate_row("memory:frag:edge_on", nominated_days_ago=10)])
+    _seed_hits(storage, "memory:frag:edge_below", 4999)
+    _seed_hits(storage, "memory:frag:edge_on", 5000)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 5000}},
+           "retrieval": {"core_char_budget": 100000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    review = stats["auto_review"]
+    assert review["approved"] == ["memory:frag:edge_on"], review
+    assert review["rejected"] == ["memory:frag:edge_below"], review
+    assert "memory:frag:edge_on" in _core_keys(storage)
+    assert CANDIDATE_TAG not in _tags(storage, "memory:frag:edge_on")
+
+
+def test_规则二_旧auto_promote段保留停用_防旧解析崩(storage):
+    """旧解析若按 stats["auto_promote"]["count"] 等字段读，不许崩：本条钉死
+    auto_promote 段恒 count=0 + note="replaced by auto_review"。
+    """
+    _seed(storage, [_candidate_row("memory:frag:hot", nominated_days_ago=10)])
+    _seed_hits(storage, "memory:frag:hot", 5)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["auto_promote"]["count"] == 0
+    assert stats["auto_promote"]["keys"] == []
+    assert "replaced by auto_review" in stats["auto_promote"]["note"]
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +552,8 @@ def test_规则三_explicit_core任何水位都不自动降(storage):
 
 
 def test_规则三_自动升进来的不豁免(storage):
-    """「人写的才豁免」的反面：机器升进来的（`tier:auto-promoted`）照样能被降。
+    """「人写的才豁免」的反面：机器升进来的（`tier:auto-promoted`，含旧 auto_promote
+    与新 auto_review_approved）照样能被降。
 
     两条都已在退居队列里（人工已审过方向），只差「谁享有豁免」这一个变量：
     手写那条（带 `memory` 标）留着，机器升那条被强降。
@@ -389,7 +563,10 @@ def test_规则三_自动升进来的不豁免(storage):
     rows[1]["tags"] = f"{CORE_TAG},{AUTO_PROMOTED_TAG},{DEMOTE_CANDIDATE_TAG}"
     rows[2]["tags"] = f"{CORE_TAG},memory"
     rows[3]["tags"] = f"{CORE_TAG},memory"
-    cfg = {"tiering": {"enabled": True, "batch_cap": 50},
+    cfg = {"tiering": {"enabled": True, "batch_cap": 50,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
            "retrieval": {"core_char_budget": 400}}          # 400/400 ⇒ 100%
     _seed(storage, rows)
 
@@ -472,7 +649,8 @@ def test_非法值回落缺省且不崩():
                                      "promote_nominate": "整个节都不是对象"}})
     assert t["enabled"] is True
     assert t["batch_cap"] == 50
-    assert t["promote_nominate"] == {"window_days": 7, "min_hits": 5}
+    assert t["promote_nominate"] == {"window_days": 7, "nominate_min_hits": 3000}
+    assert t["promote_auto"] == {"review_window_days": 7, "promote_approve_hits": 5000}
     # enabled 非法值回落 false（回落成 true 才是事故）
     assert resolve_tiering({"tiering": {"enabled": 123}})["enabled"] is False
 
@@ -480,7 +658,10 @@ def test_非法值回落缺省且不崩():
 def test_dry_run只算不写(storage):
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:hot", 9)
-    stats = run_tiering(storage, _cfg(), dry_run=True, now=NOW)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    stats = run_tiering(storage, cfg, dry_run=True, now=NOW)
     assert stats["nominate"]["count"] == 1
     assert _tags(storage, "memory:frag:hot") == ["demo"], "dry 只算不写"
 
@@ -488,9 +669,16 @@ def test_dry_run只算不写(storage):
 def test_stats_形状与明细截断(storage):
     _seed(storage, [{"key": "memory:frag:hot", "content": "热门条目" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:hot", 5)
-    stats = run_tiering(storage, _cfg(), dry_run=True, now=NOW)
-    for key in ("budget", "nominate", "auto_promote", "demote", "failed", "last_run"):
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+    stats = run_tiering(storage, cfg, dry_run=True, now=NOW)
+    for key in ("budget", "nominate", "auto_review", "auto_promote", "demote",
+                "failed", "last_run"):
         assert key in stats, key
+    # 旧 auto_promote 段保留停用
+    assert stats["auto_promote"]["count"] == 0
+    assert "replaced by auto_review" in stats["auto_promote"]["note"]
     assert set(stats["budget"]) == {"used", "total", "ratio", "used_after"}
     assert len(stats["nominate"]["keys"]) <= 20
 
@@ -522,6 +710,9 @@ def test_单条失败不中断整轮(storage, monkeypatch):
                     {"key": "memory:frag:h2", "content": "热门" * 10, "tags": "demo"}])
     _seed_hits(storage, "memory:frag:h1", 5)
     _seed_hits(storage, "memory:frag:h2", 5)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
 
     from keepsake.core import tiering as tmod
 
@@ -533,7 +724,7 @@ def test_单条失败不中断整轮(storage, monkeypatch):
         return real(storage_, key, tags, action)
 
     monkeypatch.setattr(tmod, "_write_tags", boom)
-    stats = run_tiering(storage, _cfg(), dry_run=False, now=NOW)
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
 
     assert stats["nominate"]["count"] == 1
     assert stats["failed"] and stats["failed"][0]["key"] == "memory:frag:h1"
@@ -545,13 +736,16 @@ def test_单条失败不中断整轮(storage, monkeypatch):
 
 def test_校验_缺省补齐成完整一份():
     clean = validate_tiering({"enabled": True})
-    assert clean["promote_nominate"] == {"window_days": 7, "min_hits": 5}
+    assert clean["promote_nominate"] == {"window_days": 7, "nominate_min_hits": 3000}
+    assert clean["promote_auto"] == {"review_window_days": 7, "promote_approve_hits": 5000}
     assert clean["batch_cap"] == 50
 
 
 def test_校验_非法值与未知键拒收():
     for bad in ({"batch_cap": 0}, {"batch_cap": "abc"}, {"enabled": "也许"},
-                {"promote_nominate": {"min_hits": 0}},
+                {"promote_nominate": {"nominate_min_hits": 0}},
+                {"promote_auto": {"promote_approve_hits": 0}},
+                {"promote_auto": {"review_window_days": 0}},
                 {"demote_pressure": {"warn_ratio": 2.0}},
                 {"demote_pressure": {"release_ratio": 0.95, "warn_ratio": 0.90}},
                 {"不认识的键": 1}, {"promote_nominate": 5}):
@@ -603,6 +797,11 @@ def test_status_开起来后last_run有值(client, storage, tmp_path):
     body = c.get("/api/v1/tiering/status", headers=AUTH).json()
     assert body["last_run"] == NOW.isoformat()
     assert body["last_stats"]["nominate"]["count"] == 0
+    # status 也透出新键给设置页
+    s = body["settings"]
+    assert s["promote_nominate"]["nominate_min_hits"] == 3000
+    assert s["promote_auto"]["review_window_days"] == 7
+    assert s["promote_auto"]["promote_approve_hits"] == 5000
     assert state.exists()
 
 
@@ -650,7 +849,8 @@ def test_settings_写config只动tiering一键且先备份(client, tmp_path):
 
     after = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert after["tiering"]["enabled"] is True and after["tiering"]["batch_cap"] == 7
-    assert after["tiering"]["promote_nominate"] == {"window_days": 7, "min_hits": 5}
+    assert after["tiering"]["promote_nominate"] == {"window_days": 7, "nominate_min_hits": 3000}
+    assert after["tiering"]["promote_auto"] == {"review_window_days": 7, "promote_approve_hits": 5000}
     assert after["storage"] == raw["storage"], "别的节一个都不许动"
     assert list(after) == order_before, "顶层键序必须保序"
     assert (tmp_path / "backup").exists()

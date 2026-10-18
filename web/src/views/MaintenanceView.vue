@@ -32,7 +32,7 @@
       </el-button>
     </div>
     <div class="src">
-      分级班车：每天一次 cron 跑三条规则（够热提名 / 挂够天数自动升 / 预算吃紧提名退位）。
+      分级班车：每天一次 cron 跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
       <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
     </div>
     <pre v-if="opResult" class="pre">{{ opResult }}</pre>
@@ -52,14 +52,13 @@
         <el-form-item label="总开关（默认关：先用 --dry 观察，确认无误再开）">
           <el-switch v-model="tDraft.enabled" />
         </el-form-item>
-        <el-form-item label="升提名：窗口天数 / 最少命中数">
+        <el-form-item label="升提名：窗口天数 / 最少命中数（默认 3000，7 天窗总打点≈7k 时基本关死本轨）">
           <el-input-number v-model="tDraft.promote_nominate.window_days" :min="1" :max="365" />
-          <el-input-number v-model="tDraft.promote_nominate.min_hits" :min="1" :max="100000" />
+          <el-input-number v-model="tDraft.promote_nominate.nominate_min_hits" :min="1" :max="100000" />
         </el-form-item>
-        <el-form-item label="自动升：候选挂够天数 / 近窗天数 / 近窗最少命中数">
-          <el-input-number v-model="tDraft.promote_auto.age_days" :min="1" :max="3650" />
-          <el-input-number v-model="tDraft.promote_auto.recent_window_days" :min="1" :max="365" />
-          <el-input-number v-model="tDraft.promote_auto.recent_min_hits" :min="1" :max="100000" />
+        <el-form-item label="自动审核：候选挂够天数 / 同一窗通过命中数（默认 7 天 / 5000 次；不满窗不动）">
+          <el-input-number v-model="tDraft.promote_auto.review_window_days" :min="1" :max="365" />
+          <el-input-number v-model="tDraft.promote_auto.promote_approve_hits" :min="1" :max="100000" />
         </el-form-item>
         <el-form-item label="降级：告警水位 / 释放水位（0.90 / 0.80），水位满时强降 1 条">
           <el-input-number v-model="tDraft.demote_pressure.warn_ratio" :min="0.01" :max="1" :step="0.05" />
@@ -196,8 +195,8 @@ const tStatus = ref(null)
     status 读回来后整份覆盖。给初值而不是 null，弹框的 v-model 才有对象可绑。 */
 const tDraft = ref({
   enabled: false,
-  promote_nominate: { window_days: 7, min_hits: 5 },
-  promote_auto: { age_days: 15, recent_window_days: 7, recent_min_hits: 2 },
+  promote_nominate: { window_days: 7, nominate_min_hits: 3000 },
+  promote_auto: { review_window_days: 7, promote_approve_hits: 5000 },
   demote_pressure: { warn_ratio: 0.9, release_ratio: 0.8, force_at_full: true },
   demote_exempt: { explicit_core: true },
   batch_cap: 50,
@@ -208,9 +207,8 @@ const tConfirm = ref('')
 const canSaveT = computed(() => {
   const d = tDraft.value
   if (!d) return false
-  const nums = [d.promote_nominate.window_days, d.promote_nominate.min_hits,
-    d.promote_auto.age_days, d.promote_auto.recent_window_days,
-    d.promote_auto.recent_min_hits, d.batch_cap]
+  const nums = [d.promote_nominate.window_days, d.promote_nominate.nominate_min_hits,
+    d.promote_auto.review_window_days, d.promote_auto.promote_approve_hits, d.batch_cap]
   const ratios = [d.demote_pressure.warn_ratio, d.demote_pressure.release_ratio]
   const okNums = nums.every((n) => Number.isFinite(Number(n)) && Number(n) >= 1)
   const okRatios = ratios.every((n) => Number(n) > 0 && Number(n) <= 1)

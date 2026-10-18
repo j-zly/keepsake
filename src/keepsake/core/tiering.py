@@ -21,14 +21,21 @@
 ## 三条规则
 
 1. **升提名**：检索层条目（非 `core`、非已带 `core_candidate`）在
-   `promote_nominate.window_days` 内命中 ≥ `min_hits` ⇒ 打 `core_candidate` +
-   `tier:auto-hot:<提名日>`（reason 写进 tags，审核页一眼看出是哪来的申请）。
-   **不新造表**：复用既有候选审核队列。
-2. **升自动通过**：挂着 `core_candidate` 满 `promote_auto.age_days`、且
-   `recent_window_days` 内命中 ≥ `recent_min_hits` ⇒ 自动 promote
-   （与界面批准同一条存储路径 `ops._with_core` + `ops._apply`），摘候选标、
-   加 `tier:auto-promoted` 痕迹。**预算护栏**：`used + len(content) > budget`
-   ⇒ 本轮跳过、留在队列里等下一轮 —— 绝不硬塞。
+   `promote_nominate.window_days` 内命中 ≥ `promote_nominate.nominate_min_hits`
+   （默认 3000）⇒ 打 `core_candidate` + `tier:auto-hot:<提名日>`（reason 写进
+   tags，审核页一眼看出是哪来的申请）。**不新造表**：复用既有候选审核队列。
+   🟡 阈值取 3000 是口语碎片凭高频检索打点也能进的现实压力 —— 现流量下基本
+   等于关死本轨，但核心层手动 promote 端点不受影响（人批走另一条路）。
+2. **自动审核通过 / 驳回（替换旧 auto_promote）**：候选自提名日起满
+   `promote_auto.review_window_days` 天（默认 7），评估提名后同一窗内
+   （提名日→今）命中 ≥ `promote_auto.promote_approve_hits`（默认 5000）⇒
+   **自动打 core**（与手动 promote 同一存储路径 `_with_core`+`_apply`，加
+   `tier:auto-promoted` 痕迹）；不足 ⇒ **自动驳回**：摘 `core_candidate`、
+   保留 `tier:auto-hot:<提名日>` 历史戳、加 `tier:auto-rejected:<驳回日>`
+   短戳，条目留检索层。未满窗的候选**不动**（人也可手动先批/驳）。
+   **预算护栏**：自动批准的那一步 `used + len(content) > budget` ⇒ 本轮
+   跳过、留在队列里等下一轮 —— 绝不硬塞；驳回不耗预算、不受这条护栏约束。
+3.
 3. **降级三轨**（全部只**提名** + 进审核队列；只有「强降」是自动动作）：
    * **信号轨**（`_rule_signal_demote`，**不看水位**，本单新增）：常驻条目的
      `feedback_score` 解析为负（人工点「没用」-2 / 已纠正 -1）⇒ 直接打
@@ -94,7 +101,7 @@ CANDIDATE_TAG = "core_candidate"
 DEMOTE_CANDIDATE_TAG = "tier:demote-candidate"
 
 #: 晋升提名标前缀，**带提名日**：`tier:auto-hot:2026-10-16`。
-#: 为什么要日期：规则二判「挂了候选标满 age_days」，而打标签**不动**条目时间戳
+#: 为什么要日期：规则二判「自提名日满 review_window_days」，而打标签**不动**条目时间戳
 #: （`update_fragment_fields` 不刷 `updated`；PG 侧压根没有 `updated_at` 列）。
 #: 没有一个跨后端可读的「打标时刻」，就没有跨后端可比的「挂多久了」。
 #: 审核页显示成「auto-hot · 2026-10-16」，顺带回答「这条是谁、什么时候提的」。
@@ -102,6 +109,11 @@ AUTO_HOT_PREFIX = "tier:auto-hot"
 
 #: 自动升进来的痕迹（压力轨**不豁免**它们，见模块 docstring 规则 3）。
 AUTO_PROMOTED_TAG = "tier:auto-promoted"
+
+#: 自动驳回痕迹，带驳回日：`tier:auto-rejected:2026-10-23`。
+#: 驳回**不动** `tier:auto-hot:<提名日>` 历史戳（那是哪条提的、什么时候提的）；
+#: 这一段只回答「这条被班车驳了、什么时候驳的」，给回看用。
+AUTO_REJECTED_PREFIX = "tier:auto-rejected"
 
 #: 冲突证据标前缀，**带 key**：`tier:evid:memory:frag:xxxx`。
 #: 谁打的：写侧管线（`core/pipeline.py`）判 UPDATE/DELETE 且目标是常驻条目时 ——
@@ -116,22 +128,28 @@ DISTILL_TAG = "auto-distill" # 提炼产物恒含它 ⇒ 非人手写
 AGENT_PREFIX = "agent:"      # 第三方域（子代理）⇒ 非主脑手写
 
 #: 阈值缺省（= config 里 `tiering` 节写不写都一样；见模块 docstring）
+#: `promote_nominate.nominate_min_hits` 默认 3000 是用户在带流量验证后定的
+#: 严口径 —— 口语碎片高频打点也能进的旧值（5）会污染候选队列。
+#: `promote_auto` 现在只两个键（review_window_days=7、promote_approve_hits=5000），
+#: 旧 age_days/recent_window_days/recent_min_hits 已不再使用 —— config.json 里
+#: 残留的旧键会被 `resolve_tiering` 静默忽略、由 DEFAULTS 兜底（见 GATES G4）。
 DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "promote_nominate": {"window_days": 7, "min_hits": 5},
-    "promote_auto": {"age_days": 15, "recent_window_days": 7, "recent_min_hits": 2},
+    "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+    "promote_auto": {"review_window_days": 7, "promote_approve_hits": 5000},
     "demote_pressure": {"warn_ratio": 0.90, "release_ratio": 0.80, "force_at_full": True},
     "demote_exempt": {"explicit_core": True},
     "batch_cap": 50,
 }
 
-#: 各值域（校验与回落用同一份，PUT 与读配置两条路径不许各写一套区间）
+#: 各值域（校验与回落用同一份，PUT 与读配置两条路径不许各写一套区间）。
+#: 上限按口语复活语境评分时打点峰值（单条历史最高 83 次/7d 是历史峰值；
+#: 提名阈值 3000/批 5000 给上限 100000，足够未来扩 20 倍仍不撞墙）。
 BOUNDS = {
     "window_days": (1, 365, int),
-    "min_hits": (1, 100000, int),
-    "age_days": (1, 3650, int),
-    "recent_window_days": (1, 365, int),
-    "recent_min_hits": (1, 100000, int),
+    "nominate_min_hits": (1, 100000, int),
+    "review_window_days": (1, 365, int),
+    "promote_approve_hits": (1, 100000, int),
     "warn_ratio": (0.01, 1.0, float),
     "release_ratio": (0.0, 1.0, float),
     "batch_cap": (1, 10000, int),
@@ -225,17 +243,17 @@ def resolve_tiering(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "promote_nominate": {
             "window_days": _parse_num(pn.get("window_days"), "window_days",
                                       DEFAULTS["promote_nominate"]["window_days"]),
-            "min_hits": _parse_num(pn.get("min_hits"), "min_hits",
-                                   DEFAULTS["promote_nominate"]["min_hits"]),
+            "nominate_min_hits": _parse_num(pn.get("nominate_min_hits"),
+                                            "nominate_min_hits",
+                                            DEFAULTS["promote_nominate"]["nominate_min_hits"]),
         },
         "promote_auto": {
-            "age_days": _parse_num(pa.get("age_days"), "age_days",
-                                   DEFAULTS["promote_auto"]["age_days"]),
-            "recent_window_days": _parse_num(
-                pa.get("recent_window_days"), "recent_window_days",
-                DEFAULTS["promote_auto"]["recent_window_days"]),
-            "recent_min_hits": _parse_num(pa.get("recent_min_hits"), "recent_min_hits",
-                                          DEFAULTS["promote_auto"]["recent_min_hits"]),
+            "review_window_days": _parse_num(pa.get("review_window_days"),
+                                             "review_window_days",
+                                             DEFAULTS["promote_auto"]["review_window_days"]),
+            "promote_approve_hits": _parse_num(pa.get("promote_approve_hits"),
+                                               "promote_approve_hits",
+                                               DEFAULTS["promote_auto"]["promote_approve_hits"]),
         },
         "demote_pressure": {
             "warn_ratio": _parse_num(dp.get("warn_ratio"), "warn_ratio",
@@ -508,7 +526,8 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
     cfg = t["promote_nominate"]
     cap = t["batch_cap"]
     limit = max(HOT_SCAN_MIN, cap * HOT_SCAN_FACTOR)
-    hot = storage.hits_stats(window_days=cfg["window_days"], min_hits=cfg["min_hits"],
+    hot = storage.hits_stats(window_days=cfg["window_days"],
+                             min_hits=cfg["nominate_min_hits"],
                              keys=None, limit=limit) or []
     keys = [str(r.get("key") or "") for r in hot if r.get("key")]
     rows = storage.get_fragments_batch(keys) if keys else {}
@@ -534,54 +553,102 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
                                         "reason": type(e).__name__})
     stats["nominate"] = {"count": len(picked), "keys": picked[:DETAIL_KEYS],
                          "already": skipped_candidate, "window_days": cfg["window_days"],
-                         "min_hits": cfg["min_hits"], "dry_run": dry_run}
+                         "nominate_min_hits": cfg["nominate_min_hits"],
+                         "dry_run": dry_run}
 
 
 # --------------------------------------------------------------------------
-# 规则二：升自动通过（带预算护栏）
+# 规则二：自动审核通过 / 驳回（替换旧 auto_promote）
 # --------------------------------------------------------------------------
 
-def _rule_auto_promote(storage: Any, t: Dict[str, Any], now: datetime, *,
-                       budget_total: int, used: int, dry_run: bool,
-                       stats: Dict[str, Any]) -> int:
-    """挂够天 + 最近够热 ⇒ 自动升常驻；预算不够就**留在队列里**（绝不硬塞）。
+def _rule_auto_review(storage: Any, t: Dict[str, Any], now: datetime, *,
+                      budget_total: int, used: int, dry_run: bool,
+                      stats: Dict[str, Any]) -> int:
+    """候选自提名日起满 review_window_days ⇒ **自动审核**（批 / 驳 二选一）。
 
-    返回本轮新的占用字符数（`used` 的增量），供规则三接着算水位。
+    * 同一窗内（提名日→今）命中 ≥ `promote_approve_hits` ⇒ 自动打 core
+      （走手动 promote 同一条存储路径：`_with_core` + `_apply` + 加
+      `tier:auto-promoted`），与规则三的「机器放进来的不豁免」天然兼容；
+    * 不足 ⇒ 自动驳回：摘 `core_candidate`、保留 `tier:auto-hot:<提名日>`
+      历史戳、加 `tier:auto-rejected:<驳回日>`，**条目留检索层**（不进降级队列、
+      不打 `tier:demote-candidate`）—— 驳回与降级是两件事；
+    * 未满窗的候选**不动**（人可手动先批/驳；本轮也不计入 approved/rejected，
+      计入 still_pending）。
+
+    返回本轮因自动批准产生的占用字符数（驳回不增占用，故不入 used）。
     """
     cfg = t["promote_auto"]
+    review_days = int(cfg["review_window_days"])
+    approve_hits = int(cfg["promote_approve_hits"])
     rows = [r for r in storage.list_by_tag(CANDIDATE_TAG) or [] if r.get("key")]
     keys = [str(r["key"]) for r in rows]
-    recent = _hits_by_key(storage, keys, cfg["recent_window_days"])[0]
+    recent = _hits_by_key(storage, keys, review_days)[0] if keys else {}
     used_now = used
-    promoted: List[str] = []
+    approved: List[str] = []
+    rejected: List[str] = []
+    pending: List[str] = []
     held: List[str] = []
-    for row in sorted(rows, key=lambda r: (-recent.get(str(r["key"]), 0), str(r["key"]))):
+    for row in rows:
         key = str(row["key"])
-        if len(promoted) >= t["batch_cap"]:
-            break
-        if _age_days(row, now) < cfg["age_days"]:
+        nominated_dt = nominated_on(row)
+        if nominated_dt is None:
+            pending.append(key)
             continue
-        if recent.get(key, 0) < cfg["recent_min_hits"]:
+        age = (now - nominated_dt).total_seconds() / 86400.0
+        if age < review_days:
+            pending.append(key)
             continue
-        length = len(str(row.get("content") or ""))
-        if budget_total > 0 and used_now + length > budget_total:
-            held.append(key)       # 预算护栏：留队列，下轮再试
-            continue
-        if not dry_run:
-            try:
-                _promote(storage, key, "tiering.auto_promote",
-                         extra=[AUTO_PROMOTED_TAG], drop=[CANDIDATE_TAG])
-            except Exception as e:      # noqa: BLE001
-                stats["failed"].append({"rule": "auto_promote", "key": key,
-                                        "reason": type(e).__name__})
+        hits = int(recent.get(key, 0))
+        if hits >= approve_hits:
+            # 批准：预算护栏留给这一分支；驳回不耗预算、不受护栏约束。
+            length = len(str(row.get("content") or ""))
+            if budget_total > 0 and used_now + length > budget_total:
+                held.append(key)        # 留队列，下一轮再试
                 continue
-        promoted.append(key)
-        used_now += length
-    stats["auto_promote"] = {
-        "count": len(promoted), "keys": promoted[:DETAIL_KEYS],
-        "held_for_budget": len(held), "held_keys": held[:DETAIL_KEYS],
-        "age_days": cfg["age_days"], "recent_min_hits": cfg["recent_min_hits"],
+            if not dry_run:
+                try:
+                    _promote(storage, key, "tiering.auto_review_approved",
+                             extra=[AUTO_PROMOTED_TAG], drop=[CANDIDATE_TAG])
+                except Exception as e:      # noqa: BLE001
+                    stats["failed"].append({"rule": "auto_review_approved",
+                                            "key": key,
+                                            "reason": type(e).__name__})
+                    continue
+            approved.append(key)
+            used_now += length
+        else:
+            # 驳回：摘 core_candidate + 加 tier:auto-rejected:<驳回日>；
+            # tier:auto-hot:<提名日> 不动（哪条提的、什么时候提的历史）。
+            current_tags = tag_list(row.get("tags"))
+            current_tags = _drop_tag(current_tags, CANDIDATE_TAG)
+            new_tags = ",".join(current_tags + [
+                f"{AUTO_REJECTED_PREFIX}:{now:%Y-%m-%d}"])
+            if not dry_run:
+                try:
+                    _write_tags(storage, key, new_tags, "tiering.auto_review_rejected")
+                except Exception as e:      # noqa: BLE001
+                    stats["failed"].append({"rule": "auto_review_rejected",
+                                            "key": key,
+                                            "reason": type(e).__name__})
+                    continue
+            rejected.append(key)
+    stats["auto_review"] = {
+        "approved": approved[:DETAIL_KEYS],
+        "approved_count": len(approved),
+        "rejected": rejected[:DETAIL_KEYS],
+        "rejected_count": len(rejected),
+        "still_pending": len(pending),
+        "held_for_budget": held[:DETAIL_KEYS],
+        "held_count": len(held),
+        "review_window_days": review_days,
+        "promote_approve_hits": approve_hits,
         "dry_run": dry_run,
+    }
+    # 旧解析兼容：auto_promote 段保留、停用、count 恒 0（旧看板若按字段读不会崩）。
+    stats["auto_promote"] = {
+        "count": 0,
+        "keys": [],
+        "note": "replaced by auto_review",
     }
     return used_now - used
 
@@ -796,8 +863,8 @@ def run_tiering(storage: Any, config: Optional[Dict[str, Any]] = None, *,
         "failed": [],
     }
     _rule_nominate(storage, t, now_dt, dry_run=dry_run, stats=stats)
-    used += _rule_auto_promote(storage, t, now_dt, budget_total=total, used=used,
-                               dry_run=dry_run, stats=stats)
+    used += _rule_auto_review(storage, t, now_dt, budget_total=total, used=used,
+                              dry_run=dry_run, stats=stats)
     _rule_demote(storage, t, budget_total=total, used=used, dry_run=dry_run, stats=stats)
     stats["budget"]["used_after"] = used
 
