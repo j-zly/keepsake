@@ -45,14 +45,9 @@ test('路由：/review 有页、有标题，且排在维护之前', () => {
   assert.doesNotMatch(ROUTER, /path: '\/review'[^}]*public: true/)
 })
 
-test('侧栏：审核是记忆组第一项，徽标跟着它走，记忆维护不再有徽标', () => {
+test('侧栏：记忆组审核项存在且徽标跟着它走，记忆维护不再有徽标（顺序以 nav-order.test.mjs 为唯一锁）', () => {
   assert.match(APP, /\{ path: '\/review', label: '审核', icon: ICON\.\w+ \}/,
     '记忆组里要有「审核」项，且 icon 复用 ICON 集（不新造图标依赖）')
-  // 顺序：审核在常驻层之前（高频动作不埋深）
-  assert.ok(
-    APP.indexOf("path: '/review'") < APP.indexOf("path: '/core'"),
-    '审核必须排在常驻层之前',
-  )
   // 徽标：promote + demote 挂到 /review，维护项彻底不挂了
   assert.match(APP, /function reviewBadge\(\)/)
   assert.match(APP, /if \(path === '\/review'\) return reviewBadge\(\)/)
