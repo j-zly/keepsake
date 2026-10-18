@@ -2,8 +2,10 @@
  * 知识库「审核队列」（批2：非可信来源写入的知识文档先审后用）的前端接线护栏。
  *
  * 四条，全是「不接线就静默出错」的：
- *   1) **chip 接线**：计数来自 GET /kb/pending 的 `pending_count`（前端零写死数字），
- *      为 0 时整行隐藏（不编一个「待审 0」），点 chip 才开面板；
+ *   1) **chip 接线**：计数来自 GET /kb/pending 的 `pending_count` / `count`（前端零写死数字），
+ *      chip **始终渲染**（接口可达即显示）：pending_count>0 红字「待审 N」；
+ *      count>0 但 pending_count=0 灰字「审核 · {count} 条历史」；都 0 灰字「审核 · 空」；
+ *      点 chip 才开面板。
  *   2) **二次确认**：批准与驳回都走 ConfirmDialog（没有裸 confirm/alert），
  *      驳回走的是「先填理由 → 再确认」两步；
  *   3) **驳回理由必填**：不给理由就点不下去（后端同样 400 reason_required）；
@@ -28,12 +30,15 @@ test('chip 接线：计数来自 /kb/pending，前端一个数字都不写死', 
     '页面要真的调这个接口')
   assert.match(KB, /pendCount\.value = Number\(r\?\.pending_count\) \|\| 0/,
     'chip 上的数必须是后端给的 pending_count')
-  assert.match(KB, /待审 \{\{ pendCount \}\}/, 'chip 文案要渲染后端给的数')
-  // 计数为 0 ⇒ 整行隐藏（不编一个假 chip）
-  assert.match(KB, /<div v-if="pendCount > 0" class="filter-title">审核<\/div>/,
-    '没有待审文档时「审核」那行标题要隐藏')
-  assert.match(KB, /<div v-if="pendCount > 0" class="tabs">/,
-    'chip 行本身也要隐藏')
+  assert.match(KB, /待审 \{\{ pendCount \}\}/, '旧 chip 模板串仍存在（chipText 内部消费）')
+  // chip 始终渲染（接口可达即显示）；v-if="pendCount > 0" 已撤掉 —— 不藏入口、不编假数字
+  assert.doesNotMatch(KB, /v-if="pendCount > 0" class="filter-title">审核<\/div>/,
+    '「审核」标题不该再因为 pendCount==0 而隐藏（设计盲区回归）')
+  assert.doesNotMatch(KB, /v-if="pendCount > 0" class="tabs">/,
+    'chip 行不该再因为 pendCount==0 而隐藏')
+  assert.match(KB, /\{\{ chipText \}\}/, 'chip 文案要走 chipText 三分支')
+  assert.match(KB, /'chip--danger': pendCount > 0/,
+    'pending_count>0 时 chip 走红字分支（chip--danger）')
   // 🔴 写死判据：队列不许来自任何本地常量/假数据
   assert.ok(!/const PEND_SAMPLE\s*=/.test(KB), '待审队列只能来自后端')
   assert.match(KB, /catch \(e\) \{[\s\S]{0,200}?pendCount\.value = 0/,

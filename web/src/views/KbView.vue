@@ -27,8 +27,9 @@
   标签与内容类型、来源三者取 AND；后端 update 是整体替换（不给 tags 就不动）。
 
   审核队列（批2）：**子代理**（非主代理）写进来的知识文档先进待审队列 —— 顶上一颗
-  「待审 N」chip（计数来自 GET /kb/pending 的 pending_count，**前端零写死数字**，
-  为 0 时整行隐藏），点开是待审列表面板（标题/类型/来源代理/时间/正文预览/同名重复
+  「审核」chip（计数来自 GET /kb/pending 的 pending_count / count，**前端零写死数字**，
+  接口可达即显示：pending_count>0 红字「待审 {N}」、count>0 灰字「审核 · {count} 条历史」、
+  都 0 灰字「审核 · 空」），点开是待审列表面板（标题/类型/来源代理/时间/正文预览/同名重复
   警示）。批准 = 此刻才切块进检索；驳回 = 只标状态不删正文（必填理由），两者都走
   ConfirmDialog 二次确认（与「记忆维护 › 常驻候选」审核同款，不造第三种交互）。
   🔴 站内手建与主代理写入**不经过这一关** —— 后端按「谁在写」判，前端不设第二道闸。
@@ -49,13 +50,21 @@
     </div>
 
     <div class="filter-panel">
-      <!-- 审核队列 chip（批2）：计数来自 /kb/pending 的 pending_count（后端给的真实数字，
-           **前端零写死**）；库里没有待审文档时整行隐藏（不编一个「待审 0」）。
-           点开 = 待审列表面板，批准/驳回都在那儿，与「记忆维护 › 常驻候选」审核区同款。 -->
-      <div v-if="pendCount > 0" class="filter-title">审核</div>
-      <div v-if="pendCount > 0" class="tabs">
-        <button class="tab" :class="{ 'tab--on': pendingOpen }" @click="togglePending">
-          待审 {{ pendCount }}
+      <!-- 审核队列 chip（批2）：始终渲染，**接口可达即显示**（不编假数字，也不藏入口）。
+           计数全部来自 GET /kb/pending 的 pending_count / count（前端零写死）：
+             · pending_count>0   → 红字 chip「待审 {N}」（强调真有未处理项）
+             · pending_count==0 但 count>0 → 灰字「审核 · {count} 条历史」（只看驳回历史）
+             · 都 0               → 灰字「审核 · 空」（点开仍是面板，看空态文案）
+           点开 = 待审列表面板，批准/驳回都在那儿，与「记忆维护 › 常驻候选」审核区同款。
+           🔴 侧栏徽标（App.vue /review/counts）仍维持「0 即隐藏」的语义，这里改了不影响。 -->
+      <div class="filter-title">审核</div>
+      <div class="tabs">
+        <button
+          class="tab"
+          :class="{ 'tab--on': pendingOpen && pendCount > 0, 'chip--danger': pendCount > 0 }"
+          @click="togglePending"
+        >
+          {{ chipText }}
         </button>
       </div>
       <!-- 内容类型 Tab：计数来自 /kb/type-counts（后端给的真实数字，不写死）；
@@ -150,7 +159,7 @@
         <el-skeleton :rows="2" animated />
       </div>
       <div v-else-if="!pendError && !pendRows.length" class="empty">
-        <p><b>没有待审的文档</b>子代理提交的知识文档会出现在这里。</p>
+        <p><b>没有待审的文档。</b>子代理提交的知识文档会出现在这里；<br />子代理经 MCP 提交的知识文档会进入这里。</p>
       </div>
       <div v-else class="card-grid">
         <ItemCard v-for="row in pendRows" :key="row.doc_id" chip-tone="accent">
@@ -773,6 +782,12 @@ const pendCount = ref(0)
 const pendTotal = ref(0)
 const pendPage = ref(1)
 const pendSize = ref(20)
+/** chip 文案三分支：红字待审 / 灰字历史 / 灰字空 —— 数据全来自 /kb/pending 的 count 与 pending_count */
+const chipText = computed(() => {
+  if (pendCount.value > 0) return `待审 ${pendCount.value}`
+  if (pendTotal.value > 0) return `审核 · ${pendTotal.value} 条历史`
+  return '审核 · 空'
+})
 const pendLoading = ref(false)
 const pendError = ref('')
 /** 批准/驳回共用一个确认框实例（与「常驻候选」审核同款） */
