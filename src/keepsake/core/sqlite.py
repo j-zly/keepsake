@@ -116,7 +116,10 @@ from .shared import (
     HOT_TOPIC_DECAY_HALF_DAYS,
     MAX_SYNONYMS_PER_WORD,
     SEARCH_FIELDS,
+    CHAIN_HEAD_SQL,
+    VOID_KEY,
     accumulate_co_occurrence,
+    append_supersedes,
     accumulate_word_freq,
     apply_v2_filters,
     attention_boost_from_topics,
@@ -199,13 +202,17 @@ _BLOB_COLUMNS = ("embed_bin", "embedding")
 _EXTRA_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("updated", "TEXT NOT NULL DEFAULT ''"),
     ("touch_count", "TEXT NOT NULL DEFAULT '0'"),
-    ("supersedes", "TEXT NOT NULL DEFAULT ''"),
     ("hash", "TEXT NOT NULL DEFAULT ''"),
     ("attention_score", "TEXT NOT NULL DEFAULT ''"),
     ("content_tsv", "TEXT NOT NULL DEFAULT ''"),
     ("embed_bin", "BLOB"),
     ("embedding", "BLOB"),
 )
+# 🔴 `supersedes` **从 _EXTRA_COLUMNS 挪进 FRAGMENT_COLUMNS**（2026-10 契约 v2）：
+#    它不再是「本后端独有的附加列」，而是三后端同款的契约列 —— 留在 _EXTRA_COLUMNS
+#    会与 FRAGMENT_COLUMNS 里那根**重名**，`ALL_COLUMNS` 里出现两次 ⇒ 建表语句
+#    把同一根列定义两遍 ⇒ SQLite 直接报 duplicate column name。
+#    （同一根列的历史值形态从裸 key 串变成 JSON 数组，由 `append_supersedes` 读时自愈。）
 
 #: ks_fragment 全列（声明顺序 = 建表顺序 = 批量读的返回顺序）
 ALL_COLUMNS: Tuple[str, ...] = FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS + tuple(
@@ -215,6 +222,10 @@ ALL_COLUMNS: Tuple[str, ...] = FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS + tuple(
 #: 复制两遍必然漂移，而漂移的后果是老库补不上列 ⇒ `ensure_index` 直接 False。
 _COLUMN_DDL: Dict[str, str] = {c: "TEXT NOT NULL DEFAULT ''"
                                for c in FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS}
+#: `is_latest` 默认 **'1'**（链头）而不是 ''：DEFAULT '' 会让「新增的这条到底是链头
+#: 还是链身」变成靠猜，而猜错的后果是刚写的记忆检索不出来。老行 ALTER 补列时
+#: SQLite 会用 DEFAULT 回填 ⇒ 存量行一律 '1'，迁移后检索面一字不变。
+_COLUMN_DDL["is_latest"] = "TEXT NOT NULL DEFAULT '1'"
 _COLUMN_DDL.update(dict(_EXTRA_COLUMNS))
 #: 批量读回哪几列（对齐 PG `get_fragments_batch`：全列，含维护列）
 READ_COLUMNS: Tuple[str, ...] = ALL_COLUMNS
@@ -912,8 +923,12 @@ class SqliteStorage(StorageBase):
         fragment_type: str = "",
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
+        applicability: str = "",
     ) -> bool:
-        """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store、PgStorage.store 一致。"""
+        """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store、PgStorage.store 一致。
+
+        `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
+        """
         # 情绪分析（除非明确传入）
         if sentiment_score is None or sentiment_label is None:
             intensity, label = analyze_emotion(text)
@@ -950,8 +965,8 @@ class SqliteStorage(StorageBase):
                     INSERT INTO ks_fragment (
                         key, content, tags, category, source, created, updated, hash,
                         sentiment_score, sentiment_label, feedback_score,
-                        entities, fragment_type, embed_bin, content_tsv
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        entities, fragment_type, embed_bin, content_tsv, applicability
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(key) DO UPDATE SET
                         content=excluded.content, tags=excluded.tags,
                         category=excluded.category, source=excluded.source,
@@ -962,11 +977,13 @@ class SqliteStorage(StorageBase):
                         feedback_score=excluded.feedback_score,
                         entities=excluded.entities, fragment_type=excluded.fragment_type,
                         embed_bin=COALESCE(excluded.embed_bin, ks_fragment.embed_bin),
-                        content_tsv=excluded.content_tsv
+                        content_tsv=excluded.content_tsv,
+                        applicability=excluded.applicability
                     """,
                     (key, text, final_tags, category, source, now_iso, now_iso,
                      content_hash, str(intensity), label, existing_feedback,
-                     entities_str, fragment_type, self._text_to_blob(text), tokens),
+                     entities_str, fragment_type, self._text_to_blob(text), tokens,
+                     (applicability or "").strip()),
                 )
                 self._fts_write(cur, key, tokens)
                 self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
@@ -1079,16 +1096,45 @@ class SqliteStorage(StorageBase):
             [(kw, now_ts) for kw in keywords],
         )
 
-    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
-        """封边：标 superseded_by + superseded_at（不物理删）。"""
+    def supersede_fragment(self, old_key: str, new_key: str, reason: str = "") -> bool:
+        """封边 + **维护演化链**（不物理删）。语义与 PG / Redis 侧逐条对齐。
+
+          * 旧条：`superseded_by=new_key`（DELETE 路径 `__void__`）+ `superseded_at`
+            + `is_latest='0'`；DELETE 路径没有新条，`supersede_reason` 记在旧条上
+          * 新条：`supersedes` 追加 old_key + `is_latest='1'` + `supersede_reason`
+
+        `reason` 是可选参数 ⇒ 既有调用方（pipeline `_do_update` / `_do_delete`）
+        不改一个字，落库值与改造前逐字一致，只是多了链维护。
+        """
         if not old_key:
             return False
+        voided = not new_key or new_key == VOID_KEY
         try:
             with self._write() as cur:
-                cur.execute(
-                    "UPDATE ks_fragment SET superseded_by = ?, superseded_at = ? WHERE key = ?",
-                    (new_key or "__void__", datetime.now(timezone.utc).isoformat(), old_key),
-                )
+                if voided and reason:
+                    cur.execute(
+                        "UPDATE ks_fragment SET superseded_by = ?, superseded_at = ?, "
+                        "is_latest = '0', supersede_reason = ? WHERE key = ?",
+                        (new_key or VOID_KEY, datetime.now(timezone.utc).isoformat(),
+                         reason, old_key),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE ks_fragment SET superseded_by = ?, superseded_at = ?, "
+                        "is_latest = '0' WHERE key = ?",
+                        (new_key or VOID_KEY, datetime.now(timezone.utc).isoformat(), old_key),
+                    )
+                if not voided and new_key != old_key:
+                    # 追加而不是覆盖：pipeline 的 _do_update 先调 set_supersedes
+                    # 再调本方法，两步写同一根列。
+                    row = cur.execute(
+                        "SELECT supersedes FROM ks_fragment WHERE key = ?", (new_key,)
+                    ).fetchone()
+                    cur.execute(
+                        "UPDATE ks_fragment SET supersedes = ?, is_latest = '1', "
+                        "supersede_reason = ? WHERE key = ?",
+                        (append_supersedes(row[0] if row else "", old_key), reason, new_key),
+                    )
             return True
         except StorageNotReadyError:
             raise
@@ -1442,13 +1488,21 @@ class SqliteStorage(StorageBase):
             return False
 
     def set_supersedes(self, new_key: str, old_key: str) -> bool:
-        """给新碎片打单向 `supersedes=<old_key>` 留痕（反向封边走 `supersede_fragment`）。"""
+        """给新碎片打单向反向链留痕：`supersedes` **追加** `old_key`。
+
+        值是 JSON 数组（`append_supersedes` 单点拼法，三后端同一份）。
+        追加而非覆盖：一条记忆可能顶掉多条旧条。
+        """
         if not new_key or not old_key:
             return False
         try:
             with self._write() as cur:
+                row = cur.execute(
+                    "SELECT supersedes FROM ks_fragment WHERE key = ?", (new_key,)
+                ).fetchone()
                 cur.execute(
-                    "UPDATE ks_fragment SET supersedes = ? WHERE key = ?", (old_key, new_key)
+                    "UPDATE ks_fragment SET supersedes = ? WHERE key = ?",
+                    (append_supersedes(row[0] if row else "", old_key), new_key),
                 )
                 return cur.rowcount > 0
         except StorageNotReadyError:
@@ -1582,6 +1636,9 @@ class SqliteStorage(StorageBase):
 
         clauses.append("invalid_at = ''")
         clauses.append("valid_until = ''")
+        # 契约 v2：只要链头（已被顶掉的链身不进检索面）—— 与上面两条同款口径。
+        # 常驻层（list_by_tag 的 core 列表）**不加**，见 storage_shared 的说明。
+        clauses.append(CHAIN_HEAD_SQL)
         clauses.append(f"content <> '' AND length(content) <= {int(MAX_CONTENT_LEN)}")
         return " AND ".join(clauses), params
 
@@ -1801,7 +1858,8 @@ class SqliteStorage(StorageBase):
                 cur.execute(
                     f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
                     f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
-                    f"f.entities, f.fragment_type, f.invalid_at, f.content_tsv, "
+                    f"f.entities, f.fragment_type, f.invalid_at, f.applicability, "
+                    f"f.content_tsv, "
                     # 🔴 FTS5 的 bm25() 只用来给**窗口粗排**（对应 PG 侧的 ts_rank_cd），
                     #    最终分在 Python 侧按 PG 公式重算 —— 见方法 docstring。
                     f"-bm25({FTS_TABLE}) AS bm25_pos "
@@ -1827,7 +1885,7 @@ class SqliteStorage(StorageBase):
         lower_terms = {t.lower() for t in terms}
         for row in rows:
             key, content, tags, category, source, created, sent, label, fb, \
-                entities, ftype, invalid_at, tsv, _window_score = row
+                entities, ftype, invalid_at, applic, tsv, _window_score = row
             # tf / doclen：词元口径与 PG 的 tsvector positions 逐字对齐
             # （content_tsv 落库时已按 unicode61 词元切分，见 `_tok_string`）
             words = [w.lower() for w in (tsv or "").split()]
@@ -1840,6 +1898,7 @@ class SqliteStorage(StorageBase):
                 ("source", source), ("created", created), ("sentiment_score", sent),
                 ("sentiment_label", label), ("feedback_score", fb),
                 ("entities", entities), ("fragment_type", ftype), ("invalid_at", invalid_at),
+                ("applicability", applic),
             ):
                 if value is None or value == "":
                     continue          # 稀疏语义：空值不进 dict（同 PG/Redis）

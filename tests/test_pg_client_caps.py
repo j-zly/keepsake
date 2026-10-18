@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -137,12 +138,24 @@ def test_fragment_exists_is_tri_state():
 # --------------------------------------------------------------------------
 
 def test_unsupported_capabilities_leave_identifiable_log(pg, caplog):
-    """touch_fragment / set_supersedes 必须留可辨识日志，返回 False。"""
+    """touch_fragment 必须留可辨识日志，返回 False（**禁静默跳过**）。
+
+    🔴 set_supersedes **不再是 unsupported**（2026-10 契约 v2 起 ks_fragment 补了
+    supersedes 列，PG 侧真落库）—— 与 `test_consolidate_runs_on_pg_not_unsupported`
+    同款「能力补齐后从 unsupported 名单里划掉」的写法：真写一条再读回来验，
+    比断言返回值更能证明它不是悄悄跳过了。
+    """
     with caplog.at_level(logging.INFO, logger="keepsake.storage_pg"):
         assert pg.touch_fragment("memory:frag:whatever") is False
-        assert pg.set_supersedes("memory:frag:a", "memory:frag:b") is False
     assert "touch_fragment" in caplog.text and "unsupported" in caplog.text
-    assert "set_supersedes" in caplog.text and "unsupported" in caplog.text
+
+    _WROTE_KEYS.append("memory:frag:v2chain_a")
+    _WROTE_KEYS.append("memory:frag:v2chain_b")
+    pg.write_fragments_batch([{"key": "memory:frag:v2chain_a", "content": "契约v2链旧条"},
+                              {"key": "memory:frag:v2chain_b", "content": "契约v2链新条"}])
+    assert pg.set_supersedes("memory:frag:v2chain_b", "memory:frag:v2chain_a") is True
+    got = pg.get_fragment("memory:frag:v2chain_b")
+    assert json.loads(got["supersedes"]) == ["memory:frag:v2chain_a"], got.get("supersedes")
 
 
 def test_consolidate_runs_on_pg_not_unsupported(pg):

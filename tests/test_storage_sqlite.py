@@ -227,7 +227,9 @@ def test_write_read_probes_and_feedback(store):
     assert store.set_supersedes("memory:frag:不存在", "memory:frag:a") is False  # 不在库里
     store.write_fragments_batch([{"key": "memory:frag:b", "content": "新版"}])
     assert store.set_supersedes("memory:frag:b", "memory:frag:a") is True
-    assert store.get_fragment("memory:frag:b")["supersedes"] == "memory:frag:a"
+    # 契约 v2：supersedes 存的是 **JSON 数组**（一条记忆可顶多条旧条），
+    # 不再是契约 v2 之前的裸 key 串。老值读时容错（见 storage_shared.append_supersedes）
+    assert json.loads(store.get_fragment("memory:frag:b")["supersedes"]) == ["memory:frag:a"]
     assert store.touch_fragment("memory:frag:a") is True
     assert store.get_fragment("memory:frag:a")["touch_count"] == "1"
     # store() 走完整路径（同内容去重 → 旧版封边 + 新 key）

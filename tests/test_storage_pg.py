@@ -774,11 +774,12 @@ def test_search_result_shape_matches_redis_contract(pg_search, knn_selfcheck):
     marker = uuid.uuid4().hex[:8]
     keys = _seed_corpus(pg_search, marker)
     _TOPICS.append(marker)
-    # 字段最全的一条：category/source/fragment_type 都填上 ⇒ 这些键必须真的出现，
-    # 否则「subset 通过」只是因为 PG 侧压根没产出这些字段（那是缺陷，不是稀疏）。
+    # 字段最全的一条：category/source/fragment_type/applicability 都填上
+    # ⇒ 这些键必须真的出现，否则「subset 通过」只是因为 PG 侧压根没产出这些字段
+    # （那是缺陷，不是稀疏）。applicability 是契约 v2 新进 SEARCH_FIELDS 的字段。
     full = f"工程目录约定：代码放在 /home/claude_user/ 下，标记己 {marker}"
     pg_search.store(full, tags="shared", category="convention", source="unit-test",
-                    fragment_type="fact")
+                    fragment_type="fact", applicability="runtime: python 3.11")
     _WROTE_KEYS.append(pg_search._fragment_key_for(full))     # noqa: SLF001
 
     # 恒定必现的键：空值不进 dict（与 Redis hash 稀疏语义一致），所以

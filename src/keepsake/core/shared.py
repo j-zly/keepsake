@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -162,8 +163,70 @@ FRAGMENT_FIELDS = (
 SEARCH_FIELDS = (
     "content", "tags", "category", "source", "created",
     "sentiment_score", "sentiment_label", "feedback_score",
-    "invalid_at", "entities", "fragment_type",
+    "invalid_at", "entities", "fragment_type", "applicability",
 )
+
+# ---------------------------------------------------------------------------
+# 契约 v2：演化链 + 适用条件（2026-10 keepsake_contract_v2，Hy-Memory 移植）
+# ---------------------------------------------------------------------------
+#
+# 改的是什么：原来「顶掉」只有单向的 `superseded_by`，检索侧只能靠它**逐条剔除**，
+# 既排不出链身也回溯不了「谁顶了谁」。这里补齐双向 + 链头 + 作废原因 + 适用条件。
+#
+# 四根列三后端同款（PG/SQLite 是列，Redis 是 hash 字段）：
+#   is_latest         链头标记。'1'/1 = 链头（当前有效），'0' = 链身（已被顶掉）。
+#                     **老行 NULL 视为链头**（迁移前写的行没人知道它是链头还是链身，
+#                     猜成「链身」会把存量记忆整批从检索里抹掉 ⇒ 宁多不少）。
+#   supersedes        反向链：JSON 数组，存「本条顶掉了哪些旧 key」。
+#   supersede_reason  作废原因（调用方给的，没有就是空串）。
+#   applicability     适用条件，自由文本多行 "key: value"（环境无关的记忆留空）。
+CONTRACT_V2_COLUMNS = ("is_latest", "supersedes", "supersede_reason", "applicability")
+
+#: 检索侧「只要链头」的 SQL 判据（PG / SQLite 共用一份拼法，逐字对齐）。
+#: `COALESCE(..., '1')` 就是「老行 NULL 视为链头」这条纪律的落点。
+#: 🔴 **只加在检索侧**（`_search_filter_sql`）：常驻层（`list_by_tag` 的 core 列表）
+#:    **故意不加** —— 历史 core 条目照常可见，链身与否是「进不进检索」的事，
+#:    不是「还算不算一条记忆」的事。加在这里会让老 core 列表凭空少条目。
+CHAIN_HEAD_SQL = "COALESCE(is_latest, '1') <> '0'"
+
+#: 老库未迁移这四列时的修复 SQL —— **只报给人看，代码不擅自 ALTER 生产表**。
+#: 与 `api/routers/kb.py::_CTYPE_MIGRATION_HINT` 同款纪律；执行由主脑做
+#: （脚本落在 `docs/sql/20261018_contract_v2.sql`）。
+CONTRACT_V2_MIGRATION_HINT = (
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS is_latest text NOT NULL DEFAULT '1'; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS supersedes text NOT NULL DEFAULT ''; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS supersede_reason text NOT NULL DEFAULT ''; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS applicability text NOT NULL DEFAULT '';"
+)
+
+#: DELETE 路径的 sentinel（`superseded_by='__void__'`）：旧记忆被作废但**不写新事实**。
+#: 原来这个字面量在 pipeline.py 与三个存储后端各写一遍 —— 四个地方必须永远相等，
+#: 现在它是本模块的唯一定义处（`pipeline.VOID_KEY` 转调这里，旧导入路径不变）。
+VOID_KEY = "__void__"
+
+
+def append_supersedes(existing: Any, old_key: str) -> str:
+    """反向链「追加」：把 `old_key` 并进已有的 `supersedes` 值，返回新的 JSON 数组串。
+
+    为什么是追加而不是覆盖：`supersedes` 一条记忆可能顶掉**多条**旧条
+    （pipeline 的 `_do_update` 先调 `set_supersedes` 再调 `supersede_fragment`，
+    两步写同一根列）—— 覆盖式会把前一步写进去的 key 抹掉，链就断了。
+
+    为什么容忍非 JSON 的历史值：契约 v2 之前 `supersedes` 存的是**裸 key 串**
+    （不是数组）。老库里就是那个形态，解不开就当「单元素列表」读进来，
+    写回时补成数组 —— 读-改-写一次就自愈，不为一行老数据跑迁移。
+    """
+    keys: List[str] = []
+    raw = (existing or "").strip() if isinstance(existing, str) else ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            keys = [str(k) for k in parsed] if isinstance(parsed, list) else [str(parsed)]
+        except (ValueError, TypeError):
+            keys = [raw]                       # 老形态：裸 key 串
+    if old_key and old_key not in keys:
+        keys.append(old_key)
+    return json.dumps(keys, ensure_ascii=False)
 
 # 「新版继承旧版名次」按 key 载入的 fragment 缓存（进程级 60s TTL）
 # 这些条目是稳定内容、量小，缓存避免重复往返。

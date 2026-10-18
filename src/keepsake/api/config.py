@@ -46,6 +46,24 @@ REMEMBER_SESSION_TTL = 30 * 86400
 #: keepsake 自身配置（config.json）路径 —— 透传给 `storage_from_config`
 STORAGE_CONFIG_ENV = "KEEPSAKE_CONFIG"
 
+# --------------------------------------------------------------------------
+# 记忆契约 v2（演化链 + 适用条件，2026-10）
+# --------------------------------------------------------------------------
+# ks_fragment 的四根新列：is_latest / supersedes / supersede_reason / applicability。
+# 这里是**给人看的修复文案**，与 `keepsake.storage_shared.CONTRACT_V2_MIGRATION_HINT`
+# 同一份内容（两处各有一份是因为控制台与存储层各自可能先失败；文案一字不差，
+# 改一处必须改另一处）。**代码不擅自 ALTER 生产表** —— 迁移脚本落在
+# `docs/sql/20261018_contract_v2.sql`，由主脑执行。
+CONTRACT_V2_MIGRATION_HINT = (
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS is_latest text NOT NULL DEFAULT '1'; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS supersedes text NOT NULL DEFAULT ''; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS supersede_reason text NOT NULL DEFAULT ''; "
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS applicability text NOT NULL DEFAULT '';"
+)
+
+#: 检索命中里，适用条件渲染在正文后的标签前缀（前端/导出文案同款，单点定）。
+APPLICABILITY_LABEL = "[适用条件]"
+
 #: 知识库 PG 连接串 —— **只从环境读**，代码里绝不出现连接串与口令
 PG_DSN_ENV = "KEEPSAKE_PG_DSN"
 

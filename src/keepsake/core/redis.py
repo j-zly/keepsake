@@ -34,6 +34,8 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     FRAGMENT_FIELDS,
     HOT_TOPIC_BOOST,
     HOT_TOPIC_DECAY_HALF_DAYS,
+    VOID_KEY,
+    append_supersedes,
     apply_v2_filters,
     attention_boost_from_topics,
     hot_topic_weighted_hits,
@@ -551,6 +553,19 @@ def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
     return expanded
 
 
+def _is_chain_body(value: Any) -> bool:
+    """`is_latest` 是否表示**链身**（已被顶掉、该退出检索面）。
+
+    字段缺失（老数据没有链概念）/ 空串 / `'1'` 一律算**链头** ⇒ 只有明确
+    写成 `'0'` 才算链身。理由与 SQL 侧 `CHAIN_HEAD_SQL` 的 `COALESCE` 同一个：
+    判错方向要是「老数据当成链身」，那一次迁移就把存量记忆整批从检索里抹掉。
+    bytes（decode_responses=False）一并认。
+    """
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    return str(value or "1").strip() == "0"
+
+
 def _build_create_index_cmd(dim: int) -> str:
     """根据实际向量维度构建 FT.CREATE 命令。
 
@@ -568,6 +583,11 @@ def _build_create_index_cmd(dim: int) -> str:
         f"created TEXT WEIGHT 0 "
         f"fragment_type TAG SEPARATOR , "
         f"invalid_at TAG SEPARATOR , "
+        # 契约 v2 的适用条件：TEXT（不是 TAG）—— 它是自由文本多行 "key: value"，
+        # 按逗号切 token 会把一行条件切碎。索引它只是为了能 return_fields 带出来
+        # 渲染 `[适用条件] …`，**不进任何查询式**（不做按适用条件过滤）。
+        f"applicability TEXT WEIGHT 0 "
+        f"is_latest TAG SEPARATOR , "
         f"embed_bin VECTOR FLAT 6 TYPE FLOAT32 DIM {dim} DISTANCE_METRIC COSINE "
         f"entities TAG SEPARATOR ,"
     )
@@ -833,6 +853,27 @@ class RedisStorage(StorageBase):
             except Exception as e:
                 logger.debug("storage: FT.ALTER failed (non-fatal): %s", e)
 
+            # 契约 v2 的两根索引字段（applicability / is_latest）。
+            # 🔴 与上面两根**故意不同款**：失败必须**显式返回 False**，不许
+            #    debug 吞掉。原因是这两根进了 `return_fields` —— 索引里没有这根
+            #    字段时 RediSearch 会**整条查询报错**（不只是少返回一个可选字段），
+            #    而那会在检索时才爆、且症状是「搜不出东西」。上面两根（invalid_at /
+            #    entities）当年是 debug 吞掉的写法，本单不扩大这个静默面。
+            for _fld, _spec in (("applicability", ("TEXT", "WEIGHT", "0")),
+                                ("is_latest", ("TAG", "SEPARATOR", ","))):
+                try:
+                    client.execute_command(
+                        "FT.ALTER", RS_INDEX, "SCHEMA", "ADD", _fld, *_spec
+                    )
+                    logger.info("storage: added %s field to index '%s'", _fld, RS_INDEX)
+                except redis.ResponseError:
+                    pass  # 字段已存在，忽略
+                except Exception as e:      # noqa: BLE001
+                    logger.error("storage: FT.ALTER %s 失败 —— 检索会整条报错（它在 "
+                                 "return_fields 里），显式失败而不是继续: %s: %s",
+                                 _fld, type(e).__name__, e)
+                    return False
+
             return True
 
         # 创建 index（如果不存在）
@@ -997,6 +1038,7 @@ class RedisStorage(StorageBase):
         fragment_type: str = "",
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
+        applicability: str = "",
     ) -> bool:
         """将一段文本写入碎片库。
 
@@ -1006,6 +1048,8 @@ class RedisStorage(StorageBase):
         自动计算情感权重（除非显式传入 sentiment_*）。
         自动提取关键词并计入日榜/周榜。
         支持去重：内容相同则更新已有碎片（覆盖 feedback 外字段）。
+
+        `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
         """
         client = self._get_client()
         if not client:
@@ -1078,6 +1122,14 @@ class RedisStorage(StorageBase):
                 self._record_entity_cooccurrence(client, entities)
             if fragment_type:
                 mapping["fragment_type"] = fragment_type
+            # 契约 v2：新写入的都是链头（is_latest='1'）。显式写而不靠读取方兜底 ——
+            # Redis hash 是稀疏的，不写这个字段就等于「靠默认值」，而默认值散在
+            # 三个后端三处，早晚漂一份。
+            mapping["is_latest"] = "1"
+            # 适用条件：可选入参，空串不写（稀疏 hash 与其余字段同一口径）
+            app = (applicability or "").strip()
+            if app:
+                mapping["applicability"] = app
 
             # v1.5 版本化: 同内容已存在 → 旧版标记失效（valid_until），新版写入独立 key
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -1193,13 +1245,20 @@ class RedisStorage(StorageBase):
         return True
 
     def set_supersedes(self, new_key: str, old_key: str) -> bool:
-        """单向留痕：新碎片 supersedes=<old_key>。"""
+        """单向反向链留痕：新碎片 `supersedes` **追加** `old_key`。
+
+        值是 JSON 数组（`append_supersedes` 单点拼法，三后端同一份）。
+        追加而非覆盖：一条记忆可能顶掉多条旧条。
+        """
         if not new_key or not old_key:
             return False
         client = self._get_client()
         if not client:
             return False
-        client.hset(new_key, "supersedes", old_key)
+        raw = client.hget(new_key, "supersedes")
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        client.hset(new_key, "supersedes", append_supersedes(raw, old_key))
         return True
 
     # ------------------------------------------------------------------
@@ -1498,24 +1557,46 @@ class RedisStorage(StorageBase):
             logger.debug("storage: delete_fragments_batch failed: %s", e)
             return 0
 
-    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
-        """封边：把 old_key 标 superseded_by=new_key + superseded_at=now。
+    def supersede_fragment(self, old_key: str, new_key: str, reason: str = "") -> bool:
+        """封边 + **维护演化链**（不物理删）。语义与 PG / SQLite 侧逐条对齐。
 
         旧碎片不物理删；检索/注入路径会自动排除（fragment_type!="consumed" 但
         superseded_by 非空也算被取代）。new_key='__void__' 用于 DELETE 路径
         （旧记忆矛盾但不留新事实）。
+
+        链维护（契约 v2）：
+          * 旧条 `is_latest='0'`（打成链身，检索侧据此退出结果面）
+          * 新条 `is_latest='1'` + `supersedes` **追加** old_key + `supersede_reason`
+          * DELETE 路径没有新条 ⇒ `supersede_reason` 记在**旧条**上
+
+        `reason` 是可选参数 ⇒ 既有调用方不改一个字，落库值与改造前逐字一致。
         """
         if not old_key:
             return False
         client = self._get_client()
         if not client:
             return False
+        voided = not new_key or new_key == VOID_KEY
         try:
             now = datetime.now(timezone.utc).isoformat()
             pipe = client.pipeline()
-            pipe.hset(old_key, "superseded_by", new_key or "__void__")
+            pipe.hset(old_key, "superseded_by", new_key or VOID_KEY)
             pipe.hset(old_key, "superseded_at", now)
+            pipe.hset(old_key, "is_latest", "0")
+            if voided and reason:
+                pipe.hset(old_key, "supersede_reason", reason)
             pipe.execute()
+            if not voided and new_key != old_key:
+                raw = client.hget(new_key, "supersedes")
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", "replace")
+                pipe = client.pipeline()
+                pipe.hset(new_key, "supersedes",
+                          append_supersedes(raw, old_key))
+                pipe.hset(new_key, "is_latest", "1")
+                if reason:
+                    pipe.hset(new_key, "supersede_reason", reason)
+                pipe.execute()
             return True
         except Exception as e:
             logger.warning("storage: supersede_fragment %s→%s failed: %s", old_key, new_key, e)
@@ -1855,7 +1936,7 @@ class RedisStorage(StorageBase):
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
                                "invalid_at", "valid_until", "entities",
-                               "fragment_type", "__key", "score")
+                               "fragment_type", "applicability", "is_latest", "__key", "score")
             )
 
             try:
@@ -1879,7 +1960,7 @@ class RedisStorage(StorageBase):
                     .return_fields("content", "tags", "category", "source", "created",
                                    "sentiment_score", "sentiment_label", "feedback_score",
                                    "invalid_at", "valid_until", "entities",
-                                   "fragment_type", "__key", "score")
+                                   "fragment_type", "applicability", "is_latest", "__key", "score")
                 )
                 result = client.ft(RS_INDEX).search(q)
 
@@ -1888,7 +1969,8 @@ class RedisStorage(StorageBase):
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "entities", "fragment_type"):
+                             "invalid_at", "entities", "fragment_type",
+                             "applicability"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
@@ -1907,6 +1989,9 @@ class RedisStorage(StorageBase):
                 # v1.5: 跳过历史版本（valid_until 已设 = 已被新版取代）
                 valid_until = getattr(doc, "valid_until", None)
                 if valid_until:
+                    continue
+                # 契约 v2：跳过链身（is_latest='0'），语义与 PG/Redis 同款
+                if _is_chain_body(getattr(doc, "is_latest", None)):
                     continue
                 if frag.get("content"):
                     # v1.4: 过滤超长噪音条目（背景进程输出/图片描述等长文本 BM25 分虚高）
@@ -2016,7 +2101,7 @@ class RedisStorage(StorageBase):
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
                                "invalid_at", "valid_until", "entities",
-                               "fragment_type", "__key", "score")
+                               "fragment_type", "applicability", "is_latest", "__key", "score")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )
@@ -2029,7 +2114,8 @@ class RedisStorage(StorageBase):
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "valid_until", "entities", "fragment_type"):
+                             "invalid_at", "valid_until", "entities", "fragment_type",
+                             "applicability"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
@@ -2047,6 +2133,10 @@ class RedisStorage(StorageBase):
                     continue
                 # v1.5: 跳过历史版本
                 if getattr(doc, "valid_until", None):
+                    continue
+                # 契约 v2：跳过链身（is_latest='0'）。字段缺失/空 ⇒ 视为链头
+                # （老数据没有链概念，宁可多召回也不整批抹掉）。
+                if _is_chain_body(getattr(doc, "is_latest", None)):
                     continue
                 if frag.get("content"):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))

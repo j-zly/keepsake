@@ -45,11 +45,26 @@ def _preview(text: str) -> str:
     )
 
 
+def _render(row: Dict[str, Any]) -> str:
+    """列表项正文 = 预览正文 + （适用条件非空时）一行 `[适用条件] …`。
+
+    🔴 **只加在渲染层，绝不动排序/打分**：一条带适用条件的记忆不该因此排得更靠前
+    或更靠后 —— 那是融合算法的事，本单的红线之一就是不碰它。
+    适用条件列是契约 v2 的可选列（老库未迁移时存储层读路径会省略这个键），
+    所以取不到就当没有，**出参不凭空造一个空标签**。
+    """
+    text = _preview(str(row.get("content", "")))
+    app = str(row.get("applicability", "") or "").strip()
+    if not app:
+        return text
+    return f"{text}\n{config.APPLICABILITY_LABEL} {app}"
+
+
 def _to_item(row: Dict[str, Any]) -> FragmentItem:
     return FragmentItem(
         key=str(row.get("key") or row.get("_key") or ""),
         tags=str(row.get("tags", "")),
-        content=_preview(str(row.get("content", ""))),
+        content=_render(row),
         updated_at=_updated_at(row),
         score=_score(row),
     )
@@ -127,7 +142,16 @@ def _jsonable(value: Any) -> Any:
 @router.get("/api/v1/fragments/{key}", response_model=FragmentDetail,
             dependencies=[Depends(require_session)])
 def get_fragment(key: str, storage: Any = Depends(get_storage)) -> FragmentDetail:
-    """单条记忆条目全文（全字段）。不存在 ⇒ 404。"""
+    """单条记忆条目全文（全字段）。不存在 ⇒ 404。
+
+    🔴 契约 v2 的 `applicability` / `is_latest` / `supersedes` / `supersede_reason`
+    **走 `raw` 透传，不另开字段** —— 它们是「存储层返回什么这里就带什么」的一类。
+    这么做的连带好处正是缺列降级：老库未迁移那四列时，PG 存储层读路径会**省略**
+    这几个键（`PgStorage._read_columns`），`raw` 里自然就没有它们 —— 出参不带键、
+    不假装每条都有，与 `tags`/`content_type` 的降级纪律一字同款。同一批列在
+    PG 写路径缺失时抛 `storage_pg._ContractColumnMissing`（带
+    `config.CONTRACT_V2_MIGRATION_HINT` 迁移 SQL），不静默把适用条件丢掉。
+    """
     row = storage.get_fragment(key)
     if not row:
         raise HTTPException(status_code=404,

@@ -88,6 +88,11 @@ from .base import StorageBase, fire_hits
 from .shared import (          # 与 Redis 共用的检索后处理（同一批函数对象）
     FRAGMENT_FIELDS,
     SEARCH_FIELDS,
+    CHAIN_HEAD_SQL,
+    CONTRACT_V2_COLUMNS,
+    CONTRACT_V2_MIGRATION_HINT,
+    VOID_KEY,
+    append_supersedes,
     DECAY_HALF_DAYS,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
@@ -204,6 +209,10 @@ FRAGMENT_COLUMNS = (
     "sentiment_score", "sentiment_label", "feedback_score",
     "entities", "fragment_type", "valid_until", "is_archived",
     "superseded_by", "superseded_at", "corrected_at", "invalid_at",
+    # 契约 v2 的四根（2026-10 keepsake_contract_v2，见 storage_shared 的说明）。
+    # 与 maintenance 三列一样：ensure_index 会「先查后补」自动补上，但读/写路径
+    # 仍按 `_contract_v2_missing` 做缺列降级（老库未迁移时不至于整条路报 500）。
+    "is_latest", "supersedes", "supersede_reason", "applicability",
 )
 
 # 🔴 **DDL 一律拆成 (对象名, 语句) 两元组**：`ensure_index()` 拿对象名去
@@ -241,7 +250,14 @@ _DDL_TABLES = (
         -- DEFAULT '' 兼容存量行：consolidator 的 int(f.get("level","1")) 本就容错。
         level           text NOT NULL DEFAULT '',
         consumed_by     text NOT NULL DEFAULT '',
-        consumed_at     text NOT NULL DEFAULT ''
+        consumed_at     text NOT NULL DEFAULT '',
+        -- 2026-10 keepsake_contract_v2：演化链 + 适用条件（语义见
+        -- storage_shared.CONTRACT_V2_COLUMNS）。is_latest 默认 '1' = 链头，
+        -- 存量行 ALTER 补列时统一落 '1' ⇒ 迁移后检索面一字不变。
+        is_latest       text NOT NULL DEFAULT '1',
+        supersedes      text NOT NULL DEFAULT '',
+        supersede_reason text NOT NULL DEFAULT '',
+        applicability   text NOT NULL DEFAULT ''
     )
     """),
     # 对齐 keepsake:entity_timeline:<实体> ZSET（member=碎片 key，score=时间戳）
@@ -379,6 +395,36 @@ def _maintenance_column_ddl() -> tuple:
         (c, f"ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS {c} text NOT NULL DEFAULT ''")
         for c in MAINTENANCE_COLUMNS
     )
+
+
+def _contract_v2_column_ddl() -> tuple:
+    """契约 v2 四列的 ALTER —— (列名, 语句)。
+
+    与 `_maintenance_column_ddl` 同一个套路：走「先查后补」（列已在就不发 ALTER），
+    且**必须带 `IF NOT EXISTS`** —— 这四列同样写进了 `_DDL_TABLES` 的
+    `CREATE TABLE ks_fragment`，全新库上会排出「CREATE（含四列）」+「ADD COLUMN」
+    两条同事务语句，不带 `IF NOT EXISTS` 第二条就撞 DuplicateColumn ⇒ 迁移段回滚。
+
+    🔴 **这里只补列，不建索引**：`is_latest` 的判据写在 `_search_filter_sql` 里，
+    与 `invalid_at`/`valid_until` 一样是「过滤而不是点查」，没有索引可用；
+    给它建 GIN 索引是本项目最典型的那种「造没人用的数据」—— 所以迁移脚本里
+    也刻意不加索引（见 docs/sql/20261018_contract_v2.sql 的说明）。
+    """
+    return tuple(
+        (c, f"ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS {c} "
+            f"{_CONTRACT_V2_COLUMN_DDL[c]}")
+        for c in CONTRACT_V2_COLUMNS
+    )
+
+
+#: 四根列的列声明（`is_latest` 默认 '1'，其余空串）。建表与补列共用同一份，
+#: 复制两遍必然漂 —— 漂的后果是「空库存表建成默认空串」而「新库补列默认 '1'」。
+_CONTRACT_V2_COLUMN_DDL = {
+    "is_latest": "text NOT NULL DEFAULT '1'",
+    "supersedes": "text NOT NULL DEFAULT ''",
+    "supersede_reason": "text NOT NULL DEFAULT ''",
+    "applicability": "text NOT NULL DEFAULT ''",
+}
 
 
 def _search_column_ddl(dim: int) -> tuple:
@@ -618,6 +664,15 @@ class _SchemaDimMismatch(ValueError):
 
     继承 ValueError：保持既有「显式抛错」的对外语义，同时让 ensure_index 的
     重试循环**不**去重试它。
+    """
+
+
+class _ContractColumnMissing(RuntimeError):
+    """契约 v2 的列在库里不存在，且本次调用**必须**写它。
+
+    与 `_SchemaDimMismatch` 分开：那个是配置错（重试无用），这个是**库没迁移**
+    （迁移完就好了），但同样不许静默 —— 写路径一律带迁移 SQL 抛出来，
+    让上层/运维看见人话，而不是「字段被静默丢掉，写进去的适用条件人间蒸发」。
     """
 
 
@@ -1205,6 +1260,9 @@ class PgStorage(StorageBase):
         for name, sql in _maintenance_column_ddl():
             if name not in have_columns:
                 plan.append(sql)
+        for name, sql in _contract_v2_column_ddl():
+            if name not in have_columns:
+                plan.append(sql)
         for name, sql in _search_index_ddl():
             if name not in have_indexes:
                 plan.append(sql)
@@ -1327,6 +1385,72 @@ class PgStorage(StorageBase):
         self._snap_put("syn", (), out)
         return out
 
+    # ------------------------------------------------------------------
+    # 契约 v2 四列的缺列降级（纪律抄 `api/routers/kb.py` 的 content_type 先例）
+    # ------------------------------------------------------------------
+    #
+    # 🔴 为什么 PG 侧要有这层：`ensure_index` 会自动补列，但它有两个真实窗口 ——
+    #    ① 本进程还没跑过 ensure_index（provider 构造路径不调它）；
+    #    ② ensure_index 连着三次重试都失败（返回 False，不抛错）。
+    #    这两种窗口下 SELECT 一个不存在的列 = `UndefinedColumn` 直接把**整条读路径**
+    #    打成 500 —— 而实际缺的只是「四个可选字段」中的一个。
+    #    纪律：**读路径缺列就少 SELECT 那一列（出参不带这个键，不假装每条都有），
+    #    写路径必须写它时抛 `_ContractColumnMissing` 带迁移 SQL 给人看。**
+    #    这与 kb 的 documents.content_type/tags/status 一字同款，只是探列的落点不同：
+    #    kb 在 router 层（那张表没人自动迁移），ks_fragment 在存储层（这里能自动迁移）。
+
+    def _contract_v2_missing(self) -> frozenset:
+        """库里**缺**的契约 v2 列（首次调用探测一次，之后进程内记忆）。
+
+        与 PG 的其它「先查后补」一样带进程内记忆：健康路径上就是空集，
+        一次 information_schema 查询的事。ensure_index 补完列后**不**失效记忆
+        —— 宁可让本进程继续按「缺列」降级到下次重启，也不每条读都去问一次目录
+        （那等于把 information_schema 查成热路径）。
+        """
+        missing = getattr(self, "_contract_v2_missing_cache", None)
+        if missing is None:
+            try:
+                with self._ro() as cur:
+                    have = _fetch_col(cur, _LIST_FRAGMENT_COLUMNS_SQL)
+            except Exception as e:      # noqa: BLE001
+                # 探不到目录 = 探测本身失败，不当成「列都在」（那会让读路径整条炸）；
+                # 也不当成「列都不在」（那会让检索面凭空少一批存量记忆）——
+                # 判成「四列都缺」是唯一保守的选择：读路径只是少四个可选字段。
+                logger.warning("storage_pg: 探测 ks_fragment 列失败，按「契约 v2 四列全缺」"
+                               "降级（读路径少 SELECT 四列）: %s: %s", type(e).__name__, e)
+                have = set()
+            missing = frozenset(c for c in CONTRACT_V2_COLUMNS if c not in have)
+            self._contract_v2_missing_cache = missing
+            if missing:
+                logger.warning(
+                    "storage_pg: ks_fragment 缺契约 v2 列 %s —— 读路径已降级（出参不带这"
+                    "几个键），写路径会带迁移 SQL 报 500。补列脚本：docs/sql/"
+                    "20261018_contract_v2.sql（也可以直接跑 ensure_index，它会自动补）",
+                    sorted(missing),
+                )
+        return missing
+
+    def _read_columns(self, columns: Tuple[str, ...]) -> Tuple[str, ...]:
+        """读路径的列清单：**剔掉库里真缺的**契约 v2 列。
+
+        只剔契约 v2 四列 —— 其它列缺了就是 schema 坏了，那是 ensure_index 的活，
+        不该在这里被静默吞掉（否则「忘了补 level」会变成合并功能静默失效）。
+        """
+        missing = self._contract_v2_missing()
+        if not missing:
+            return columns
+        return tuple(c for c in columns if c not in missing)
+
+    def _require_contract_v2(self, *columns: str) -> None:
+        """写路径的缺列闸：必须写的列缺了 ⇒ 抛人话错（含迁移 SQL），不静默丢字段。"""
+        missing = self._contract_v2_missing() & set(columns)
+        if not missing:
+            return
+        raise _ContractColumnMissing(
+            f"storage_pg: ks_fragment 缺列 {sorted(missing)}，无法写入该字段。"
+            f"请执行迁移（或重启让 ensure_index 自动补列）：{CONTRACT_V2_MIGRATION_HINT}"
+        )
+
     def _search_filter_sql(
         self,
         tag_filter: str,
@@ -1378,6 +1502,12 @@ class PgStorage(StorageBase):
         # 两版检索共同的「不是活记忆」过滤（对齐 Redis search_* 里的 continue）
         clauses.append("invalid_at = ''")
         clauses.append("valid_until = ''")
+        # 契约 v2：只要**链头**（已被顶掉的链身不进检索面）。
+        # 与上面两条同款口径 —— 都是「这条还算不算当前有效记忆」的判据。
+        # 🔴 老库未迁移这列时**不加**（缺列探测同款纪律）：加了就是 UndefinedColumn
+        #    把整条检索打成 500，而实际只是「没有链概念的老数据照常可检索」。
+        if not (self._contract_v2_missing() & {"is_latest"}):
+            clauses.append(CHAIN_HEAD_SQL)
         clauses.append(f"content <> '' AND length(content) <= {MAX_CONTENT_LEN}")
         return " AND ".join(clauses), params
 
@@ -1898,12 +2028,13 @@ class PgStorage(StorageBase):
         need = [f for f in fragments if f.get("_chash")]
         if not need:
             return fragments
+        cols = self._read_columns(FRAGMENT_COLUMNS)
         with self._ro() as cur:
             cur.execute(
-                f"SELECT {', '.join(FRAGMENT_COLUMNS)} FROM ks_fragment WHERE key = ANY(%s)",
+                f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key = ANY(%s)",
                 ([f["_key"] for f in need],),
             )
-            rows = {row[0]: self._row_to_fragment(row) for row in cur.fetchall()}
+            rows = {row[0]: self._row_to_fragment(row, cols) for row in cur.fetchall()}
         out: List[Dict[str, Any]] = []
         gone = 0
         for frag in fragments:      # 按原顺序走一遍，别把两段来源重排了
@@ -1950,13 +2081,14 @@ class PgStorage(StorageBase):
         out: Dict[str, Dict[str, Any]] = {}
         if not keys:
             return out
+        cols = self._read_columns(FRAGMENT_COLUMNS)
         with self._ro() as cur:
             cur.execute(
-                f"SELECT {', '.join(FRAGMENT_COLUMNS)} FROM ks_fragment WHERE key = ANY(%s)",
+                f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key = ANY(%s)",
                 (list(keys),),
             )
             for row in cur.fetchall():
-                out[row[0]] = self._row_to_fragment(row)
+                out[row[0]] = self._row_to_fragment(row, cols)
         return out
 
     # ------------------------------------------------------------------
@@ -2156,14 +2288,17 @@ class PgStorage(StorageBase):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _row_to_fragment(row: tuple) -> Dict[str, Any]:
+    def _row_to_fragment(row: tuple, cols: Tuple[str, ...] = FRAGMENT_COLUMNS) -> Dict[str, Any]:
         """DB 行 → 碎片 dict（键值全是 str，空值不进 dict）。
 
         与 Redis hash 语义对齐：Redis 只存写过的字段，这里靠「空串不进 dict」
         达到同样的稀疏效果（上层 get_fragment 的用法一致）。
+
+        `cols` 缺省整表列；缺列降级时调用方传**实际 SELECT 出来的**那几列，
+        出参就自然不带缺的键（与 tags/content_type 的降级出参同款）。
         """
         out: Dict[str, Any] = {}
-        for name, value in zip(FRAGMENT_COLUMNS, row):
+        for name, value in zip(cols, row):
             if name == "key":
                 continue
             if value is None or value == "":
@@ -2241,8 +2376,14 @@ class PgStorage(StorageBase):
         # 否则列数与参数数对不上，psycopg 直接报「placeholder 数不符」。
         cols: List[str] = ["key"]
         params: List[Any] = [key]
+        missing = self._contract_v2_missing()
         for hash_field, column in self._HASH_TO_COLUMN.items():
             if hash_field == "key" or hash_field not in fields:
+                continue
+            # 缺列降级：调用方**明确给了**这根列却库里没有 ⇒ 报人话错（不静默丢字段）；
+            # 没给的（老迁移脚本不带这四列）直接跳过，SQL 里连列名都不出现。
+            if column in missing:
+                self._require_contract_v2(column)
                 continue
             cols.append(column)
             params.append(_text_field(fields[hash_field], hash_field))
@@ -2297,8 +2438,14 @@ class PgStorage(StorageBase):
         fragment_type: str = "",
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
+        applicability: str = "",
     ) -> bool:
-        """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store 一致。"""
+        """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store 一致。
+
+        `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
+        缺列降级：**不传**时连列都不写（老库照常写碎片）；**传了**却缺列 ⇒ 抛
+        `_ContractColumnMissing` 带迁移 SQL，绝不静默把适用条件丢掉。
+        """
         # 写路径让检索快照立即失效：本次会改 ks_fragment 的 content_tsv（→ N/avgdl/df）、
         # 并累加 ks_hot_topic / ks_attention（→ 重排加权信号）。
         self._snap_drop(*self._SNAPSHOT_GROUPS)
@@ -2356,14 +2503,21 @@ class PgStorage(StorageBase):
             vec = self._text_to_vector(text)
             vec_sql = "%s::vector" if vec else "NULL::vector"
 
+            # 适用条件：可选列，缺列时**只在真要写它**时才报错（见 docstring）
+            app = (applicability or "").strip()
+            app_cols = app_params = ""
+            if app:
+                self._require_contract_v2("applicability")
+                app_cols, app_params = ", applicability", ", %s"
+
             cur.execute(
                 f"""
                 INSERT INTO ks_fragment (
                     key, content, tags, category, source, created,
                     sentiment_score, sentiment_label, feedback_score,
-                    entities, fragment_type, content_tsv, embedding
+                    entities, fragment_type, content_tsv, embedding{app_cols}
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          {TSV_SETWEIGHT_SQL}, {vec_sql})
+                          {TSV_SETWEIGHT_SQL}, {vec_sql}{app_params})
                 """,
                 (
                     key, text, final_tags, category, source, now_iso,
@@ -2371,6 +2525,7 @@ class PgStorage(StorageBase):
                     entities_str, fragment_type,
                     *tsv_params,
                     *([self._vector_literal(vec)] if vec else []),
+                    *([app] if app else []),
                 ),
             )
             self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
@@ -2599,17 +2754,55 @@ class PgStorage(StorageBase):
         )
 
     @with_deadlock_retry
-    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
-        """封边：标 superseded_by + superseded_at（不物理删）。"""
+    def supersede_fragment(self, old_key: str, new_key: str, reason: str = "") -> bool:
+        """封边 + **维护演化链**（不物理删）。
+
+        本方法从「只打两个标记」升级成**链维护的唯一入口**（契约 v2）：
+          * 旧条：`superseded_by=new_key`（DELETE 路径是 `__void__`）+
+            `superseded_at=now` + **`is_latest='0'`**（打成链身）
+          * 新条：**`supersedes` 追加 old_key** + `is_latest='1'` + `supersede_reason`
+          * DELETE 路径（`new_key` 为空/`__void__`）没有新条 ⇒ 只动旧条，
+            `supersede_reason` 记在**旧条**上（谁把它作废了，是唯一能记的地方）
+
+        🔴 **对既有调用方逐字向后兼容**：`reason` 是可选参数，默认空串 ⇒
+        superseded_by/superseded_at 的落库值与改造前**完全一致**，只是多了链维护。
+        `supersedes` 用「追加」而不是「覆盖」：pipeline 的 `_do_update` 会先调
+        `set_supersedes` 再调本方法，两步都写同一根列，覆盖会把前一步的信息抹掉。
+
+        🔴 死锁纪律：两条 UPDATE 走 `sorted()` 固定加锁顺序（与 `correct_fragments`
+        同款理由），而不是按调用顺序盲加锁。
+        """
         if not old_key:
             return False
+        self._require_contract_v2("is_latest", "supersede_reason")
         self._snap_drop("n_avgdl", "dfs")   # 封边不改 content_tsv，但会改「活记忆」口径的 N
         now_iso = datetime.now(timezone.utc).isoformat()
+        voided = not new_key or new_key == VOID_KEY
         with self._tx() as cur:
-            cur.execute(
-                "UPDATE ks_fragment SET superseded_by = %s, superseded_at = %s WHERE key = %s",
-                (new_key or "__void__", now_iso, old_key),
-            )
+            # 旧条：DELETE 路径没有新条，supersede_reason 只能记在旧条上
+            if voided and reason:
+                cur.execute(
+                    "UPDATE ks_fragment SET superseded_by = %s, superseded_at = %s, "
+                    "is_latest = '0', supersede_reason = %s WHERE key = %s",
+                    (new_key or VOID_KEY, now_iso, reason, old_key),
+                )
+            else:
+                cur.execute(
+                    "UPDATE ks_fragment SET superseded_by = %s, superseded_at = %s, "
+                    "is_latest = '0' WHERE key = %s",
+                    (new_key or VOID_KEY, now_iso, old_key),
+                )
+            if not voided and new_key != old_key:
+                self._require_contract_v2("supersedes")
+                cur.execute(
+                    "SELECT supersedes FROM ks_fragment WHERE key = %s", (new_key,)
+                )
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE ks_fragment SET supersedes = %s, is_latest = '1', "
+                    "supersede_reason = %s WHERE key = %s",
+                    (append_supersedes(row[0] if row else "", old_key), reason, new_key),
+                )
         return True
 
     @with_deadlock_retry
@@ -2683,13 +2876,14 @@ class PgStorage(StorageBase):
         """读单个碎片全字段；不存在返回 None。"""
         if not key:
             return None
+        cols = self._read_columns(FRAGMENT_COLUMNS)
         with self._ro() as cur:
             cur.execute(
-                f"SELECT {', '.join(FRAGMENT_COLUMNS)} FROM ks_fragment WHERE key = %s",
+                f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key = %s",
                 (key,),
             )
             row = cur.fetchone()
-        return self._row_to_fragment(row) if row else None
+        return self._row_to_fragment(row, cols) if row else None
 
     def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量读；缺失的 key 不出现在结果里。
@@ -2701,7 +2895,7 @@ class PgStorage(StorageBase):
         out: Dict[str, Dict[str, Any]] = {}
         if not keys:
             return out
-        cols = FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS
+        cols = self._read_columns(FRAGMENT_COLUMNS + MAINTENANCE_COLUMNS)
         with self._ro() as cur:
             cur.execute(
                 f"SELECT {', '.join(cols)} FROM ks_fragment WHERE key = ANY(%s)",
@@ -2812,7 +3006,12 @@ class PgStorage(StorageBase):
         if not key or not fields:
             return False
         allowed = (set(FRAGMENT_COLUMNS) | set(MAINTENANCE_COLUMNS)) - {"key"}
-        cols = [c for c in fields if c in allowed]
+        missing = self._contract_v2_missing()
+        # 缺列时：调用方点名要写的契约 v2 列 → 报人话错；没点的照常写别的列。
+        for c in fields:
+            if c in missing:
+                self._require_contract_v2(c)
+        cols = [c for c in fields if c in allowed and c not in missing]
         if not cols:
             return False
         set_sql = ", ".join(f"{c} = %s" for c in cols)
@@ -2909,8 +3108,8 @@ class PgStorage(StorageBase):
     #   fragment_exists  → ks_fragment.key 是主键，**完全等价**，真查库
     #   touch_fragment   → 无 touch_count/updated_at 列（R6 的核心语义「不覆盖
     #                      content」由调用方 store() 短路保证，与后端无关）
-    #   set_supersedes   → 无 supersedes 列（该字段至今无任何读取方）
-    # 后两个返回 False 并留可辨识日志，**禁止静默跳过**。
+    #   set_supersedes   → 2026-10 契约 v2 起真落库（`supersedes` 列已补），不再是 unsupported
+    # touch_fragment 仍返回 False 并留可辨识日志，**禁止静默跳过**。
     # ------------------------------------------------------------------
 
     def fragment_exists(self, key: str) -> Optional[bool]:
@@ -2942,19 +3141,23 @@ class PgStorage(StorageBase):
         return False
 
     def set_supersedes(self, new_key: str, old_key: str) -> bool:
-        """unsupported：ks_fragment 无 supersedes 列。
+        """单向留痕：新碎片 `supersedes` 追加 `old_key`。
 
-        `supersedes` 是**单向**留痕字段（全仓 grep 无任何读取方）；反向封边走
-        `supersede_fragment(old_key, new_key)` —— 那个两后端都已实现，不受影响。
+        2026-10 keepsake_contract_v2 起**不再是 unsupported** —— 契约 v2 补了
+        `supersedes` 列，本方法与 Redis / SQLite 侧同款真落库。
+        值是 JSON 数组（`append_supersedes` 单点拼法，三后端同一份）。
         """
         if not new_key or not old_key:
             return False
-        logger.info(
-            "storage_pg: set_supersedes(%s <- %s) unsupported — ks_fragment 无 "
-            "supersedes 列（该字段无读取方；反向封边请用 supersede_fragment）",
-            new_key, old_key,
-        )
-        return False
+        self._require_contract_v2("supersedes")
+        with self._tx() as cur:
+            cur.execute("SELECT supersedes FROM ks_fragment WHERE key = %s", (new_key,))
+            row = cur.fetchone()
+            cur.execute(
+                "UPDATE ks_fragment SET supersedes = %s WHERE key = %s",
+                (append_supersedes(row[0] if row else "", old_key), new_key),
+            )
+        return True
 
     # ------------------------------------------------------------------
     # 检索命中打点（2026-10 ks_hit_tracking）
