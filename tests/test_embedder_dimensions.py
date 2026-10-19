@@ -53,6 +53,8 @@ class TestModelDimensionTable:
         ("nomic-embed-text", 768),
         # BGE 系列（本次任务核心）
         ("bge-m3", 1024),
+        # 托管 API 用的带命名空间前缀 ID（BAAI/bge-m3）—— 同模型同维度
+        ("baai/bge-m3", 1024),
         ("bge-large-zh-v1.5", 1024),
         ("bge-large-en-v1.5", 1024),
         ("bge-base-zh-v1.5", 768),
@@ -72,6 +74,8 @@ class TestModelDimensionTable:
         assert resolve_dimension("BGE-M3") == 1024
         assert resolve_dimension(" bge-m3 ") == 1024
         assert resolve_dimension("Bge-M3") == 1024
+        # 带命名空间前缀的托管 API ID 也走同一条大小写归一路径
+        assert resolve_dimension("BAAI/bge-m3") == 1024
 
 
 # ===========================================================================

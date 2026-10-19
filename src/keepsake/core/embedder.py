@@ -41,6 +41,9 @@ _MODEL_DIMENSIONS: dict[str, int] = {
     #       https://huggingface.co/BAAI/bge-large-en-v1.5 (dim 1024)
     #       https://huggingface.co/BAAI/bge-base-zh-v1.5  (dim  768)
     "bge-m3": 1024,
+    # 硅基流动等托管 API 使用带命名空间前缀的模型 ID（BAAI/bge-m3），
+    # 与裸名 bge-m3 同模型同维度（1024）。
+    "baai/bge-m3": 1024,
     "bge-large-zh-v1.5": 1024,
     "bge-large-en-v1.5": 1024,
     "bge-base-zh-v1.5": 768,
