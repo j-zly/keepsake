@@ -339,6 +339,41 @@ RESERVED_TAG_EXACT = frozenset({"core", "core_candidate", "shared"})
 #: 前缀即保留的标签族（代理归属由存储层按 `_agent_id` 注入，不是调用方能填的）。
 RESERVED_TAG_PREFIX = "agent:"
 
+#: **受控**元认知标签（2026-10 keepsake_reconcile_v2，Hy-Memory `models/memory.py:169-207`
+#: 的薄版）—— 提炼管线对自己产出的**自评**，声明它们不改变任何人的权限。
+#:
+#: 🔴 为什么它们不是上面那个 `RESERVED_TAG_EXACT` 的同类：治理保留字（`core` /
+#:    `core_candidate`）是「谁能声明它，决定一条记忆进不进常驻/审核队列」，谁
+#:    声明都危险，所以一律剥；而 `low_confidence` / `context_dependent` 只描述
+#:    「这条自己拿不准 / 只在特定语境下成立」—— 它不参与召回、排序、注入判据
+#:    （检索渲染层原样透出），因此**受控放行**而不是剥除。
+#:
+#: 单点定义的理由同上：谁都能声明这两个标签本身就是无害的，但「哪两个是受控的」
+#: 若有两份口径，迟早漂出一份「又多放行了一个自造标签」的清单。
+META_COGNITIVE_TAGS = ("low_confidence", "context_dependent")
+
+
+def sanitize_distill_tags(raw: Any) -> str:
+    """提炼相（自动写入）标签净化：只放行 `META_COGNITIVE_TAGS`，其余自造标签照剥。
+
+    与 `sanitize_reserved_tags` 的分工：那条判「是不是**治理**保留字」，剥掉 +
+    记录；本条判「是不是**受控**元认知标签」，只留白名单里的那几个。两条同时需要
+    时（控制台写入）调用方自己串起来 —— 提炼相当前只产生本条的输出。
+
+    剥掉的自造标签**不报错也不记 touched**：自动提炼无权声明任何东西，剥掉继续
+    写即可（与提炼侧调 `sanitize_reserved_tags(forbid=())` 同款取舍）。
+
+    ponytail: 只做「白名单里有没有」+ 去重两件事，**不做大小写归一** ——
+    `Low_Confidence` 与 `low_confidence` 是两个不同的标签，放行前者的判据只会有
+    一处（这里），归一了就等于承认两种写法等价、而全库未必是那么写的。
+    """
+    allowed = set(META_COGNITIVE_TAGS)
+    kept: List[str] = []
+    for t in (x.strip() for x in str(raw or "").split(",")):
+        if t and t in allowed and t not in kept:
+            kept.append(t)
+    return ",".join(kept)
+
 
 def sanitize_reserved_tags(raw: Any, forbid: Tuple[str, ...] = ()) -> Tuple[str, List[Tuple[str, str]]]:
     """剥除治理保留标签。返回 `(清洗后的逗号串, [(被处理标签, 原因)])`。

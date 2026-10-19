@@ -22,9 +22,29 @@ superseded_by/superseded_at 时间窗，检索默认只出当前有效。
   ├─ 线程    daemon=True；窗口触发：≥window_pairs 对 OR 距上次 drain ≥ window_seconds
   ├─ 提取相  一次 LLM（输入=本窗口 + 最近 8 条环形缓冲文本）→ JSON facts
   └─ 更新相  每条 fact 用 search_bm25 取 top-5（已自然排除 consumed/superseded）→
-              一次 LLM 四选一（ADD / UPDATE / DELETE / NOOP）
-              UPDATE：新碎片 supersedes=<old>；旧碎片只打 superseded_by 标记
-              DELETE：旧碎片 superseded_by='__void__'
+              一次 LLM 五选一（ADD / UPDATE / SUPERSEDE / VOID / NOOP）
+              UPDATE：同一条记忆的改写（写新条 + 封旧，落库值与批 1 逐字一致）
+              SUPERSEDE：两条独立事实、新顶旧（旧的不再成立）→ 走契约 v2 写路径
+                         （supersede_fragment 带 reason），旧条 is_latest='0'
+              VOID：旧条逻辑删（supersede_reason='voided'），不写新事实
+              旧提示词输出的 DELETE **按 VOID 处理**（映射 + 一行日志，向后兼容）
+
+# 调和协议移植（2026-10 keepsake_reconcile_v2，Hy-Memory 批 2）
+
+四选一（实为五选一）的判据来自 Hy-Memory 被 few-shot 校准过的调和协议
+（`hy_memory/agent/reconciler.py:489-592`、`prompts_zh.py:779-869`）。我们自己的
+痛账：同一事实在 core 层同日沉淀两条不同措辞（本周一手动去重 4 对）、旧事实被
+覆盖时链不可追溯、DELETE 走的是「封边/归档」而非逻辑删。四条移植进来的规则：
+
+  1. **SUPERSEDE 仅限「同一维度、不能同时为真」**（换城市 / 偏好明确反转 /
+     数值口径更新）。加细节、措辞差异、可共存的偏好**一律不许** SUPERSEDE ——
+     「不许」是有代价的（宁可多留一条也不错顶），所以另配一条服务端兜底闸。
+  2. **新条正文只写新状态**，禁止把被顶旧条的细节抄进来（抄进来链头就自相矛盾：
+     同一条链上既有「租约到 3 月」又有「租约到 9 月」）。
+  3. **主体不同永不合并**：「John 喝黑咖啡」不许动「用户喝黑咖啡」。裁决必须带
+     `subject`，服务端在 SUPERSEDE/UPDATE 前过一道 normalize 等值闸
+     （折叠空白 + 小写，Hy-Memory `coding/fact_reconciler.py:152-166` 同款）。
+  4. **同一事件类型的另一次发生 = 独立 ADD**（复发不写次数长句）。
 
 # 🔴 常驻层的否决权在人手里（治理拍板）
 
@@ -33,7 +53,7 @@ superseded_by/superseded_at 时间窗，检索默认只出当前有效。
 的东西，它的生死不该由一次自动提炼说了算。本模块的处理不是「排除 core」
 （那等于把「这条常驻与新事实冲突」这个**最难得的一手信号**一起扔掉），而是：
 
-  目标带 core 标 + 动作 ∈ {UPDATE, DELETE} ⇒ **不封边**，改打退居建议标 +
+  目标带 core 标 + 动作 ∈ {UPDATE, SUPERSEDE, VOID} ⇒ **不封边**，改打退居建议标 +
   冲突证据标（`tiering.DEMOTE_CANDIDATE_TAG` / `tiering.EVID_PREFIX:<新事实 key>`，
   见 `_nominate_core_conflict`）⇒ 转进审核队列「退居建议」，由人裁决。
   冲突证据（那条新事实）先落库再提名，审核页上看得见「它跟哪条新事实打架」。
@@ -61,7 +81,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, NamedTuple, Optional, Tuple
+
+# 受控元认知标签的判据（`low_confidence` / `context_dependent`）单点在 shared.py ——
+# 与治理保留字（`core` / `core_candidate`）同一处口径表，见那里的两条注释。
+from .shared import sanitize_distill_tags
 
 # 常驻层治理的**标签口径**从 tiering 单点 import（core.pipeline → core.tiering
 # 单向；tiering 不 import 本模块，没有环）。理由是 G5 那条单点闸：同一个标在两个
@@ -94,10 +118,48 @@ DEFAULT_PIPELINE_CONFIG: Dict[str, Any] = {
 
 VALID_KINDS = frozenset({"fact", "decision", "preference", "pending", "state_change"})
 
-#: DELETE 路径专用 sentinel。唯一定义处在 `storage_shared`（契约 v2 起）——
+#: VOID（= 旧 DELETE）路径专用 sentinel。唯一定义处在 `storage_shared`（契约 v2 起）——
 #: 三个存储后端判「这条是不是作废封边」用的是**同一个对象**，字面量分头写一遍
 #: 早晚会漂一处，而漂了的后果是 DELETE 封边被当成普通 UPDATE 封边。
 VOID_KEY = _VOID_KEY
+
+#: 更新相的五类裁决（Hy-Memory 调和协议移植）。
+#: `SUPERSEDE` 与 `UPDATE` 的差别在**语义**不在写路径：两者都走
+#: `supersede_fragment(old, new)`，SUPERSEDE 额外带 `reason`（旧的不再成立），
+#: UPDATE 不带（它是同一条记忆的下一版，批 1 落库值逐字不变）。
+VALID_ACTIONS = frozenset({"ADD", "UPDATE", "SUPERSEDE", "VOID", "NOOP"})
+
+#: 旧提示词的四类输出 → 新五类裁决的映射（向后兼容，不炸线上）。
+#: DELETE 就是 VOID 的旧名（它一直就是「封旧、不写新事实」），这里只做改名映射。
+_LEGACY_ACTION_ALIASES = {"DELETE": "VOID"}
+
+#: VOID 在旧条上落的 `supersede_reason` 值（写死在库里，检索/审计按字面查）。
+VOID_REASON = "voided"
+
+#: SUPERSEDE 裁决没给 reason 时的兜底值（reason 是必填字段，但 LLM 会漏）。
+DEFAULT_SUPERSEDE_REASON = "superseded"
+
+
+def normalize_subject(text: Any) -> str:
+    """主体归一（Hy-Memory `coding/fact_reconciler.py:152-166` 同款）：折叠所有空白 + 小写。
+
+    折叠（而不是压缩成单个空格）是因为中文正文里空格常是排版噪声：`用户 常驻上海`
+    与 `用户常驻杭州` 指同一个人，判等闸不该被排版差异骗过去。
+    """
+    return "".join(str(text or "").split()).casefold()
+
+
+def _parse_tag_list(raw: Any) -> str:
+    """提取相的 `tags` 字段 → 逗号串（两种写法都收：数组 / 逗号串）。
+
+    净化不在这里做 —— 放行判据单点在 `shared.sanitize_distill_tags`，写入时才过，
+    这样「提炼输出」与「落库标签」两处不会各有一份白名单。
+    """
+    if isinstance(raw, (list, tuple)):
+        items = [str(x) for x in raw]
+    else:
+        items = str(raw or "").split(",")
+    return ",".join(t.strip() for t in items if str(t).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +173,8 @@ VOID_KEY = _VOID_KEY
 #      - "可以的" → 空数组（废话）
 #      - "资金总览要做分页" → pending（任务/待办）
 #      - "我选了A方案今晚部署" → decision（用户决定）
+#   4. tags：只有两个**受控**标签可写（low_confidence / context_dependent），
+#      其余自造标签服务端一律剥掉 —— 所以提示词里明说「不要自造」。
 EXTRACT_SYSTEM = "你是一位知识提取专家，擅长从对话中提炼长期有价值的事实条目。"
 
 EXTRACT_USER_TEMPLATE = """从以下对话窗口中提取"脱离本对话仍有长期价值"的事实条目。
@@ -120,7 +184,13 @@ EXTRACT_USER_TEMPLATE = """从以下对话窗口中提取"脱离本对话仍有�
 2. 纯确认（"可以的"）、寒暄、状态询问 → 返回空数组
 3. kind 取值：fact / decision / preference / pending / state_change
 4. 每条 fact 包含 content 和 kind
-5. 输出严格 JSON，格式：`{{"facts":[{{"content":"...","kind":"..."}}]}}`
+5. tags 是可选数组：你**拿不准**这条时写 "low_confidence"，只有**在特定语境下
+   才成立**时写 "context_dependent"，两者都不必写就是空数组
+   ⚠️ 不要自造其他标签（系统会全部剥掉）
+6. content 只写事实本身，**不要**把旧表述或上一轮的细节抄进来
+7. content 必须**以主体开头**（"用户…"/"John…"/"订单A…"）：更新相靠主体判
+   「是不是同一个人/同一个对象」，正文里没有主体，那条判据就无从比对
+8. 输出严格 JSON，格式：`{{"facts":[{{"content":"...","kind":"...","tags":[]}}]}}`
 
 会话内最近 {recent_count} 条上下文（仅供语境参考，不要从中提事实）：
 {recent_context}
@@ -130,18 +200,22 @@ EXTRACT_USER_TEMPLATE = """从以下对话窗口中提取"脱离本对话仍有�
 
 few-shot：
 - "可以的" → {{"facts":[]}}
-- "资金总览要做分页" → {{"facts":[{{"content":"资金总览需要做分页","kind":"pending"}}]}}
-- "我选了A方案今晚部署" → {{"facts":[{{"content":"用户决定选择A方案今晚部署","kind":"decision"}}]}}
+- "资金总览要做分页" → {{"facts":[{{"content":"资金总览需要做分页","kind":"pending","tags":[]}}]}}
+- "我选了A方案今晚部署" → {{"facts":[{{"content":"用户决定选择A方案今晚部署","kind":"decision","tags":[]}}]}}
+- "好像是三四月份吧" → {{"facts":[{{"content":"用户提到上线时间记不太准","kind":"fact","tags":["low_confidence"]}}]}}
 """
 
 
-# 更新相：要点写在注释里
+# 更新相（调和协议）：要点写在注释里
 #   1. ADD：无等价物 → 写新碎片
-#   2. UPDATE：同主题且有新信息 → 写新碎片，旧碎片只打 superseded_by 标记
-#   3. DELETE：与旧碎片矛盾且新事实不一定占优 → 封旧（superseded_by=__void__）
-#   4. NOOP：忽略
-#   5. few-shot 必须含状态变更例：旧"用户要求做前端分页" + 新"分页已完成上线" → UPDATE 封旧
-UPDATE_SYSTEM = "你是一位记忆整理专家，决定新事实与已有记忆的关系（ADD/UPDATE/DELETE/NOOP）。"
+#   2. UPDATE：**同一条**记忆的改写（它是自己的下一版）→ 写新条 + 封旧
+#   3. SUPERSEDE：两条独立事实、新顶旧（旧的不再成立）→ 写新条 + 封旧 + 记 reason
+#   4. VOID：旧的不再成立且**没有**替代它的新事实 → 只封旧（逻辑删，不写新条）
+#   5. NOOP：忽略
+#   6. 每条裁决必须带 subject（主体）；服务端会拿它做等值闸，主体不同直接降级 ADD
+#   7. few-shot 四例（顶替链 / 链头禁抄 / 异主体拆 / 复发独立）—— 移植自
+#      Hy-Memory prompts_zh.py:779-869 的校准集，格式随本模块既有风格
+UPDATE_SYSTEM = "你是一位记忆整理专家，决定新事实与已有记忆的关系（ADD/UPDATE/SUPERSEDE/VOID/NOOP）。"
 
 UPDATE_USER_TEMPLATE = """新事实：{new_fact}
 kind: {new_kind}
@@ -149,16 +223,36 @@ kind: {new_kind}
 已有相似记忆（top {top_k}）：
 {candidates_block}
 
-四选一：
+五选一：
 - ADD：新事实无等价物 → 写新记忆
-- UPDATE：新事实是同一主题的更新 → 写新记忆，旧记忆封边（superseded_by）
-- DELETE：新事实与旧记忆矛盾但新事实不一定占优 → 封旧记忆（不留新事实）
+- UPDATE：同一条记忆的改写（旧表述过时，新表述是它自己的下一版）→ 写新记忆 + 封旧
+- SUPERSEDE：两条独立事实，新事实顶掉旧事实（旧的不再成立）→ 写新记忆 + 封旧 + 记原因
+- VOID：旧记忆已经不成立且**没有**替代它的新事实 → 只封旧，不写新记忆
 - NOOP：新事实已被旧记忆覆盖 → 忽略
 
-输出严格 JSON：`{{"action":"ADD|UPDATE|DELETE|NOOP","target_key":"<旧 key 或空>"}}`
+判定规则（违反任意一条都会算你判错）：
+1. SUPERSEDE 只用于「同一维度、不能同时为真」：换城市 / 偏好明确反转 / 数值口径更新。
+   **加细节、措辞不同、可以共存的两条偏好，一律不许 SUPERSEDE**（用 UPDATE 或 ADD）。
+2. SUPERSEDE 时新条正文**只写新状态**：不许把被顶旧条的细节抄进来（链头会自相矛盾）。
+3. **主体不同永不合并**：「John 喝黑咖啡」不许动「用户喝黑咖啡」→ 判 ADD。
+4. 同一事件类型的**另一次发生**是独立事实（判 ADD），不要写"第 N 次"这种次数长句。
+
+subject：本条事实的主体（人/组织/对象，如"用户"/"John"/"订单A"），必填。
+reason：仅 SUPERSEDE 必填，一句话说明旧事实为什么不再成立。
+
+输出严格 JSON：`{{"action":"ADD|UPDATE|SUPERSEDE|VOID|NOOP","target_key":"<旧 key 或空>","subject":"...","reason":"..."}}`
 
 few-shot：
-- 旧"用户要求做前端分页" + 新"分页已完成上线并验证" → UPDATE 封旧
+- 顶替链：旧"用户常驻上海" + 新"用户常驻杭州" →
+  {{"action":"SUPERSEDE","target_key":"<旧 key>","subject":"用户","reason":"居住城市由上海变更为杭州"}}
+- 链头禁抄：旧"用户常驻上海，租约 2026 年 3 月到期" + 新"用户已搬到杭州，租约转签到 2026 年 9 月" →
+  {{"action":"SUPERSEDE","target_key":"<旧 key>","subject":"用户","reason":"搬家后租约随之转签"}}（新条正文只写杭州与 9 月，不许抄"3 月到期"）
+- 异主体拆：旧"用户喝黑咖啡" + 新"John 喝黑咖啡" →
+  {{"action":"ADD","target_key":"","subject":"John","reason":""}}（主体不同，永不合并）
+- 复发独立：旧"用户 10 月 8 日完成了周报" + 新"用户 10 月 15 日又完成了一次周报" →
+  {{"action":"ADD","target_key":"","subject":"用户","reason":""}}（同一事件的另一次发生 = 独立事实）
+- 状态变更：旧"用户要求做前端分页" + 新"分页已完成上线并验证" →
+  {{"action":"UPDATE","target_key":"<旧 key>","subject":"用户","reason":""}}
 """
 
 
@@ -179,6 +273,10 @@ class Fact:
     """提取相输出：单条事实。"""
     content: str
     kind: str  # fact / decision / preference / pending / state_change
+    #: 提炼相自评的**受控**标签（逗号串；只有 `low_confidence` /
+    #: `context_dependent` 会被 `sanitize_distill_tags` 放行，其余自造照剥）。
+    #: 默认空串 ⇒ 既有构造点 `Fact("x", "fact")` 逐字不受影响。
+    tags: str = ""
 
 
 @dataclass
@@ -188,11 +286,32 @@ class DrainResult:
     facts_extracted: int = 0
     adds: int = 0
     updates: int = 0
+    #: SUPERSEDE（新顶旧）计数。UPDATE 仍记在 `updates` —— 两者写路径同款、
+    #: 只差 reason，而 reason 落在碎片上不落在统计里，拆两个计数器是给看板看的。
+    supersedes: int = 0
+    #: VOID（逻辑删）计数。字段名沿用 `deletes`：它是既有对外字段，而 VOID 就是
+    #: 老 DELETE 的正名（映射见 `_parse_action`），改名会让既有看板断线。
     deletes: int = 0
     noops: int = 0
     llm_calls: int = 0
     fallback_v1: bool = False
     fallback_reason: str = ""
+
+
+class Verdict(NamedTuple):
+    """更新相裁决：`action` + 目标 + 主体 + 顶替原因。
+
+    用 NamedTuple 而不是普通 dataclass：既有断言改写成 `Verdict("ADD")` 后，
+    读起来仍与老写法一一对应，且多出的两个字段带着默认值 = 少写两处的构造噪音。
+
+    ⚠️ 注意它**不是**二元组了：与 `("ADD", None)` 的相等比较会因长度不等而 False
+    （元组相等比的是逐元素**且等长**）。既有的 `== ("ADD", None)` 断言已改成
+    `== Verdict("ADD")` —— 这正是加字段该有的样子：改断言，别改判据。
+    """
+    action: str
+    target_key: Optional[str] = None
+    subject: str = ""
+    reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -418,21 +537,26 @@ class Pipeline:
             if result.llm_calls >= self._max_calls:
                 return self._fallback_to_v1(turns, result, reason="budget_exceeded")
             try:
-                action, target_key = self._update_phase(fact)
+                verdict = self._update_phase(fact)
             except _LLMFailure as e:
                 return self._fallback_to_v1(turns, result, reason=f"update_failed:{e}")
             except _BudgetExceeded:
                 return self._fallback_to_v1(turns, result, reason="budget_exceeded")
             result.llm_calls += 1
 
+            action = verdict.action
+            target_key = verdict.target_key
             if action == "ADD":
                 self._do_add(fact)
                 result.adds += 1
             elif action == "UPDATE":
                 self._do_update(fact, target_key)
                 result.updates += 1
-            elif action == "DELETE":
-                self._do_delete(fact, target_key)
+            elif action == "SUPERSEDE":
+                self._do_supersede(fact, target_key, verdict.reason)
+                result.supersedes += 1
+            elif action == "VOID":
+                self._do_void(fact, target_key)
                 result.deletes += 1
             else:  # NOOP 或未知 action
                 result.noops += 1
@@ -506,21 +630,26 @@ class Pipeline:
             kind = str(kind).strip().lower()
             if kind not in VALID_KINDS:
                 kind = "fact"  # 未知 kind 兜底为 fact
-            out.append(Fact(content=content.strip(), kind=kind))
+            out.append(Fact(content=content.strip(), kind=kind,
+                            tags=_parse_tag_list(item.get("tags"))))
         return out
 
     # ------------------------------------------------------------------
     # 更新相
     # ------------------------------------------------------------------
 
-    def _update_phase(self, fact: Fact) -> Tuple[str, Optional[str]]:
-        """一次 LLM 调用：拿新 fact + 已有相似 → (action, target_key)。
+    def _update_phase(self, fact: Fact) -> Verdict:
+        """一次 LLM 调用：拿新 fact + 已有相似 → `Verdict`（action/target/subject/reason）。
 
-        target_key 仅在 UPDATE/DELETE 时有意义（要封边哪个旧 key）；
+        target_key 仅在 UPDATE/SUPERSEDE/VOID 时有意义（要封边哪个旧 key）；
         ADD/NOOP 时为 None —— 由执行函数按需 search 兜底。
 
         target_key 必须过 _sane_target 双校验（白名单 + exists）才返回；幻觉 key
-        一律打 warning + 退回 None，让 _do_update/_do_delete 走 _find_supersede_target。
+        一律打 warning + 退回 None，让执行函数走 _find_supersede_target。
+
+        🔴 **主体闸在这里**（`_subject_gate_ok`）：裁决声明的 subject 必须同时命中
+        新正文与目标旧正文，否则 SUPERSEDE/UPDATE 一律**降级为 ADD** + 一行日志 ——
+        「主体不同永不合并」是提示词教不会的那条，必须服务端兜底。
         """
         # 取 top-K 相似旧碎片（search_bm25 已经自然排除 consumed/superseded）
         candidates: List[Dict[str, Any]] = []
@@ -557,47 +686,95 @@ class Pipeline:
             raise _LLMFailure(f"update LLM raised: {e}") from e
         if raw is None:
             raise _LLMFailure("llm returned None")
-        action, raw_target_key = self._parse_action(raw)
+        verdict = self._parse_action(raw)
 
         # 校验 LLM 给的 target_key：白名单 + exists 双保险；任一不过 → 拒为幻觉 key
-        if raw_target_key is not None and action in ("UPDATE", "DELETE"):
-            sane_key = self._sane_target(raw_target_key, candidates, raw_from_llm=True)
+        if verdict.target_key is not None and verdict.action in ("UPDATE", "SUPERSEDE", "VOID"):
+            sane_key = self._sane_target(verdict.target_key, candidates, raw_from_llm=True)
             if sane_key is None:
                 logger.warning(
                     "pipeline: rejected hallucinated target_key fact=%r key=%s",
-                    fact.content[:60], raw_target_key,
+                    fact.content[:60], verdict.target_key,
                 )
-                raw_target_key = None
+                verdict = verdict._replace(target_key=None)
 
-        return action, raw_target_key
+        # 🔴 主体闸：主体不同不许合并 → 降级 ADD（只对「LLM 明确点了目标」的路径
+        # 生效：target_key 被拒或走 _find 兜底时手里没有旧正文可比，见闸的注释）。
+        if verdict.action in ("UPDATE", "SUPERSEDE") and verdict.target_key:
+            old_row = next((c for c in candidates
+                            if c.get("_key") == verdict.target_key), None)
+            if old_row is not None and not self._subject_gate_ok(
+                    verdict.subject, fact.content, old_row.get("content", "")):
+                logger.warning(
+                    "pipeline: subject gate tripped (降级 ADD) action=%s subject=%r "
+                    "fact=%r key=%s", verdict.action, verdict.subject,
+                    fact.content[:60], verdict.target_key,
+                )
+                verdict = verdict._replace(action="ADD", target_key=None)
+
+        return verdict
 
     @staticmethod
-    def _parse_action(raw: str) -> Tuple[str, Optional[str]]:
-        """LLM 输出 → (action, target_key)。
+    def _subject_gate_ok(subject: str, new_content: str, old_content: str) -> bool:
+        """主体闸：归一后的 subject 必须**同时**出现在新正文与旧正文里（任一缺 → 拒）。
+
+        为什么要这道闸：`SUPERSEDE`/`UPDATE` 会让旧条退出结果面（`is_latest='0'`），
+        而「主体不同」（John vs 用户）是唯一一种**错了也不报错**的错顶 —— 内容看着
+        相近、旧条照样被打上链身、损失是静默的。提示词里教了主体不许合并，但
+        few-shot 校准压不住每一次，所以服务端再判一道。
+
+        ponytail: 判据是「声明的 subject 双边命中正文」而不是「旧条主体 == 新条主体
+        逐字相等」—— 旧条的主体**没有落库**（契约 v2 四列里没有 subject 列，加列
+        要动三后端迁移，超出本单范围），只能反查正文。因此它的精度挂在提取相
+        「content 以主体开头」那条提示词上（`EXTRACT_USER_TEMPLATE` 第 7 条）。
+        误伤有两种：声明了抽象主体（如"工作地点"）、或新条省略了主语 ⇒ 一次本该
+        SUPERSEDE 的裁决被降级成 ADD。**方向是安全的**（多留一条 + 一行日志，
+        绝不错顶别人的记忆），这也是刻意选它的原因。升级路径：契约补 `subject`
+        列后改成两值逐字相等，误伤随之归零。
+        """
+        s = normalize_subject(subject)
+        if not s:
+            return True   # 没声明主体 = 老式输出，不拦（拦了会把线上 UPDATE 全打成 ADD）
+        return (s in normalize_subject(new_content)
+                and s in normalize_subject(old_content))
+
+    @staticmethod
+    def _parse_action(raw: str) -> Verdict:
+        """LLM 输出 → `Verdict`（action / target_key / subject / reason）。
 
         严格策略：只接受合法 JSON。JSON 缺失/解析失败/action 不在
-        {ADD, UPDATE, DELETE, NOOP} 内 → 一律返回 ("NOOP", None)。
+        {ADD, UPDATE, SUPERSEDE, VOID, NOOP} 内 → 一律返回 `Verdict("NOOP")`。
 
         拒绝文本关键字兜底——「无需 UPDATE」这类解释性废话会误触发 UPDATE 封边。
+
+        `DELETE` 经 `_LEGACY_ACTION_ALIASES` 映射成 `VOID`（旧提示词输出的正名，
+        行为不变 + 一行日志），这样**换提示词不需要同时换模型**：升级当天线上仍可能
+        吐出 DELETE。
         """
         text = raw.strip()
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            return ("NOOP", None)
+            return Verdict("NOOP")
         candidate = text[start:end + 1]
         try:
             obj = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
-            return ("NOOP", None)
+            return Verdict("NOOP")
         action = str(obj.get("action", "")).strip().upper()
         tk = obj.get("target_key")
         target_key: Optional[str] = None
         if isinstance(tk, str) and tk:
             target_key = tk
-        if action not in {"ADD", "UPDATE", "DELETE", "NOOP"}:
-            return ("NOOP", None)
-        return action, target_key
+        if action in _LEGACY_ACTION_ALIASES:
+            action = _LEGACY_ACTION_ALIASES[action]
+            logger.info("pipeline: legacy action DELETE mapped to VOID (target=%s)",
+                        target_key or "-")
+        if action not in VALID_ACTIONS:
+            return Verdict("NOOP")
+        return Verdict(action, target_key,
+                       subject=str(obj.get("subject") or "").strip(),
+                       reason=str(obj.get("reason") or "").strip())
 
     # ------------------------------------------------------------------
     # 写入 / 封边（不 import redis，全走注入 storage）
@@ -704,6 +881,37 @@ class Pipeline:
         scrubbed 后的内容计算 key（否则新 key 与原 key 不一致，封边断裂）。
 
         🔴 目标是常驻条目时**不封边**，改走退居提名（`_nominate_core_conflict`）。
+
+        reason 恒为空串（UPDATE = 同一条记忆的下一版，没有「旧的不再成立」可言）
+        ⇒ 落库值与批 1 逐字一致，本方法体就是 SUPERSEDE 的 `reason=""` 特例。
+        """
+        self._seal_with_new(fact, target_key, reason="", action="UPDATE")
+
+    def _do_supersede(self, fact: Fact, target_key: Optional[str] = None,
+                      reason: str = "") -> None:
+        """SUPERSEDE：写新碎片 + 旧碎片 superseded_by（带 reason，走契约 v2 写路径）。
+
+        与 UPDATE 的差别只有**语义**（写入层同一段代码）：
+          * SUPERSEDE = 两条独立事实、旧的不再成立 ⇒ 旧条 `superseded_by` + 转链身
+            （`is_latest='0'`）+ 新条 `supersedes=[旧 key]` + `supersede_reason`；
+          * UPDATE = 同一条记忆的下一版 ⇒ 不带 reason（批 1 的既有行为逐字不变）。
+
+        reason 缺失（LLM 漏填）时兜底成 `DEFAULT_SUPERSEDE_REASON`，不留空 ——
+        「为什么顶掉」是这条链唯一可解释的东西，空串等于把查证路堵死。
+        """
+        self._seal_with_new(
+            fact, target_key,
+            reason=reason.strip() or DEFAULT_SUPERSEDE_REASON,
+            action="SUPERSEDE",
+        )
+
+    def _seal_with_new(self, fact: Fact, target_key: Optional[str], *,
+                       reason: str, action: str) -> None:
+        """UPDATE / SUPERSEDE 共用体：写新条 → 常驻否决 → 封旧 + 记 reason。
+
+        两个动作共用不是「抽象洁癖」，是因为它们**必须逐字同款地**走同一条链维护
+        路径（set_supersedes + supersede_fragment，且都是 store 在前、封边在后）；
+        抄两份就是下一单「改了 A 忘了 B」的标准现场。差别只由 `reason` 承载。
         """
         old_key = target_key or self._find_supersede_target(fact.content)
         if not old_key:
@@ -717,7 +925,7 @@ class Pipeline:
         # 转成退居提名（新事实已入库，正好当证据）。放在 store 之后、supersede
         # 之前 —— 两个动作互斥且顺序固定（先有证据实体，再提名）。
         if self._is_core(old_key):
-            self._nominate_core_conflict(old_key, action="UPDATE", evid_key=new_key)
+            self._nominate_core_conflict(old_key, action=action, evid_key=new_key)
             return
         try:
             # 新碎片加 supersedes 字段（单向留痕，走后端中立接口）
@@ -725,15 +933,24 @@ class Pipeline:
         except Exception as e:
             logger.debug("pipeline: set supersedes field failed: %s", e)
         try:
-            self._storage.supersede_fragment(old_key, new_key)
+            self._storage.supersede_fragment(old_key, new_key, reason)
         except Exception as e:
             logger.warning("pipeline: supersede_fragment failed: %s", e)
 
-    def _do_delete(self, fact: Fact, target_key: Optional[str] = None) -> None:
-        """DELETE：封旧（superseded_by=__void__），不写新事实。
+    def _do_void(self, fact: Fact, target_key: Optional[str] = None) -> None:
+        """VOID（= 旧 DELETE 的正名）：旧条**逻辑删**，不写新事实。
+
+        落库形态 = 旧条 `superseded_by='__void__'` + `supersede_reason='voided'`
+        + `is_latest='0'`（检索侧据此退出结果面），**正文保留** —— 「永不召回但
+        保留正文」是可查证与可回滚的前提，物理删就查不动「当初为什么删的」了。
+
+        与「supersede 封边」的实现关系：三后端的 `supersede_fragment` 对
+        `new_key == __void__` 走的就是**逻辑删分支**（不打新条、reason 记旧条），
+        与封边分支同函数不同分支，所以**不必拆函数**；差别体现在 reason 这个新参数上
+        —— 封边传裁决给的 reason，逻辑删恒传 `VOID_REASON`。
 
         🔴 目标是 core 时**例外**：不封边，改走退居提名（见 `_nominate_core_conflict`）；
-        这条路径要把触发性新事实**先落库**（DELETE 原语义不写库），否则证据 key
+        这条路径要把触发性新事实**先落库**（VOID 原语义不写库），否则证据 key
         指向一个不存在的条目。
         """
         old_key = target_key or self._find_supersede_target(fact.content)
@@ -741,12 +958,12 @@ class Pipeline:
             return
         if self._is_core(old_key):
             evid_key = self._store_fact(fact)
-            self._nominate_core_conflict(old_key, action="DELETE", evid_key=evid_key)
+            self._nominate_core_conflict(old_key, action="VOID", evid_key=evid_key)
             return
         try:
-            self._storage.supersede_fragment(old_key, VOID_KEY)
+            self._storage.supersede_fragment(old_key, VOID_KEY, VOID_REASON)
         except Exception as e:
-            logger.warning("pipeline: DELETE failed: %s", e)
+            logger.warning("pipeline: VOID failed: %s", e)
 
     def _find_supersede_target(self, fact_content: str) -> Optional[str]:
         """取 search_bm25 top 结果作为封边目标。带 exists 校验（防 LLM 幻觉 key 盲封）。
@@ -817,8 +1034,15 @@ class Pipeline:
 
     @staticmethod
     def _tags_for(fact: Fact) -> str:
-        """根据 fact.kind 派生 tags，保留 agent 注入由 storage.store 自己加。"""
-        return f"kind:{fact.kind},pipeline:v2"
+        """根据 fact.kind 派生 tags，保留 agent 注入由 storage.store 自己加。
+
+        末尾追加提炼相的**受控**自评标签（`low_confidence` / `context_dependent`，
+        判据单点在 `shared.sanitize_distill_tags`）：这两个不剥，其余自造照剥。
+        检索渲染层不因它们改任何行为 —— 标签只是原样透出给人看。
+        """
+        base = f"kind:{fact.kind},pipeline:v2"
+        extra = sanitize_distill_tags(fact.tags)
+        return f"{base},{extra}" if extra else base
 
     # ------------------------------------------------------------------
     # 兜底：v1 路径
@@ -887,8 +1111,12 @@ __all__ = [
     "Pipeline",
     "Turn",
     "Fact",
+    "Verdict",
     "DrainResult",
     "DEFAULT_PIPELINE_CONFIG",
     "VALID_KINDS",
+    "VALID_ACTIONS",
     "VOID_KEY",
+    "VOID_REASON",
+    "normalize_subject",
 ]

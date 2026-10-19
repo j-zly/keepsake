@@ -26,9 +26,11 @@ from keepsake.pipeline import (
     Pipeline,
     Turn,
     Fact,
+    Verdict,
     DrainResult,
     DEFAULT_PIPELINE_CONFIG,
     VOID_KEY,
+    VOID_REASON,
 )
 
 
@@ -65,7 +67,7 @@ class FakeStorage:
     def __init__(self):
         self.stored: List[Dict[str, Any]] = []      # store() 调用记录
         self.search_calls: List[str] = []            # search_bm25 调用记录
-        self.supersede_calls: List[Tuple[str, str]] = []  # (old, new) 记录
+        self.supersede_calls: List[Tuple[str, str, str]] = []  # (old, new, reason) 记录
         # 模拟记忆条目库（按 key 索引）
         self.fragments: Dict[str, Dict[str, Any]] = {}
         # 模拟 search 索引（按 content 关键词返回）
@@ -147,12 +149,26 @@ class FakeStorage:
         return out[:5]
 
     # --- 模拟 supersede_fragment(): 写入封边字段 ---
-    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
-        self.supersede_calls.append((old_key, new_key))
+    def supersede_fragment(self, old_key: str, new_key: str, reason: str = "") -> bool:
+        # 批 2：契约 v2 的 `reason` 形参（三后端签名一致，见 base.py）。
+        # 这里照真后端的语义记：旧条转链身 + 记 reason；封边时 reason 记在新条上。
+        self.supersede_calls.append((old_key, new_key, reason))
         frag = self.fragments.get(old_key)
         if frag is not None:
             frag["superseded_by"] = new_key
             frag["superseded_at"] = "2026-09-08T00:00:00+00:00"
+            frag["is_latest"] = "0"
+            if not new_key or new_key == VOID_KEY:
+                if reason:
+                    frag["supersede_reason"] = reason
+        else:
+            return False
+        if new_key and new_key != VOID_KEY and new_key != old_key:
+            new_frag = self.fragments.get(new_key)
+            if new_frag is not None:
+                new_frag["is_latest"] = "1"
+                if reason:
+                    new_frag["supersede_reason"] = reason
         return True
 
     def _get_client(self):
@@ -300,7 +316,7 @@ class TestUpdateSupersedeFlow:
         assert result.updates == 1
         # 关键断言：supersede_fragment 被调用过
         assert len(st.supersede_calls) >= 1
-        old_sealed, new_key = st.supersede_calls[0]
+        old_sealed, new_key, _reason = st.supersede_calls[0]
         assert old_sealed == old_key
         assert "已完成" in st.fragments.get(new_key, {}).get("text", "") or new_key.startswith("memory:frag:")
 
@@ -359,7 +375,7 @@ class TestUpdateSupersedeFlow:
         )
         assert result.deletes == 1
         # 旧记忆条目被 supersede_fragment(old, __void__)
-        assert (old_key, VOID_KEY) in st.supersede_calls
+        assert (old_key, VOID_KEY, VOID_REASON) in st.supersede_calls
         # 验证旧记忆条目标了 superseded_by=__void__
         assert st.fragments[old_key]["superseded_by"] == VOID_KEY
 
@@ -634,11 +650,11 @@ class TestJSONParseRobustness:
 
     def test_parse_action_recognizes_add(self):
         # target_key 为空串会被代码过滤为 None（避免被误当作有效 key）
-        assert Pipeline._parse_action('{"action":"ADD","target_key":""}') == ("ADD", None)
+        assert Pipeline._parse_action('{"action":"ADD","target_key":""}') == Verdict("ADD")
 
     def test_parse_action_recognizes_update_with_markdown(self):
         text = '```\n{"action":"UPDATE","target_key":"abc"}\n```'
-        assert Pipeline._parse_action(text) == ("UPDATE", "abc")
+        assert Pipeline._parse_action(text) == Verdict("UPDATE", "abc")
 
     def test_parse_action_rejects_text_fallback(self):
         """LLM 输出含 ADD 关键字但 JSON 损坏 → 一律 NOOP（拒绝关键字兜底）。
@@ -646,9 +662,9 @@ class TestJSONParseRobustness:
         解释性废话如「该信息与旧记忆不冲突，无需 UPDATE」会被关键字兜底误判为
         UPDATE → 触发 UPDATE 路径封旧事实。修洞2后一律 NOOP。
         """
-        assert Pipeline._parse_action("I recommend ADD this fact") == ("NOOP", None)
+        assert Pipeline._parse_action("I recommend ADD this fact") == Verdict("NOOP")
         # 中文解释性废话（含 UPDATE 字样但无 JSON）→ 也 NOOP
-        assert Pipeline._parse_action("该信息与旧记忆不冲突，无需 UPDATE") == ("NOOP", None)
+        assert Pipeline._parse_action("该信息与旧记忆不冲突，无需 UPDATE") == Verdict("NOOP")
 
 
 # ===========================================================================
@@ -723,7 +739,7 @@ class TestSaneTargetRejectsHallucinatedKey:
             [],
         )
         # 关键断言：幻觉 key 从未被 supersede_fragment 调用过（防半壳键核心）
-        supersede_keys = [k for (k, _) in st.supersede_calls]
+        supersede_keys = [k for (k, _n, _r) in st.supersede_calls]
         assert hallucinated_key not in supersede_keys, (
             f"幻觉 key 不应触发 supersede_fragment，实际 {st.supersede_calls}"
         )
@@ -805,7 +821,7 @@ class TestSaneTargetRejectsHallucinatedKey:
             [],
         )
         # 关键断言：unrelated_key 不被直接 supersede（被白名单拒）
-        supersede_keys = [k for (k, _) in st.supersede_calls]
+        supersede_keys = [k for (k, _n, _r) in st.supersede_calls]
         assert unrelated_key not in supersede_keys, (
             f"白名单外 key 不应被 supersede，实际 {st.supersede_calls}"
         )
@@ -881,7 +897,7 @@ class TestBlindFallbackRemoved:
             [],
         )
         # _find_supersede_target 找到 old_key（first BM25 hit, exists=True）→ UPDATE 成功
-        supersede_keys = [k for (k, _) in st.supersede_calls]
+        supersede_keys = [k for (k, _n, _r) in st.supersede_calls]
         assert old_key in supersede_keys, (
             f"_find 兜底应封 old_key，实际 supersede_keys={supersede_keys}"
         )
@@ -928,7 +944,7 @@ class TestBlindFallbackRemoved:
             [],
         )
         # ghost_key 不被 supersede（防半壳键）
-        assert all(k != ghost_key for (k, _) in st.supersede_calls)
+        assert all(k != ghost_key for (k, _n, _r) in st.supersede_calls)
         # 整个 fallback chain 退化 ADD：新事实入库
         assert any("已完成" in s["text"] for s in st.stored)
 
@@ -969,44 +985,51 @@ class TestParseActionStrict:
         """解释性废话「无需 UPDATE」含 UPDATE 字样 → NOOP（防误触发封边）。"""
         assert Pipeline._parse_action(
             "该信息与旧记忆不冲突，无需 UPDATE"
-        ) == ("NOOP", None)
+        ) == Verdict("NOOP")
 
     def test_explanatory_text_with_delete_keyword_returns_noop(self):
         """解释性废话「不该 DELETE」含 DELETE 字样 → NOOP。"""
         assert Pipeline._parse_action(
             "我评估了一下，不该 DELETE 这条记忆"
-        ) == ("NOOP", None)
+        ) == Verdict("NOOP")
 
     def test_garbled_no_json_returns_noop(self):
         """乱码无 JSON → NOOP。"""
-        assert Pipeline._parse_action("乱码内容 12345 !@#$%") == ("NOOP", None)
-        assert Pipeline._parse_action("") == ("NOOP", None)
+        assert Pipeline._parse_action("乱码内容 12345 !@#$%") == Verdict("NOOP")
+        assert Pipeline._parse_action("") == Verdict("NOOP")
         # None 由 _update_phase 在调用前已 raise _LLMFailure，不进 _parse_action
 
     def test_malformed_json_returns_noop(self):
         """JSON 语法错误（如缺右括号） → NOOP。"""
-        assert Pipeline._parse_action('{"action":"UPDATE","target_key":') == ("NOOP", None)
+        assert Pipeline._parse_action('{"action":"UPDATE","target_key":') == Verdict("NOOP")
 
     def test_unknown_action_returns_noop(self):
         """合法 JSON 但 action 不在四操作内 → NOOP。"""
-        assert Pipeline._parse_action('{"action":"REPLACE","target_key":"x"}') == ("NOOP", None)
+        assert Pipeline._parse_action('{"action":"REPLACE","target_key":"x"}') == Verdict("NOOP")
 
-    def test_legal_json_four_actions_still_work(self):
-        """合法 JSON 四操作各照常（不矫枉过正）。"""
-        assert Pipeline._parse_action('{"action":"ADD","target_key":""}') == ("ADD", None)
-        assert Pipeline._parse_action('{"action":"UPDATE","target_key":"k1"}') == ("UPDATE", "k1")
-        assert Pipeline._parse_action('{"action":"DELETE","target_key":"k1"}') == ("DELETE", "k1")
-        assert Pipeline._parse_action('{"action":"NOOP","target_key":"k1"}') == ("NOOP", "k1")
+    def test_legal_json_actions_still_work(self):
+        """合法 JSON 五操作各照常（不矫枉过正）。"""
+        assert Pipeline._parse_action('{"action":"ADD","target_key":""}') == Verdict("ADD")
+        assert Pipeline._parse_action('{"action":"UPDATE","target_key":"k1"}') == Verdict("UPDATE", "k1")
+        assert Pipeline._parse_action('{"action":"SUPERSEDE","target_key":"k1"}') == Verdict("SUPERSEDE", "k1")
+        assert Pipeline._parse_action('{"action":"VOID","target_key":"k1"}') == Verdict("VOID", "k1")
+        assert Pipeline._parse_action('{"action":"NOOP","target_key":"k1"}') == Verdict("NOOP", "k1")
+
+    def test_legacy_DELETE_mapped_to_VOID(self):
+        """旧提示词输出的 DELETE → 按 VOID 处理（向后兼容，换提示词不必换模型）。"""
+        v = Pipeline._parse_action('{"action":"DELETE","target_key":"k1"}')
+        assert v.action == "VOID"
+        assert v.target_key == "k1"
 
     def test_json_in_markdown_wrapper_parsed(self):
         """LLM 偶尔用 markdown 包 JSON → 兼容解析（这是 JSON 解析范畴，非关键字兜底）。"""
         text = '```json\n{"action":"UPDATE","target_key":"k1"}\n```'
-        assert Pipeline._parse_action(text) == ("UPDATE", "k1")
+        assert Pipeline._parse_action(text) == Verdict("UPDATE", "k1")
 
     def test_json_with_preamble_parsed(self):
         """LLM 在 JSON 前写几句解释 → 兼容解析。"""
         text = '好的，我的判断如下：\n{"action":"ADD","target_key":""}'
-        assert Pipeline._parse_action(text) == ("ADD", None)
+        assert Pipeline._parse_action(text) == Verdict("ADD")
 
 
 # ===========================================================================

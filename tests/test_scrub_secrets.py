@@ -354,7 +354,7 @@ class _FakeStorage:
     def search_bm25(self, q: str, tag_filter: str = ""):
         return []
 
-    def supersede_fragment(self, old_key: str, new_key_or_void: str) -> bool:
+    def supersede_fragment(self, old_key: str, new_key_or_void: str, reason: str = "") -> bool:
         return True
 
     def get_fragment(self, key: str):

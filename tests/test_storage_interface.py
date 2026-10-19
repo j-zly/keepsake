@@ -65,22 +65,16 @@ def _missing_methods(cls) -> list:
 def _signature_mismatches(cls) -> list:
     """该类的方法签名与接口声明不一致的项。
 
-    契约规则：
+    契约规则（2026-10 keepsake_reconcile_v2 起恢复严格）：
       - 接口声明的**每个**参数都得在实现里出现，且名字 + 默认值一致；
-      - 实现**额外**追加的参数只能是「三后端**全**带有的、带默认值的可选入参」
-        —— 这是「契约演化」的临时口径：2026-10 契约 v2 引入的 `applicability`
-        / `reason` 在 Pg/Sqlite/Redis 三个后端都已就位（默认值都是空串），
-        但 base.py 还没补（接口补齐归后续单统一收口），在补齐之前允许
-        三后端签名比接口多出这几个可选入参而不算漂移；只在一个后端出现
-        的额外参数（任意后端独有）依然算漂移。
-      - 实现**漏**接口里的参数 ⇒ 真漂移，仍按 mismatch 报。
+      - 实现里**任何**接口外的额外参数都算漂移 —— 无论它是带默认值的可选入参
+        还是别的。契约 v2 引入的 `applicability` / `reason` 已在 base.py 补齐，
+        当初那条「三后端共同 allowlist」的过渡口径（让三后端签名比接口多出
+        这几个可选入参而不报漂移）随之**删除**：接口已经把这几个入参收进去，
+        再留一条「多几个也算合法」的口子，下一个单子里多出来的参数就会
+        顺着这条口子滑进去 —— 而漂移的表现不是报错，是「只有一个后端认这个
+        参数」，排查成本极高（2026-06 DriftedPg.store 就是这么溜进去的）。
     """
-    # 三后端共同追加的可选入参（默认空串）：口径=「全栈一致的额外参数」。
-    # 注意：单后端特有的额外参数仍按漂移报（如 DriftedPg.store 的 unexpected）。
-    _EXTRA_PARAM_ALLOWLIST = {
-        "store": {"applicability"},
-        "supersede_fragment": {"reason"},
-    }
     bad = []
     for name in REQUIRED_METHODS:
         impl = getattr(cls, name, None)
@@ -99,21 +93,12 @@ def _signature_mismatches(cls) -> list:
                 mismatch = True
                 break
         if not mismatch:
-            # 2) 实现里**不在接口**里的额外参数：仅当「在三后端共同 allowlist
-            # 内、且带默认值」时允许；否则算漂移。
-            allowed_extra = _EXTRA_PARAM_ALLOWLIST.get(name, set())
+            # 2) 实现里**不在接口**里的额外参数 = 漂移（严格口径，无 allowlist）
             for ep in impl_params:
                 if ep.name in base_names:
                     continue
-                if (ep.kind in (inspect.Parameter.VAR_POSITIONAL,
-                                inspect.Parameter.VAR_KEYWORD,
-                                inspect.Parameter.KEYWORD_ONLY)
-                        or ep.default is inspect.Parameter.empty):
-                    mismatch = True
-                    break
-                if ep.name not in allowed_extra:
-                    mismatch = True
-                    break
+                mismatch = True
+                break
         if mismatch:
             bad.append(name)
     return bad

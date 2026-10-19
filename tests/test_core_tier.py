@@ -334,7 +334,7 @@ def test_unimplemented_backend_raises_instead_of_empty():
         def close(self): pass
         def store(self, text, tags="", category="", source="",
                   fragment_type="", sentiment_score=None, sentiment_label=None): return True
-        def supersede_fragment(self, old_key, new_key): return True
+        def supersede_fragment(self, old_key, new_key, reason=""): return True
         def correct_fragments(self, keys): return 0
         def record_feedback(self, fragment_key, is_positive): return True
         def get_fragment(self, key): return None

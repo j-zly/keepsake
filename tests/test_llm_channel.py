@@ -544,7 +544,8 @@ class TestPipelineChannelRefresherHotReload:
             def search_bm25(self, q, tag_filter=""):
                 return []
 
-            def supersede_fragment(self, old, new):
+            def supersede_fragment(self, old, new, reason=""):
+                # 批 2：契约 v2 的 reason 形参（三后端签名一致，见 base.py）
                 return True
 
             def _get_client(self):

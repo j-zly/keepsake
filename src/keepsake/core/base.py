@@ -78,12 +78,23 @@ class StorageBase(ABC):
         fragment_type: str = "",
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
+        applicability: str = "",
     ) -> bool:
-        """将一段文本写入碎片库（同名内容去重：保留 feedback 并版本化归档旧版）。"""
+        """将一段文本写入碎片库（同名内容去重：保留 feedback 并版本化归档旧版）。
+
+        `applicability` 是契约 v2 的可选入参（默认空串 = 环境无关的记忆照常写，
+        老调用方逐字不受影响）。**不传**时后端连列都不写；**传了**却缺列 ⇒
+        写路径报人话错误（附迁移 SQL），绝不静默丢字段。
+        """
 
     @abstractmethod
-    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
-        """封边：旧碎片标 superseded_by=new_key + superseded_at=now，不物理删。"""
+    def supersede_fragment(self, old_key: str, new_key: str, reason: str = "") -> bool:
+        """封边：旧碎片标 superseded_by=new_key + superseded_at=now + is_latest='0'，不物理删。
+
+        `reason` 是可选的**作废原因**（默认空串 = 落库值与加它之前逐字一致）：
+          * 有新条 ⇒ 记在**新条**的 `supersede_reason` 上，同时旧条转链身；
+          * `new_key` 为 `__void__`（或空串）⇒ 没有新条，`reason` 记在**旧条**上。
+        """
 
     @abstractmethod
     def correct_fragments(self, keys: List[str]) -> int:
