@@ -1,6 +1,6 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
-> 最后校准: 2026-10-15（对齐 HEAD 2ca18c5：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
+> 最后校准: 2026-10-19（对齐 HEAD bec8427：契约v2演化链四列+调和协议五裁决+班车 3000/5000 准入已上线；检索层批3在途：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
 
 The Keepsake system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
 
