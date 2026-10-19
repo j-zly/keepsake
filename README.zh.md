@@ -1,6 +1,6 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
-> 最后校准: 2026-10-15（对齐 HEAD 2ca18c5：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
+> 最后校准: 2026-10-19（对齐 HEAD 11e0ef0：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP + Hy-Memory 借鉴线三批（契约v2 演化链四列 / 调和协议五裁决 / 检索层批3）全部上线，班车 3000/5000 准入改制生效）
 
 碎片化记忆系统 — 每次对话自动检索相关记忆注入上下文。
 
@@ -415,7 +415,7 @@ yeah
 
 PG 侧维护列 `level` / `consumed_by` / `consumed_at` 是 `TEXT NOT NULL DEFAULT ''`。**判「未设置」必须用 `= ''`，不得用 `IS NULL`**；默认值保证存量行兼容。
 
-写入语义同样等价：同内容去重时旧版本标 `valid_until` / `is_archived`，新版本另起 `:<epoch>` 后缀 key；R6「命中不覆盖 content」的规则在两个后端上都成立。
+写入语义同样等价：同内容去重**只在链头之间进行**（批3 起，`is_latest='0'` 的链身是被顶掉的历史、由当前链头代表，新写入不与链身判重，而是直接另起 `:<epoch>` key 且不动链身）；命中链头复本时旧版标 `valid_until` / `is_archived`，新版本另起 `:<epoch>` 后缀 key，复本保留确定性 = 最早 created 者为链头代表。链头判据全仓单点：Python 侧 `shared.is_chain_head()` + SQL 侧 `CHAIN_HEAD_SQL`，字段缺失/空串/`'1'` 一律按链头处理（老库未迁移不炸）。R6「命中不覆盖 content」的规则在两个后端上都成立。
 
 ### 合并阈值
 
@@ -649,6 +649,16 @@ keepsake: auto-registered cron job '记忆去重'
 3. **写侧数据卫生。** R1 闸门拒收系统注入文本（compaction 摘要、网关重启提示 `[System note`）；热门话题链路 jieba 分支只收含 CJK 的 token（英文碎渣绝迹）+ 英文虚词表过滤，技术词（`api`/`ssh`/`log`…）刻意保留防误杀；存量污染用 `scripts/cleanup_hot_topics.py` 清洗（默认 dry-run）。
 
 实测效果：30 条真实查询回归集（`scripts/eval_spotcheck.py`）BM25-only 67% → BM25+KNN（bge-m3，RRF 融合）73%。
+
+## Hy-Memory 借鉴线（2026-10，三批收官）
+
+从 Hy-Memory 开源实现移植的三段能力，全部按「读路径顺手做、零新增定时任务、fail-open」纪律落地：
+
+1. **批1 · 契约v2 演化链**：条目四列 `is_latest` / `supersedes` / `supersede_reason` / `applicability` 进三后端（缺列降级照 content_type 先例）；supersede 双向链维护，检索默认只召回链头。
+2. **批2 · 调和协议五裁决**：写入管线的更新相裁决扩为 ADD / UPDATE / SUPERSEDE / VOID / NOOP——UPDATE=同条下一版（封旧+落新、reason 恒空），SUPERSEDE=两条独立事实新顶旧（带 reason 走双向链），VOID=逻辑删（正文保留、`supersede_reason='voided'`，旧 DELETE 动作名向后兼容）；subject 归一化等值闸防「张三的咖啡顶掉用户的」；链头禁抄旧细节 + 同事件另次发生独立 ADD 两条规则进提示词。
+3. **批3 · 检索层惰性过期 + 链头判重**：`valid_until` 三态语义——空串=普通事实、过去=归档/版本化（检索滤掉）、**未来=意图有效期**（进候选；被召回时若已过期，`apply_v2_filters` 第五道当场清 `valid_until` + 打 `expired_fact` 标签并从本次结果剔除，下次当普通事实召回，不新增 cron）；store 判重只在链头之间进行（见「维护能力」节）。
+
+配套纪律：链头/裁决类判据一律单点出口（`is_chain_head()` / `CHAIN_HEAD_SQL`），防回归测试类 `TestSingleSourceOfTruth` 钉死"不许出现第三份实现"。
 
 ## 项目结构
 
