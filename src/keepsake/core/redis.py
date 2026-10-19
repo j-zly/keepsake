@@ -35,10 +35,12 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     HOT_TOPIC_BOOST,
     HOT_TOPIC_DECAY_HALF_DAYS,
     VOID_KEY,
+    _parse_iso_dt,
     append_supersedes,
     apply_v2_filters,
     attention_boost_from_topics,
     hot_topic_weighted_hits,
+    is_chain_head,
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
@@ -551,19 +553,6 @@ def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
                 if syn not in expanded:
                     expanded.append(syn)
     return expanded
-
-
-def _is_chain_body(value: Any) -> bool:
-    """`is_latest` 是否表示**链身**（已被顶掉、该退出检索面）。
-
-    字段缺失（老数据没有链概念）/ 空串 / `'1'` 一律算**链头** ⇒ 只有明确
-    写成 `'0'` 才算链身。理由与 SQL 侧 `CHAIN_HEAD_SQL` 的 `COALESCE` 同一个：
-    判错方向要是「老数据当成链身」，那一次迁移就把存量记忆整批从检索里抹掉。
-    bytes（decode_responses=False）一并认。
-    """
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode("utf-8", "replace")
-    return str(value or "1").strip() == "0"
 
 
 def _build_create_index_cmd(dim: int) -> str:
@@ -1131,12 +1120,23 @@ class RedisStorage(StorageBase):
             if app:
                 mapping["applicability"] = app
 
-            # v1.5 版本化: 同内容已存在 → 旧版标记失效（valid_until），新版写入独立 key
+            # 2026-10 ks_retrieval_v3：链头判重（Hy-Memory `_retrieval/dedup.py` 移植）。
+            # 同内容已存在时，**只在它是链头**（is_latest≠'0'，包括缺字段 = 链头）
+            # 才视作去重目标并版本化；若是链身（被 supersede 顶掉的链身），不动它，
+            # 直接新建独立 key —— 链身是历史，由当前链头代表，不该把新条目判成
+            # 「与某条已作废链身重复」。链头复本保留确定性 = 最早 created 者为链头
+            # 代表；同一 key 唯一（hash(content)[:12]），所以这条判据在 store 层
+            # 自然落到「行本身就是链头时版本化」上。
             now_iso = datetime.now(timezone.utc).isoformat()
+            existing_is_head = False
             if client.exists(key):
-                client.hset(key, "valid_until", now_iso)
-                client.hset(key, "is_archived", "1")
-                key = f"{key}:{int(time.time())}"
+                is_latest_raw = client.hget(key, "is_latest")
+                existing_is_head = is_chain_head(is_latest_raw)
+                if existing_is_head:
+                    client.hset(key, "valid_until", now_iso)
+                    client.hset(key, "is_archived", "1")
+                    key = f"{key}:{int(time.time())}"
+                # else: 链身 ⇒ 不动它，新写入走独立 key（hash 拼 epoch）
 
             # v1.5 实体时间线索引: 每个实体一个 ZSET，score=时间戳（供时间线查询）
             if entities:
@@ -1969,7 +1969,7 @@ class RedisStorage(StorageBase):
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "entities", "fragment_type",
+                             "invalid_at", "valid_until", "entities", "fragment_type",
                              "applicability"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
@@ -1986,12 +1986,18 @@ class RedisStorage(StorageBase):
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
                     continue
-                # v1.5: 跳过历史版本（valid_until 已设 = 已被新版取代）
-                valid_until = getattr(doc, "valid_until", None)
-                if valid_until:
-                    continue
-                # 契约 v2：跳过链身（is_latest='0'），语义与 PG/Redis 同款
-                if _is_chain_body(getattr(doc, "is_latest", None)):
+                # 2026-10 ks_retrieval_v3：valid_until 区分两种语义——
+                #   * 过去时间戳 = 版本化/归档（v1.5 老语义），照旧 skip
+                #   * 未来时间戳 = 意图过期标记，要让候选出现，在 apply_v2_filters
+                #     里惰性降级 + 剔除
+                valid_until_raw = getattr(doc, "valid_until", None)
+                if valid_until_raw:
+                    vu_dt = _parse_iso_dt(valid_until_raw)
+                    if vu_dt is not None and vu_dt <= datetime.now(timezone.utc):
+                        continue   # 过去 ⇒ 归档/版本化历史
+                    # 未来 OR 解析失败：放行（解析失败 fail-open ⇒ 当作未过期）
+                # 契约 v2：跳过链身（is_latest='0'），语义与 PG/SQLite 同款
+                if not is_chain_head(getattr(doc, "is_latest", None)):
                     continue
                 if frag.get("content"):
                     # v1.4: 过滤超长噪音条目（背景进程输出/图片描述等长文本 BM25 分虚高）
@@ -2131,12 +2137,16 @@ class RedisStorage(StorageBase):
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
                     continue
-                # v1.5: 跳过历史版本
-                if getattr(doc, "valid_until", None):
-                    continue
+                # 2026-10 ks_retrieval_v3：valid_until 区分两种语义 —— 过去 skip（归档），
+                # 未来放行（让 apply_v2_filters 的「第五道」惰性降级）。解析失败 fail-open。
+                valid_until_raw = getattr(doc, "valid_until", None)
+                if valid_until_raw:
+                    vu_dt = _parse_iso_dt(valid_until_raw)
+                    if vu_dt is not None and vu_dt <= datetime.now(timezone.utc):
+                        continue
                 # 契约 v2：跳过链身（is_latest='0'）。字段缺失/空 ⇒ 视为链头
                 # （老数据没有链概念，宁可多召回也不整批抹掉）。
-                if _is_chain_body(getattr(doc, "is_latest", None)):
+                if not is_chain_head(getattr(doc, "is_latest", None)):
                     continue
                 if frag.get("content"):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))

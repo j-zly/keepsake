@@ -156,14 +156,15 @@ FRAGMENT_FIELDS = (
     "invalid_at", "valid_until", "entities", "fragment_type",
 )
 
-# 🔴 **检索结果**的字段集（比 FRAGMENT_FIELDS 少 valid_until）。
-# 为什么少：Redis 侧 search_bm25 / search_knn 读 valid_until 只是为了「跳过已封边
-# 的历史版本」，并不把它放进结果；_load_fragments_by_keys 才把它带出去。
-# 两后端的结果必须逐字同形，所以把「哪个字段进结果」也钉死在这里。
+# 🔴 **检索结果**的字段集（两后端必须逐字同形）。
+# `valid_until` 进结果：2026-10 ks_retrieval_v3 意图惰性过期后，
+# `apply_v2_filters` 的「第五道」要按 fragment 自身的 valid_until 当场判
+# 「过期 ⇒ 降级 + 剔除」；不读它就无法判断。`_load_fragments_by_keys` 之前
+# 只为「新版继承旧版名次」临时加载，**不动这条字段集合**。
 SEARCH_FIELDS = (
     "content", "tags", "category", "source", "created",
     "sentiment_score", "sentiment_label", "feedback_score",
-    "invalid_at", "entities", "fragment_type", "applicability",
+    "invalid_at", "valid_until", "entities", "fragment_type", "applicability",
 )
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,119 @@ def append_supersedes(existing: Any, old_key: str) -> str:
     if old_key and old_key not in keys:
         keys.append(old_key)
     return json.dumps(keys, ensure_ascii=False)
+
+
+def is_chain_head(value: Any) -> bool:
+    """`is_latest` 是否表示**链头**（当前有效、应被召回/被去重基准）。
+
+    字段缺失（老数据没有链概念）/ 空串 / `'1'` 一律算**链头** ⇒ 只有明确
+    写成 `'0'` 才算链身。理由与 `CHAIN_HEAD_SQL` 的 `COALESCE` 同一个：
+    判错方向要是「老数据当成链身」，那一次迁移就把存量记忆整批从检索里抹掉。
+    bytes（decode_responses=False）一并认。
+
+    单点化（2026-10 ks_retrieval_v3）：Redis 侧的 `_is_chain_body` 与 SQL 侧的
+    `COALESCE(is_latest, '1') <> '0'` 现在都收口到这里 + `CHAIN_HEAD_SQL`，
+    「链头 vs 链身」这条判据整个仓库只允许这两个出口说。
+    """
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    return str(value or "1").strip() != "0"
+
+
+#: 意图惰性过期后打上的「已过期事实」标签（Hy-Memory 移植语义）。
+#: 检索读到「带 valid_until 且已过期」的条目时降级落此标签；下次当普通事实召回。
+EXPIRED_FACT_TAG = "expired_fact"
+
+
+def _parse_iso_dt(value: Any) -> Optional[datetime]:
+    """把 ISO 时间串解析为带 tz 的 datetime；解析失败返回 None（fail-open）。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    # fromisoformat 在 3.11 之前不认 'Z' 后缀；老行可能落成这种形态
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_intent_expired(fragment: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    """`fragment["valid_until"]` 是否已过期（now >= valid_until）。
+
+    没设 valid_until / 解析失败 ⇒ 视为未过期（普通事实，**不该**走降级路径）。
+    """
+    if not fragment:
+        return False
+    vu = fragment.get("valid_until") or ""
+    if not vu:
+        return False
+    vu_dt = _parse_iso_dt(vu)
+    if vu_dt is None:
+        return False
+    return vu_dt <= (now or datetime.now(timezone.utc))
+
+
+def downgrade_expired_intent(
+    storage: Any,
+    fragment: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> bool:
+    """惰性降级过期意图：valid_until 清空 + 打 `expired_fact` 标签（fail-open）。
+
+    读路径顺手做（Hy-Memory `_retrieval/intention.py` 移植语义）：
+      * 「带 valid_until 且已过期」⇒ 本次召回里**当场**降级（不依赖定时任务）
+      * valid_until 清空 ⇒ 下次当普通事实召回
+      * tags 加 `expired_fact` ⇒ 保留语义提示（不挡其他 consumer）
+
+    返回 True = 成功降级；False = 失败（不抛异常，绝不冒到检索路径）。
+    """
+    if not fragment or not fragment.get("_key"):
+        return False
+    if not is_intent_expired(fragment, now=now):
+        return False
+    key = fragment["_key"]
+
+    # 读现有 tags，避免覆盖（tags 是逗号串，见 storage_shared.tag_match_sql 的说明）。
+    # 读失败时**也**写入 expired_fact（兜底单标签）—— valid_until 是核心动作，
+    # tags 是语义提示，fail-open 不该把后者整个丢掉。
+    new_tags: Optional[str] = None
+    try:
+        existing = storage.get_fragment(key)
+        if existing is not None:
+            tags_str = (existing.get("tags") or "") if isinstance(existing.get("tags"), str) else ""
+            tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+            if EXPIRED_FACT_TAG not in tag_list:
+                tag_list.append(EXPIRED_FACT_TAG)
+            new_tags = ",".join(tag_list)
+    except Exception as e:      # noqa: BLE001
+        logger.debug("storage_shared: 读 tags 失败（fail-open，单标签兜底）: %s: %s",
+                     type(e).__name__, e)
+        new_tags = EXPIRED_FACT_TAG
+
+    fields: Dict[str, Any] = {"valid_until": ""}
+    if new_tags is not None:
+        fields["tags"] = new_tags
+    try:
+        ok = storage.update_fragment_fields(key, fields)
+    except Exception as e:      # noqa: BLE001
+        logger.debug("storage_shared: 惰性降级写回失败（fail-open，检索不受影响）: "
+                     "%s: %s", type(e).__name__, e)
+        return False
+    if not ok:
+        # 列缺 / key 不存在等情况：debug 留痕，但绝不让检索冒错
+        logger.debug("storage_shared: 惰性降级写回无更新（key=%s）", key)
+    return True
 
 # 「新版继承旧版名次」按 key 载入的 fragment 缓存（进程级 60s TTL）
 # 这些条目是稳定内容、量小，缓存避免重复往返。
@@ -684,7 +798,25 @@ def apply_v2_filters(storage: Any, fragments: List[Dict[str, Any]]) -> List[Dict
             if sim < floor:
                 continue
             kept.append(f)
-        return kept
+        after_super = kept
+
+    # 第五道：意图惰性过期（2026-10 ks_retrieval_v3 借鉴 Hy-Memory）
+    # 读路径顺手做：带 valid_until 且已过期的条目当场降级 + 从本次结果剔除。
+    # 不增定时任务、不改 valid_until 现存语义（过去 valid_until 仍由检索过滤先挡掉）。
+    # fail-open：降级失败（get_fragment / update_fragment_fields 抛错）只 debug，
+    # 检索结果本身一个字段都不许变。
+    after_expire: List[Dict[str, Any]] = []
+    for f in after_super:
+        if is_intent_expired(f):
+            try:
+                downgrade_expired_intent(storage, f)
+            except Exception as e:      # noqa: BLE001
+                logger.debug("storage_shared: 惰性降级抛错（fail-open）: %s: %s",
+                             type(e).__name__, e)
+            continue   # 从本次结果剔除；下次当普通事实召回
+        after_expire.append(f)
+    after_super = after_expire
+
     return after_super
 
 

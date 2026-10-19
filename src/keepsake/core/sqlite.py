@@ -121,10 +121,12 @@ from .shared import (
     accumulate_co_occurrence,
     append_supersedes,
     accumulate_word_freq,
+    _parse_iso_dt,
     apply_v2_filters,
     attention_boost_from_topics,
     discover_synonym_pairs,
     hot_topic_weighted_hits,
+    is_chain_head,
     is_pure_ascii_short,
     jieba_dict_entries,
     jieba_dict_words,
@@ -946,15 +948,25 @@ class SqliteStorage(StorageBase):
         try:
             with self._write() as cur:
                 # 去重：同内容已存在 → 保留 feedback_score + 旧版标失效 + 新版独立 key
+                # 2026-10 ks_retrieval_v3：链头判重（Hy-Memory `_retrieval/dedup.py` 移植）。
+                # 同 key 命中行时，**只在它是链头**（is_latest≠'0'）才走版本化；
+                # 链身是被 supersede 顶掉的旧条，由当前链头代表 ⇒ 不动它，
+                # 直接走独立 key。复本保留确定性 = 最早 created 者为链头代表
+                # （同 key 唯一 ⇒ 行本身已是最早链头）。is_latest 列缺时按链头处理
+                # （与 PG `CHAIN_HEAD_SQL` 的 `COALESCE` 同款纪律）。
                 row = cur.execute(
-                    "SELECT feedback_score FROM ks_fragment WHERE key = ?", (key,)
+                    "SELECT feedback_score, is_latest FROM ks_fragment WHERE key = ?", (key,)
                 ).fetchone()
                 existing_feedback = (row[0] if row and row[0] else "0") or "0"
                 if row is not None:
-                    cur.execute(
-                        "UPDATE ks_fragment SET valid_until = ?, is_archived = '1' WHERE key = ?",
-                        (now_iso, key),
-                    )
+                    row_is_latest = row[1] if len(row) >= 2 else None
+                    if is_chain_head(row_is_latest):
+                        # 链头复本：版本化 → 旧条标归档、新条独立 key
+                        cur.execute(
+                            "UPDATE ks_fragment SET valid_until = ?, is_archived = '1' WHERE key = ?",
+                            (now_iso, key),
+                        )
+                    # 链身（is_latest='0'）⇒ 不动它，新写入照样要独立 key（主键唯一约束）
                     key = f"{key}:{int(time.time())}"
                 entities_str = ",".join(entities) if entities else ""
                 # 批 2：分词文本与 FTS 索引**同一个写事务**、且在主表之后
@@ -1635,7 +1647,11 @@ class SqliteStorage(StorageBase):
                 params.extend(args)
 
         clauses.append("invalid_at = ''")
-        clauses.append("valid_until = ''")
+        # 2026-10 ks_retrieval_v3：valid_until 放宽到「空串 OR 未来」——老行/版本化归档
+        # 行为不变（它们写入时 valid_until 是当前时刻），新写的意图条目进入读路径
+        # 才能在 apply_v2_filters 里惰性降级。
+        params.append(datetime.now(timezone.utc).isoformat())
+        clauses.append("(valid_until = '' OR valid_until > ?)")
         # 契约 v2：只要链头（已被顶掉的链身不进检索面）—— 与上面两条同款口径。
         # 常驻层（list_by_tag 的 core 列表）**不加**，见 storage_shared 的说明。
         clauses.append(CHAIN_HEAD_SQL)
@@ -1858,7 +1874,7 @@ class SqliteStorage(StorageBase):
                 cur.execute(
                     f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
                     f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
-                    f"f.entities, f.fragment_type, f.invalid_at, f.applicability, "
+                    f"f.entities, f.fragment_type, f.invalid_at, f.valid_until, f.applicability, "
                     f"f.content_tsv, "
                     # 🔴 FTS5 的 bm25() 只用来给**窗口粗排**（对应 PG 侧的 ts_rank_cd），
                     #    最终分在 Python 侧按 PG 公式重算 —— 见方法 docstring。
@@ -1885,7 +1901,7 @@ class SqliteStorage(StorageBase):
         lower_terms = {t.lower() for t in terms}
         for row in rows:
             key, content, tags, category, source, created, sent, label, fb, \
-                entities, ftype, invalid_at, applic, tsv, _window_score = row
+                entities, ftype, invalid_at, valid_until, applic, tsv, _window_score = row
             # tf / doclen：词元口径与 PG 的 tsvector positions 逐字对齐
             # （content_tsv 落库时已按 unicode61 词元切分，见 `_tok_string`）
             words = [w.lower() for w in (tsv or "").split()]
@@ -1898,6 +1914,7 @@ class SqliteStorage(StorageBase):
                 ("source", source), ("created", created), ("sentiment_score", sent),
                 ("sentiment_label", label), ("feedback_score", fb),
                 ("entities", entities), ("fragment_type", ftype), ("invalid_at", invalid_at),
+                ("valid_until", valid_until),
                 ("applicability", applic),
             ):
                 if value is None or value == "":

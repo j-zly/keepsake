@@ -300,17 +300,20 @@ def test_redis_supersede_旧条转链身_新条回填反向链():
 
 
 def test_redis_链身判据_老数据当链头():
-    """`_is_chain_body`：字段缺失/空/'1' 一律链头，只有 '0' 是链身。
+    """`is_chain_head`：字段缺失/空/'1' 一律链头，只有 '0' 是链身。
 
-    判错方向只有一侧有灾难：老数据当成链身 = 一次升级把存量记忆整批从检索里抹掉。
+    2026-10 ks_retrieval_v3：Redis 侧的 `_is_chain_body` 已删，本判据与
+    PG `CHAIN_HEAD_SQL` 同走 storage_shared.is_chain_head 单点。语义反过来：
+    `is_chain_head(v)` 为 True ⇒ 不是链身（即 `_is_chain_body(v)` 为 False）。
+    「判错方向只有一侧有灾难：老数据当成链身 = 一次升级把存量记忆整批从检索里抹掉」。
     """
-    from keepsake.core.redis import _is_chain_body
-    assert _is_chain_body(None) is False          # 字段压根没有
-    assert _is_chain_body("") is False            # 空串
-    assert _is_chain_body("1") is False           # 链头
-    assert _is_chain_body(b"0") is True           # 链身（bytes 未解码的旧配置）
-    assert _is_chain_body("0") is True
-    assert _is_chain_body(" 0 ") is True
+    from keepsake.core.shared import is_chain_head
+    assert is_chain_head(None) is True            # 字段压根没有 ⇒ 链头
+    assert is_chain_head("") is True              # 空串 ⇒ 链头
+    assert is_chain_head("1") is True             # 链头
+    assert is_chain_head(b"0") is False           # 链身（bytes 未解码的旧配置）
+    assert is_chain_head("0") is False
+    assert is_chain_head(" 0 ") is False
 
 
 # =============================================================================

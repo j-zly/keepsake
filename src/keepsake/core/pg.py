@@ -98,9 +98,11 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     FEEDBACK_POSITIVE_BOOST,
     HOT_TOPIC_BOOST,
     HOT_TOPIC_DECAY_HALF_DAYS,
+    _parse_iso_dt,
     apply_v2_filters,
     attention_boost_from_topics,
     hot_topic_weighted_hits,
+    is_chain_head,
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
@@ -1501,7 +1503,13 @@ class PgStorage(StorageBase):
 
         # 两版检索共同的「不是活记忆」过滤（对齐 Redis search_* 里的 continue）
         clauses.append("invalid_at = ''")
-        clauses.append("valid_until = ''")
+        # 2026-10 ks_retrieval_v3：valid_until 的「过去时间戳」仍是归档/版本化语义
+        # （store / archive_fragment 把当前时刻写进去），照旧滤掉；**未来时间戳**
+        # 是「意图过期」标记，要让候选里出现才能在 apply_v2_filters 里惰性降级。
+        # 兼容思路：把条件放宽成「空串 OR 未来」 ⇒ 老行 / 版本化归档行为不变，
+        # 新写的 intent 条目才进入读路径。
+        params.append(datetime.now(timezone.utc).isoformat())
+        clauses.append("(valid_until = '' OR valid_until > %s)")
         # 契约 v2：只要**链头**（已被顶掉的链身不进检索面）。
         # 与上面两条同款口径 —— 都是「这条还算不算当前有效记忆」的判据。
         # 🔴 老库未迁移这列时**不加**（缺列探测同款纪律）：加了就是 UndefinedColumn
@@ -2476,19 +2484,35 @@ class PgStorage(StorageBase):
 
         with self._tx() as cur:
             # 去重：同内容已存在 → 保留 feedback_score + 旧版标失效 + 新版独立 key
+            # 2026-10 ks_retrieval_v3：链头判重（Hy-Memory `_retrieval/dedup.py` 移植）。
+            # 同 key 命中行时，**只在它是链头**（is_latest≠'0'）才走版本化；
+            # 链身是被 supersede 顶掉的旧条，由当前链头代表 ⇒ 不动它，
+            # 直接新建独立 key。复本保留确定性 = 最早 created 者为链头代表
+            # （同 key 唯一 ⇒ 行本身已是最早链头）。
             cur.execute(
-                "SELECT feedback_score, valid_until FROM ks_fragment WHERE key = %s",
+                "SELECT feedback_score, valid_until, is_latest FROM ks_fragment "
+                "WHERE key = %s",
                 (key,),
             )
             row = cur.fetchone()
             existing_feedback = (row[0] if row and row[0] else "0") or "0"
 
+            # is_latest 列缺时（老库未迁移）按链头处理（与 CHAIN_HEAD_SQL 同款纪律）
+            row_is_latest = row[2] if row and len(row) >= 3 else None
+            row_is_head = True if row is None else is_chain_head(row_is_latest)
+
             if row is not None:
-                cur.execute(
-                    "UPDATE ks_fragment SET valid_until = %s, is_archived = '1' WHERE key = %s",
-                    (now_iso, key),
-                )
+                if row_is_head:
+                    # 链头复本：版本化 → 旧条标归档、新条独立 key
+                    cur.execute(
+                        "UPDATE ks_fragment SET valid_until = %s, is_archived = '1' WHERE key = %s",
+                        (now_iso, key),
+                    )
+                # 链身（被 supersede 顶掉的历史）：不动它，由当前链头代表；
+                # 新写入照样要独立 key（hash+epoch），否则 PG 的 ks_fragment.key
+                # 主键唯一约束会撞 —— 但**不**走版本化那条 UPDATE。
                 key = f"{key}:{int(time.time())}"
+            # row is None ⇒ 直接 INSERT（key 不变）
 
             entities_str = ",".join(entities) if entities else ""
             # ---- 批 2：同步算好检索用的两列，别让调用方回填 ----

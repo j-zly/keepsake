@@ -806,9 +806,11 @@ def test_search_result_shape_matches_redis_contract(pg_search, knn_selfcheck):
         assert full_key in by_key, f"{method.__name__} 没召回字段齐全的那条"
         plain = set(by_key[full_key]) - {score_key, "_sim", "_combined_score",
                                          "_weights", "_key"}
-        assert plain == (contract - {"invalid_at"}), (
+        # 2026-10 ks_retrieval_v3：valid_until 与 invalid_at 同款「稀疏」语义
+        # （空值时不进 dict —— 与 Redis hash 稀疏一致），也从契约里扣掉比对。
+        assert plain == (contract - {"invalid_at", "valid_until"}), (
             f"{method.__name__} 字段齐全时普通字段集合与 Redis 契约不符\n"
-            f"  Redis 契约: {sorted(contract - {'invalid_at'})}\n"
+            f"  Redis 契约: {sorted(contract - {'invalid_at', 'valid_until'})}\n"
             f"  PG 实际   : {sorted(plain)}"
         )
 

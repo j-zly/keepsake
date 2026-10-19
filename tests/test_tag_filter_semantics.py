@@ -61,20 +61,25 @@ def _bare(cls):
 
 
 def test_filter_sql_uses_comma_boundaries_not_pipes():
-    """两个后端的 tag 片段都必须是逗号包裹的针脚，且不再出现竖线包裹。"""
+    """两个后端的 tag 片段都必须是逗号包裹的针脚，且不再出现竖线包裹。
+
+    2026-10 ks_retrieval_v3：valid_until 放宽到「空串 OR 未来」⇒ 多了一个
+    ISO 时间戳占位符；这里比对**前 N 个**（=标签占位符数）以屏蔽其差异。
+    """
     from keepsake.storage_pg import PgStorage
     from keepsake.storage_sqlite import SqliteStorage as _S
 
     sql_pg, params_pg = PgStorage._search_filter_sql(_bare(PgStorage), "a,c", "", True)
     assert "|tags" not in sql_pg and "'|'" not in sql_pg, sql_pg
-    assert params_pg == [",a,", ",c,"], params_pg
+    # 标签占位符数 = 2（与多 tag 数量一致）；valid_until 那枚是时间戳，跳过它比对
+    assert params_pg[:2] == [",a,", ",c,"], params_pg
     # 多 tag 是 OR（并集），不是拼成 ",a,c," 这种相邻子串
-    assert sql_pg.count("%s") == 2 and " OR " in sql_pg, sql_pg
+    assert sql_pg.count("%s") == 3 and " OR " in sql_pg, sql_pg
 
     sql_lite, params_lite = _S._search_filter_sql(_bare(_S), "a,c", "", True)
     assert "|tags" not in sql_lite and "'|'" not in sql_lite, sql_lite
-    assert params_lite == [",a,", ",c,"], params_lite
-    assert sql_lite.count("?") == 2 and " OR " in sql_lite, sql_lite
+    assert params_lite[:2] == [",a,", ",c,"], params_lite
+    assert sql_lite.count("?") == 3 and " OR " in sql_lite, sql_lite
 
 
 def test_clean_tag_still_scrubs_separators():
