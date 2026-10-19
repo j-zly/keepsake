@@ -23,5 +23,6 @@ Thumbs.db
 *.env
 
 # Console（P1 可视化后台）本地依赖
+.venv
 .venv/
 web/node_modules/
