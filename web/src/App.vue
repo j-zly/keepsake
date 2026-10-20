@@ -165,7 +165,7 @@ const GROUPS = [
       { path: '/core', label: '常驻层', icon: ICON.layers },
       { path: '/fragments', label: '记忆条目', icon: ICON.search },
       { path: '/maintenance', label: '记忆维护', icon: ICON.broom },
-      { path: '/agents', label: '代理治理', icon: ICON.users },
+      { path: '/agents', label: '代理治理（登记/审核）', icon: ICON.users },
       // 审核排组尾：与知识库组同口径（用户指定「业务页在上、审核在下」，2026-10-18）；徽标随项走
       { path: '/review', label: '审核', icon: ICON.check },
     ],

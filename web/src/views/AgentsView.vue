@@ -19,6 +19,13 @@
       <p class="page-sub">
         新接入的代理默认待审，批准时签发一次性凭据；未批准与已吊销的代理读写全拒。
       </p>
+      <p class="page-sub">
+        未登记的代理连上来会自动出现在这里（pending）；也可以点「登记新代理」预先登记再批准。
+      </p>
+      <!-- 页头操作区：登记 = 「还没连上就先占个位」的那一步（批准仍在每张卡上） -->
+      <div class="head-acts">
+        <el-button type="primary" @click="openRegister">登记新代理</el-button>
+      </div>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -117,6 +124,20 @@
 
         <div class="aname">
           <span class="aname-txt" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
+          <!-- 改名钮：复用现成的小图标钮（.copy-btn 那套尺寸），只改备注名 -->
+          <button
+            class="copy-btn name-edit"
+            :disabled="busy"
+            title="改名"
+            aria-label="改名"
+            @click="openRename(a)"
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
+              <path d="M9.4 4.2l2.4 2.4" />
+            </svg>
+          </button>
           <span class="chip">{{ a.role === 'primary' ? '主代理' : '子代理' }}</span>
         </div>
 
@@ -215,6 +236,92 @@
         <el-button :disabled="busy" @click="credOpen = false">我已转交，关掉</el-button>
       </template>
     </el-dialog>
+
+    <!-- 登记新代理：手工占个位（pending）；勾「立即批准」当场发一次性凭据 -->
+    <el-dialog
+      v-model="regOpen"
+      title="登记新代理"
+      width="480px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busy"
+      :show-close="!busy"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="agent_id（必填）">
+          <el-input
+            v-model="regId"
+            placeholder="如 worker-2"
+            autocomplete="off"
+            spellcheck="false"
+            @keyup.enter="doRegister"
+          />
+        </el-form-item>
+        <el-form-item label="备注名（可选）">
+          <el-input
+            v-model="regName"
+            placeholder="给人看的名字；留空则与 agent_id 同名"
+            @keyup.enter="doRegister"
+          />
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="regApproveNow">立即批准并签发一次性凭据</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <p class="tip">
+        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
+        登记只是占位（pending）—— 不批准的代理读写全拒；已存在的同名代理会被直接拒绝，绝不覆盖。
+      </p>
+      <template #footer>
+        <el-button :disabled="busy" @click="regOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="busy"
+          :disabled="!regId.trim()"
+          @click="doRegister"
+        >
+          登记
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 改名：只改备注名 —— 状态 / 角色 / 已发的凭据一律不碰 -->
+    <el-dialog
+      v-model="renameOpen"
+      title="改备注名"
+      width="440px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busy"
+      :show-close="!busy"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="新备注名（必填）">
+          <el-input
+            v-model="renameName"
+            autocomplete="off"
+            spellcheck="false"
+            @keyup.enter="doRename"
+          />
+        </el-form-item>
+      </el-form>
+      <p class="tip">
+        只改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
+      </p>
+      <template #footer>
+        <el-button :disabled="busy" @click="renameOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="busy"
+          :disabled="!renameName.trim()"
+          @click="doRename"
+        >
+          改名
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -224,7 +331,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
-import { api } from '../api'
+import http, { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -351,6 +458,86 @@ function forget() {
   credNote.value = ''
 }
 
+// ---------------------------------------------------------------------------
+// 登记新代理 / 改名：两条新的治理动作（后端 /api/v1/agents 与 .../rename）
+// ---------------------------------------------------------------------------
+
+// 登记：agent_id + 备注名 + 「立即批准并签发一次性凭据」
+const regOpen = ref(false)
+const regId = ref('')
+const regName = ref('')
+const regApproveNow = ref(false)
+
+function openRegister() {
+  regId.value = ''
+  regName.value = ''
+  regApproveNow.value = false
+  regOpen.value = true
+}
+
+async function doRegister() {
+  const agentId = (regId.value || '').trim()
+  if (!agentId) return
+  busy.value = true
+  try {
+    const r = await http.post('/api/v1/agents', {
+      agent_id: agentId,
+      name: (regName.value || '').trim(),
+      confirm: true,
+      approve_now: regApproveNow.value,
+    }).then((res) => res.data)
+    regOpen.value = false
+    showToast(`已登记：${r.agent_id}（${r.status === 'approved' ? '已批准' : '待审核'}）`)
+    // 🔴 凭据明文只在这一刻落到前端内存态：**复用「批准」那一个一次性弹框**
+    // （同一份 cred / credNote / @closed=forget），不另写一套显示逻辑。
+    if (r.credential) {
+      cred.value = r.credential
+      credNote.value = r.note || ''
+      credOpen.value = true
+    }
+    // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
+    load(true)
+  } catch (e) {
+    showError(`登记失败：${e.message}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+// 改名：只改备注名（状态 / 角色 / 凭据都不动）
+const renameOpen = ref(false)
+const renameRow = ref(null)
+const renameName = ref('')
+
+function openRename(row) {
+  renameRow.value = row
+  renameName.value = row?.name || ''
+  renameOpen.value = true
+}
+
+async function doRename() {
+  const row = renameRow.value
+  const name = (renameName.value || '').trim()
+  if (!row || !name) return
+  busy.value = true
+  try {
+    await http
+      .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/rename`, {
+        name,
+        confirm: true,
+      })
+      .then((res) => res.data)
+    renameOpen.value = false
+    showToast(`已改名：${row.agent_id}`)
+    // 同上：改完重拉，状态由后端说了算
+    load(true)
+  } catch (e) {
+    showError(`改名失败：${e.message}`)
+  } finally {
+    busy.value = false
+  }
+}
+
 const dlgOpen = ref(false)
 const dlgKind = ref('')
 const dlgRow = ref(null)
@@ -469,6 +656,12 @@ async function doAction(typed) {
 .pad {
   padding: 20px;
 }
+/* 页头操作区：按钮靠右一行（窄屏自动换行），不放进下面那块筛选面板里 */
+.head-acts {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
 /* 第二行：名字（可截断）+ 角色徽标，名字太长时徽标不许被挤掉 */
 .aname {
   display: flex;
@@ -484,6 +677,11 @@ async function doAction(typed) {
   font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 改名钮：沿用全局 .copy-btn 的小图标钮尺寸，只补一条禁用态（复制钮从不禁用） */
+.name-edit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .kv .row .v.mono {
   font-family: var(--mono);

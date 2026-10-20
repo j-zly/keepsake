@@ -539,6 +539,23 @@ class Registry:
         self._be.update(aid, {"exclude_from_primary": flag})
         return True
 
+    def rename(self, agent_id: str, name: str) -> bool:
+        """改**备注名**（只改 `name` 一个字段）。返回**值是否真的变了**。
+
+        🔴 `status` / `role` / `credential_hash` / `credential_hint` / `meta`
+        **一律不碰**：改名是给人看的标签，不是治理动作 —— 它既不该放行一个
+        pending 代理，也不该作废一条已发的凭据。行不存在 ⇒ False（调用方 404）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        new_name = (name or "").strip()
+        if row["name"] == new_name:
+            return False
+        self._be.update(aid, {"name": new_name})
+        return True
+
     # ---- 凭据校验 ----------------------------------------------------
     def verify(self, agent_id: str, credential: str) -> Dict[str, Any]:
         """凭据校验 → `{ok, role, status, reason}`。**pending / revoked 一律拒**。

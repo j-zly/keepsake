@@ -1,7 +1,8 @@
 """代理注册表控制台端点测试（`keepsake_agent_registry` 第 1 张单）。
 
 覆盖：读面形状 / 一次性凭据响应 / revoke 与 role 的确认串口径 / exclude 开关 /
-未认证 401 / 未知代理 404 / 审计留痕（含被拒绝的写）/ 写面枚举。
+未认证 401 / 未知代理 404 / 审计留痕（含被拒绝的写）/ 写面枚举 /
+手工登记（pending / 重复 409 / 立即批准发一次性凭据）与改名（只动 name）。
 
 存储用 `dependency_overrides` 注入**临时 SQLite**（真 `ks_agent` 表，走
 `ensure_index` 建表那一路）—— 不连 Redis / PG / 生产库，也不碰主脑的 config。
@@ -22,12 +23,14 @@ from keepsake.api.deps import get_storage
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
-#: 四条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
+#: 六条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
 WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/approve",
     "/api/v1/agents/{agent_id}/revoke",
     "/api/v1/agents/{agent_id}/role",
     "/api/v1/agents/{agent_id}/exclude",
+    "/api/v1/agents",
+    "/api/v1/agents/{agent_id}/rename",
 )
 
 
@@ -231,6 +234,162 @@ def test_exclude不带confirm_400(env):
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
 
 
+# ---------------------------------------------------------------- 登记 / 改名
+
+def test_登记成功_落一行pending(env):
+    """登记 = 建一行 pending（**不批准就读写全拒**）：先有名字，再等批准。"""
+    client, reg = env
+    r = client.post("/api/v1/agents", headers=AUTH,
+                    json={"agent_id": "worker-2", "name": "第二台机器", "confirm": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["agent_id"] == "worker-2"
+    assert body["status"] == "pending"
+    row = reg.get("worker-2")
+    assert row["status"] == "pending" and row["name"] == "第二台机器"
+    assert row["role"] == "sub" and row["credential_hint"] == ""
+    # 列表里能看见它（前端登记完就是靠列表刷新看到的）
+    ids = [a["agent_id"] for a in client.get("/api/v1/agents", headers=AUTH).json()["items"]]
+    assert "worker-2" in ids
+
+
+def test_登记非法agent_id_400且不建行(env):
+    """🔴 agent_id 形态是硬闸：它进审计目录文件名与 Redis key，放开就是开口子。"""
+    client, reg = env
+    for bad in ["Bad_ID", "-lead", "a", "有中文", "w" * 41, "with space"]:
+        r = client.post("/api/v1/agents", headers=AUTH,
+                        json={"agent_id": bad, "confirm": True})
+        assert r.status_code == 400, bad
+        assert r.json()["detail"]["error"] == "bad_agent_id", bad
+        assert reg.get(bad) is None
+    # 合规的就该过（2 位与 40 位都合法）
+    assert client.post("/api/v1/agents", headers=AUTH,
+                        json={"agent_id": "ab", "confirm": True}).status_code == 200
+    assert client.post("/api/v1/agents", headers=AUTH,
+                        json={"agent_id": "w" * 40, "confirm": True}).status_code == 200
+
+
+def test_登记重复_409且不覆盖已有行(env):
+    """🔴 已存在（任何状态，含 revoked）⇒ 409，绝不静默覆盖。
+
+    覆盖会把管理员的吊销决定洗白（改了名看着像新代理，实际还是那条吊销的行）。
+    """
+    client, reg = env
+    _seed(reg, "worker-1")
+    reg.approve("worker-1")
+    reg.set_role("worker-1", "primary")
+    r = client.post("/api/v1/agents", headers=AUTH,
+                    json={"agent_id": "worker-1", "name": "顶替者", "confirm": True})
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "agent_exists"
+    row = reg.get("worker-1")
+    assert row["name"] == "worker-1" and row["status"] == "approved"
+    assert row["role"] == "primary" and row["credential_hint"] != ""
+
+
+def test_登记已吊销的代理_同样409(env):
+    """revoked 也算「已存在」—— 吊销是「停到人重新批准为止」，不是「注销」。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    reg.approve("worker-1")
+    reg.revoke("worker-1")
+    r = client.post("/api/v1/agents", headers=AUTH,
+                    json={"agent_id": "worker-1", "confirm": True})
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "agent_exists"
+    assert reg.get("worker-1")["status"] == "revoked"
+
+
+def test_登记不带confirm_400且不建行(env):
+    client, reg = env
+    r = client.post("/api/v1/agents", headers=AUTH, json={"agent_id": "worker-2"})
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
+    assert reg.get("worker-2") is None
+
+
+def test_登记并立即批准_一次性凭据且二次调用换发(env):
+    """`approve_now=true` ⇒ 登记 + 批准一次做完，明文只在这条响应里出现一次。"""
+    client, reg = env
+    r = client.post("/api/v1/agents", headers=AUTH,
+                    json={"agent_id": "worker-2", "name": "急用", "confirm": True,
+                          "approve_now": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "approved"
+    assert body["credential"].startswith(CREDENTIAL_PREFIX)
+    assert body["credential_hint"] == body["credential"][:8]
+    assert "只此一次" in body["note"]
+    assert reg.verify("worker-2", body["credential"])["ok"] is True
+    # 二次调用 = 再登记一次同名 ⇒ 409；重新发凭据走 approve（换一条新的）
+    again = client.post("/api/v1/agents", headers=AUTH,
+                        json={"agent_id": "worker-2", "confirm": True, "approve_now": True})
+    assert again.status_code == 409 and again.json()["detail"]["error"] == "agent_exists"
+    reissued = client.post("/api/v1/agents/worker-2/approve", headers=AUTH,
+                            json={"confirm": True}).json()["credential"]
+    assert reissued != body["credential"]
+    assert reg.verify("worker-2", body["credential"])["ok"] is False
+    assert reg.verify("worker-2", reissued)["ok"] is True
+
+
+def test_改名只动name_状态与凭据hint不变(env):
+    """🔴 改名是给人看的标签：status / role / 凭据 / meta 一律不碰。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    credential = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                             json={"confirm": True}).json()["credential"]
+    before = reg.get("worker-1")
+    r = client.post("/api/v1/agents/worker-1/rename", headers=AUTH,
+                    json={"name": "打包机一号", "confirm": True})
+    assert r.status_code == 200 and r.json()["name"] == "打包机一号"
+    after = reg.get("worker-1")
+    assert after["name"] == "打包机一号"
+    assert after["status"] == before["status"] == "approved"
+    assert after["role"] == before["role"]
+    assert after["credential_hint"] == before["credential_hint"]
+    assert after["meta"] == before["meta"]
+    # 凭据没被作废（改个名不该把正在服务的代理踢下线）
+    assert reg.verify("worker-1", credential)["ok"] is True
+
+
+def test_改名未知代理_404(env):
+    client, _ = env
+    r = client.post("/api/v1/agents/查无此代理/rename", headers=AUTH,
+                    json={"name": "新名字", "confirm": True})
+    assert r.status_code == 404 and r.json()["detail"]["error"] == "agent_not_found"
+
+
+def test_改名不带confirm_400且不改名(env):
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/rename", headers=AUTH, json={"name": "新名字"})
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
+    assert reg.get("worker-1")["name"] == "worker-1"
+
+
+def test_改名留空名_400(env):
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/rename", headers=AUTH,
+                    json={"name": "   ", "confirm": True})
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "bad_name"
+    assert reg.get("worker-1")["name"] == "worker-1"
+
+
+def test_登记与改名都留审计且不含凭据明文(env, tmp_path):
+    """🔴 凭据纪律：登记 + 立即批准这一路，审计里也不许出现明文。"""
+    client, reg = env
+    credential = client.post("/api/v1/agents", headers=AUTH,
+                             json={"agent_id": "worker-2", "confirm": True,
+                                   "approve_now": True}).json()["credential"]
+    client.post("/api/v1/agents/worker-2/rename", headers=AUTH,
+                json={"name": "改名了", "confirm": True})
+    client.post("/api/v1/agents", headers=AUTH, json={"agent_id": "worker-2"})
+    lines = _audit_lines(tmp_path)
+    actions = {(l["action"], l["ok"]) for l in lines}
+    assert ("agents.register", True) in actions
+    assert ("agents.rename", True) in actions
+    assert ("agents.register", False) in actions        # 被拒绝的写也要留痕
+    assert credential not in json.dumps(lines, ensure_ascii=False)
+
 # ------------------------------------------------- 现役 primary 的三道闸（409）
 
 def _primary(reg: Registry, agent_id: str = "main") -> str:
@@ -380,13 +539,20 @@ def test_写前备份落盘(env, tmp_path):
 
 # ---------------------------------------------------------------- 写面枚举
 
-def test_写面枚举_四条agents写端点都在(env):
-    """与 tests/api/test_api_readonly.py 的白名单互为反面：少挂一条依赖就红。"""
+def test_写面枚举_六条agents写端点都在(env):
+    """与 tests/api/test_api_readonly.py 的白名单互为反面：少挂一条依赖就红。
+
+    （代理治理原有四条 approve / revoke / role / exclude，本次加登记与改名两条。）
+    """
     app = create_app()
     paths = {getattr(r, "path", "") for r in app.routes}
     assert set(WRITE_PATHS) <= paths
     for p in WRITE_PATHS:
-        route = next(r for r in app.routes if getattr(r, "path", "") == p)
+        # 🔴 按 **方法** 挑路由：`/api/v1/agents` 同时挂着 GET（列表）与 POST（登记），
+        # 只按 path 挑会挑到先注册的那条 GET，判据就落在错误的路由上了。
+        route = next(r for r in app.routes
+                     if getattr(r, "path", "") == p
+                     and "POST" in getattr(r, "methods", set()))
         names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
         assert any("require_session" in n for n in names), p
         assert any("write_guard" in n for n in names), p

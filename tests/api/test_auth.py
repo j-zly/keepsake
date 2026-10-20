@@ -701,7 +701,8 @@ def test_写面仍是二十五条业务写端点加四条auth_POST():
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
         "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
         "/api/v1/crons/{job_id}/edit",
-        "/api/v1/agents/{agent_id}/approve", "/api/v1/agents/{agent_id}/revoke",
+        "/api/v1/agents", "/api/v1/agents/{agent_id}/approve",
+        "/api/v1/agents/{agent_id}/rename", "/api/v1/agents/{agent_id}/revoke",
         "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
     }, sorted(write)
 

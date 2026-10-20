@@ -25,7 +25,7 @@ test('侧栏：看板在第一组「总览」，共三组，八个入口', () =>
   )
   assert.deepEqual(groups[0].items, ['看板'])
   // 记忆组：业务页在前、审核收尾（用户指定「业务页在上、审核在下」，与知识库组同口径）
-  assert.deepEqual(groups[1].items, ['常驻层', '记忆条目', '记忆维护', '代理治理', '审核'])
+  assert.deepEqual(groups[1].items, ['常驻层', '记忆条目', '记忆维护', '代理治理（登记/审核）', '审核'])
   // 知识库组：知识库浏览在前、审核在后（用户指定顺序，2026-10-18）
   assert.deepEqual(groups[2].items, ['知识库', '审核'])
   assert.equal(groups.flatMap((g) => g.items).length, 8)
