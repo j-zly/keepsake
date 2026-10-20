@@ -1792,3 +1792,61 @@ def test_maintenance_modules_are_backend_neutral_ast():
         backends = {"storage", "storage_pg", "storage_sqlite", "redis"} & {
             m.split(".")[-1] for m in imported}
         assert not backends, f"{mod}.py 直接 import 了具体后端 {backends} ⇒ 存在后端分叉"
+
+
+# ---------------------------------------------------------------------------
+# 归属级联（reassign_agent）—— 改 agent_id 时把记忆的归属标签一起搬走
+# ---------------------------------------------------------------------------
+
+def _hits(store: SqliteStorage, query: str, tag: str = "") -> List[str]:
+    """BM25 召回的 key 列表（`is_primary=True` = 主代理视角，不带 agent 隔离）。"""
+    return [f["_key"] for f in store.search_bm25(query, tag_filter=tag, is_primary=True)]
+
+
+def test_reassign_agent_搬归属并重算索引(store):
+    """🔴 归属只有一个落库形态（`tags` 里的 `agent:<id>`），搬它 = 换这个词。
+
+    🔴 **索引必须跟着重算**：只改 tags 不重算 content_tsv / FTS，库里写着新归属、
+    BM25 还按旧标签召回 —— 不报错、不空召回，只是召回旧归属（本仓库已知坑）。
+    """
+    store.store("部署流程要点：证书续签", tags="agent:old-agent", category="ops")
+    key = store.scan_fragment_keys()[1][0]
+    assert store.get_fragment(key)["tags"] == "agent:old-agent"
+    assert _hits(store, "old-agent", "agent:old-agent") == [key]
+
+    assert store.reassign_agent("old-agent", "new-agent") == 1
+    frag = store.get_fragment(key)
+    assert frag["tags"] == "agent:new-agent"
+    # 归属召回：新 tag 命中、旧 tag 落空
+    assert _hits(store, "new-agent", "agent:new-agent") == [key]
+    assert _hits(store, "new-agent", "agent:old-agent") == []
+    # 🔴 索引重算：旧词召不回、新词召得回
+    assert _hits(store, "old") == []
+    assert _hits(store, "new") == [key]
+
+
+def test_reassign_agent_不误伤别的代理(store):
+    """🔴 `agent:win` 与 `agent:win-desktop` 是两个代理：改前者不许动后者。"""
+    store.store("打包机甲的部署要点", tags="agent:win", category="ops")
+    store.store("打包机乙的部署要点", tags="agent:win-desktop", category="ops")
+    keys = store.scan_fragment_keys()[1]
+    assert store.reassign_agent("win", "win-new") == 1
+    assert sorted(store.get_fragment(k)["tags"] for k in keys) == [
+        "agent:win-desktop", "agent:win-new"]
+
+
+def test_reassign_agent_历史行consumed也搬(store):
+    """🔴 consumed / superseded 的历史行**一起搬**（归属是事实，不是活跃状态）。"""
+    store.store("一条已被合并吞掉的记忆", tags="agent:old-agent",
+                fragment_type="consumed")
+    key = store.scan_fragment_keys()[1][0]
+    assert store.reassign_agent("old-agent", "new-agent") == 1
+    frag = store.get_fragment(key)
+    assert frag["tags"] == "agent:new-agent"
+    assert frag["fragment_type"] == "consumed"
+
+
+def test_reassign_agent_没有归属或同串时搬不动(store):
+    store.store("没有归属标签的记忆", tags="shared", category="ops")
+    assert store.reassign_agent("old-agent", "new-agent") == 0
+    assert store.reassign_agent("same-id", "same-id") == 0

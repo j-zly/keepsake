@@ -516,6 +516,39 @@ def sanitize_reserved_tags(raw: Any, forbid: Tuple[str, ...] = ()) -> Tuple[str,
     return ",".join(kept), touched
 
 
+def agent_tag(agent_id: str) -> str:
+    """代理归属标签（`agent:<id>`）—— 归属的**唯一落库形态**。
+
+    🔴 碎片的归属**没有独立列**：`ks_fragment` 里没有 `agent_id` 列，归属就是
+    `tags` 里的这一个词（`store()` 按 `_agent_id` 注入，见各后端实现）。
+    所以「改 agent_id」在存储层的全部含义 = **把这个词换掉**。
+    """
+    return f"{RESERVED_TAG_PREFIX}{agent_id or ''}"
+
+
+def replace_agent_tag(tags: str, old_id: str, new_id: str) -> str:
+    """`tags` 里的 `agent:<old>` 精确换成 `agent:<new>`；没命中就原样返回。
+
+    🔴 为什么必须按**标签边界**换、不能 `str.replace`：标签之间用逗号分隔，
+    而 `agent:win` 是 `agent:win-desktop` 的前缀 ⇒ 子串替换会把**另一个代理**
+    的归属也改掉（两个代理的记忆互相污染，事后从库里看不出来）。
+    判据与 `tag_match_sql` 一致：**逗号边界上的完整标签相等**。
+
+    ponytail: 只换**首个精确相等**的那个标签（归属标签本来就只该有一个），
+    不做「把所有 agent: 前缀的标签都重写一遍」—— 那是另一个动作
+    （把一条记忆改归别人），语义不同，不能混在「改 id」里。
+    """
+    old_tag = agent_tag(old_id)
+    new_tag = agent_tag(new_id)
+    if not old_id or not new_id or old_tag == new_tag:
+        return tags or ""
+    parts = [t.strip() for t in (tags or "").split(",")]
+    if old_tag not in parts:
+        return tags or ""
+    parts[parts.index(old_tag)] = new_tag
+    return ",".join(parts)
+
+
 def fragment_key_for(text: str) -> str:
     """记忆条目 key —— 三后端 `store()` 的**同一套算法**（sha256 前 12 位）。
 

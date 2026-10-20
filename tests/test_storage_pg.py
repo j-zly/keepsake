@@ -827,3 +827,57 @@ def test_search_result_shape_matches_redis_contract(pg_search, knn_selfcheck):
     )
     assert storage_mod.RedisStorage is RedisStorage
     assert keys["数据库迁移方案"]   # corpus 确实建出来了
+
+
+def test_reassign_agent_搬归属并重算索引(pg):
+    """🔴 归属只有一个落库形态（`tags` 里的 `agent:<id>`），搬它 = 换这个词。
+
+    🔴 **索引必须跟着重算**（PG 侧是 content_tsv 的 B 权重含 tags）：
+    只改 tags 不重算 ⇒ 库里写着新归属、BM25 还按旧标签召回。
+    """
+    text = _text("PG归属级联")
+    assert pg.store(text, tags="agent:old-agent", category="pref") is True
+    key = pg._fragment_key_for(text)      # noqa: SLF001 — 与 Redis 同算法
+    _WROTE_KEYS.append(key)
+    assert pg.get_fragment(key)["tags"] == "agent:old-agent"
+
+    assert pg.reassign_agent("old-agent", "new-agent") == 1
+    frag = pg.get_fragment(key)
+    assert frag["tags"] == "agent:new-agent"
+    # 归属召回：新 tag 命中、旧 tag 落空
+    new_hits = [f["_key"] for f in pg.search_bm25(
+        "PG归属级联", tag_filter="agent:new-agent", is_primary=True)]
+    old_hits = [f["_key"] for f in pg.search_bm25(
+        "PG归属级联", tag_filter="agent:old-agent", is_primary=True)]
+    assert key in new_hits
+    assert key not in old_hits
+    # 🔴 索引重算的直证：content_tsv 里不再有旧归属的词元，只有新的
+    with pg._tx() as cur:                 # noqa: SLF001 — 测试内直读索引列
+        cur.execute("SELECT content_tsv::text FROM ks_fragment WHERE key = %s", (key,))
+        tsv = cur.fetchone()[0] or ""
+    assert "old" not in tsv and "new" in tsv
+
+
+def test_reassign_agent_不误伤别的代理(pg):
+    """🔴 `agent:win` 与 `agent:win-desktop` 是两个代理：改前者不许动后者。"""
+    t1, t2 = _text("PG归属甲"), _text("PG归属乙")
+    pg.store(t1, tags="agent:win")
+    pg.store(t2, tags="agent:win-desktop")
+    k1, k2 = pg._fragment_key_for(t1), pg._fragment_key_for(t2)   # noqa: SLF001
+    _WROTE_KEYS.extend([k1, k2])
+
+    assert pg.reassign_agent("win", "win-new") == 1
+    assert pg.get_fragment(k1)["tags"] == "agent:win-new"
+    assert pg.get_fragment(k2)["tags"] == "agent:win-desktop"
+
+
+def test_reassign_agent_历史行consumed也搬(pg):
+    """🔴 consumed / superseded 的历史行**一起搬**（归属是事实，不是活跃状态）。"""
+    text = _text("PG归属历史行")
+    pg.store(text, tags="agent:old-agent", fragment_type="consumed")
+    key = pg._fragment_key_for(text)      # noqa: SLF001
+    _WROTE_KEYS.append(key)
+    assert pg.reassign_agent("old-agent", "new-agent") == 1
+    frag = pg.get_fragment(key)
+    assert frag["tags"] == "agent:new-agent"
+    assert frag["fragment_type"] == "consumed"

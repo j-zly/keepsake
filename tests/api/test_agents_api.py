@@ -2,7 +2,8 @@
 
 覆盖：读面形状 / 一次性凭据响应 / revoke 与 role 的确认串口径 / exclude 开关 /
 未认证 401 / 未知代理 404 / 审计留痕（含被拒绝的写）/ 写面枚举 /
-手工登记（pending / 重复 409 / 立即批准发一次性凭据）与改名（只动 name）。
+手工登记（pending / 重复 409 / 立即批准发一次性凭据）、改名（只动 name）
+与改 id（换主键 + 归属级联 + 凭据不换用 / 唯一性 409 / primary 拒改 400）。
 
 存储用 `dependency_overrides` 注入**临时 SQLite**（真 `ks_agent` 表，走
 `ensure_index` 建表那一路）—— 不连 Redis / PG / 生产库，也不碰主脑的 config。
@@ -23,7 +24,7 @@ from keepsake.api.deps import get_storage
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
-#: 六条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
+#: 七条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
 WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/approve",
     "/api/v1/agents/{agent_id}/revoke",
@@ -31,6 +32,7 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/exclude",
     "/api/v1/agents",
     "/api/v1/agents/{agent_id}/rename",
+    "/api/v1/agents/{agent_id}/set_id",
 )
 
 
@@ -539,10 +541,11 @@ def test_写前备份落盘(env, tmp_path):
 
 # ---------------------------------------------------------------- 写面枚举
 
-def test_写面枚举_六条agents写端点都在(env):
+def test_写面枚举_七条agents写端点都在(env):
     """与 tests/api/test_api_readonly.py 的白名单互为反面：少挂一条依赖就红。
 
-    （代理治理原有四条 approve / revoke / role / exclude，本次加登记与改名两条。）
+    （代理治理原有四条 approve / revoke / role / exclude，登记与改名两条，
+    本次再加改 id 一条 —— 换主键 + 记忆归属级联。）
     """
     app = create_app()
     paths = {getattr(r, "path", "") for r in app.routes}
@@ -556,3 +559,223 @@ def test_写面枚举_六条agents写端点都在(env):
         names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
         assert any("require_session" in n for n in names), p
         assert any("write_guard" in n for n in names), p
+
+# ---------------------------------------------------------------- 改 id（换主键 + 归属级联）
+
+def _storage(client) -> Any:
+    """从 dependency_overrides 拿回存储实例（用例要直接种记忆）。"""
+    return client.app.dependency_overrides[get_storage]()
+
+
+def _hits(storage: Any, query: str, tag: str = "") -> List[str]:
+    """BM25 召回的 key 列表（`is_primary=True` = 主代理视角，不带 agent 隔离）。"""
+    return [f["_key"] for f in storage.search_bm25(query, tag_filter=tag, is_primary=True)]
+
+
+def test_set_id成功_凭据不换用且反查是新id(env):
+    """🔴 改 id **不作废凭据**：客户端身份由凭据反查（`verify_any`），凭据不动 ⇒
+    已发出去的凭据继续有效，而且反查出来的必须是**新 id**（否则客户端拿到旧身份）。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    credential = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                             json={"confirm": True}).json()["credential"]
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": "worker-2", "confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["agent_id"] == "worker-2"
+    assert body["moved_memories"] == 0
+    # 旧 id 没了、新 id 在（整行搬过去：状态 / 角色 / 计数都还在）
+    assert reg.get("worker-1") is None
+    after = reg.get("worker-2")
+    assert after["status"] == "approved" and after["role"] == "sub"
+    # 凭据不换：旧凭据还能用，且 verify_any 反查出来的是新 id
+    res = reg.verify_any(credential)
+    assert res["ok"] is True and res["agent_id"] == "worker-2"
+    assert reg.verify("worker-2", credential)["ok"] is True
+    assert reg.verify("worker-1", credential)["ok"] is False
+    # 列表里新 id 出现、旧 id 消失
+    ids = [a["agent_id"] for a in client.get("/api/v1/agents", headers=AUTH).json()["items"]]
+    assert "worker-2" in ids and "worker-1" not in ids
+
+
+def test_set_id新id已存在_409且不覆盖(env):
+    """🔴 唯一性：新 id 已被占用 ⇒ 409，**绝不覆盖**（覆盖会洗白别人的行）。"""
+    client, reg = env
+    _seed(reg, "worker-1", "worker-2")
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": "worker-2", "confirm": True})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "agent_exists"
+    # 人话文案要点名冲突 + 给下一步（唯一性反馈要看得见）
+    assert "worker-2" in detail["message"]
+    # 两个行都还在，谁也没被动
+    assert reg.get("worker-1") is not None and reg.get("worker-2") is not None
+
+
+def test_set_id现役primary拒改_400(env):
+    """🔴 primary 的 id 不许改：主脑的引导配置绑在这个 id 上，改了等于换了个主代理。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    _primary(reg)
+    r = client.post("/api/v1/agents/main/set_id", headers=AUTH,
+                    json={"new_id": "main-2", "confirm": True})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == "primary_id_locked"
+    assert "主代理" in r.json()["detail"]["message"]
+    assert reg.get("main") is not None and reg.get("main-2") is None
+
+
+@pytest.mark.parametrize("bad", ["Bad_ID", "-lead", "a", "有中文", "w" * 41, "with space"])
+def test_set_id非法新id_400(env, bad):
+    """🔴 新 id 与登记同一套形态闸（它会进审计目录文件名与 Redis key）。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": bad, "confirm": True})
+    assert r.status_code == 400, bad
+    assert r.json()["detail"]["error"] == "bad_agent_id", bad
+    assert reg.get("worker-1") is not None
+
+
+def test_set_id不带confirm_400且不改(env):
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH, json={"new_id": "worker-2"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "confirm_required"
+    assert reg.get("worker-1") is not None and reg.get("worker-2") is None
+
+
+def test_set_id未知代理_404(env):
+    client, _ = env
+    r = client.post("/api/v1/agents/查无此代理/set_id", headers=AUTH,
+                    json={"new_id": "worker-9", "confirm": True})
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "agent_not_found"
+
+
+def test_set_id新旧同串_400(env):
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": "worker-1", "confirm": True})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "same_agent_id"
+    assert reg.get("worker-1") is not None
+
+
+def test_set_id级联搬归属与索引(env):
+    """🔴 归属级联 + **索引必须跟着重算**（本仓库已知坑）。
+
+    种一条 `tags=agent:old-agent` 的记忆 → 改 id 后：
+      ① 归属标签换成 `agent:new-agent`；
+      ② 按**新 tag** 召得回、按**旧 tag** 召不回；
+      ③ 🔴 按**旧 id 的词**召不回、按新 id 的词召得回 ——
+         这条钉的是 content_tsv 重算：只改 tags 不重算索引，库里写着新归属、
+         BM25 还按旧标签召回（不报错、不空召回，只是召回旧归属）。
+    """
+    client, reg = env
+    storage = _storage(client)
+    _seed(reg, "old-agent")
+    storage.store("部署流程要点：证书续签", tags="agent:old-agent", category="ops")
+    key = storage.scan_fragment_keys()[1][0]
+    assert storage.get_fragment(key)["tags"] == "agent:old-agent"
+    assert _hits(storage, "old-agent", "agent:old-agent") == [key]
+
+    r = client.post("/api/v1/agents/old-agent/set_id", headers=AUTH,
+                    json={"new_id": "new-agent", "confirm": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["moved_memories"] == 1
+    assert storage.get_fragment(key)["tags"] == "agent:new-agent"
+    # 归属召回：新 tag 命中、旧 tag 落空
+    assert _hits(storage, "new-agent", "agent:new-agent") == [key]
+    assert _hits(storage, "new-agent", "agent:old-agent") == []
+    # 🔴 索引重算：旧词召不回、新词召得回
+    assert _hits(storage, "old") == []
+    assert _hits(storage, "new") == [key]
+
+
+def test_set_id级联_不误伤别的代理(env):
+    """🔴 `agent:win` 与 `agent:win-desktop` 是两个代理：改前者不许动后者。"""
+    client, reg = env
+    storage = _storage(client)
+    _seed(reg, "win", "win-desktop")
+    storage.store("打包机甲的部署要点", tags="agent:win", category="ops")
+    storage.store("打包机乙的部署要点", tags="agent:win-desktop", category="ops")
+    keys = storage.scan_fragment_keys()[1]
+    r = client.post("/api/v1/agents/win/set_id", headers=AUTH,
+                    json={"new_id": "win-new", "confirm": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["moved_memories"] == 1
+    tags = sorted(storage.get_fragment(k)["tags"] for k in keys)
+    assert tags == ["agent:win-desktop", "agent:win-new"]
+
+
+def test_set_id级联_历史行consumed也搬(env):
+    """🔴 consumed / superseded 的历史行**一起搬**（归属是事实，不是活跃状态）。"""
+    client, reg = env
+    storage = _storage(client)
+    _seed(reg, "old-agent")
+    storage.store("一条已被合并吞掉的记忆", tags="agent:old-agent",
+                  fragment_type="consumed")
+    key = storage.scan_fragment_keys()[1][0]
+    r = client.post("/api/v1/agents/old-agent/set_id", headers=AUTH,
+                    json={"new_id": "new-agent", "confirm": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["moved_memories"] == 1
+    frag = storage.get_fragment(key)
+    assert frag["tags"] == "agent:new-agent"
+    assert frag["fragment_type"] == "consumed"      # 历史属性不动，只搬归属
+
+
+def test_set_id留审计且写前有备份(env, tmp_path):
+    """改 id 不可逆到「回滚靠记忆」 ⇒ 改前必须有整份注册表快照 + 审计一行。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": "worker-2", "confirm": True})
+    assert r.status_code == 200
+    backup = r.json()["backup"]
+    saved = json.loads(open(backup, encoding="utf-8").read())
+    assert {a["agent_id"] for a in saved} == {"worker-1"}
+    lines = _audit_lines(tmp_path)
+    assert ("agents.set_id", True) in {(l["action"], l["ok"]) for l in lines}
+
+
+def test_改名同名_回包点名但不拦(env):
+    """备注名只是给人看的标签：撞名**不拦**（不改治理语义），但回包要点名。"""
+    client, reg = env
+    _seed(reg, "worker-1", "worker-2")
+    client.post("/api/v1/agents/worker-1/rename", headers=AUTH,
+                json={"name": "打包机一号", "confirm": True})
+    body = client.post("/api/v1/agents/worker-2/rename", headers=AUTH,
+                       json={"name": "打包机一号", "confirm": True}).json()
+    assert body["name"] == "打包机一号"
+    assert "worker-1" in body["note"]          # 点名是谁也占了这个名字
+    assert reg.get("worker-2")["name"] == "打包机一号"
+
+
+def test_set_id_级联失败仍报改成功但说清楚(env, monkeypatch):
+    """🔴 换 id 已生效（主键已换、不可回滚）⇒ 级联失败**不能报 500**。
+
+    报 500 会让操作者以为没改、于是重试（重试只会拿到「代理不存在」，更迷惑）。
+    正确姿态：换 id 成功就 200，把没搬动的那部分**说清楚**。
+    """
+    client, reg = env
+    storage = _storage(client)
+    _seed(reg, "worker-1")
+
+    def _boom(old_id, new_id):
+        raise RuntimeError("存储层炸了")
+
+    monkeypatch.setattr(storage, "reassign_agent", _boom)
+    r = client.post("/api/v1/agents/worker-1/set_id", headers=AUTH,
+                    json={"new_id": "worker-2", "confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["agent_id"] == "worker-2"
+    assert body["moved_memories"] == 0
+    assert "归属" in body["note"]              # 说清楚哪一步没成
+    assert reg.get("worker-2") is not None     # 换 id 确实生效了

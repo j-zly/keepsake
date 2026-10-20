@@ -110,6 +110,8 @@ from . import shared as storage_shared
 from .shared import (
     DECAY_HALF_DAYS,
     DENOISE_STOPWORDS,
+    agent_tag,
+    replace_agent_tag,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
     HOT_TOPIC_BOOST,
@@ -1427,6 +1429,55 @@ class SqliteStorage(StorageBase):
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: update_fragment_fields(%s) failed: %s", key, e)
             return False
+
+    def reassign_agent(self, old_id: str, new_id: str) -> int:
+        """把归属 `agent:<old>` 的记忆整批搬到 `agent:<new>`（返回搬动行数）。
+
+        🔴 **归属只有一个落库形态**：`ks_fragment` 没有 `agent_id` 列，归属就是
+        `tags` 里的 `agent:<id>` 那个词 ⇒ 「改 id」在存储层 = 换这个词
+        （判据见 `storage_shared.replace_agent_tag`：逗号边界精确相等）。
+
+        🔴 **tags 变了必须同事务重算 `content_tsv` 并同步 FTS5**：本后端有**两份**
+        索引（`content_tsv` 列 + `ks_fragment_fts` 虚表），只改 tags 不重算 =
+        「库里新归属、召回还是旧标签」—— 不报错、不空召回，只是召回旧归属。
+
+        consumed / superseded 的**历史行一起搬**（归属是事实，不是活跃状态）。
+
+        ponytail: 一条 UPDATE 的形状（逐行参数不同 ⇒ executemany），因为 FTS5
+        虚表必须逐行重写（没有 ON CONFLICT upsert）。
+        """
+        old_tag = agent_tag(old_id)
+        new_tag = agent_tag(new_id)
+        if not old_id or not new_id or old_id == new_id:
+            return 0
+        clause, args = tag_match_sql("tags", [old_tag], "?")
+        moved = 0
+        try:
+            with self._write() as cur:
+                cur.execute(
+                    "SELECT key, content, COALESCE(entities, ''), COALESCE(tags, '') "
+                    f"FROM ks_fragment WHERE {clause}",
+                    args,
+                )
+                rows = cur.fetchall()
+                for key, content, entities, tags in rows:
+                    new_tags = replace_agent_tag(tags, old_id, new_id)
+                    if new_tags == tags:
+                        continue
+                    tokens = self._fts_tokens(content, entities, new_tags)
+                    cur.execute(
+                        "UPDATE ks_fragment SET tags = ?, content_tsv = ? WHERE key = ?",
+                        (new_tags, tokens, key),
+                    )
+                    # 🔴 FTS 虚表同步（先删后插 —— FTS5 没有 ON CONFLICT）
+                    self._fts_write(cur, key, tokens)
+                    moved += 1
+        except StorageNotReadyError:
+            raise
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: reassign_agent failed: %s", e)
+            return 0
+        return moved
 
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量硬删 + 时间线清理（碎片没了，时间线成员就是死引用）。

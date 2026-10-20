@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict
 
@@ -43,6 +44,9 @@ from ..schemas import AgentItem, AgentList, AgentActionBody, AgentRoleBody
 from .ops import _need_flag, _need_text, _reject, write_guard
 
 router = APIRouter(tags=["agents"])
+
+#: 日志名（与 audit 同款命名：keepsake.api.<模块>）。
+logger = logging.getLogger("keepsake.api.agents")
 
 #: 吊销的确认串 = agent_id **前 8 位**（与 ops 的「key 末 8 位」同一道闸的口径：
 #: 手输一段记认得到的前缀，错一个代理不至于按下去）。前端从列表里拿 agent_id 自行截取。
@@ -84,6 +88,17 @@ class AgentRenameBody(BaseModel):
     confirm: Any = False
 
 
+class AgentSetIdBody(BaseModel):
+    """`POST /api/v1/agents/{agent_id}/set_id` 的请求体：改**代理 id**本身。
+
+    `new_id` 走与登记同一套形态闸（`_valid_agent_id`）；`confirm` 是显式二次确认
+    （与本文件其余写端点同一道闸）。
+    """
+
+    new_id: str = Field("", description="新 agent_id：小写字母/数字开头，可含连字符，2~40 位")
+    confirm: Any = False
+
+
 def _valid_agent_id(agent_id: str) -> bool:
     """agent_id 是否合规（口径单点：前后端各写一份正则就会漂）。
 
@@ -121,6 +136,21 @@ def _backup(action: str, rows: Any) -> str:
 #: 试图动现役 primary 时的回显（前端提示与 409 的 detail 共用这一句口径）。
 PRIMARY_LOCKED_NOTE = (
     "现役主代理不可直接吊销/降级/排除 —— 先把另一个代理设为主代理，再回来动它。"
+)
+
+#: 改**主代理 id** 时的回显（400 的 detail 共用这一句口径）。
+#: 🔴 与上面那句不是一回事：吊销/降级/排除是「对 primary 这个角色的限制」，
+#: 改 id 是「**身份本身**不能换」—— 主脑的引导配置（`agent_id`）就写死在
+#: 客户端侧，改了 id 等于让主脑拿着旧 id 上门，直接被写闸拒在外面。
+PRIMARY_ID_LOCKED_NOTE = (
+    "现役主代理的 id 不能改 —— 主脑的引导配置就绑在这个 id 上，改了等于换了个主代理。"
+    "先把另一个代理设为主代理，再回来改这个 id。"
+)
+
+#: 新 id 已被占用时的回显（409 的 detail 共用这一句口径）：**点名**是谁占了，
+#: 并给出下一步（换一个 / 先去列表里找它）。
+AGENT_EXISTS_NOTE = (
+    "已经有代理叫 {new_id} 了 —— 换一个别的 id，或者先去列表里找找它是不是已经改过名了。"
 )
 
 
@@ -325,6 +355,73 @@ def register_agent(body: AgentRegisterBody,
             "note": CREDENTIAL_ONCE_NOTE, "backup": backup}
 
 
+@router.post("/api/v1/agents/{agent_id}/set_id",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_id(agent_id: str, body: AgentSetIdBody,
+                 storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """改**代理 id 本身**（换主键 + 归属级联）。
+
+    改 id 不作废凭据：客户端身份由凭据反查（`verify_any`），凭据不动 ⇒
+    已发出去的凭据继续有效，**http 客户端不需要重配**。但记忆归属要跟着搬：
+    碎片的归属是 `tags` 里的 `agent:<id>` 那个词，搬完还得重算 BM25 索引
+    （`reassign_agent`），否则库里写着新归属、检索还按旧标签召回。
+
+    🔴 **顺序**（每一步都有明确的人话理由，不让人猜是哪一条挡的）：
+      格式校验 → 旧行存在(404) → 现役 primary 拒改(400) → 新 id 已被占用(409)
+      → 显式确认 → 备份整份注册表 → 换主键 → 归属级联。
+    唯一性的**最终判定在 `Registry.set_id` 里**（路由层的预检只算体验）。
+    """
+    action = "agents.set_id"
+    registry = _registry(storage)
+    old_id = (agent_id or "").strip()
+    new_id = (body.new_id or "").strip()
+    # 🔴 形态先判（不碰存储）：新 id 会进审计目录的文件名与 Redis key。
+    if not _valid_agent_id(new_id):
+        _reject(400, "bad_agent_id",
+                f"新 agent_id 不合规：只允许小写字母、数字与连字符，"
+                f"且必须以字母或数字开头、总长 2~40 位（收到 {new_id!r}）",
+                action, old_id)
+    if new_id == old_id:
+        _reject(400, "same_agent_id",
+                "新 id 与当前 id 一样 —— 什么也没改，换一个吧", action, old_id)
+    _need_agent(registry, old_id, action)
+    row = registry.get(old_id) or {}
+    if row.get("role") == ROLE_PRIMARY:
+        _reject(400, "primary_id_locked", PRIMARY_ID_LOCKED_NOTE, action, old_id)
+    if registry.get(new_id):
+        _reject(409, "agent_exists", AGENT_EXISTS_NOTE.format(new_id=new_id),
+                action, old_id)
+    _need_flag(body.confirm, action, old_id, '必须显式传 {"confirm": true} 才改 id')
+    # 改前备份**整份注册表**：换的是主键，快照要能一眼看出「谁换成了谁」。
+    backup = _backup("set_id", registry.list_agents())
+    if not registry.set_id(old_id, new_id):
+        # 权威判定在 Registry.set_id 里（并发下它才是真的）⇒ 这里只补区分文案。
+        if registry.get(new_id):
+            _reject(409, "agent_exists", AGENT_EXISTS_NOTE.format(new_id=new_id),
+                    action, old_id)
+        if not registry.get(old_id):
+            _reject(404, "agent_not_found", f"注册表里没有这个代理：{old_id}",
+                    action, old_id)
+        _reject(409, "agent_race", "换 id 时撞上并发改动，请重试", action, old_id)
+    # 归属级联：碎片的 `agent:<old>` 词换成 `agent:<new>`，并重算检索索引。
+    # 🔴 换 id **已经生效**（主键已换、不可回滚），所以级联失败**不能把它说成失败**：
+    # 报 500 会让操作者以为没改、于是重试（重试只会拿到「代理不存在」，更迷惑）。
+    # 正确姿态：换 id 成功就 200，把没搬动的那部分**说清楚**（note）。
+    note = ""
+    try:
+        moved = int(storage.reassign_agent(old_id, new_id) or 0)
+    except Exception as e:      # noqa: BLE001 —— 换 id 已生效，不许把它说成失败
+        logger.warning("keepsake: 代理 %s → %s 换 id 成功，但记忆归属没搬动（%s: %s）",
+                       old_id, new_id, type(e).__name__, e)
+        moved = 0
+        note = ("代理 id 已改成功，但历史记忆的归属没能一起搬（存储层报错）"
+                "—— 请重跑一次归属搬迁。")
+    audit.record(action, old_id, ok=True,
+                 reason=f"agent_id {old_id} -> {new_id}; moved={moved}; backup={backup}")
+    return {"ok": True, "agent_id": new_id, "moved_memories": moved,
+            "backup": backup, "note": note}
+
+
 @router.post("/api/v1/agents/{agent_id}/rename",
              dependencies=[Depends(require_session), Depends(write_guard)])
 def rename_agent(agent_id: str, body: AgentRenameBody,
@@ -349,5 +446,15 @@ def rename_agent(agent_id: str, body: AgentRenameBody,
     audit.record(action, agent_id, ok=True,
                  reason=f"name={name} (changed={changed}); backup={backup}")
     after = registry.get(agent_id) or {}
+    # 🔴 唯一性反馈：备注名**只是给人看的标签，不拦**（拦了就是改治理语义），
+    # 但同名要在回包里**点名** —— 否则列表里两个一样的名字，操作者根本分不清
+    # 自己刚改的是哪一个。身份唯一性由 `agent_id` 兜底（改名端点不碰它）。
+    twins = [a["agent_id"] for a in registry.list_agents()
+             if a["agent_id"] != agent_id and a.get("name") == name]
+    note = ""
+    if twins:
+        note = (f"另一个代理的备注名也叫「{name}」（{', '.join(twins)}）—— "
+                f"备注名只是给人看的，不影响身份；要分清就改其中一个。")
     return {"ok": True, "agent_id": agent_id, "name": after.get("name", name),
-            "status": after.get("status", ""), "changed": changed, "backup": backup}
+            "status": after.get("status", ""), "changed": changed, "backup": backup,
+            "note": note}

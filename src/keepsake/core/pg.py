@@ -89,6 +89,8 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     FRAGMENT_FIELDS,
     SEARCH_FIELDS,
     CHAIN_HEAD_SQL,
+    agent_tag,
+    replace_agent_tag,
     CONTRACT_V2_COLUMNS,
     CONTRACT_V2_MIGRATION_HINT,
     VOID_KEY,
@@ -3108,6 +3110,62 @@ class PgStorage(StorageBase):
         self._snap_drop("n_avgdl", "dfs")
         now = self.get_fragment(key) or {}
         return str(now.get("content", "")) == content
+
+    @with_deadlock_retry
+    def reassign_agent(self, old_id: str, new_id: str) -> int:
+        """把归属 `agent:<old>` 的记忆整批搬到 `agent:<new>`（返回搬动行数）。
+
+        🔴 **归属只有一个落库形态**：`ks_fragment` 没有 `agent_id` 列，归属就是
+        `tags` 里的 `agent:<id>` 那个词（`store()` 按 `_agent_id` 注入）⇒
+        「改 id」在存储层的全部含义 = **把这个词换掉**（判据见
+        `storage_shared.replace_agent_tag`：逗号边界精确相等，
+        `agent:win` 不会误伤 `agent:win-desktop`）。
+
+        🔴 **tags 变了必须同事务重算 `content_tsv`**（B 权重含 tags）：不重算就是
+        「库里写着新归属、BM25 还按旧标签召回」—— 不报错、不空召回，只是**召回
+        旧归属**，这是本仓库已知坑。拼法与分词复用 `tsv_expr_params`
+        （= `update_fragment_content` 的同一份函数），不另写一份 to_tsvector。
+
+        consumed / superseded 的**历史行一起搬**（归属是事实，不是活跃状态）；
+        `ks_hit_event`（key 维度，无 agent 列）与审计日志**不动** —— 那是历史。
+
+        ponytail: 一次事务内「先 SELECT 出受影响的行 → 逐行算新 tsv → executemany
+        一条 UPDATE」。纯 SQL 一条 UPDATE 做不到 —— A 权重（正文）的词元是
+        jieba 在 Python 侧切的，SQL 侧重算不出同一份词元。
+        """
+        old_tag = agent_tag(old_id)
+        new_tag = agent_tag(new_id)
+        if not old_id or not new_id or old_id == new_id:
+            return 0
+        clause, args = tag_match_sql("tags", [old_tag], "%s", pos_fn="strpos")
+        moved = 0
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT key, content, COALESCE(entities, ''), COALESCE(tags, '') "
+                f"FROM ks_fragment WHERE {clause}",
+                args,
+            )
+            rows = cur.fetchall()
+            updates: List[List[Any]] = []
+            for key, content, entities, tags in rows:
+                new_tags = replace_agent_tag(tags, old_id, new_id)
+                if new_tags == tags:
+                    continue
+                params = [new_tags]
+                params.extend(tsv_expr_params(content, entities, new_tags))
+                params.append(key)
+                updates.append(params)
+            if updates:
+                cur.executemany(
+                    f"UPDATE ks_fragment SET tags = %s, content_tsv = {TSV_SETWEIGHT_SQL} "
+                    "WHERE key = %s",
+                    updates,
+                )
+                moved = len(updates)
+        if moved:
+            # content_tsv 变了 ⇒ N/avgdl/df 快照陈旧（与 store/upsert 同款）
+            self._snap_drop("n_avgdl", "dfs")
+        return moved
 
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量硬删。一条 DELETE + 一条时间线清理（碎片没了，时间线成员就是死引用）。

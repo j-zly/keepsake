@@ -130,6 +130,25 @@
                   <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
                 </svg>
               </button>
+              <!--
+                改 id 的铅笔钮：与备注名那支同款小图标钮（复制钮**保留** ——
+                复制 id 仍是最常用的操作）。🔴 primary 行不给：主脑的引导配置
+                绑在这个 id 上，改了等于换了个主代理（后端同口径 400）。
+              -->
+              <button
+                v-if="a.role !== 'primary'"
+                class="copy-btn id-edit"
+                :disabled="busy"
+                title="改代理 ID"
+                aria-label="改代理 ID"
+                @click="openSetId(a)"
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
+                  <path d="M9.4 4.2l2.4 2.4" />
+                </svg>
+              </button>
             </div>
 
             <div class="aname">
@@ -280,6 +299,46 @@
           @click="doRegister"
         >
           登记
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 改代理 ID：换主键 —— 凭据与权限不变，历史记忆的归属跟着一起搬 -->
+    <el-dialog
+      v-model="setIdOpen"
+      title="改代理 ID"
+      width="460px"
+      align-center
+      :close-on-click-modal="false"
+      :close-on-press-escape="!busy"
+      :show-close="!busy"
+      append-to-body
+    >
+      <el-form label-position="top">
+        <el-form-item label="新 agent_id（必填）">
+          <el-input
+            v-model="setIdValue"
+            placeholder="如 worker-2"
+            autocomplete="off"
+            spellcheck="false"
+            @keyup.enter="doSetId"
+          />
+        </el-form-item>
+      </el-form>
+      <p class="tip">
+        凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
+        历史记忆的归属会一起搬过去（它写过的记忆仍归它）。
+        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
+      </p>
+      <template #footer>
+        <el-button :disabled="busy" @click="setIdOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="busy"
+          :disabled="!setIdValue.trim() || setIdValue.trim() === (setIdRow?.agent_id || '')"
+          @click="doSetId"
+        >
+          改 ID
         </el-button>
       </template>
     </el-dialog>
@@ -527,18 +586,58 @@ async function doRename() {
   if (!row || !name) return
   busy.value = true
   try {
-    await http
+    const r = await http
       .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/rename`, {
         name,
         confirm: true,
       })
       .then((res) => res.data)
     renameOpen.value = false
-    showToast(`已改名：${row.agent_id}`)
+    // 🔴 同名提醒**原样透出**（后端只在真撞名时给 note）—— 备注名不拦，
+    // 但列表里两个一样的名字要看得见（唯一性反馈要在页面上看得见）。
+    showToast(r.note ? `已改名：${row.agent_id} · ${r.note}` : `已改名：${row.agent_id}`)
     // 同上：改完重拉，状态由后端说了算
     load(true)
   } catch (e) {
     showError(`改名失败：${e.message}`)
+  } finally {
+    busy.value = false
+  }
+}
+
+// 改代理 ID：换主键（凭据不动、记忆归属跟着搬）
+const setIdOpen = ref(false)
+const setIdRow = ref(null)
+const setIdValue = ref('')
+
+function openSetId(row) {
+  setIdRow.value = row
+  setIdValue.value = row?.agent_id || ''
+  setIdOpen.value = true
+}
+
+async function doSetId() {
+  const row = setIdRow.value
+  const newId = (setIdValue.value || '').trim()
+  if (!row || !newId) return
+  busy.value = true
+  try {
+    const r = await http
+      .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/set_id`, {
+        new_id: newId,
+        confirm: true,
+      })
+      .then((res) => res.data)
+    setIdOpen.value = false
+    showToast(
+      `已改 ID：${row.agent_id} → ${r.agent_id}（搬动 ${r.moved_memories ?? 0} 条记忆）` +
+        (r.note ? ` · ${r.note}` : ''),
+    )
+    // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
+    load(true)
+  } catch (e) {
+    // 🔴 后端的人话文案原样透出（409「已被占用」/ 400「primary 不能改」都在里面）
+    showError(`改 ID 失败：${e.message}`)
   } finally {
     busy.value = false
   }
@@ -684,8 +783,9 @@ async function doAction(typed) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 改名钮：沿用全局 .copy-btn 的小图标钮尺寸，只补一条禁用态（复制钮从不禁用） */
-.name-edit:disabled {
+/* 改名钮 / 改 id 钮：沿用全局 .copy-btn 的小图标钮尺寸，只补一条禁用态（复制钮从不禁用） */
+.name-edit:disabled,
+.id-edit:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }

@@ -415,6 +415,15 @@ class FakeRedisClient:
             if key.startswith(prefix):
                 yield key
 
+    def renamenx(self, key, new_key):
+        """原子改名：目标已存在 ⇒ 0（**不覆盖**）；源不存在 ⇒ 0。"""
+        src = self._key(key)
+        dst = self._key(new_key)
+        if src not in self.hashes or dst in self.hashes:
+            return 0
+        self.hashes[dst] = self.hashes.pop(src)
+        return 1
+
 
 class FakeRedisStorage:
     """Redis 后端替身（只有 `_get_client`，正是 `_backend_of` 认 Redis 的判据）。"""
@@ -694,3 +703,52 @@ def test_prefetch真检索记read而skip路径不记(tmp_path):
         assert spy.calls == [], "skip 掉的问题不该记检索活动"
     finally:
         st.close()
+
+
+# --------------------------------------------------------------------------
+# ⑪ 改 id（换主键）：唯一性判断 + 凭据原样搬（Redis 侧）
+# --------------------------------------------------------------------------
+
+def test_redis_换id整行搬走凭据不变(red):
+    """🔴 改 id = 换主键：整行搬到新键下，**凭据原样搬** ⇒ 已发的凭据继续有效。
+
+    Redis 侧的 key 布局沿用原样（`keepsake:agent:<id>` hash），不另造键格式。
+    """
+    reg, storage = red
+    reg.register("worker-1", "工人")
+    credential = reg.approve("worker-1")
+    assert reg.set_id("worker-1", "worker-2") is True
+    assert reg.get("worker-1") is None
+    row = reg.get("worker-2")
+    assert row["name"] == "工人" and row["status"] == "approved"
+    # 凭据不换：旧凭据还能用，反查出来的是**新 id**
+    assert reg.verify_any(credential)["agent_id"] == "worker-2"
+    assert reg.verify("worker-2", credential)["ok"] is True
+    assert reg.verify("worker-1", credential)["ok"] is False
+    assert set(storage.client.hashes) == {"keepsake:agent:worker-2"}
+
+
+def test_redis_换id唯一性判断是第一职责(red):
+    """🔴 行不存在 / 新 id 已存在 / 新旧同串 ⇒ 一律 False（**绝不覆盖**别人的行）。"""
+    reg, _ = red
+    reg.register("worker-1")
+    reg.register("worker-2")
+    assert reg.set_id("worker-1", "worker-2") is False      # 新 id 已存在
+    assert reg.set_id("worker-1", "worker-1") is False      # 新旧同串
+    assert reg.set_id("查无此代理", "worker-3") is False     # 行不存在
+    assert reg.get("worker-1") is not None
+    assert reg.get("worker-2") is not None
+
+
+def test_sqlite_换id整行搬走凭据不变(lite):
+    """SQL 侧同款语义（`UPDATE ks_agent SET agent_id=...` ⇒ 其余列一个都不动）。"""
+    reg = lite
+    reg.register("worker-1", "工人")
+    credential = reg.approve("worker-1")
+    assert reg.set_id("worker-1", "worker-2") is True
+    assert reg.get("worker-1") is None
+    row = reg.get("worker-2")
+    assert row["name"] == "工人" and row["status"] == "approved"
+    assert reg.verify_any(credential)["agent_id"] == "worker-2"
+    assert reg.set_id("worker-2", "worker-1") is True       # 换回去
+    assert reg.get("worker-1") is not None

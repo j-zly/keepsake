@@ -232,3 +232,51 @@ test('无裸 alert / confirm', () => {
   assert.match(VIEW, /import \{ showError, showToast \} from '\.\.\/utils\/dialog'/, '提示走现成的 dialog 工具')
   assert.doesNotMatch(VIEW, /window\.confirm|window\.alert/, '全局弹框也不许')
 })
+
+// ---------------------------------------------------------------------------
+// 改代理 ID（keepsake_agent_setid 的控制台面）
+// ---------------------------------------------------------------------------
+//
+// 这页多了一个**能改 id** 的入口，所以这两条是它的护栏：
+//   1) 弹框必须**说清后果**（凭据不变 + 记忆归属跟着搬），否则操作者会以为
+//      「改 id = 换个名字」；回车能提交（这一页其它动作都回车提交）。
+//   2) 🔴 primary 行**不给**这个钮：主脑的引导配置绑在 id 上，改了等于换了个
+//      主代理（后端同口径 400）。前端不给只是不让人看见，后端还要再挡一次。
+
+test('改代理 ID：铅笔钮 + 弹框 + 后果说明 + 回车提交 + toast 带搬动条数', () => {
+  // 铅笔钮在 id 旁，**复制钮保留**（复制 id 仍是最常用操作）
+  assert.match(VIEW, /class="copy-btn id-edit"/, '改 id 的铅笔钮要与复制钮并存')
+  assert.match(VIEW, /@click="openSetId\(a\)"/, '铅笔钮打开改 id 弹框')
+  assert.match(VIEW, /title="改代理 ID"/, '铅笔钮要有 title 说明它干什么')
+
+  // 弹框：预填当前 id + 回车提交 + 后果说明
+  assert.match(VIEW, /<el-dialog[\s\S]*?v-model="setIdOpen"[\s\S]*?title="改代理 ID"/,
+    '改 id 弹框要渲染')
+  assert.match(VIEW, /v-model="setIdValue"/, '弹框里要有新 id 的输入框')
+  assert.match(VIEW, /@keyup\.enter="doSetId"/, '回车提交')
+  assert.match(VIEW, /凭据与权限不变/, '要说清凭据与权限不变（不用重配客户端）')
+  assert.match(VIEW, /历史记忆的归属会一起搬/, '要说清历史记忆归属会一起搬')
+  assert.match(VIEW, /:close-on-click-modal="false"/, '弹框禁遮罩关闭')
+
+  // 提交 → toast（带搬动条数）→ 重拉列表；报错原样透出后端文案
+  const body = VIEW.slice(VIEW.indexOf('async function doSetId'))
+  assert.match(body.slice(0, 900), /\/set_id`/, '打到 set_id 端点')
+  assert.match(body.slice(0, 900), /new_id: newId/, '带上新 id')
+  assert.match(body.slice(0, 900), /confirm: true/, '带 confirm 闸')
+  assert.match(body.slice(0, 900), /已改 ID：/, '成功 toast 说得清改了什么')
+  assert.match(body.slice(0, 900), /moved_memories/, 'toast 里带搬动条数')
+  assert.match(body.slice(0, 900), /load\(true\)/, '改完重拉列表')
+  assert.match(body.slice(0, 900), /showError\(`改 ID 失败：\$\{e\.message\}`\)/,
+    '后端的人话文案原样透出（别吞成「请求失败」）')
+})
+
+test('primary 行没有改 ID 的铅笔钮', () => {
+  // 铅笔钮自己带 v-if 判角色（主代理不给）
+  const cellKey = VIEW.slice(VIEW.indexOf('<div class="cell-key">'))
+  const block = cellKey.slice(0, cellKey.indexOf('</div>'))
+  assert.match(block, /class="copy-btn id-edit"/, 'id 旁要有铅笔钮')
+  assert.match(block, /v-if="a\.role !== 'primary'"/, 'primary 行不给改 id 钮')
+  // 反钉：primary 分支（分流点之前）不许出现改 id 的入口
+  const primaryBranch = block.slice(0, block.indexOf('v-if="a.role !== \'primary\'"'))
+  assert.doesNotMatch(primaryBranch, /openSetId/, 'primary 行不许出现改 id 入口')
+})

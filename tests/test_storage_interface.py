@@ -235,3 +235,26 @@ def test_psycopg_is_not_a_module_level_import():
         for alias in getattr(node, "names", [])
     }
     assert "psycopg" not in top_level, "psycopg 必须在 _connect() 内部延迟 import"
+
+
+# ---------------------------------------------------------------------------
+# 改 agent_id 的归属级联（2026-10 keepsake_agent_setid）
+# ---------------------------------------------------------------------------
+#
+# 🔴 `reassign_agent` **不进 REQUIRED_METHODS**：那份清单与
+# `StorageBase.__abstractmethods__` 逐字相等（见上面那条断言），而本原语在
+# 基类里没有抽象声明 —— 它是**三后端各自实现**的扩展原语。
+# 漏一个后端 = 「换个后端，代理改 id 之后记忆归属不跟着搬」的静默分叉，
+# 所以这里单独钉一条：三后端都得**自己**实现（继承来的空壳不算）。
+
+@pytest.mark.parametrize("backend_name", sorted(BACKENDS))
+def test_backend_implements_reassign_agent(backend_name):
+    """三后端都得自己实现 `reassign_agent`（改 id 时归属跟着搬）。"""
+    cls = BACKENDS[backend_name]
+    impl = getattr(cls, "reassign_agent", None)
+    assert callable(impl), f"{backend_name} 缺 reassign_agent"
+    assert "reassign_agent" in vars(cls), \
+        f"{backend_name} 的 reassign_agent 是继承来的（没自己实现）"
+    import inspect
+    params = list(inspect.signature(impl).parameters)
+    assert params == ["self", "old_id", "new_id"], f"{backend_name} 签名漂移：{params}"

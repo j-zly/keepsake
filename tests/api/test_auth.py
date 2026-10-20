@@ -677,11 +677,12 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是二十五条业务写端点加四条auth_POST():
+def test_写面仍是二十九条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
     可用（不接代理身份），接线口径见 `routers/kb.py` 的 `kb_approve_document`。
+    🆕 代理治理再加改 id 一条（28 → 29）：换主键 + 记忆归属级联。
     """
     app = create_app()
     write = {r.path for r in app.routes
@@ -704,6 +705,7 @@ def test_写面仍是二十五条业务写端点加四条auth_POST():
         "/api/v1/agents", "/api/v1/agents/{agent_id}/approve",
         "/api/v1/agents/{agent_id}/rename", "/api/v1/agents/{agent_id}/revoke",
         "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
+        "/api/v1/agents/{agent_id}/set_id",
     }, sorted(write)
 
 
@@ -726,7 +728,8 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
                  "/api/v1/crons/{job_id}/edit",
                  "/api/v1/agents/{agent_id}/approve", "/api/v1/agents/{agent_id}/revoke",
-                 "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude"}
+                 "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
+                 "/api/v1/agents/{agent_id}/set_id"}
     for r in app.routes:
         if getattr(r, "path", "") in protected:
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}

@@ -314,6 +314,30 @@ class _SqlBackend:
             (_now_iso(), agent_id),
         ))
 
+    def rename_id(self, old_id: str, new_id: str) -> bool:
+        """换主键：`agent_id` 从 old 改成 new，**其余列一个都不动**。
+
+        🔴 凭据哈希原样保留 ⇒ 已发出去的凭据继续有效（换 id 不需要客户端重配）。
+
+        主键冲突（并发下新 id 被别人抢走）⇒ 换名失败（False），**绝不覆盖** ——
+        覆盖会把别人的行洗白，还可能留下两行同凭据。
+        """
+        def _fn(cur: Any) -> bool:
+            cur.execute(
+                f"UPDATE {TABLE} SET agent_id = {self.ph} WHERE agent_id = {self.ph}",
+                (new_id, old_id),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self.write(_fn))
+        except Exception:
+            # 只有「新 id 已经存在」才当失败吞掉；其它异常照旧上抛（不把故障说成冲突）
+            if self.load(new_id):
+                logger.warning("keepsake: 换 agent_id 撞上并发占用：%s", new_id)
+                return False
+            raise
+
 
 class _RedisBackend:
     """Redis：`keepsake:agent:<id>` hash。字段名与 `AGENT_FIELDS` 同名。"""
@@ -381,6 +405,25 @@ class _RedisBackend:
         client = self._client()
         client.hincrby(self.key(agent_id), kind, 1)
         client.hset(self.key(agent_id), "last_seen_at", _now_iso())
+
+    def rename_id(self, old_id: str, new_id: str) -> bool:
+        """换主键：`keepsake:agent:<old>` 这个 hash 整个搬到 `<new>` 下。
+
+        🔴 **用 Redis 原生的 `RENAMENX`**（原子：新 key 已存在就返回 0，不覆盖）：
+        「HGETALL → HSET 新键 → DEL 旧键」这种三步写法，中间崩一次就会留下
+        **两行同凭据**（新键已写、旧键未删）—— 那正是本模块要防的形态；
+        `RENAMENX` 一步到位，key 布局与 hash 字段一个字节都不改。
+
+        `RENAMENX` 只搬 key，不改 hash **字段** ⇒ 搬完补一次 `agent_id` 字段
+        （读面是从字段取 id 的，字段不补就会读出旧 id）。
+        """
+        client = self._client()
+        if not client.exists(self.key(old_id)):
+            return False
+        if not client.renamenx(self.key(old_id), self.key(new_id)):
+            return False          # 新 id 已被占用 ⇒ 换名失败，绝不覆盖
+        client.hset(self.key(new_id), "agent_id", new_id)
+        return True
 
 
 def _text(value: Any) -> str:
@@ -555,6 +598,33 @@ class Registry:
             return False
         self._be.update(aid, {"name": new_name})
         return True
+
+    # ---- 改 id（换主键 + 归属级联） ----------------------------------
+    def set_id(self, old_id: str, new_id: str) -> bool:
+        """改 `agent_id`（换主键）：**整行**搬到新 id 下，旧 id 消失。
+
+        🔴 **唯一性判断是本方法的第一职责**：行不存在 / 新 id 已存在 / 新旧同串
+        ⇒ 一律返回 False（**不抛**，路由层据此给区分文案）。路由层的预检只算
+        体验，**最终以这里为准** —— 并发下不会出现两个代理占同一个 id，
+        更不会留下两行同凭据。
+
+        🔴 **凭据原样搬**：`credential_hash` / `credential_hint` 一个都不动 ⇒
+        已发出去的凭据继续有效（http 客户端身份由凭据反查 `verify_any`，
+        换 id 不需要客户端重配）。
+
+        🔴 **记忆归属不在本方法里搬**：碎片的归属是 `tags` 里的 `agent:<id>`
+        那个词，搬它要走存储层的 `reassign_agent`（还要重算 BM25 索引），
+        由路由层在换名成功后接着调 —— 两件事分开做，失败时能分清是哪一步坏了。
+        """
+        old = (old_id or "").strip()
+        new = (new_id or "").strip()
+        if not old or not new or old == new:
+            return False
+        if not self._be.load(old):
+            return False
+        if self._be.load(new):
+            return False
+        return self._be.rename_id(old, new)
 
     # ---- 凭据校验 ----------------------------------------------------
     def verify(self, agent_id: str, credential: str) -> Dict[str, Any]:

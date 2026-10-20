@@ -28,6 +28,7 @@ from .base import StorageBase, fire_hits
 # 2026-10 ks_pg_b2：检索后处理与排序权重抽到 storage_shared —— Redis / PG 共用同一份。
 # 下面这几个名字从 storage_shared 转出，是给既有调用方（cleanup_hot_topics 等）的转出口。
 from .shared import (          # noqa: F401 — 常量与函数均为有意 re-export
+    replace_agent_tag,
     DECAY_HALF_DAYS,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
@@ -1543,6 +1544,57 @@ class RedisStorage(StorageBase):
         except Exception as e:
             logger.debug("storage: update_fragment_fields(%s) failed: %s", key, e)
             return False
+
+    def reassign_agent(self, old_id: str, new_id: str) -> int:
+        """把归属 `agent:<old>` 的记忆整批搬到 `agent:<new>`（返回搬动行数）。
+
+        🔴 **归属只有一个落库形态**：碎片 hash 没有 `agent_id` 字段，归属就是
+        `tags` 里的 `agent:<id>` 那个词 ⇒ 「改 id」在存储层 = 换这个词
+        （判据见 `storage_shared.replace_agent_tag`：逗号边界精确相等）。
+
+        🔴 **索引不用手动同步**：本后端没有 `content_tsv` 列，RediSearch 的索引
+        是 `FT.CREATE ... ON HASH PREFIX 1 memory:frag:`，对命中前缀的 hash
+        **每次写都自动维护** ⇒ HSET 改 tags 之后 BM25/KNN 立即跟着走
+        （与 `StorageBase.update_fragment_content` 的说明同一口径）。
+
+        consumed / superseded 的**历史行一起搬**（归属是事实，不是活跃状态）。
+
+        ponytail: SCAN 游标逐页扫（不 KEYS、不一次拉全库），每页一个 pipeline
+        批量 HGET tags —— 只读 tags 这一个字段，不 HGETALL（省二进制字段解码）。
+        """
+        if not old_id or not new_id or old_id == new_id:
+            return 0
+        client = self._get_client()
+        if not client:
+            return 0
+        moved = 0
+        try:
+            cursor = 0
+            while True:
+                cursor, raw_keys = client.scan(cursor=cursor, match="memory:frag:*",
+                                              count=500)
+                keys = [k.decode("utf-8") if isinstance(k, bytes) else k
+                        for k in (raw_keys or [])]
+                if keys:
+                    pipe = client.pipeline()
+                    for key in keys:
+                        pipe.hget(key, "tags")
+                    for key, raw in zip(keys, pipe.execute()):
+                        if raw is None:
+                            continue
+                        tags = (raw.decode("utf-8", "replace")
+                                if isinstance(raw, (bytes, bytearray)) else str(raw))
+                        new_tags = replace_agent_tag(tags, old_id, new_id)
+                        if new_tags == tags:
+                            continue
+                        client.hset(key, "tags", new_tags)
+                        moved += 1
+                if int(cursor) == 0:
+                    break
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage: reassign_agent failed: %s", e)
+            return moved
+        return moved
 
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量 DEL。返回实际删除条数。"""
