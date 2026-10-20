@@ -330,7 +330,7 @@
           />
           <p v-if="editPrimary" class="tip">主代理 ID 不可改（备注名照常可以改）。</p>
         </el-form-item>
-        <el-form-item label="备注名">
+        <el-form-item label="备注名（必填）">
           <el-input
             v-model="editName"
             placeholder="给人看的名字"
@@ -588,6 +588,12 @@ async function doEdit() {
   const newName = (editName.value || '').trim()
   const idChanged = !editPrimary.value && newId !== oldId
   const nameChanged = newName !== oldName
+  // 🔴 备注名非空护栏（原改名弹框有、合并时不许丢）：后端 bad_name 400 会拦，
+  // 但若 ID 侧先成功生效，空备注名报错会落成「改了一半」的 warning toast —— 前端先拦。
+  if (nameChanged && !newName) {
+    showError('备注名不能为空（留空就分不清是哪一个代理了）')
+    return
+  }
   // 什么都没改：关窗，一个请求都不发
   if (!idChanged && !nameChanged) {
     editOpen.value = false

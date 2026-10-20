@@ -370,6 +370,8 @@ test('提交：先 set_id 再 rename；set_id 失败即中止；toast 合并说�
   assert.match(idBlock, /showError\(`改 ID 失败：\$\{e\.message\}`\)/,
     '后端的人话文案原样透出（别吞成「请求失败」）')
   assert.match(idBlock, /return/, 'set_id 失败必须中止（对旧 id 做 rename 是错操作）')
+  // 备注名非空护栏（原改名弹框有，合并后不许丢）：前端先拦，别等后端 400
+  assert.match(body, /if \(nameChanged && !newName\)/, '空备注名在前端就被拦')
 })
 
 test('primary 行：ID 输入框 disabled（能改备注名，不能改 ID）', () => {
