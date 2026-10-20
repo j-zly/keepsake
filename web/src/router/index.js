@@ -9,6 +9,7 @@ import KbReviewView from '../views/KbReviewView.vue'
 import KbView from '../views/KbView.vue'
 import LoginView from '../views/LoginView.vue'
 import MaintenanceView from '../views/MaintenanceView.vue'
+import MessagesView from '../views/MessagesView.vue'
 import ReviewView from '../views/ReviewView.vue'
 import SetupView from '../views/SetupView.vue'
 import StatsView from '../views/StatsView.vue'
@@ -30,6 +31,8 @@ const routes = [
   // 铺在文档浏览页的抽屉里既看不清也翻不动。配方与 /review 记忆审核同款
   { path: '/kb-review', name: 'kb-review', component: KbReviewView, meta: { title: '知识库审核' } },
   { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理登记' } },
+  // 消息中心独立成页：代理之间的往来消息全量可查（用户铁律：绝不被背着开小会）
+  { path: '/messages', name: 'messages', component: MessagesView, meta: { title: '消息中心' } },
   // 代理审核独立成页（原来挤在 AgentsView 里）：待审队列要逐条判，
   // 与已批准代理的日常维护（登记/改名/设角色）分开摆
   { path: '/agents-review', name: 'agents-review', component: AgentsReviewView, meta: { title: '代理审核' } },

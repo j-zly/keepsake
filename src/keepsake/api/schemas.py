@@ -330,6 +330,9 @@ class AgentItem(BaseModel):
         False, description="该代理的条目是否排除出主脑上下文（退役键的新家）")
     credential_hint: str = Field("", description="凭据前 8 位，供人工比对（不是凭据）")
     meta: Dict[str, Any] = Field(default_factory=dict)
+    #: 私信开关（`dm_enabled`）：false = 这个代理**不收**私信（别人投不进来）。
+    #: 默认**开**（老行缺列也算开 —— 新增字段不许改存量语义）。
+    dm_enabled: bool = Field(True, description="是否接收私信（默认开）")
 
 
 class AgentList(BaseModel):

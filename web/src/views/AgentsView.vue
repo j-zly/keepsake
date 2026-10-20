@@ -218,6 +218,24 @@
               >
                 重新生成凭据
               </button>
+
+              <!--
+                私信开关（dm_enabled）：关掉之后，别人往它信箱里投的消息一律拒投
+                （投递闸门在后端，与 MCP 的 message_send 同一条规矩）。
+                🔴 放在 primary 的分流链**外面** —— 关了自己也收不到私信，合法
+                （用户明确要过）；它是**投递偏好**，不是治理动作（不碰状态 / 角色 / 凭据）。
+                失败回滚：乐观值丢掉即回到服务器口径，并报红条（不许留下「以为改成了」）。
+              -->
+              <span class="dm-toggle">
+                <span class="dm-label">私信</span>
+                <el-switch
+                  :model-value="dmOn(a)"
+                  size="small"
+                  :loading="dmBusy === a.agent_id"
+                  :title="dmOn(a) ? '已开启：接收私信' : '已关闭：别人投不进来'"
+                  @change="toggleDm(a, $event)"
+                />
+              </span>
             </template>
           </ItemCard>
         </div>
@@ -383,6 +401,11 @@ const loading = ref(true)
 const error = ref('')
 const busy = ref(false)
 
+/** 私信开关的乐观值（agent_id → 开/关）：只活到下一次成功刷新；失败即丢掉（回滚）。 */
+const dmState = ref({})
+/** 正在提交的那一行（同一时刻只允许一个，避免连点连发）。 */
+const dmBusy = ref('')
+
 // 搜索 + 服务端分页（口径照抄 CoreView：回车查、清空回全量、seq 防串）
 const q = ref('')
 const page = ref(1)
@@ -436,6 +459,8 @@ async function load(silent = false) {
     data.value = list
     error.value = ''
     lastErr = ''
+    // 服务器口径为准：没有正在提交的行时，乐观值一律丢掉（页面回到真实状态）
+    if (!dmBusy.value) dmState.value = {}
   } catch (e) {
     if (isStale(seq, reqSeq)) return
     // 保留旧数据不清屏：一次抖动不该把正在审的列表抽走
@@ -487,6 +512,43 @@ onUnmounted(() => {
 async function doCopy(text) {
   const ok = await copyText(text)
   ok ? showToast(`已复制：${text}`) : showError('复制失败，请手动选中复制')
+}
+
+// ---------------------------------------------------------------------------
+// 私信开关（dm_enabled）：投递偏好，不是治理动作
+// ---------------------------------------------------------------------------
+
+/** 当前开关状态：乐观值优先；没有乐观值就看服务器给的（缺字段按**开** —— 老数据兼容）。 */
+function dmOn(a) {
+  const s = dmState.value
+  if (a.agent_id in s) return s[a.agent_id]
+  return a.dm_enabled !== false
+}
+
+/**
+ * 切换私信开关：乐观更新 → 打端点 → 失败回滚（丢掉乐观值）+ 红条。
+ *
+ * 🔴 失败**必须**回滚：不回滚的话，界面显示「已关」而服务端根本没改 ——
+ * 那正是这套治理要拔掉的「以为改成了」。
+ */
+async function toggleDm(a, val) {
+  const id = a.agent_id
+  dmState.value = { ...dmState.value, [id]: !!val }
+  dmBusy.value = id
+  try {
+    await api.setAgentDm(id, !!val)
+    showToast(`${id}：私信已${val ? '开启' : '关闭'}`)
+    // 状态以服务器为准（本地改了很快就和注册表对不上）
+    await load(true)
+  } catch (e) {
+    const next = { ...dmState.value }
+    delete next[id]
+    dmState.value = next
+    error.value = `私信开关切换失败：${e.message}`
+    showError(error.value)
+  } finally {
+    dmBusy.value = ''
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -844,5 +906,17 @@ async function doAction(typed) {
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.7;
+}
+/* 私信开关：文字 + 开关并排（投递偏好，不是危险动作 —— 不用危险色那一档） */
+.dm-toggle {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex: none;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dm-label {
+  color: var(--text-dim);
 }
 </style>

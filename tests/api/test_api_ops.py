@@ -34,7 +34,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: （批准 / 吊销 / 改角色 / 上下文排除开关），keepsake_change_password 起再加
 #: 1 条认证写端点（改口令），keepsake_kb_review（知识库审核队列）起再加 2 条审核
 #: 端点（批准 / 驳回子代理提交的知识文档 —— 只接控制台会话，不接代理身份），
-#: keepsake_agent_setid 起再加 1 条代理治理端点（改代理 id = 换主键 + 归属级联）。
+#: keepsake_agent_setid 起再加 1 条代理治理端点（改代理 id = 换主键 + 归属级联），
+#: ks_messages_console 起再加 1 条私信开关端点（dm_enabled —— 投递偏好，不是治理动作）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -73,6 +74,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/role",
     "/api/v1/agents/{agent_id}/exclude",
     "/api/v1/agents/{agent_id}/set_id",
+    # 消息中心加私信开关一条（ks_messages_console）：投递偏好，不是治理动作
+    "/api/v1/agents/{agent_id}/dm",
 } | AUTH_POST_PATHS
 
 
@@ -479,13 +482,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_29条业务加4条认证():
+def test_写面白名单全量断点_30条业务加4条认证():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 33
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 29
+    assert len(ALLOWED_POST_PATHS) == 34
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 30
 
 
 def test_P1只读路由未被写面影响(client):

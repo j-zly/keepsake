@@ -249,6 +249,16 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return row
 
 
+def _dm_is_on(row: Optional[Dict[str, Any]]) -> bool:
+    """`dm_enabled` 这一列的**唯一判读口**（默认**开**）。
+
+    🔴 老行没有这一列 / 值为空 ⇒ 一律当**开**（「新增字段必须兼容旧数据」：
+    存量行的语义不许因为加了一列而变）。查无此代理（空行）也当开 ——
+    「代理存不存在」是**另一道闸**（由发送侧先判），不是这一列的事。
+    """
+    return str((row or {}).get("dm_enabled") or DM_ENABLED_ON).strip() not in DM_DISABLED_VALUES
+
+
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     """对外形状（控制台 GET 与判定方共用的字段集）。
 
@@ -267,6 +277,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "exclude_from_primary": row["exclude_from_primary"],
         "credential_hint": row["credential_hint"],
         "meta": row["meta"],
+        # 私信开关（投递偏好）：控制台要能看见当前状态 —— 判读口径与
+        # `Registry.dm_enabled` 同一个（`_dm_is_on`），两处不许各写一份。
+        "dm_enabled": _dm_is_on(row),
     }
 
 
@@ -712,7 +725,7 @@ class Registry:
         row = self._be.load((agent_id or "").strip())
         if not row:
             return True
-        return str(row.get("dm_enabled") or DM_ENABLED_ON).strip() not in DM_DISABLED_VALUES
+        return _dm_is_on(row)
 
     def set_dm_enabled(self, agent_id: str, flag: bool) -> bool:
         """开关私信接收。返回**值是否真的变了**（与 `set_exclude` 同款语义）。

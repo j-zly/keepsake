@@ -88,9 +88,10 @@ def test_列表形状与pending计数(env):
     body = client.get("/api/v1/agents", headers=AUTH).json()
     assert body["count"] == 2 and body["pending_count"] == 2
     item = body["items"][0]
+    # 🆕 多了 dm_enabled（私信开关）：控制台的「私信开关」读的就是这个字段
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
-                         "credential_hint", "meta"}
+                         "credential_hint", "meta", "dm_enabled"}
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文
     assert "credential_hash" not in json.dumps(body)

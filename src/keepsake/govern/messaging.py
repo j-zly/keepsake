@@ -158,6 +158,25 @@ def _clamp_limit(limit: Any) -> int:
     return max(1, min(n, LIMIT_MAX))
 
 
+def _clamp_page(page: Any) -> int:
+    """页码下限 1（非法值按 1 算 —— 负页码/空串都不该把查询打成怪东西）。"""
+    try:
+        return max(1, int(page))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _like_escape(needle: str) -> str:
+    """转义 LIKE 里的通配符（`%` / `_` / 转义符本身）。
+
+    🔴 不转义的话，用户搜一个 `100%` 会匹配到**全部**消息 —— 一个搜索词
+    悄悄变成「全库倒出来」，那不是搜索，那是意外的全量导出。
+    转义符取 `!`（反斜杠在 PG 侧还要看 `standard_conforming_strings`，
+    `!` 没这层讲究）。
+    """
+    return needle.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
 # --------------------------------------------------------------------------
 # 后端适配：只有「怎么存取」不同，语义全部在 Messaging 里
 # --------------------------------------------------------------------------
@@ -256,6 +275,41 @@ class _MsgSqlBackend(_SqlBase):
             (agent_id,),
         )
         return int(rows[0][0]) if rows and rows[0] else 0
+
+    # -- 治理面只读列表 -------------------------------------------------
+    def list_messages(self, agent: str, thread: str, q: str,
+                      page: int, size: int) -> Tuple[List[Dict[str, Any]], int]:
+        """全库消息的一页（按 seq **倒序** = 新的在前）+ 过滤后的总数。
+
+        🔴 **只读**：本方法**一个字段都不改**（尤其不动 `read_at`）——
+        看历史不该把对方的消息吃掉（与 `recent_between` 同纪律）。
+
+        过滤三件：代理（发件**或**收件都算）、线程（`thread_id`）、
+        正文关键词（大小写不敏感子串，通配符已转义）。
+        """
+        where: List[str] = []
+        params: List[Any] = []
+        if agent:
+            where.append(f"(from_id = {self.ph} OR to_id = {self.ph})")
+            params += [agent, agent]
+        if thread:
+            where.append(f"thread_id = {self.ph}")
+            params.append(thread)
+        if q:
+            # 🔴 `lower()` 两边都落：SQLite 的 LIKE 默认不区分大小写、PG 的区分 ——
+            # 不统一的话，同一个搜索词在两个后端上结果不一样。
+            where.append(f"lower(content) LIKE {self.ph} ESCAPE '!'")
+            params.append(f"%{_like_escape(q.lower())}%")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        total_rows = self.read(f"SELECT COUNT(*) FROM {TABLE}{clause}", tuple(params))
+        total = int(total_rows[0][0]) if total_rows and total_rows[0] else 0
+        cols = ", ".join(MESSAGE_FIELDS)
+        rows = self.read(
+            f"SELECT {cols} FROM {TABLE}{clause} "
+            f"ORDER BY seq DESC LIMIT {self.ph} OFFSET {self.ph}",
+            (*params, size, (page - 1) * size),
+        )
+        return [_norm_row(dict(zip(MESSAGE_FIELDS, r))) for r in rows], total
 
     # -- 标读 -----------------------------------------------------------
     def _mark_read(self, seqs: List[int]) -> Any:
@@ -366,6 +420,37 @@ class _RedisBackend:
     def unread_count(self, agent_id: str) -> int:
         return int(self._client().llen(self.inbox_key(agent_id)) or 0)
 
+    # -- 治理面只读列表 -------------------------------------------------
+    def list_messages(self, agent: str, thread: str, q: str,
+                      page: int, size: int) -> Tuple[List[Dict[str, Any]], int]:
+        """全库消息的一页（按 seq **倒序** = 新的在前）+ 过滤后的总数。
+
+        🔴 **只读**：不动 `read_at`（Redis 侧已读时刻在 hash 里，本方法只读不写）。
+
+        `ponytail:` Redis 侧是 O(全量) 扫 —— 与 `recent_between` 同一取舍
+        （全量 LIST 是只增不减的，没有索引可走）。信箱量级是「代理之间几十条
+        对话」，可接受；真要上量就把 `keepsake:msg` 换成 ZSET
+        （`ZRANGE by score` 取最近 N 条），已读状态那套不动。
+        """
+        needle = (q or "").strip().lower()
+        picked: List[Dict[str, Any]] = []
+        for blob in self._all_blobs():
+            try:
+                row = _norm_row(json.loads(blob))
+            except (TypeError, ValueError):
+                continue
+            if agent and row["from_id"] != agent and row["to_id"] != agent:
+                continue
+            if thread and row["thread_id"] != thread:
+                continue
+            if needle and needle not in row["content"].lower():
+                continue
+            picked.append(row)
+        picked.sort(key=lambda r: r["seq"], reverse=True)
+        total = len(picked)
+        start = (page - 1) * size
+        return self._fill_read_at(picked[start:start + size]), total
+
 
 # --------------------------------------------------------------------------
 # 信箱本体
@@ -452,6 +537,26 @@ class Messaging:
             return 0
         self._ready()
         return int(self._be.unread_count(aid))
+
+    # ---- 治理面只读列表（控制台「消息中心」用）------------------------
+    def list_messages(self, agent: str = "", thread: str = "", q: str = "",
+                      page: int = 1, size: int = DEFAULT_LIMIT) -> Dict[str, Any]:
+        """全库消息列表（**只读**）：`{"items": [...], "total": n}`。
+
+        * `agent` 非空 ⇒ 只看**与该代理有关**的消息（发件或收件都算）；
+        * `thread` 非空 ⇒ 只看该线程（`thread_id`）；
+        * `q` 非空 ⇒ 正文关键词（大小写不敏感子串）；
+        * 按 **seq 倒序**（新的在前）分页，`page` 从 1 起，`size` 上限 `LIMIT_MAX`。
+
+        🔴 **只读**：不改任何字段（尤其不动 `read_at`）—— 看历史不该把对方
+        的消息吃掉（与 `recent_between` 同纪律）。三后端语义逐字段一致。
+        """
+        self._ready()
+        rows, total = self._be.list_messages(
+            (agent or "").strip(), (thread or "").strip(), (q or "").strip(),
+            _clamp_page(page), _clamp_limit(size),
+        )
+        return {"items": list(rows), "total": int(total)}
 
 
 __all__ = [

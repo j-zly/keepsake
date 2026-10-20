@@ -165,6 +165,14 @@ export const api = {
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/role`, { role, confirm }).then((r) => r.data),
   setAgentExclude: (agentId, exclude) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/exclude`, { confirm: true, exclude }).then((r) => r.data),
+  // ---- 消息中心（代理互聊信箱的治理面）--------------------------------
+  // 消息列表：**只读**（后端不改任何字段），筛代理 / 线程 / 关键词 + 服务端分页。
+  // 参数名是 page / size（不是 page_size —— 那是注册表列表那套口径）。
+  listMessages: (params) => http.get('/api/v1/messages', { params }).then((r) => r.data),
+  // 私信开关（dm_enabled）：confirm 恒为 true（后端要显式二次确认），enabled 传目标状态。
+  // 🔴 失败时**不要**自己改 UI —— 页面负责回滚（回滚逻辑在 AgentsView 里）。
+  setAgentDm: (agentId, enabled) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/dm`, { enabled, confirm: true }).then((r) => r.data),
 
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。
