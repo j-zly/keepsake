@@ -160,6 +160,26 @@ test('四个动作都收在 primary 的 v-else 分支里', () => {
 //   3) 确认后打 approve 端点，新凭据走**两页共用**的那一个 CredentialDialog；
 //   4) 🔴 失败不许留下「以为换发了」的误导：红条 + 不弹凭据框。
 
+/**
+ * 从 `openMarker`（如 `<template v-else>`）起做 <template> 嵌套配对，
+ * 返回它所属分支闭合 `</template>` 的下标；找不到返回 -1。
+ * 用途：断言某元素必须落在该分支**外面**——`indexOf(x) > indexOf('<template v-else>')`
+ * 是恒真断言（分支内部的元素同样在开标记之后），必须比到闭合位置。
+ */
+function templateBranchEnd(block, openMarker) {
+  const open = block.indexOf(openMarker)
+  if (open === -1) return -1
+  let depth = 0
+  const re = /<\/?template\b/g
+  let m
+  re.lastIndex = open
+  while ((m = re.exec(block)) !== null) {
+    depth += m[0].startsWith('</') ? -1 : 1
+    if (depth === 0) return m.index
+  }
+  return -1
+}
+
 /** 「重新生成凭据」按钮那一段（从 <button 标签到它的 @click）。 */
 function rotateButton() {
   const at = VIEW.indexOf("ask('rotate', a)")
@@ -180,10 +200,14 @@ test('已批准行有「重新生成凭据」按钮；待审 / 已吊销的行�
   // 非危险色那一档：吊销那种红底留给真会毁掉东西的动作
   assert.match(btn, /class="act-btn"/, '走 act-btn 样式')
   assert.doesNotMatch(btn, /act-btn--danger/, '不占危险色那一档')
-  // 🔴 换发对主代理无副作用：按钮在 primary / 非 primary 的分流链**外面**（主代理行也要有）
-  const elseAt = actions.indexOf('<template v-else>')
-  assert.ok(elseAt !== -1, '缺少 v-else 分支')
-  assert.ok(actions.indexOf("ask('rotate', a)") > elseAt, '换发钮放在分流链外面（主代理行同样有）')
+  // 🔴 换发对主代理无副作用：按钮在 primary / 非 primary 的分流链**外面**（主代理行也要有）。
+  //    旧断言 `> elseAt` 是恒真的（v-else **内部**的元素同样在 elseAt 之后，零检出能力），
+  //    改钉到 v-else 分支**闭合之后** —— 把换发钮挪回分支里必须让本测试转红（judge 2026-10-20）。
+  const vElseEnd = templateBranchEnd(actions, '<template v-else>')
+  assert.ok(vElseEnd !== -1, '找不到 v-else 分支的闭合')
+  assert.ok(actions.indexOf("ask('rotate', a)") > vElseEnd, '换发钮必须落在 v-else 分支之外（主代理行才看得见）')
+  // 同一条链外面还站着「编辑」入口（改备注名对主代理照样要能改）——顺手用同一个闭合钉死
+  assert.ok(actions.indexOf('openEdit(a)') > vElseEnd, '编辑钮同样必须落在 v-else 分支之外')
 })
 
 test('换发走手输闸：照抄 agent_id 前 8 位才让提交', () => {
