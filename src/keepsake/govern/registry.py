@@ -107,8 +107,18 @@ REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
-    "meta",
+    "meta", "dm_enabled",
 )
+
+#: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: 关掉的值一律认这几种（大小写都收）；其余（含空 / 缺列）都当**开**——
+#: 「新增字段必须兼容旧数据」：老行没有这一列 ⇒ 默认开。
+DM_ENABLED_ON = "1"
+DM_DISABLED_VALUES: Tuple[str, ...] = ("0", "false", "False", "no", "off")
+
+#: `dm_enabled` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
+DM_COLUMN = "dm_enabled"
+DM_COLUMN_DECL = "text NOT NULL DEFAULT '1'"
 
 #: 计数与布尔列（SQL 里是 integer，Redis hash 里存字符串 —— 规范化时统一成 int/bool）
 _INT_FIELDS = ("reads", "writes")
@@ -131,13 +141,54 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     reads                integer NOT NULL DEFAULT 0,
     writes               integer NOT NULL DEFAULT 0,
     exclude_from_primary integer NOT NULL DEFAULT 0,
-    meta                 text NOT NULL DEFAULT '{}'
+    meta                 text NOT NULL DEFAULT '{}',
+    -- 2026-10 ks_agent_messaging：是否接收别的代理的私信（代理互聊信箱）。
+    -- 默认 '1'（开）—— 老库补列时也落 '1'，存量行的语义不变。
+    dm_enabled           text NOT NULL DEFAULT '1'
 )
 """
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------------------------------------------------------------
+# 连接类异常的判据（**只认类名**，不 import psycopg）
+#
+# 🔴 为什么只看类名：本模块（及 `govern` 包整体）**只依赖标准库**
+#   （`core/pg.py` 反向 import 它的 DDL 建表，见模块 docstring）——
+#   在这里 import psycopg 会把「没装 PG 依赖的人」也拖挂。
+#   `psycopg.OperationalError` / `psycopg_pool.PoolTimeout` 的类名是稳定的。
+# --------------------------------------------------------------------------
+
+#: 广义「服务端暂时读不到」的异常（连接层坏了 **或** 池里借不到连接）。
+CONNECTION_ERROR_NAMES = frozenset({
+    "OperationalError", "InterfaceError", "PoolTimeout", "PoolClosed",
+    "AdminShutdown", "CannotConnectNow", "TooManyConnections", "ConnectionError",
+})
+
+#: 连接**实体**坏了（⇒ 池里的这条连接该丢弃/重建）。
+#: 🔴 `PoolTimeout` **不在这里**：池被借空是「并发太高」，不是「连接坏了」——
+#: 重建池只会凭空多开一批连接，把拥塞变成雪崩。
+BROKEN_CONNECTION_ERROR_NAMES = frozenset({
+    "OperationalError", "InterfaceError", "AdminShutdown", "CannotConnectNow",
+    "TooManyConnections", "ConnectionError",
+})
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """这个异常是不是「服务端暂时读不到」那一类（连接层）。
+
+    业务错误（约束冲突、语法错、权限错）**不在**名单里 ⇒ 不会被误报成
+    「PG 抖动」—— 那句文案会让运维去查网络，而真因在 SQL。
+    """
+    return type(exc).__name__ in CONNECTION_ERROR_NAMES
+
+
+def is_broken_connection_error(exc: BaseException) -> bool:
+    """连接**实体**坏了（该丢弃这条连接 / 重建池）。池超时不算（见上面的说明）。"""
+    return type(exc).__name__ in BROKEN_CONNECTION_ERROR_NAMES
 
 
 def new_credential() -> str:
@@ -186,6 +237,10 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         except (TypeError, ValueError):
             parsed = {}
         row["meta"] = parsed if isinstance(parsed, dict) else {}
+    # dm_enabled：缺列 / 空值 ⇒ 默认**开**（与 DDL 的 DEFAULT '1' 同口径，
+    # 老行没有这一列时语义不变）；显式的关掉值原样留着。
+    dm = str(row.get("dm_enabled") or "").strip()
+    row["dm_enabled"] = dm if dm else DM_ENABLED_ON
     # 脏数据不许悄悄当权威：角色/状态只认枚举内的值
     if row["role"] not in ROLES:
         row["role"] = ROLE_SUB
@@ -233,8 +288,13 @@ def _backend_of(storage: Any) -> str:
     return "redis"
 
 
-class _SqlBackend:
-    """PG / SQLite 共用：SQL 只差**占位符**与事务入口，其余逐字相同。"""
+class _SqlBase:
+    """PG / SQLite 共用的**存取原语**（占位符 / 读 / 写 / 建表入口）。
+
+    🔴 `ks_agent`（本文件）与 `ks_message`（`govern/messaging.py`）**共用这一份**：
+    SQL 只差占位符与事务入口，其余逐字相同 —— 复制一份必然漂，而漂的后果是
+    「一个模块在某个后端上读不到另一个模块写的行」。
+    """
 
     def __init__(self, storage: Any, kind: str) -> None:
         self._st = storage
@@ -262,7 +322,62 @@ class _SqlBackend:
         with ctx as cur:
             return fn(cur)
 
+    # -- 老库补列（先查后补）------------------------------------------
+    def has_column(self, column: str) -> bool:
+        """这张表有没有某列（**先查后补**的第一步）。
+
+        🔴 为什么不直接发 `ADD COLUMN IF NOT EXISTS`：PG 侧**列已存在也要拿
+        ACCESS EXCLUSIVE**（见 `core/pg.py::ensure_index` 的说明）⇒ 与并发 DML
+        互等成环、还挡住整张表的读写。先查后补 ⇒ 列在时**一条 DDL 都不发**。
+        """
+        if self.kind == "postgres":
+            rows = self.read(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = %s AND column_name = %s LIMIT 1",
+                (TABLE, column),
+            )
+            return bool(rows)
+        rows = self.read(f"PRAGMA table_info({TABLE})")
+        return any(str(r[1]) == column for r in rows)
+
+    def add_column(self, column: str, decl: str) -> None:
+        """补一列（已存在 ⇒ 吞掉「重复列」错误，不当失败）。"""
+        if self.kind == "postgres":
+            sql = f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {column} {decl}"
+        else:
+            sql = f"ALTER TABLE {TABLE} ADD COLUMN {column} {decl}"
+        try:
+            self.write(lambda cur: cur.execute(sql))
+        except Exception as e:      # noqa: BLE001 —— 并发补列撞车（duplicate column）
+            msg = str(e).lower()
+            if "duplicate" in msg or "already exists" in msg:
+                return
+            raise
+
+
+class _SqlBackend(_SqlBase):
+    """PG / SQLite 共用：SQL 只差**占位符**与事务入口，其余逐字相同。"""
+
     # -- ks_agent 专用 --------------------------------------------------
+    def ensure_schema(self) -> bool:
+        """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` 列。
+
+        🔴 补列走「先查后补」（`_SqlBase.has_column`）：列已在 ⇒ **一条 DDL 都不发**
+        （PG 的 `ADD COLUMN IF NOT EXISTS` 列已存在也要拿 ACCESS EXCLUSIVE，
+        会与并发 DML 互等成环 —— 见 `core/pg.py::ensure_index` 的说明）。
+        """
+        if not super().ensure_schema():
+            return False
+        try:
+            if not self.has_column(DM_COLUMN):
+                self.add_column(DM_COLUMN, DM_COLUMN_DECL)
+        except Exception as e:      # noqa: BLE001 —— 返回 False，不抛（调用方决定降级）
+            logger.warning("keepsake: 注册表补列 %s 失败（%s: %s）",
+                           DM_COLUMN, type(e).__name__, e)
+            return False
+        return True
+
     def load(self, agent_id: str) -> Optional[Dict[str, Any]]:
         rows = self.read(
             f"SELECT {', '.join(AGENT_FIELDS)} FROM {TABLE} WHERE agent_id = {self.ph}",
@@ -466,6 +581,9 @@ class Registry:
     def __init__(self, storage: Any) -> None:
         kind = _backend_of(storage)
         self.backend = kind
+        #: 底层存储句柄（**只读用途**）：`govern/messaging.py` 的信箱要经它连同一个库，
+        #: 不另开连接、不另拼 DSN。
+        self.storage = storage
         self._be: Any = _SqlBackend(storage, kind) if kind != "redis" else _RedisBackend(storage)
         # `touch()` 的限频表按实例存（进程内遥测，重启归零是正常的）
         self._last_touch: Dict[str, float] = {}
@@ -524,6 +642,7 @@ class Registry:
             "writes": 0,
             "exclude_from_primary": False,
             "meta": {},
+            "dm_enabled": DM_ENABLED_ON,
         })
         return self.get(aid) or {}
 
@@ -580,6 +699,35 @@ class Registry:
         if row["exclude_from_primary"] == flag:
             return False
         self._be.update(aid, {"exclude_from_primary": flag})
+        return True
+
+    # ---- 私信开关（代理互聊信箱）-------------------------------------
+    def dm_enabled(self, agent_id: str) -> bool:
+        """这个代理**是否接收私信**（`dm_enabled` 开关）。默认**开**。
+
+        🔴 查不到代理 / 老行没有这一列 ⇒ 一律 True：
+        「新增字段必须兼容旧数据」—— 存量行的语义不许因为加了一列而变。
+        （代理存不存在是**另一道闸**，由发送侧先判。）
+        """
+        row = self._be.load((agent_id or "").strip())
+        if not row:
+            return True
+        return str(row.get("dm_enabled") or DM_ENABLED_ON).strip() not in DM_DISABLED_VALUES
+
+    def set_dm_enabled(self, agent_id: str, flag: bool) -> bool:
+        """开关私信接收。返回**值是否真的变了**（与 `set_exclude` 同款语义）。
+
+        🔴 行不存在 ⇒ False（调用方 404）；`status` / `role` / 凭据**一个都不碰**
+        —— 收不收私信是「投递偏好」，不是治理动作。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        want = DM_ENABLED_ON if flag else "0"
+        if str(row.get("dm_enabled") or DM_ENABLED_ON).strip() == want:
+            return False
+        self._be.update(aid, {"dm_enabled": want})
         return True
 
     def rename(self, agent_id: str, name: str) -> bool:

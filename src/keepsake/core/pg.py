@@ -84,6 +84,7 @@ from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
 # 代理注册表 `ks_agent` 的 DDL 唯一定义处（本模块只 import，不重复实现语义）
 from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
+from ..govern.registry import is_broken_connection_error
 from .base import StorageBase, fire_hits
 from .shared import (          # 与 Redis 共用的检索后处理（同一批函数对象）
     FRAGMENT_FIELDS,
@@ -218,6 +219,24 @@ FRAGMENT_COLUMNS = (
     # 仍按 `_contract_v2_missing` 做缺列降级（老库未迁移时不至于整条路报 500）。
     "is_latest", "supersedes", "supersede_reason", "applicability",
 )
+
+# --------------------------------------------------------------------------
+# 连接池参数（2026-10 ks_pg_pool）
+#
+# 🔴 为什么是这些数：
+#   * `min_size=1` —— 平时只养一条（省 PG 的连接槽），不够时池子自己长；
+#   * `max_size=8` —— 现有并发度上界：检索那两路并行（主线程 + 2 worker）
+#     再加控制台/API 的并发请求，8 条够用；真要更高就调这里（**池会排队**，
+#     借不到就抛 PoolTimeout ⇒ 走 fail-closed，文案说清楚「服务端暂时读不到」）。
+#   * `max_idle=60` —— 空闲超过 60s 就回收（不占着 PG 的连接槽）；
+#   * `max_lifetime=3600` —— 连接最长活 1 小时，到期换新（防长连累积的半死状态）。
+# --------------------------------------------------------------------------
+POOL_MIN_SIZE = 1
+POOL_MAX_SIZE = 8
+POOL_MAX_IDLE_S = 60.0
+POOL_MAX_LIFETIME_S = 3600.0
+#: 借连接的等待上限（秒）—— 超过就抛 PoolTimeout（fail-closed，不静默降级）
+POOL_CHECKOUT_TIMEOUT_S = 30.0
 
 # 🔴 **DDL 一律拆成 (对象名, 语句) 两元组**：`ensure_index()` 拿对象名去
 # information_schema / pg_indexes 核对，**只补真缺的那些**。
@@ -930,11 +949,15 @@ class PgStorage(StorageBase):
         self._attention_base_increment = float(attention_base_increment)
         self._attention_emotion_factor = float(attention_emotion_factor)
         self._hot_topic_decay_half_days = int(hot_topic_decay_half_days)
-        self._conn: Optional[Any] = None
-        # ---- 并行检索：每线程一条只读连接（psycopg Connection 非线程安全）----
-        self._tls = threading.local()
+        # ---- 连接池（2026-10 ks_pg_pool）：进程级，惰性建 ----
+        self._conn_pool: Optional[Any] = None
+        #: 建这个池时用的 conninfo（变了就重建，见 `_get_pool`）
+        self._pool_conninfo: str = ""
         self._conn_lock = threading.Lock()
-        self._worker_conns: List[Any] = []
+        #: 新建连接时的初始化回调（可注入）。测试用它把「精确 KNN 计划」钉到
+        #: **每一条**池连接上（池化之后会话级设置不再只属于某一条连接）。
+        self._pool_configure: Optional[Callable[[Any], None]] = None
+        # ---- 并行检索的线程池（与连接池不是一回事）----
         self._pool: Optional[ThreadPoolExecutor] = None
 
     def _has_embedder(self) -> bool:
@@ -946,22 +969,18 @@ class PgStorage(StorageBase):
         )
 
     # ------------------------------------------------------------------
-    # 连接管理
+    # 连接管理（连接池）
+    #
+    # 🔴 2026-10-20 换官方件的根因（实锤）：**单条持久连接**在家网抖动半断后
+    #    **不自愈** —— 闸门查询抛异常，被 fail-closed 吞成「main-brain 未批准」，
+    #    现场时间窗翻转、与客户端无关（用户据此误判两小时）。
+    #    现在用 psycopg3 自带的 `psycopg_pool`：
+    #      * `check=ConnectionPool.check_connection` —— 借出前健康探测，
+    #        坏连接当场丢弃重建（**不自造自愈**）；
+    #      * `max_idle` / `max_lifetime` —— 空闲回收与过期换新；
+    #      * 每条操作**借一条、用完还回** ⇒ 并发线程天然各持一条连接
+    #        （旧代码要另写一套「每线程一条连接」，现在池子替我们做了）。
     # ------------------------------------------------------------------
-
-    def _open_conn(self) -> Any:
-        """建一条**新**连接（不碰 `self._conn`）—— 并行检索的工作线程各调一次。"""
-        import psycopg  # noqa: PLC0415 — optional 依赖，延迟到真要用 PG 时
-
-        conninfo = self._conninfo()
-        try:
-            conn = psycopg.connect(conninfo, connect_timeout=self._connect_timeout)
-        except Exception as e:
-            # 只出 host，不出 conninfo（可能含口令）
-            logger.error("storage_pg: connect to %s:%s failed: %s", self._host, self._port, e)
-            raise
-        logger.info("storage_pg: connected to %s:%s/%s", self._host, self._port, self._dbname)
-        return conn
 
     def _conninfo(self) -> str:
         if self._dsn:
@@ -979,61 +998,133 @@ class PgStorage(StorageBase):
             parts.append(f"sslmode={self._sslmode}")
         return " ".join(parts)
 
-    def _connect(self) -> Any:
-        """惰性建连。psycopg 在这里才 import —— 没装也不影响 import 本模块。"""
-        if self._conn is not None:
-            return self._conn
-        self._conn = self._open_conn()
-        return self._conn
+    def _build_pool(self) -> Any:
+        """建连接池（`psycopg_pool` 官方件）。
 
-    def _drop_conn(self) -> None:
-        conn, self._conn = self._conn, None
-        if conn is not None:
+        🔴 `psycopg_pool` 是 **optional 依赖**（`psycopg[binary,pool]`），
+        延迟到真要用 PG 时才 import —— 没装 PG 依赖的人不该被这个模块拖挂。
+
+        🔴 **建池前先探一次**（保住「坏 DSN 立刻报错」的老口径）：池子会**在后台
+        重试**连库，客户端要等到 checkout 超时才拿到 `PoolTimeout` —— 那会让
+        「DSN 写错了」变成「每次调用白等 30 秒」。先探一次：连不上就直接抛
+        psycopg 的**连接类**异常（与改池之前 `psycopg.connect` 的口径逐字一致）。
+        """
+        import psycopg  # noqa: PLC0415 — optional 依赖
+        from psycopg_pool import ConnectionPool  # noqa: PLC0415 — optional 依赖
+
+        try:
+            probe = psycopg.connect(self._conninfo(), connect_timeout=self._connect_timeout)
+        except Exception as e:
+            # 只出 host，不出 conninfo（可能含口令）
+            logger.error("storage_pg: connect to %s:%s failed: %s", self._host, self._port, e)
+            raise
+        probe.close()
+
+        pool = ConnectionPool(
+            self._conninfo(),
+            min_size=POOL_MIN_SIZE,
+            max_size=POOL_MAX_SIZE,
+            max_idle=POOL_MAX_IDLE_S,
+            max_lifetime=POOL_MAX_LIFETIME_S,
+            check=ConnectionPool.check_connection,
+            kwargs={"connect_timeout": self._connect_timeout},
+            configure=self._pool_configure,
+            open=False,
+        )
+        pool.open()
+        logger.info("storage_pg: 连接池已建（min=%d max=%d）→ %s:%s/%s",
+                    POOL_MIN_SIZE, POOL_MAX_SIZE, self._host, self._port, self._dbname)
+        return pool
+
+    def _get_pool(self) -> Any:
+        """取（必要时建）进程级连接池。
+
+        🔴 **conninfo 变了就重建**（评测器给 DSN 追加
+        `default_transaction_read_only=on` 那一套就靠这个生效）——
+        池子是按旧 conninfo 建的，不重建就等于「改了配置没生效」。
+        """
+        pool = self._conn_pool
+        if pool is not None and self._pool_conninfo == self._conninfo():
+            return pool
+        with self._conn_lock:
+            if self._conn_pool is not None and self._pool_conninfo == self._conninfo():
+                return self._conn_pool
+            old, self._conn_pool = self._conn_pool, None
+            if old is not None:
+                try:
+                    old.close()
+                except Exception as e:      # noqa: BLE001 —— 关不掉也要把新池建起来
+                    logger.warning("storage_pg: 关旧连接池失败: %s: %s", type(e).__name__, e)
+            self._conn_pool = self._build_pool()
+            self._pool_conninfo = self._conninfo()
+            return self._conn_pool
+
+    def _rebuild_pool(self) -> Any:
+        """**池重建语义**：关掉旧池，另起一个。
+
+        什么时候用：借连接时抛**连接类**异常（OperationalError / PoolClosed…）
+        ⇒ 池里的连接整体坏了，重建比在坏池里空等更快。
+        `PoolTimeout`（池被借空）**不重建** —— 那是并发太高，重建只会多开连接。
+        """
+        with self._conn_lock:
+            old, self._conn_pool = self._conn_pool, None
+        if old is not None:
+            try:
+                old.close()
+            except Exception as e:      # noqa: BLE001 —— 关不掉也要把新池建起来
+                logger.warning("storage_pg: 关旧连接池失败: %s: %s", type(e).__name__, e)
+        return self._get_pool()
+
+    def _checkout(self) -> Tuple[Any, Any]:
+        """借一条连接 ⇒ `(pool, conn)`。
+
+        🔴 **借不到（连接类异常）⇒ 重建池再借一次**（池重建语义）。
+        """
+        for attempt in (1, 2):
+            pool = self._get_pool()
+            try:
+                return pool, pool.getconn(timeout=POOL_CHECKOUT_TIMEOUT_S)
+            except Exception as e:
+                if attempt == 1 and is_broken_connection_error(e):
+                    logger.warning(
+                        "storage_pg: 连接池 checkout 失败（%s: %s）—— 重建池后重试",
+                        type(e).__name__, e)
+                    self._rebuild_pool()
+                    continue
+                raise
+        raise RuntimeError("storage_pg: 连接池 checkout 不可达（不该到这）")
+
+    def _release(self, pool: Any, conn: Any) -> None:
+        """把连接还回**它来的那个池**（池自己判断留不留：坏连接会被丢弃重建）。"""
+        try:
+            pool.putconn(conn)
+        except Exception as e:      # noqa: BLE001 —— 池已关等情况：直接关掉这条
+            logger.warning("storage_pg: 归还连接失败: %s: %s", type(e).__name__, e)
             try:
                 conn.close()
             except Exception:
                 pass
 
-    # ---- 并行检索用的「每线程一条连接」 ----
-    #
-    # 🔴 为什么不能共用 `self._conn`：psycopg 的 Connection **不是线程安全的** ——
-    #    两个线程各开一个 cursor 在同一条连接上交替 execute，结果集会互相踩
-    #    （psycopg 用一把锁把 execute 串起来，但 fetchall 读到的是**对方**的
-    #    结果集）。所以 BM25 与 KNN 并行时必须各持一条连接。
-    #
-    # ponytail: 线程池固定 2 个 worker ⇒ 连接数上界 = 3（主线程 + 2 worker），
-    # 不做通用连接池。升级路径：真要放开并发度再换 psycopg_pool。
-    def _worker_conn(self) -> Any:
-        """取本线程的只读连接（首次调用时建，连到 `self._drop_conn` 之后重建）。"""
-        conn = getattr(self._tls, "conn", None)
-        if conn is not None:
-            return conn
-        conn = self._open_conn()
-        self._tls.conn = conn
-        with self._conn_lock:
-            self._worker_conns.append(conn)
-        return conn
+    @contextmanager
+    def _borrow(self) -> Iterator[Any]:
+        """借一条连接（用完还回池子）。
 
-    def _drop_worker_conn(self) -> None:
-        """本线程连接出错时丢弃并清空（与 `_drop_conn` 对称）。"""
-        conn, self._tls.conn = getattr(self._tls, "conn", None), None
-        if conn is None:
-            return
-        with self._conn_lock:
-            if conn in self._worker_conns:
-                self._worker_conns.remove(conn)
+        🔴 **worker 线程不再另开连接** —— 池子天然保证：同一条连接不会同时被
+        两个线程拿着（旧代码要另写一套「每线程一条连接」，现在池子替我们做了）。
+        """
+        pool, conn = self._checkout()
         try:
-            conn.close()
-        except Exception:
-            pass
+            yield conn
+        finally:
+            self._release(pool, conn)
 
     def _search_pool(self) -> ThreadPoolExecutor:
         """后台活（BM25/KNN 并行两路 + 检索命中打点）共用的线程池，惰性建、复用。
 
         🔴 **打点为什么不自己起线程**（2026-10 ks_hit_tracking）：起线程会让每次
-        检索多一条 PG 连接（`_worker_conn()` 是**按线程**存的，直到 `close()`
-        才回收）—— 聊几轮就攒出几十条僵尸连接。自建线程池的 worker 数固定，
-        连接数上界恒定，且 `close()` 里已经 shutdown 了这条路径。
+        检索多占一条池连接（借了要还、还了要等池回收）—— 聊几轮就攒出一堆
+        借还往返。自建线程池的 worker 数固定，连接数上界恒定，
+        且 `close()` 里已经 shutdown 了这条路径。
         """
         pool = self._pool
         if pool is None:
@@ -1046,61 +1137,41 @@ class PgStorage(StorageBase):
 
     @contextmanager
     def _ro(self) -> Iterator[Any]:
-        """只读游标。读完显式 commit 关掉 psycopg 的隐式事务。
+        """只读游标（从连接池借一条连接）。读完显式 commit 关掉 psycopg 的隐式事务。
 
         为什么要关：psycopg 默认非 autocommit，任何 SELECT 都会开一个隐式事务并
         一直挂着（既留脏状态，也让后续 `_tx()` 只拿到 SAVEPOINT 而不提交）。
+
+        🔴 借还走**池子**：worker 线程与主线程各借各的（池天然保证同一条连接
+        不会被两个线程同时拿着），旧代码那套「每线程一条连接」不再需要。
         """
-        # 并行检索的工作线程走**自己那条**连接，绝不与主线程共用 cursor。
-        if getattr(self._tls, "in_worker", False):
-            conn = self._worker_conn()
-            try:
-                with conn.cursor() as cur:
-                    yield cur
-                conn.commit()
-            except Exception:
-                self._drop_worker_conn()
-                raise
-            return
-        conn = self._connect()
-        try:
+        with self._borrow() as conn:
             with conn.cursor() as cur:
                 yield cur
             conn.commit()
-        except Exception:
-            self._drop_conn()
-            raise
 
     @contextmanager
     def _tx(self) -> Iterator[Any]:
-        """事务 + 游标。异常时丢弃连接并原样上抛（不吞、不降级）。
+        """事务 + 游标（连接从池里借）。异常时原样上抛（不吞、不降级）。
 
         🔴 退出时**必须显式 commit**（2026-10 ks_pg_b2 实测修掉的静默丢写）：
         `_ro()` 会在连接上开一个隐式事务。此后 psycopg 的 `conn.transaction()`
         只会建 SAVEPOINT，退出时释放保存点、外层隐式事务**仍未提交**，
-        而 `Connection.close()` 会把它回滚 ⇒ 「先查后写」时写入全部丢失。
+        而连接还回池子时会被回滚 ⇒ 「先查后写」时写入全部丢失。
         本函数是本模块唯一的写入口，所以在这里兜死。
 
-        🔴 **后台线程里的写也走这里，但换成本线程那条连接**（2026-10 ks_hit_tracking
-        撞出来的真故障）：psycopg 的 Connection 非线程安全，主连接正被调用线程
-        的事务占着时，打点线程再拿它开事务 ⇒ `ProgrammingError: Explicit commit()
-        forbidden within a Transaction context`，**并把调用线程那条连接搞成
-        [BAD]**（主线程下一次读直接炸）。判据沿用 `_ro()` 那套 `in_worker` 标志，
-        两条路径于是同源：worker 线程各持一条连接（`close()` 里统一关）。
+        🔴 **后台线程里的写也走这里，但换成本线程借的那条连接**
+        （2026-10 ks_hit_tracking 撞出来的真故障）：psycopg 的 Connection 非线程
+        安全，主连接正被调用线程的事务占着时，打点线程再拿它开事务 ⇒
+        `ProgrammingError: Explicit commit() forbidden within a Transaction
+        context`，**并把调用线程那条连接搞成 [BAD]**（主线程下一次读直接炸）。
+        池化之后这条纪律由池子兜住：每个线程借到的都是**自己那条**连接。
         """
-        in_worker = getattr(self._tls, "in_worker", False)
-        conn = self._worker_conn() if in_worker else self._connect()
-        try:
+        with self._borrow() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     yield cur
             conn.commit()
-        except Exception:
-            if in_worker:
-                self._drop_worker_conn()
-            else:
-                self._drop_conn()
-            raise
 
     def health_check(self) -> bool:
         """后端中立存活探针：SELECT 1。"""
@@ -1294,18 +1365,17 @@ class PgStorage(StorageBase):
             )
 
     def close(self) -> None:
-        """关连接，可重复调用。"""
+        """关连接（连接池 + 检索线程池），可重复调用。"""
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=True)
         with self._conn_lock:
-            conns, self._worker_conns = self._worker_conns, []
-        for conn in conns:
+            conn_pool, self._conn_pool = self._conn_pool, None
+        if conn_pool is not None:
             try:
-                conn.close()
-            except Exception:
-                pass
-        self._drop_conn()
+                conn_pool.close()
+            except Exception as e:      # noqa: BLE001 —— 关池失败不许挡住后面的清理
+                logger.warning("storage_pg: 关连接池失败: %s: %s", type(e).__name__, e)
 
     # ------------------------------------------------------------------
     # 语料维护类仍未实现（显式抛错，绝不静默返回零统计）
@@ -1962,9 +2032,9 @@ class PgStorage(StorageBase):
         串行等于让 BM25 的 SQL 白等一次网络往返。现在两路各投一个 worker：
         KNN 先投（它要先做 HTTP），BM25 同时跑，墙钟 ≈ max(两路)。
 
-        安全性：两路都是**只读**且各自 `self._ro()`；worker 线程走
-        `_worker_conn()` 的**独立连接**（psycopg Connection 非线程安全，
-        共用一条会让两个 cursor 的结果集互相踩，见 `_worker_conn` 注释）。
+        安全性：两路都是**只读**且各自 `self._ro()`；每个线程都从**连接池**里
+        借一条自己的连接（psycopg Connection 非线程安全，共用一条会让两个
+        cursor 的结果集互相踩 —— 池子按 checkout 天然隔离，见 `_borrow`）。
         合并顺序、融合/过滤/重排全部在主线程按**原顺序**执行，排序语义未动。
 
         查询向量**每次 search 只算一次**：`_knn_thin` 是唯一调
@@ -2004,23 +2074,15 @@ class PgStorage(StorageBase):
         两路都只读，所以「BM25 成功 / KNN 失败」不会留下写副作用。
 
         线程池**按实例复用**（`_pool` 惰性建、2 个 worker、`close()` 里
-        shutdown）—— 每次 search 新建线程池会让 worker 连接反复重建，
+        shutdown）—— 每次 search 新建线程池会让 worker 反复借还连接，
         而建连到远端库要 2~4s，比省下的那点时间贵得多。
         """
         pool = self._search_pool()
 
-        def run(fn, *args):
-            # 标记本线程走独立连接（`_ro()` 据此分流到 `_worker_conn`）
-            self._tls.in_worker = True
-            try:
-                return fn(*args)
-            finally:
-                self._tls.in_worker = False
-
         # KNN 先投：它要先做查询向量的 embedder HTTP 调用（最慢的一段），
         # 先投进去让 BM25 的 SQL 与它重叠，而不是排在它后面等。
-        f_knn = pool.submit(run, self._knn_thin, query, tag_filter, agent_id, is_primary)
-        f_bm25 = pool.submit(run, self._bm25_thin, query, tag_filter, agent_id, is_primary)
+        f_knn = pool.submit(self._knn_thin, query, tag_filter, agent_id, is_primary)
+        f_bm25 = pool.submit(self._bm25_thin, query, tag_filter, agent_id, is_primary)
         # 取 BM25 的结果先（它通常更短），但两路都已 in-flight，取哪个不影响并行度
         bm25_results = f_bm25.result()
         knn_results = f_knn.result()
@@ -3253,16 +3315,11 @@ class PgStorage(StorageBase):
     def _submit_hit_work(self, fn: Any) -> bool:
         """PG 侧执行器：把打点丢进检索那条复用线程池（不打新线程 ⇒ 连接数有上界）。
 
-        worker 带 `in_worker` 标记 ⇒ 落库走**本线程那条独立连接**，绝不与调用
-        线程的主连接抢事务（psycopg Connection 非线程安全，见 `_tx` 的注释）。
+        🔴 落库走**本线程从池里借的那条连接**，绝不与调用线程抢同一条
+        （psycopg Connection 非线程安全，见 `_tx` 的注释）—— 池化之后这条
+        纪律由池子兜住，不需要再打 `in_worker` 标记。
         """
-        def run() -> None:
-            self._tls.in_worker = True
-            try:
-                fn()
-            finally:
-                self._tls.in_worker = False
-        self._search_pool().submit(run)
+        self._search_pool().submit(fn)
         return True
 
     def _fire_hits(self, fragments: List[Dict[str, Any]]) -> None:
@@ -3285,13 +3342,8 @@ class PgStorage(StorageBase):
         rows = [(k, datetime.now(timezone.utc)) for k in dict.fromkeys(keys) if k]
         if not rows:
             return 0
-        in_worker = threading.current_thread() is not threading.main_thread()
-        self._tls.in_worker = in_worker
-        try:
-            with self._tx() as cur:
-                cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (%s, %s)", rows)
-        finally:
-            self._tls.in_worker = False
+        with self._tx() as cur:
+            cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (%s, %s)", rows)
         return len(rows)
 
     def hits_stats(

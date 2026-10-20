@@ -1,4 +1,4 @@
-"""MCP 工具面 —— 8 个记忆 tool + 5 个治理 tool 的实现。
+"""MCP 工具面 —— 8 个记忆 tool + 3 个信箱 tool + 5 个治理 tool 的实现。
 
 **取数只经 `MemoryProvider` 协议**：数据出口只有
 `provider.search/get/add/remove/merge/forget/capabilities/system_prompt_block`。
@@ -34,11 +34,13 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Protocol, runtime_checkable
+import uuid
+from typing import Any, Dict, List, Protocol, Tuple, runtime_checkable
 
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ..api import audit
+from ..govern.messaging import CONTENT_MAX as MESSAGE_CONTENT_MAX, Messaging
 from ..govern.registry import (
     ROLE_PRIMARY,
     ROLES,
@@ -48,7 +50,7 @@ from ..govern.registry import (
 
 __all__ = ["ToolError", "StorageIntrospection", "register_tools",
            "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS",
-           "GOVERN_TOOLS", "GOVERN_DENIED"]
+           "GOVERN_TOOLS", "GOVERN_DENIED", "MESSAGE_TOOLS"]
 
 #: `memory_search` 结果里单条正文的截断长度（全文走 `memory_get` / resource）
 SEARCH_PREVIEW_CHARS = 300
@@ -291,6 +293,10 @@ def _govern_identity(gate: Any, registry: Any, tool_name: str) -> str:
     if registry is None or gate is None:
         raise ToolError("治理工具需要代理注册表（当前 provider 未装配 ks_agent）")
     res = gate.identify(tool_name)
+    # 🔴 注册表**暂时读不到**（PG 抖动）不是「你不是 primary」——
+    #   各回各话：前者重试就好，后者要去控制台改角色。
+    if str(res.get("reason") or "") == "registry_unavailable":
+        raise ToolError(gate.denied_text(res))
     role = str(res.get("role") or "")
     if not res.get("ok") or role != ROLE_PRIMARY:
         raise ToolError(GOVERN_DENIED.format(
@@ -396,12 +402,101 @@ def agent_set_exclude(registry: Any, agent_id: str, exclude: bool = False) -> Di
 
 
 # --------------------------------------------------------------------------
+# 代理互聊信箱（message_*）：**所有已批准代理**可用，与治理面无关
+#
+# 🔴 **发件人身份只认凭据反查**（`gate.check` 那条链）：工具签名里**没有 from**
+#   —— 调用侧自报身份正是这套治理要拔掉的东西。
+# 🔴 **收件人资格先判后投**：目标代理不存在 / 未批准 / 已吊销 ⇒ 一条都不投；
+#   目标关了私信（`dm_enabled=0`）⇒ 拒投并说明为什么。
+# 🔴 **三个工具都算写**（`server.GATE_WRITE_TOOLS`）：收信即消费（标已读）
+#   是状态变更，不是纯读。
+# --------------------------------------------------------------------------
+
+#: 信箱三工具的名字（都在 `server.GATE_WRITE_TOOLS` 里登记为写口）
+MESSAGE_TOOLS = ("message_send", "message_inbox", "message_recent")
+
+#: 线程号前缀（空 thread_id 时自动生成 `th_<8 位 hex>`）
+THREAD_PREFIX = "th_"
+
+
+def _message_ctx(gate: Any, box: Any, tool_name: str) -> Tuple[str, Any]:
+    """信箱工具的入口：取**调用方身份**（凭据反查）与信箱句柄。
+
+    没有注册表 ⇒ 明确报错（与治理面同款：不让调用方以为工具凭空消失）。
+    """
+    if gate is None or box is None:
+        raise ToolError("代理互聊信箱需要代理注册表（当前 provider 未装配 ks_agent）")
+    res = gate.check(tool_name)
+    return str(res.get("agent_id") or ""), box
+
+
+def _message_target(registry: Any, to_id: str) -> str:
+    """收件人资格闸：不存在 / 未批准 / 已吊销 ⇒ 拒投；关了私信 ⇒ 拒投。"""
+    target = (to_id or "").strip()
+    if not target:
+        raise ToolError("to 不能为空")
+    row = registry.get(target)
+    if not row or row.get("status") != STATUS_APPROVED:
+        raise ToolError(
+            f"目标代理未批准，消息未投递：{target}（代理不存在 / 未批准 / 已吊销）")
+    if not registry.dm_enabled(target):
+        raise ToolError(
+            f"目标代理 {target} 已关闭私信接收（dm_enabled=0），消息未投递")
+    return target
+
+
+def message_send(registry: Any, box: Any, caller: str, to: str, content: str,
+                 thread_id: str = "") -> Dict[str, Any]:
+    """投一条私信给 `to`。返回 `{ok, seq, thread_id}`。
+
+    `thread_id` 留空 ⇒ 自动生成 `th_<8 位 hex>` 并**回显**（回复时带上它即可续上
+    同一段对话）。正文超长 ⇒ 报错（不静默截断 —— 截断的信会让人读错话）。
+    """
+    target = _message_target(registry, to)
+    body = (content or "").strip()
+    if not body:
+        raise ToolError("content 不能为空")
+    if len(body) > MESSAGE_CONTENT_MAX:
+        raise ToolError(
+            f"content 超长（{len(body)} 字符 > 上限 {MESSAGE_CONTENT_MAX}）")
+    tid = (thread_id or "").strip() or f"{THREAD_PREFIX}{uuid.uuid4().hex[:8]}"
+    seq = box.send(caller, target, body, tid)
+    return {"ok": True, "seq": seq, "thread_id": tid}
+
+
+def _message_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """信箱行 → 对外形状（`from` 而不是 `from_id`：模型读起来更像一句话）。"""
+    return [
+        {
+            "seq": r.get("seq"),
+            "from": r.get("from_id", ""),
+            "to": r.get("to_id", ""),
+            "content": r.get("content", ""),
+            "thread_id": r.get("thread_id", ""),
+            "created": r.get("created", ""),
+        }
+        for r in rows
+    ]
+
+
+def message_inbox(box: Any, caller: str, unread_only: bool = True,
+                  limit: int = 20) -> List[Dict[str, Any]]:
+    """收件箱（**fetch 即标读**：取到的消息当场算已读）。"""
+    return _message_rows(box.fetch_inbox(caller, unread_only=unread_only, limit=limit))
+
+
+def message_recent(box: Any, caller: str, peer: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """与 `peer` 的**双向**最近消息（含自己发的；**不动**对方的已读状态）。"""
+    return _message_rows(box.recent_between(caller, (peer or "").strip(), limit=limit))
+
+
+# --------------------------------------------------------------------------
 # 注册到 FastMCP/MCPServer
 # --------------------------------------------------------------------------
 
 def register_tools(server: Any, provider: Any, gate: Any = None, *,
                    govern: bool = False) -> Any:
-    """把 8 个记忆 tool（+ `govern=True` 时再挂 5 个治理 tool）挂到 `server` 上。
+    """把 8 个记忆 tool + 3 个信箱 tool（+ `govern=True` 时再挂 5 个治理 tool）挂到 `server` 上。
 
     `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
     先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
@@ -411,8 +506,14 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     治理那 5 个走 `gate.identify` + `role == primary`（见 `_govern_identity`）：
     自造 provider 没有注册表（`gate is None`）时它们照常注册，只是每个都明确报
     「治理工具需要代理注册表」—— 不静默消失，免得调用方以为治理面不存在。
+
+    信箱那 3 个（`message_*`）与治理面**无关**：所有已批准代理都能用（判定走
+    `gate.check` 那条身份链）；没有注册表时同样照常注册并明确报错。
     """
     registry = getattr(gate, "registry", None)
+    #: 信箱句柄（与注册表**同一个 storage** ⇒ 不另开连接、不另拼 DSN）。
+    #: 没有注册表时留 None —— 工具照常注册，但每次调用明确报「需要代理注册表」。
+    box = Messaging(registry.storage) if registry is not None else None
 
     def _authorize(tool_name: str) -> None:
         if gate is not None:
@@ -481,6 +582,34 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     def _forget(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
         _authorize("memory_forget")
         return memory_forget(provider, dry_run, confirm)
+
+    # ---- 代理互聊信箱：所有**已批准**代理可用（与 govern 无关）----------
+    # 身份判定走 `gate.check`（与记忆工具同一条身份链）：发件人 = 凭据反查出来的
+    # 调用方，**工具签名里没有 from** —— 不给调用侧自报身份留口子。
+    @server.tool(
+        name="message_send",
+        description="给另一个已批准代理发一条私信（对方用 message_inbox 收）。"
+                    "正文 ≤4000 字符；thread_id 留空自动生成并回显。",
+    )
+    def _message_send(to: str, content: str, thread_id: str = "") -> Dict[str, Any]:
+        caller, mbox = _message_ctx(gate, box, "message_send")
+        return message_send(registry, mbox, caller, to, content, thread_id)
+
+    @server.tool(
+        name="message_inbox",
+        description="取收件箱里的私信（默认只取未读；**取走即算已读**）。",
+    )
+    def _message_inbox(unread_only: bool = True, limit: int = 20) -> List[Dict[str, Any]]:
+        caller, mbox = _message_ctx(gate, box, "message_inbox")
+        return message_inbox(mbox, caller, unread_only=unread_only, limit=limit)
+
+    @server.tool(
+        name="message_recent",
+        description="看与某个代理的双向最近消息（含自己发的；不会改动已读状态）。",
+    )
+    def _message_recent(peer: str, limit: int = 20) -> List[Dict[str, Any]]:
+        caller, mbox = _message_ctx(gate, box, "message_recent")
+        return message_recent(mbox, caller, peer, limit=limit)
 
     # ---- 治理面：仅 primary，且只在本单显式开了 govern 时才存在 ----------
     # 二次判定在每个治理工具**函数体第一行**（`_govern_identity`）而不是靠

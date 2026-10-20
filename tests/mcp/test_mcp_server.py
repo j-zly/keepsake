@@ -24,9 +24,14 @@ from keepsake.mcp_server.server import build_server, main
 from keepsake.mcp_server.tools import ToolError
 
 #: 任务书给定的工具面，一个不多一个不少
+#:
+#: 2026-10 ks_agent_messaging：**新增 3 个信箱工具**（`message_send` /
+#: `message_inbox` / `message_recent`）—— 与治理面无关，**所有已批准代理可用**。
+#: 记忆工具那 8 个的契约**逐字不动**（仍逐个在集合里，见下面的 `<=` 断言）。
 EXPECTED_TOOLS = {
     "memory_capabilities", "memory_search", "memory_get", "memory_core_list",
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
+    "message_send", "message_inbox", "message_recent",
 }
 
 

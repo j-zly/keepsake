@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from keepsake.storage import DEFAULT_BM25_LIMIT
+from keepsake.storage_shared import frozen_scoring_now
 from keepsake.storage_sqlite import SqliteStorage
 
 # ---------------------------------------------------------------------------
@@ -93,36 +94,45 @@ def corpus(tmp_path_factory) -> str:
 
 def _recall_at(path: str, ks=(1, 5, 15, 50), bm25_limit: int = DEFAULT_BM25_LIMIT,
                repeat: int = 1) -> tuple:
-    """跑一遍探针，返回 `(各档 Recall@k, 逐条命中的 key 序列列表, 语料条数)`。"""
+    """跑一遍探针，返回 `(各档 Recall@k, 逐条命中的 key 序列列表, 语料条数)`。
+
+    🔴 **评分时钟必须冻住**（2026-10-20 修）：时衰减按「查询那一刻」求值 ⇒
+    同一行两次查询分数就不同，只差 1e-7 级的近同行会互相穿过
+    （`core/shared.py::scoring_now` 的说明里记着这条实测：轮间隔 1.5s 即换位）。
+    不冻 ⇒ 「同查询连跑 3 次 key 序列逐字相同」是掷骰子（同款修复见
+    `scripts/recall_eval.py`：评测器一直用 `frozen_scoring_now()`）。
+    **断言一个字没删、没放宽** —— 只是把「不可复现」变成「可复现」。
+    """
     st = SqliteStorage(path=path, bm25_limit=bm25_limit, final_limit=max(ks),
                        is_primary=True)
     try:
         probes = make_probes()
         key_seqs: list = []
         hits: dict = {k: 0 for k in ks}
-        for p in probes:
-            seq = []
-            rank = None
-            for i, frag in enumerate(st.search_bm25(p["query"]) or [], 1):
-                seq.append(frag.get("_key"))
-                if rank is None and p["expect_substring"] in str(frag.get("content", "")):
-                    rank = i
-            key_seqs.append(seq)
-            for k in ks:
-                if rank is not None and rank <= k:
-                    hits[k] += 1
-        with st._lock:                                   # noqa: SLF001 — 只读计数
-            n_docs = st._db().execute(                  # noqa: SLF001
-                "SELECT COUNT(*) FROM ks_fragment").fetchone()[0]
-        repeat_seqs = key_seqs if repeat <= 1 else [
-            key_seqs,                                            # 占位，下面再跑 repeat-1 轮
-        ]
-        for _ in range(max(0, repeat - 1)):
-            again = []
+        with frozen_scoring_now():
             for p in probes:
-                again.append([f.get("_key") for f in
-                              (st.search_bm25(p["query"]) or [])])
-            repeat_seqs.append(again)
+                seq = []
+                rank = None
+                for i, frag in enumerate(st.search_bm25(p["query"]) or [], 1):
+                    seq.append(frag.get("_key"))
+                    if rank is None and p["expect_substring"] in str(frag.get("content", "")):
+                        rank = i
+                key_seqs.append(seq)
+                for k in ks:
+                    if rank is not None and rank <= k:
+                        hits[k] += 1
+            with st._lock:                                   # noqa: SLF001 — 只读计数
+                n_docs = st._db().execute(                  # noqa: SLF001
+                    "SELECT COUNT(*) FROM ks_fragment").fetchone()[0]
+            repeat_seqs = key_seqs if repeat <= 1 else [
+                key_seqs,                                            # 占位，下面再跑 repeat-1 轮
+            ]
+            for _ in range(max(0, repeat - 1)):
+                again = []
+                for p in probes:
+                    again.append([f.get("_key") for f in
+                                  (st.search_bm25(p["query"]) or [])])
+                repeat_seqs.append(again)
     finally:
         st.close()
     recall = {k: hits[k] / len(probes) for k in ks}

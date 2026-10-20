@@ -475,8 +475,9 @@ def pg_search():
 
 @pytest.fixture()
 def exact_knn(pg_search):
-    """🔴 让本用例期间的 KNN 走**精确检索**：主连接上 `SET enable_indexscan = off`
-    ⇒ 规划器不能选 `idx_ks_fragment_embedding_hnsw`，只能顺序扫 ⇒ 结果是精确的。
+    """🔴 让本用例期间的 KNN 走**精确检索**：**每条池连接**上
+    `SET enable_indexscan = off` ⇒ 规划器不能选 `idx_ks_fragment_embedding_hnsw`，
+    只能顺序扫 ⇒ 结果是精确的。
 
     为什么需要（2026-10-12 实测）：本套用例用 `_FakeEmbedder`（n-gram 哈希**退化稀疏
     向量**，互距全挤 1.0 平台），而共享 `keepsake_test` 已长到 ~3730 行 ⇒ 计划器从顺序扫
@@ -485,23 +486,23 @@ def exact_knn(pg_search):
     这是「假 embedder × 索引计划」的测试环境问题，不是检索逻辑 bug —— 所以修的是**计划**，
     不是断言；断言保持原样（该用例该验的 filter / rerank / hydrate / RRF 一行没改）。
 
-    作用域：只在本用例期间生效（主连接 SET，收尾 RESET），不改库级设置、不影响其它用例。
+    🔴 2026-10 ks_pg_pool：连接**池化**之后，会话级设置不再只属于「那条主连接」
+    （每次操作借到的可能是池里另一条）⇒ 改用池的 `configure` 回调，把设置钉到
+    **每一条新建连接**上；夹具两头发起一次池重建，让现役连接也带上它。
+    作用域：只在本用例期间生效，不改库级设置、不影响其它用例。
     """
-    conn = pg_search._connect()          # noqa: SLF001 — 测试内取会话连接
-    with conn.cursor() as cur:
-        cur.execute("SET enable_indexscan = off")
-    conn.commit()
+    def _configure(conn) -> None:
+        with conn.cursor() as cur:
+            cur.execute("SET enable_indexscan = off")
+        conn.commit()
+
+    pg_search._pool_configure = _configure       # noqa: SLF001 — 新建连接时的初始化
+    pg_search._rebuild_pool()                    # noqa: SLF001 — 让现役连接也带上该设置
     try:
         yield
     finally:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("RESET enable_indexscan")
-            conn.commit()
-        except Exception:
-            # 会话连接已废（比如中途报错被 _drop_conn 清掉）：丢弃即可，
-            # 新连接本来就是默认计划，不会把设置漏出去。
-            pg_search._drop_conn()       # noqa: SLF001
+        pg_search._pool_configure = None         # noqa: SLF001
+        pg_search._rebuild_pool()                # noqa: SLF001 — 去掉设置，重建一条干净的池
 
 
 @pytest.fixture()
@@ -726,12 +727,18 @@ def test_empty_query_is_explicit_not_silent(pg_search, caplog):
 
 
 def test_ensure_index_is_idempotent_with_search_columns(pg_search):
-    """ensure_index 幂等：tsv / embedding 两列与两个索引重复建不炸。"""
+    """ensure_index 幂等：tsv / embedding 两列与两个索引重复建不炸。
+
+    🔴 2026-10-20：查询**必须**带 `AND schemaname='public'` —— `pg_indexes` 是
+    全库视图，同名索引在别的 schema（共享测试库的其它副本）也会被数进去，
+    count 断言因此假红（主脑 10-20 实锤根因）。
+    """
     assert pg_search.ensure_index() is True
     with pg_search._ro() as cur:                      # noqa: SLF001
         cur.execute("""
             SELECT indexname FROM pg_indexes
             WHERE tablename = 'ks_fragment'
+              AND schemaname = 'public'
               AND indexname IN ('idx_ks_fragment_content_tsv', 'idx_ks_fragment_embedding_hnsw')
             ORDER BY indexname
         """)

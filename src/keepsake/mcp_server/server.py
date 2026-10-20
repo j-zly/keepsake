@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional
 import anyio
 from mcp.server.fastmcp import FastMCP
 
+from ..govern.registry import CREDENTIAL_HINT_LEN, is_connection_error
 from .factory import DEFAULT_AGENT_ID, default_provider
 from .resources import register_resources
 from .tools import ToolError, register_tools
@@ -69,6 +70,19 @@ INSTRUCTIONS = (
     "删除必须显式 confirm；merge/forget 默认 dry-run，只统计不写。"
 )
 
+#: 代理互聊信箱的用法说明（**什么时候用信箱，而不是 memory_add**）。
+#:
+#: 🔴 两条路各有各的语义，混用会把「传话」变成「广播」：
+#:   * `memory_add` = 往**自己的记忆**里写一条（检索时能被自己召回）；
+#:   * `message_send` = 给**另一个代理**投一封信（对方收信箱里才看得到，
+#:     需要对方**即时响应**时才用；不需要即时响应就别投信箱，写进记忆更合适）。
+MESSAGING_HINT = (
+    "代理互聊信箱：message_send 给另一个已批准代理投私信（thread_id 留空会自动生成并回显，"
+    "回复时带上它续同一段对话），message_inbox 取收件箱（取走即算已读），"
+    "message_recent 看与某个代理的双向最近消息。"
+    "只有在「需要对方即时响应」时才投信箱；只是要自己以后能检索到的内容，写 memory_add。"
+)
+
 #: 治理面只在 `build_server(govern=True)` 时存在 —— 那时才把它写进 instructions，
 #: 免得模型按一段并不存在的工具说明去调（govern=False 时那段话是假的）。
 GOVERN_HINT = (
@@ -87,9 +101,11 @@ GOVERN_HINT = (
 
 #: 写类工具（其余算读）：决定 `touch(read|write)` 的口径。
 #: `agent_*` 治理写口自然算写 —— 批准/吊销/改角色/改上下文开关都动注册表。
+#: `message_*` 三个信箱工具**也算写**：收信即消费（标已读）是状态变更，不是纯读。
 GATE_WRITE_TOOLS = frozenset({
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
     "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
+    "message_send", "message_inbox", "message_recent",
 })
 
 #: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
@@ -97,6 +113,54 @@ GATE_RECHECK_S = 60.0
 
 #: 未批准 / 凭据不对时的**唯一**对外文案（🔴 不回显任何凭据内容）。
 GATE_DENIED = "代理 {agent_id} 未批准/已吊销，请到控制台审核通过后领取凭据"
+
+# --------------------------------------------------------------------------
+# 🔴 拒绝文案**三分法**（2026-10-20 用户本机误判两小时的根因）
+#
+# 此前三种情况都回显成「代理 {agent_id} 未批准」：没带凭据 / 凭据无效 / 代理未批准
+# —— 而「反查不到人时 agent_id 回退进程默认名 main-brain」，于是真因（客户端
+# **没带 Authorization 头**）被读成「main-brain 没批准」，白查两小时。
+# 现在按 `verify_any` 的 reason 各回各话：
+# --------------------------------------------------------------------------
+
+#: 没带凭据（客户端 MCP 配置里缺 Authorization 头）
+GATE_DENIED_NO_CREDENTIAL = "请求未带凭据（检查客户端 MCP 配置的 Authorization 头）"
+
+#: 凭据无效 / 已换发（旧的那条已经作废）
+GATE_DENIED_UNKNOWN_AGENT = "凭据无效或已更换（到控制台重新换发）"
+
+#: 未批准 / 已吊销 —— 保持原措辞，外加**真实反查线索**（凭据前 8 位，hint 级）
+GATE_DENIED_NOT_APPROVED = (
+    "代理 {agent_id} 未批准/已吊销，请到控制台审核通过后领取凭据"
+    "（凭据前 8 位 {hint} 未匹配到已批准代理）"
+)
+
+#: 注册表**暂时读不到**（PG 抖动 / 池借不到连接）—— 与「查无此人」分开说
+GATE_DENIED_UNAVAILABLE = "服务端暂时读不到注册表（PG 抖动），请几十秒后重试"
+
+#: `verify_any` / `verify` 的 reason → 拒绝文案。
+#: 🔴 每一类各回各话：**不许**把「没带凭据」「凭据无效」「未批准」「服务端读不到」
+#:   揉成同一句 —— 那正是让用户误判两小时的写法。
+GATE_DENIED_BY_REASON = {
+    "no_credential": GATE_DENIED_NO_CREDENTIAL,
+    "unknown_agent": GATE_DENIED_UNKNOWN_AGENT,
+    "bad_credential": GATE_DENIED_UNKNOWN_AGENT,
+    "not_approved": GATE_DENIED_NOT_APPROVED,
+    "registry_unavailable": GATE_DENIED_UNAVAILABLE,
+}
+
+
+def gate_denied_text(reason: str, agent_id: str = "", credential_hint: str = "") -> str:
+    """按 reason 生成拒绝文案（🔴 只回显 hint 级信息，绝不回显完整凭据）。
+
+    未在表里的 reason（`not_local` / `verify_error` / 空）⇒ 回落**通用**那句
+    （保持旧行为，不给陌生 reason 编新话）。
+    """
+    key = str(reason or "")
+    if key == "not_approved":
+        return GATE_DENIED_NOT_APPROVED.format(
+            agent_id=agent_id or "-", hint=credential_hint or "-")
+    return GATE_DENIED_BY_REASON.get(key) or GATE_DENIED.format(agent_id=agent_id or "-")
 
 #: 环境变量名（stdio 客户端启动时带；`KEEPSAKE_AGENT_ID` 缺省仍是 `DEFAULT_AGENT_ID`）
 ENV_AGENT_ID = "KEEPSAKE_AGENT_ID"
@@ -160,7 +224,11 @@ class AgentGate:
             res = dict(self._stdio_verify() or {})
         except Exception as e:      # noqa: BLE001
             logger.warning("keepsake MCP: 凭据复核异常（按拒绝处理）: %s", type(e).__name__)
-            res = {}
+            # 🔴 连接类异常（PG 抖动）**不与「查无此人」混同一句**：
+            #   前者重试几十秒就好，后者要重新换发凭据 —— 混了就会把人引到错的方向。
+            res = {"ok": False, "role": "", "status": "unknown",
+                   "reason": ("registry_unavailable" if is_connection_error(e)
+                              else "verify_error")}
         res["ok"] = bool(res.get("ok"))
         self._stdio_res = res
         self._stdio_ok, self._stdio_at = res["ok"], time.monotonic()
@@ -207,6 +275,17 @@ class AgentGate:
         raw = str(raw).strip()
         return raw[len("Bearer "):].strip() if raw.startswith("Bearer ") else ""
 
+    def _verify_any(self, credential: str) -> Dict[str, Any]:
+        """按凭据反查身份；**连接类异常** ⇒ 「服务端暂时读不到」，不与「查无此人」混同。"""
+        try:
+            return dict(self._registry.verify_any(credential))
+        except Exception as e:      # noqa: BLE001 —— 分类后按类说话
+            if not is_connection_error(e):
+                raise
+            logger.warning("keepsake MCP: 注册表暂时读不到（%s: %s）", type(e).__name__, e)
+            return {"ok": False, "role": "", "status": "unknown",
+                    "reason": "registry_unavailable", "agent_id": ""}
+
     def identify(self, tool_name: str = "") -> Dict[str, Any]:
         """**本次调用的身份判定结论**（不抛、不记账）：`{ok, agent_id, role, status, reason}`。
 
@@ -221,16 +300,34 @@ class AgentGate:
         `GATE_RECHECK_S`（哪怕工具一直在被调、复核线程还没轮到）。
         """
         headers = self._http_headers()
+        credential = ""
         if headers is not None:
             # http：头里只有 Bearer，身份由凭据反查（`verify_any`）—— 不采信客户端
             # 自报的 agent_id，那正是这套治理要拔掉的东西。
-            res = dict(self._registry.verify_any(self._bearer(headers)))
+            credential = self._bearer(headers)
+            res = self._verify_any(credential)
+            # 🔴 反查不到人时**不回退**进程默认名（`main-brain`）——
+            #   2026-10-20 用户本机据此误判两小时（真因是请求没带 Authorization 头）。
+            if not res.get("agent_id"):
+                res["agent_id"] = ""
         else:
             if self._stdio_ok is None or time.monotonic() - self._stdio_at >= GATE_RECHECK_S:
                 self._recheck()
             res = dict(self._stdio_res)
-        res["agent_id"] = str(res.get("agent_id") or self.agent_id)
+            credential = self._credential
+            res["agent_id"] = str(res.get("agent_id") or self.agent_id)
+        # 🔴 只带**前 8 位**（hint 级）：够人比对「我手上这条对不对」，
+        #   绝不足以当凭据用，也绝不回显完整凭据。
+        res["credential_hint"] = str(credential or "")[:CREDENTIAL_HINT_LEN]
         return res
+
+    def denied_text(self, res: Dict[str, Any]) -> str:
+        """按 reason 生成拒绝文案（记忆面与治理面共用这一份，别处不再解一遍）。"""
+        return gate_denied_text(
+            str(res.get("reason") or ""),
+            agent_id=str(res.get("agent_id") or ""),
+            credential_hint=str(res.get("credential_hint") or ""),
+        )
 
     def record_activity(self, caller: str, tool_name: str) -> None:
         """按工具口径打活动（`check` 与治理工具面共用的记账点）。"""
@@ -240,7 +337,7 @@ class AgentGate:
         """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
         res = self.identify(tool_name)
         if not res.get("ok"):
-            raise ToolError(GATE_DENIED.format(agent_id=res["agent_id"]))
+            raise ToolError(self.denied_text(res))
         self.record_activity(res["agent_id"], tool_name)
         return res
 
@@ -404,7 +501,8 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
     if provider is None:
         provider = default_provider()
     server = FastMCP(name=SERVER_NAME,
-                     instructions=INSTRUCTIONS + (GOVERN_HINT if govern else ""))
+                     instructions=INSTRUCTIONS + MESSAGING_HINT
+                     + (GOVERN_HINT if govern else ""))
     gate = AgentGate.for_provider(provider, server)
     register_tools(server, provider, gate=gate, govern=govern)
     register_resources(server, provider)
