@@ -149,6 +149,78 @@ test('四个动作都收在 primary 的 v-else 分支里', () => {
   assert.doesNotMatch(actions.slice(0, elseAt), /ask\('/, '分流点之前不许有动作调用')
 })
 
+// ---------------------------------------------------------------------------
+// 重新生成凭据（换发）：approve 本就是换发语义，前端只加一个入口
+// ---------------------------------------------------------------------------
+//
+// 已批准的代理要能自己换一把凭据（泄露场景）：后端 POST .../approve **本就是换发**
+// （重新调用即换发、旧的那条随即失效），所以零后端改动，这页只加一个入口：
+//   1) 入口只开在「已批准」行上（待审的去了审核页、已吊销的走「重新批准」）；
+//   2) 走同一套 kind 机制的手输确认框：照抄 agent_id 前 8 位才让提交；
+//   3) 确认后打 approve 端点，新凭据走**两页共用**的那一个 CredentialDialog；
+//   4) 🔴 失败不许留下「以为换发了」的误导：红条 + 不弹凭据框。
+
+/** 「重新生成凭据」按钮那一段（从 <button 标签到它的 @click）。 */
+function rotateButton() {
+  const at = VIEW.indexOf("ask('rotate', a)")
+  assert.ok(at !== -1, '没有「重新生成凭据」入口')
+  const start = VIEW.lastIndexOf('<button', at)
+  assert.ok(start !== -1, '入口不是按钮')
+  return VIEW.slice(start, at + "ask('rotate', a)".length)
+}
+
+test('已批准行有「重新生成凭据」按钮；待审 / 已吊销的行没有', () => {
+  const actions = actionsBlock()
+  assert.match(actions, /重新生成凭据/, '操作区要有「重新生成凭据」入口')
+  assert.match(actions, /@click="ask\('rotate', a\)"/, '入口走统一的确认框（kind=rotate）')
+  const btn = rotateButton()
+  // 门只开在已批准行上：待审行（去审核页）与已吊销行（走「重新批准」）都拿不到这个钮
+  assert.match(btn, /v-if="a\.status === 'approved'"/, '只有已批准行才给换发钮')
+  assert.doesNotMatch(VIEW, /a\.status === 'pending'/, '本页压根不渲染待审行，遑论给待审行换发')
+  // 非危险色那一档：吊销那种红底留给真会毁掉东西的动作
+  assert.match(btn, /class="act-btn"/, '走 act-btn 样式')
+  assert.doesNotMatch(btn, /act-btn--danger/, '不占危险色那一档')
+  // 🔴 换发对主代理无副作用：按钮在 primary / 非 primary 的分流链**外面**（主代理行也要有）
+  const elseAt = actions.indexOf('<template v-else>')
+  assert.ok(elseAt !== -1, '缺少 v-else 分支')
+  assert.ok(actions.indexOf("ask('rotate', a)") > elseAt, '换发钮放在分流链外面（主代理行同样有）')
+})
+
+test('换发走手输闸：照抄 agent_id 前 8 位才让提交', () => {
+  // 闸 = 吊销那一道（同为作废旧凭据）：agent_id 前 8 位
+  assert.match(VIEW, /if \(dlgKind\.value === 'rotate'\) return revokePrefix\.value/, '换发要手输前 8 位')
+  assert.match(VIEW, /:expect="dlgExpect"/, '确认框吃的就是这个 expect')
+  // ConfirmDialog 本体那把闸：串不对就不许点确认（不给正确前缀 = 提交不了）
+  const CD = read('components/ConfirmDialog.vue')
+  assert.match(
+    CD,
+    /const armed = computed\(\(\) => !props\.expect \|\| typed\.value\.trim\(\) === props\.expect\)/,
+    '串不对不许提交',
+  )
+  // 后果文案要说清三件事
+  assert.match(VIEW, /旧凭据立即作废/, '要说清旧凭据立即作废')
+  assert.match(VIEW, /使用该凭据的客户端最迟 60 秒内被拒/, '要说清客户端最迟 60 秒内被拒')
+  assert.match(VIEW, /代理状态与记忆归属不变/, '要说清状态与记忆归属不变')
+  // 确认后打 approve 端点（confirm: true 由 api 层带）
+  const body = VIEW.slice(VIEW.indexOf('async function doAction'))
+  assert.match(body.slice(0, 900), /api\.approveAgent\(row\.agent_id\)/, '换发走 approve 端点（换发语义在后端）')
+  // 新凭据走**两页共用**的那一个弹框（不许自己再留一份显示逻辑）
+  assert.match(VIEW, /<CredentialDialog/, '用共用弹框')
+  assert.doesNotMatch(VIEW, /<pre class="pre">\{\{ cred \}\}<\/pre>/, '不许自己再留一份显示逻辑')
+})
+
+test('换发失败：不弹凭据框，红条透出后端 message（不留「以为换发了」的误导）', () => {
+  const body = VIEW.slice(VIEW.indexOf('async function doAction'))
+  const catchBlock = body.slice(body.indexOf('} catch (e) {'))
+  const errBlock = catchBlock.slice(0, catchBlock.indexOf('} finally'))
+  assert.match(errBlock, /showError\(/, '失败走红条')
+  assert.match(errBlock, /e\.message/, '后端 message 原样透出')
+  assert.doesNotMatch(errBlock, /credOpen\.value = true/, '失败路径不许弹凭据框')
+  // 就算后端 200 却没回明文，也不许弹一个空框（空框 = 让人以为换成了）
+  assert.match(VIEW, /function showCred\(r\) \{/, '凭据在本页只有一个入口')
+  assert.match(VIEW, /if \(!r\?\.credential\) \{/, '没有明文不开框')
+})
+
 test('搜索 + 服务端分页：filter-panel 三件套 + PagerBar 接线', () => {
   // 搜索框（回车查 / 清空回全量 / 状态三分支）
   assert.match(VIEW, /class="filter-panel"/, '搜索面板走全站统一的 filter-panel')

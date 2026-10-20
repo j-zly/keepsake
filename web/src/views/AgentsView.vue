@@ -2,7 +2,7 @@
   代理登记（keepsake_agent_registry 的控制台面 · 业务页）。
 
   2026-10-20 拆页：待审队列从本页整段搬去 /agents-review（代理审核）。
-  本页只管**已批准代理的日常维护**（编辑 ID 与备注名 / 设角色 / 上下文过滤 / 吊销 / 重新批准）
+  本页只管**已批准代理的日常维护**（编辑 ID 与备注名 / 设角色 / 上下文过滤 / 吊销 / 重新批准 / 换发凭据）
   +「登记新代理」；pending 的行不在本页出现（去审核页看）。
   两页共用一次性凭据弹框（components/CredentialDialog.vue）—— **一份实现，不复制**。
 
@@ -14,6 +14,10 @@
   只留一句「不可吊销 / 不可排除」+ 一个「编辑」（能改备注名，id 被后端锁死）。
   换主的唯一路径是给别的行点「设为主代理」—— 那次会自动把旧主降级。
   后端同口径 409，绕开 UI 打 API 也一样被挡。
+
+  ⚠️ 唯一的例外是「重新生成凭据」：换发就是**再 approve 一次**（approve 本就是
+  换发语义 —— 旧的那条立即作废），主代理行同样给。主脑走本机 bootstrap，
+  不吃这把凭据，泄露时它也得能自己换一把。
 
   ponytail: 后端 GET /api/v1/agents 不按 status 过滤（零后端改动约束），所以本页的
   分页与计数是**全状态口径** —— pending 行占着页位却不渲染（它去审核页）。
@@ -197,6 +201,23 @@
                 改备注名它照样要能改（后端同口径：primary 只锁 id）。
               -->
               <button class="act-btn" :disabled="busy" @click="openEdit(a)">编辑</button>
+
+              <!--
+                重新生成凭据：**换发**（再 approve 一次 —— 旧的那条立即作废，新的一条顶上来）。
+                放在 primary / 非 primary 的分流链**外面** —— 换发对主代理无副作用
+                （主脑走本机 bootstrap，不吃这把凭据），泄露场景下主代理同样得能换。
+                门只开在「已批准」行上：待审的去审核页，已吊销的走「重新批准」。
+                🔴 不是危险色那一档：吊销 / 排除 / 改角色会毁掉东西，这里只是**换一把钥匙**
+                （代理照旧能读写），所以走普通 act-btn。
+              -->
+              <button
+                v-if="a.status === 'approved'"
+                class="act-btn"
+                :disabled="busy"
+                @click="ask('rotate', a)"
+              >
+                重新生成凭据
+              </button>
             </template>
           </ItemCard>
         </div>
@@ -211,7 +232,7 @@
       @update:page-size="onSize"
     />
 
-    <!-- 四个动作共用一个确认框：kind 决定标题 / 后果 / 确认串 / 按钮色（照抄记忆维护页那套） -->
+    <!-- 四个动作共用一个确认框（换发 rotate 也走这一个）：kind 决定标题 / 后果 / 确认串 / 按钮色 -->
     <ConfirmDialog
       v-model="dlgOpen"
       :title="dlgTitle"
@@ -482,6 +503,22 @@ function forget() {
   credNote.value = ''
 }
 
+/**
+ * 把后端回的一次性凭据摆进共用弹框（两页共用 CredentialDialog，这里是本页**唯一**入口）。
+ * 没有明文就**不开框**并说红条 —— 弹一个空框 = 让人以为凭据已经换到手。
+ * 明文只在这一刻落到前端内存态：弹框一关（@closed）就抹掉。
+ */
+function showCred(r) {
+  if (!r?.credential) {
+    showError('后端没有返回新凭据，操作未生效，请重试')
+    return false
+  }
+  cred.value = r.credential
+  credNote.value = r.note || ''
+  credOpen.value = true
+  return true
+}
+
 // ---------------------------------------------------------------------------
 // 登记新代理 / 改名：两条新的治理动作（后端 /api/v1/agents 与 .../rename）
 // ---------------------------------------------------------------------------
@@ -514,11 +551,7 @@ async function doRegister() {
     showToast(`已登记：${r.agent_id}（${r.status === 'approved' ? '已批准' : '待审核'}）`)
     // 🔴 凭据明文只在这一刻落到前端内存态：**复用「批准」那一个一次性弹框**
     // （同一份 cred / credNote / @closed=forget），不另写一套显示逻辑。
-    if (r.credential) {
-      cred.value = r.credential
-      credNote.value = r.note || ''
-      credOpen.value = true
-    }
+    if (r.credential) showCred(r)
     // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
     load(true)
   } catch (e) {
@@ -624,11 +657,13 @@ const dlgKind = ref('')
 const dlgRow = ref(null)
 
 const wasRevoked = computed(() => dlgRow.value?.status === 'revoked')
+/** 手输闸的串：agent_id 前 8 位（吊销与换发共用这一道 —— 都是作废旧凭据）。 */
 const revokePrefix = computed(() => (dlgRow.value?.agent_id || '').slice(0, 8))
 
 const dlgTitle = computed(() => {
   const id = dlgRow.value?.agent_id || ''
   if (dlgKind.value === 'approve') return wasRevoked.value ? `重新批准 ${id}？` : `批准 ${id}？`
+  if (dlgKind.value === 'rotate') return `重新生成 ${id} 的凭据？`
   if (dlgKind.value === 'revoke') return `吊销 ${id}？`
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
   return `${dlgRow.value?.exclude_from_primary ? '加入' : '移出'}主脑上下文？`
@@ -636,16 +671,24 @@ const dlgTitle = computed(() => {
 
 const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'approve') return wasRevoked.value ? '重新批准' : '批准'
+  if (dlgKind.value === 'rotate') return '重新生成凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
   return '确认修改'
 })
 
-/** 两道手输闸的口径与后端逐字一致：吊销 = 前 8 位，改角色 = 完整 agent_id。 */
+/** 三道手输闸的口径：吊销 / 换发 = 前 8 位，改角色 = 完整 agent_id。 */
 const dlgExpect = computed(() => {
   if (dlgKind.value === 'revoke') return revokePrefix.value
+  if (dlgKind.value === 'rotate') return revokePrefix.value
   if (dlgKind.value === 'role') return dlgRow.value?.agent_id || ''
   return ''
+})
+
+/** 成功后的提示语：换发与批准各说各的（dlgRow 在这一刻仍指当前那一行）。 */
+const dlgDoneText = computed(() => {
+  const id = dlgRow.value?.agent_id || ''
+  return dlgKind.value === 'rotate' ? `已重新生成凭据：${id}` : `已批准：${id}`
 })
 
 const dlgTone = computed(() => (dlgKind.value === 'revoke' || dlgKind.value === 'role' ? 'danger' : 'primary'))
@@ -659,6 +702,13 @@ const dlgConsequences = computed(() => {
       '签发一条新凭据并把这个代理置为已批准：之前发的那条（若有）立即作废。',
       '凭据明文只在这个响应里出现一次，关掉弹框就再也拿不到了 —— 请当场转交。',
       '批准后它才会被放行读写；未批准期间它的每一次调用都被拒绝。',
+    ]
+  }
+  if (dlgKind.value === 'rotate') {
+    return [
+      '旧凭据立即作废：使用该凭据的客户端最迟 60 秒内被拒（哈希一换即失配）。',
+      '代理状态与记忆归属不变 —— 还是已批准、角色照旧、它写过的记忆照旧归它。',
+      '新凭据明文只在这个响应里出现一次，关掉弹框就再也拿不到了 —— 请当场转交。',
     ]
   }
   if (dlgKind.value === 'revoke') {
@@ -702,13 +752,11 @@ async function doAction(typed) {
   dlgOpen.value = false
   busy.value = true
   try {
-    if (kind === 'approve') {
+    if (kind === 'approve' || kind === 'rotate') {
+      // 换发与批准是**同一个端点**（approve 本就是换发语义：旧的立即作废）
       const r = await api.approveAgent(row.agent_id)
-      // 明文只在这一刻落到前端内存态：弹框一关（@closed）就抹掉
-      cred.value = r.credential || ''
-      credNote.value = r.note || ''
-      credOpen.value = true
-      showToast(`已批准：${row.agent_id}`)
+      // 明文只在这一刻落到内存态（关框即抹）；没回明文就没有成功可言（红条已报）
+      if (showCred(r)) showToast(dlgDoneText.value)
     } else if (kind === 'revoke') {
       await api.revokeAgent(row.agent_id, typed)
       showToast(`已吊销：${row.agent_id}`)
