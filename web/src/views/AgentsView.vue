@@ -1,28 +1,34 @@
 <!--
-  代理治理（keepsake_agent_registry 的控制台面）。
+  代理登记（keepsake_agent_registry 的控制台面 · 业务页）。
 
-  子代理的 MCP 连上来就会在这里登记：新接入的一律 pending —— **未批准读写真全拒**，
-  批准时才签发一条**一次性凭据**（明文只回来这一次，库里只存 sha256）。
+  2026-10-20 拆页：待审队列从本页整段搬去 /agents-review（代理审核）。
+  本页只管**已批准代理的日常维护**（改名 / 设角色 / 上下文过滤 / 吊销 / 重新批准）
+  +「登记新代理」；pending 的行不在本页出现（去审核页看）。
+  两页共用一次性凭据弹框（components/CredentialDialog.vue）—— **一份实现，不复制**。
 
-  🔴 凭据纪律（本页唯一不可让步的一条）：明文只放在 cred 这一个 ref 里，
-  弹框一关就清（@closed="forget"）。不进 URL、不进浏览器存储、不进日志；
+  🔴 凭据纪律（不可让步的一条）：明文只放在 cred 这一个 ref 里，弹框一关就清
+  （<CredentialDialog @closed="forget" />）。不进 URL、不进浏览器存储、不进日志；
   页面里的复制只到剪贴板为止，转交由人自己走别的渠道。
 
   🔴 主代理保护：primary 行**不给任何动作按钮**（approve/revoke/role/exclude 全无），
   只留一句「不可吊销 / 不可排除」。换主的唯一路径是给别的行点「设为主代理」——
   那次会自动把旧主降级。后端同口径 409，绕开 UI 打 API 也一样被挡。
+
+  ponytail: 后端 GET /api/v1/agents 不按 status 过滤（零后端改动约束），所以本页的
+  分页与计数是**全状态口径** —— pending 行占着页位却不渲染（它去审核页）。
+  升级路径 = 后端加一个 status 参数，这里改回服务端过滤，前端这层拆组即可删掉。
 -->
 <template>
   <div>
     <div class="page-head">
-      <h1 class="page-title">代理治理</h1>
+      <h1 class="page-title">代理登记</h1>
       <p class="page-sub">
-        新接入的代理默认待审，批准时签发一次性凭据；未批准与已吊销的代理读写全拒。
+        已批准代理的日常维护台：改名、设角色、上下文过滤、吊销都在这里。
       </p>
       <p class="page-sub">
-        未登记的代理连上来会自动出现在这里（pending）；也可以点「登记新代理」预先登记再批准。
+        新接入的代理默认待审 —— 待审那一摞在「代理审核」页；未批准与已吊销的代理读写全拒。
       </p>
-      <!-- 页头操作区：登记 = 「还没连上就先占个位」的那一步（批准仍在每张卡上） -->
+      <!-- 页头操作区：登记 = 「还没连上就先占个位」的那一步（批准在审核页） -->
       <div class="head-acts">
         <el-button type="primary" @click="openRegister">登记新代理</el-button>
       </div>
@@ -31,20 +37,8 @@
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
     <div class="stat-grid">
-      <StatCard label="接入过的代理" :value="count" unit="个" hint="按 agent_id 排序，逐条审" />
-      <StatCard
-        label="待审核"
-        :value="pendingCount"
-        unit="个"
-        tone="danger"
-        hint="待审期间读写全拒，批准后才会发凭据"
-      />
+      <StatCard label="接入过的代理" :value="count" unit="个" hint="按 agent_id 排序；待审的在「代理审核」页" />
       <StatCard label="主代理" :value="primaryId || '—'" hint="全库唯一，只有它能改常驻层" />
-    </div>
-
-    <!-- 待审要一眼看见：待审的代理此刻正在被拒，这是这页唯一要盯的数 -->
-    <div v-if="pendingCount > 0" class="banner banner--danger">
-      {{ pendingCount }} 个代理待审核 —— 在这页批准之前，它们连不上、也写不进任何记忆。
     </div>
 
     <!-- 搜索 + 分页：与常驻层/知识库同一套 filter-panel 口径（回车查、清空回全量、seq 防串） -->
@@ -76,8 +70,8 @@
         <el-button type="primary" :loading="loading" @click="search">查询</el-button>
       </div>
       <div class="filter-result">
-        <!-- pending_count 是全量口径（后端不随 q 变）：红条上的数永远等于全库待审数 -->
-        <span>共 {{ count }} 个匹配 · 全库待审 {{ pendingCount }} 个 · 每页 {{ pageSize }}</span>
+        <!-- count 是后端口径（全状态）：待审的行不在这页渲染，见页头说明 -->
+        <span>共 {{ count }} 个匹配 · 每页 {{ pageSize }}</span>
         <div class="acts">
           <button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选</button>
           <button class="ghost-btn" :disabled="loading" @click="load">刷新</button>
@@ -106,93 +100,111 @@
         </p>
       </div>
     </div>
-    <div v-else class="card-grid">
-      <ItemCard v-for="a in agents" :key="a.agent_id" :chip-tone="chipTone(a)">
-        <template #tag>{{ STATUS_TEXT[a.status] || a.status }}</template>
-        <template #time>{{ toLocal(a.first_seen_at) }}</template>
-
-        <div class="cell-key">
-          <span class="k" :title="a.agent_id">{{ a.agent_id }}</span>
-          <button class="copy-btn" title="复制 agent_id" @click="doCopy(a.agent_id)">
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
-              <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
-            </svg>
-          </button>
-        </div>
-
-        <div class="aname">
-          <span class="aname-txt" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
-          <!-- 改名钮：复用现成的小图标钮（.copy-btn 那套尺寸），只改备注名 -->
-          <button
-            class="copy-btn name-edit"
-            :disabled="busy"
-            title="改名"
-            aria-label="改名"
-            @click="openRename(a)"
-          >
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-              stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
-              <path d="M9.4 4.2l2.4 2.4" />
-            </svg>
-          </button>
-          <span class="chip">{{ a.role === 'primary' ? '主代理' : '子代理' }}</span>
-        </div>
-
-        <div class="kv">
-          <div class="row">
-            <span class="k">最后活动</span>
-            <span class="v">{{ toLocal(a.last_seen_at) }}</span>
-          </div>
-          <div class="row">
-            <span class="k">读 / 写</span>
-            <span class="v num">{{ a.reads }} / {{ a.writes }}</span>
-          </div>
-          <div class="row">
-            <span class="k">凭据</span>
-            <span class="v mono">{{ hintText(a) }}</span>
-          </div>
-        </div>
-
-        <template #tags>
-          <span v-if="a.exclude_from_primary" class="tag">不进主脑上下文</span>
-        </template>
-
-        <template #actions>
-          <!--
-            🔴 主代理行**只留一句话**，四个动作一个都不给（approve/revoke/role/exclude）：
-            吊销它 = 写闸 fail-closed 把主脑降成 sub，常驻写入全降级、候选链瘫痪；
-            排除它更没有意义（过滤是给别人的看的，它自己每轮就在上下文里）。
-            换主的唯一安全路径是「先把另一个设为主代理」，那次会自动把它降级。
-            后端同口径 409（`_need_not_primary`）—— 这里只是不让人看见那个钮。
-          -->
-          <span v-if="a.role === 'primary'" class="act-note">主代理 · 不可吊销 / 不可排除</span>
-          <template v-else>
-            <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
-            <button
-              v-if="a.status !== 'approved'"
-              class="act-btn"
-              :disabled="busy"
-              @click="ask('approve', a)"
-            >
-              {{ a.status === 'revoked' ? '重新批准' : '批准' }}
-            </button>
-            <template v-if="a.status === 'approved'">
-              <!-- 内层这道 v-if 是本地护栏：外层已经按 role 分流，这里再钉一次 -->
-              <button v-if="a.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask('role', a)">
-                设为主代理
-              </button>
-              <button class="act-btn" :disabled="busy" @click="ask('exclude', a)">
-                {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
-              </button>
-              <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
-            </template>
-          </template>
-        </template>
-      </ItemCard>
+    <!-- 这一页有行、但一行都不是已批准/已吊销（整页都是待审）：说清去哪看 -->
+    <div v-else-if="!groups.length" class="panel">
+      <div class="empty">
+        <p>
+          <b>这一页没有已批准或已吊销的代理</b>
+          待审的代理都在「代理审核」页 —— 未批准之前它们读写全拒。
+        </p>
+      </div>
     </div>
+    <!-- 两个分组：已批准在上、已吊销在下；待审的行不在本页（去审核页） -->
+    <template v-else>
+      <template v-for="grp in groups" :key="grp.key">
+        <div class="group-head">
+          <span class="group-title">{{ grp.title }}</span>
+          <span class="group-count num">{{ grp.rows.length }} 个</span>
+        </div>
+        <div class="card-grid">
+          <ItemCard v-for="a in grp.rows" :key="a.agent_id" :chip-tone="chipTone(a)">
+            <template #tag>{{ STATUS_TEXT[a.status] || a.status }}</template>
+            <template #time>{{ toLocal(a.first_seen_at) }}</template>
+
+            <div class="cell-key">
+              <span class="k" :title="a.agent_id">{{ a.agent_id }}</span>
+              <button class="copy-btn" title="复制 agent_id" @click="doCopy(a.agent_id)">
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
+                  <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="aname">
+              <span class="aname-txt" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
+              <!-- 改名钮：复用现成的小图标钮（.copy-btn 那套尺寸），只改备注名 -->
+              <button
+                class="copy-btn name-edit"
+                :disabled="busy"
+                title="改名"
+                aria-label="改名"
+                @click="openRename(a)"
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
+                  <path d="M9.4 4.2l2.4 2.4" />
+                </svg>
+              </button>
+              <span class="chip">{{ a.role === 'primary' ? '主代理' : '子代理' }}</span>
+            </div>
+
+            <div class="kv">
+              <div class="row">
+                <span class="k">最后活动</span>
+                <span class="v">{{ toLocal(a.last_seen_at) }}</span>
+              </div>
+              <div class="row">
+                <span class="k">读 / 写</span>
+                <span class="v num">{{ a.reads }} / {{ a.writes }}</span>
+              </div>
+              <div class="row">
+                <span class="k">凭据</span>
+                <span class="v mono">{{ hintText(a) }}</span>
+              </div>
+            </div>
+
+            <template #tags>
+              <span v-if="a.exclude_from_primary" class="tag">不进主脑上下文</span>
+            </template>
+
+            <template #actions>
+              <!--
+                🔴 主代理行**只留一句话**，四个动作一个都不给（approve/revoke/role/exclude）：
+                吊销它 = 写闸 fail-closed 把主脑降成 sub，常驻写入全降级、候选链瘫痪；
+                排除它更没有意义（过滤是给别人的看的，它自己每轮就在上下文里）。
+                换主的唯一安全路径是「先把另一个设为主代理」，那次会自动把它降级。
+                后端同口径 409（`_need_not_primary`）—— 这里只是不让人看见那个钮。
+              -->
+              <span v-if="a.role === 'primary'" class="act-note">主代理 · 不可吊销 / 不可排除</span>
+              <template v-else>
+                <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
+                <button
+                  v-if="a.status !== 'approved'"
+                  class="act-btn"
+                  :disabled="busy"
+                  @click="ask('approve', a)"
+                >
+                  {{ a.status === 'revoked' ? '重新批准' : '批准' }}
+                </button>
+                <template v-if="a.status === 'approved'">
+                  <!-- 内层这道 v-if 是本地护栏：外层已经按 role 分流，这里再钉一次 -->
+                  <button v-if="a.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask('role', a)">
+                    设为主代理
+                  </button>
+                  <button class="act-btn" :disabled="busy" @click="ask('exclude', a)">
+                    {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
+                  </button>
+                  <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
+                </template>
+              </template>
+            </template>
+          </ItemCard>
+        </div>
+      </template>
+    </template>
 
     <PagerBar
       :total="count"
@@ -214,28 +226,14 @@
       @confirm="doAction"
     />
 
-    <!-- 一次性凭据：全文 + 复制 + 红字提醒；关掉即从内存里抹掉（forget），拿不回来就重批 -->
-    <el-dialog
+    <!-- 一次性凭据：共用组件（登记页 / 审核页同一份实现，不许复制第二份）；关掉即从内存里抹掉 -->
+    <CredentialDialog
       v-model="credOpen"
-      title="一次性凭据"
-      width="520px"
-      align-center
-      :close-on-click-modal="false"
-      :close-on-press-escape="!busy"
-      :show-close="!busy"
-      append-to-body
+      :credential="cred"
+      :note="credNote"
+      :busy="busy"
       @closed="forget"
-    >
-      <p class="warn">只显示这一次，请立即转交给代理进程 —— 关掉这个弹框就再也拿不到了。</p>
-      <pre class="pre">{{ cred }}</pre>
-      <div class="cred-acts">
-        <el-button @click="doCopy(cred)">复制凭据</el-button>
-      </div>
-      <p class="tip">{{ credNote }}</p>
-      <template #footer>
-        <el-button :disabled="busy" @click="credOpen = false">我已转交，关掉</el-button>
-      </template>
-    </el-dialog>
+    />
 
     <!-- 登记新代理：手工占个位（pending）；勾「立即批准」当场发一次性凭据 -->
     <el-dialog
@@ -328,6 +326,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import CredentialDialog from '../components/CredentialDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
@@ -353,16 +352,23 @@ const pageSize = ref(20)
 const agents = computed(() => data.value?.items || [])
 /** `count` 是**过滤后**的总数（后端口径），PagerBar 拿它算页数，前端不另算。 */
 const count = computed(() => data.value?.count ?? agents.value.length)
-/** 🔴 待审数恒为全量口径：后端不随 q 变，红条上的数永远等于全库待审数。 */
-const pendingCount = computed(() => data.value?.pending_count || 0)
 const primaryId = computed(() => agents.value.find((a) => a.role === 'primary')?.agent_id || '')
+/** 本页只渲染已批准 + 已吊销两摞：pending 的行去「代理审核」页。 */
+const approvedRows = computed(() => agents.value.filter((a) => a.status === 'approved'))
+const revokedRows = computed(() => agents.value.filter((a) => a.status === 'revoked'))
+/** 页面要渲染的分组（空组不占地方；顺序 = 已批准在上、已吊销在下）。 */
+const groups = computed(() =>
+  [
+    { key: 'approved', title: '已批准', rows: approvedRows.value },
+    { key: 'revoked', title: '已吊销', rows: revokedRows.value },
+  ].filter((g) => g.rows.length),
+)
 /** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它。 */
 const dirty = computed(() => !!(q.value || '').trim())
 
-/** approved 走蓝底、pending 红底（此刻它正在被拒，要醒目）、revoked 中性灰。 */
+/** approved 走蓝底、revoked 中性灰（pending 红底那一摞在审核页）。 */
 function chipTone(a) {
   if (a.status === 'approved') return 'accent'
-  if (a.status === 'pending') return 'danger'
   return ''
 }
 
@@ -687,22 +693,27 @@ async function doAction(typed) {
   font-family: var(--mono);
   font-size: 12px;
 }
-/* 一次性凭据弹框：红色提醒 + 全文 + 复制 */
-.warn {
-  margin: 0 0 12px;
-  color: var(--danger);
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.65;
-}
-.cred-acts {
-  margin-top: 12px;
-}
 .tip {
   margin: 12px 0 0;
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.7;
+}
+/* 分组标题：已批准 / 已吊销 两摞各带一行小标题（空组不渲染） */
+.group-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 18px 0 10px;
+}
+.group-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.group-count {
+  color: var(--text-faint);
+  font-size: 12px;
 }
 /* 主代理行的那句说明：不是按钮，是「这里本来该有按钮、但按规矩不给」的人话 */
 .act-note {

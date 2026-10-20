@@ -1,5 +1,11 @@
 /**
- * 代理治理页（keepsake_agent_registry 的控制台面）的前端接线护栏。
+ * 代理登记页（keepsake_agent_registry 的控制台面 · 业务页 /agents）的前端接线护栏。
+ *
+ * 2026-10-20 拆页：待审队列整段搬去 /agents-review（代理审核页）。本页只管
+ * 已批准代理的日常维护 + 登记新代理。下列第 3、7 条随之搬去
+ * **agents-review-page.test.mjs**（红条与 pending_count 全量口径现在钉在那儿）；
+ * 一次性凭据的显示实现抽成共用组件 components/CredentialDialog.vue
+ * （两页同一份，不许复制第二份 —— 见下面「凭据展示」那条）。
  *
  * 这页的静默失败模式特别多，逐条钉死：
  *   1) **凭据纪律**：approve 的明文只许活在一次性弹框的前端内存态 ——
@@ -9,7 +15,7 @@
  *      agent_id 前 8 位，改角色要手输完整 agent_id —— 与后端口径逐字一致。
  *      少一闸就是「点一下真改数据」。
  *   3) **待审醒目**：pending > 0 时顶部必须有 banner，且它的读写正被拒，
- *      静默地把它排在网格里等于没提示。
+ *      静默地把它排在网格里等于没提示 —— 已随审核页搬走（那边钉）。
  *   4) **自动刷新要收干净**：10s 定时器不 clearInterval，离开这页还在打接口。
  *   5) **主代理行一个动作都不给**：不只是「不给设为主代理」—— 吊销 / 排除 /
  *      批准同样不给。吊销主脑 = 写闸 fail-closed 把它降成 sub，常驻写入全降级、
@@ -17,7 +23,8 @@
  *      漏挂一个钮就等于自锁洞还开着。
  *   6) **搜索 + 服务端分页**：filter-panel 三件套（回车查 / 清空回全量 /
  *      seq 防串）与 PagerBar 接线；q/page/page_size 全部透传，前端不切片。
- *   7) **pending_count 全量口径**：红条上的待审数不许被搜索词或分页吞掉。
+ *   7) **pending_count 全量口径**：红条上的待审数不许被搜索词或分页吞掉
+ *      —— 已随审核页搬走（那边钉）。本页改成反钉：待审的痕迹不许留在这页。
  *   8) 无裸 alert / confirm，提示一律走 utils/dialog。
  */
 import test from 'node:test'
@@ -45,13 +52,20 @@ test('凭据纪律：本页不碰浏览器持久存储，凭据只活在前端�
   )
 })
 
-test('凭据展示：全文 + 复制 + 一次性红色提醒', () => {
-  assert.match(VIEW, /<pre class="pre">\{\{ cred \}\}<\/pre>/, '凭据全文要显示出来（用户要抄走）')
-  assert.match(VIEW, /只显示这一次，请立即转交给代理进程/, '一次性提醒是这句，且要给红色语义色')
-  assert.match(VIEW, /class="warn"/, '提醒走红色语义类')
-  assert.match(VIEW, /@click="doCopy\(cred\)"/, '有复制按钮（凭据形态长，只靠手抄容易错）')
+test('凭据展示：全文 + 复制 + 一次性红色提醒（共用组件，两页同一份实现）', () => {
+  const CRED = read('components/CredentialDialog.vue')
+  assert.match(CRED, /<pre class="pre">\{\{ credential \}\}<\/pre>/, '凭据全文要显示出来（用户要抄走）')
+  assert.match(CRED, /只显示这一次，请立即转交给代理进程/, '一次性提醒是这句，且要给红色语义色')
+  assert.match(CRED, /class="warn"/, '提醒走红色语义类')
+  assert.match(CRED, /@click="doCopy"/, '有复制按钮（凭据形态长，只靠手抄容易错）')
   // 确认框不许让凭据被顺手截走：误点遮罩不该等于「看过就作废」
-  assert.match(VIEW, /:close-on-click-modal="false"/, '凭据弹框同样禁遮罩关闭')
+  assert.match(CRED, /:close-on-click-modal="false"/, '凭据弹框同样禁遮罩关闭')
+  // 🔴 两页都调这一个组件 —— 谁再自己留一份显示逻辑，就是两处漂移的坑
+  for (const [name, src] of [['登记页', VIEW], ['审核页', read('views/AgentsReviewView.vue')]]) {
+    assert.match(src, /import CredentialDialog from '\.\.\/components\/CredentialDialog\.vue'/, `${name}必须引共用组件`)
+    assert.match(src, /<CredentialDialog/, `${name}必须真的渲染那个组件`)
+    assert.doesNotMatch(src, /<pre class="pre">\{\{ cred \}\}<\/pre>/, `${name}不许自己再留一份凭据显示逻辑`)
+  }
 })
 
 test('五条 API 齐全，且 confirm 口径与后端逐字一致', () => {
@@ -170,18 +184,24 @@ test('分页：PagerBar 复用，q/page/page_size 全部透传给后端', () => 
   assert.match(VIEW, /function onSize\(s\) \{\s*\n\s*pageSize\.value = s\s*\n\s*page\.value = 1/, '改条数回第 1 页')
 })
 
-test('pending_count 是全量口径：红条不能被搜索词吞掉', () => {
-  // 后端保证不随 q 变（pending_count 走注册表原始计数）；前端只负责照原样显示
-  assert.match(VIEW, /const pendingCount = computed\(\(\) => data\.value\?\.pending_count \|\| 0\)/, '直接用后端的全量待审数')
-  assert.doesNotMatch(VIEW, /pendingCount = computed\(\(\) => agents\.value\.filter/, '待审数不许在前端按当前页过滤后数（分页下一屏就少一个）')
-  assert.match(VIEW, /v-if="pendingCount > 0" class="banner banner--danger"/, '红条仍由它驱动')
+test('待审已搬走：登记页不留待审痕迹（那一摞在「代理审核」页）', () => {
+  // 反钉：pending 的行、待审计数、待审红条都不许留在这页（搬走不是复制）
+  assert.doesNotMatch(VIEW, /pendingCount/, '登记页不该再有待审计数（它在审核页与侧栏徽标上）')
+  assert.doesNotMatch(VIEW, /v-if="pendingCount > 0" class="banner banner--danger"/, '待审红条搬去审核页')
+  assert.doesNotMatch(VIEW, /个代理待审核/, '待审提示搬去审核页')
+  assert.doesNotMatch(VIEW, /a\.status === 'pending'/, '登记页不渲染 pending 行')
+  // 搬走不是删除：审核页接手了这些（正向断言在 agents-review-page.test.mjs）
+  assert.match(read('views/AgentsReviewView.vue'), /pendingCount/, '审核页才有待审计数')
 })
 
-test('待审醒目：pending_count>0 走 banner--danger', () => {
-  assert.match(VIEW, /v-if="pendingCount > 0" class="banner banner--danger"/, '待审数 > 0 时顶部必须红条')
-  assert.match(VIEW, /个代理待审核/, '红条要说清「几个待审核」')
-  // 卡片上的状态徽标同样分色：pending 正在被拒，不能跟已批准一样灰着
-  assert.match(VIEW, /if \(a\.status === 'pending'\) return 'danger'/, 'pending 徽标走红色语义')
+test('两组分组：已批准在上、已吊销在下（待审不在本页）', () => {
+  assert.match(VIEW, /const approvedRows = computed\(\(\) => agents\.value\.filter\(\(a\) => a\.status === 'approved'\)\)/, '已批准那一摞')
+  assert.match(VIEW, /const revokedRows = computed\(\(\) => agents\.value\.filter\(\(a\) => a\.status === 'revoked'\)\)/, '已吊销那一摞（保留展示，可重新批准）')
+  assert.match(VIEW, /title: '已批准'/, '分组标题')
+  assert.match(VIEW, /title: '已吊销'/, '分组标题')
+  assert.match(VIEW, /<ItemCard v-for="a in grp\.rows"/, '卡片循环走的是筛过的两摞')
+  // 已吊销的行仍能「重新批准」（这是既有行为，别在拆页时丢了）
+  assert.match(VIEW, /a\.status === 'revoked' \? '重新批准' : '批准'/, '已吊销的行走重新批准')
 })
 
 test('自动刷新：10s 静默重拉，卸载必须清定时器', () => {

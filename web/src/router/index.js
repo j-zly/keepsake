@@ -1,6 +1,7 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
 import { api, getToken } from '../api'
+import AgentsReviewView from '../views/AgentsReviewView.vue'
 import AgentsView from '../views/AgentsView.vue'
 import CoreView from '../views/CoreView.vue'
 import FragmentsView from '../views/FragmentsView.vue'
@@ -28,7 +29,10 @@ const routes = [
   // 知识库审核独立成页（原来挤在 KbView 里、要点顶部那颗 chip 才展开）：待审队列要逐条判，
   // 铺在文档浏览页的抽屉里既看不清也翻不动。配方与 /review 记忆审核同款
   { path: '/kb-review', name: 'kb-review', component: KbReviewView, meta: { title: '知识库审核' } },
-  { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理治理' } },
+  { path: '/agents', name: 'agents', component: AgentsView, meta: { title: '代理登记' } },
+  // 代理审核独立成页（原来挤在 AgentsView 里）：待审队列要逐条判，
+  // 与已批准代理的日常维护（登记/改名/设角色）分开摆
+  { path: '/agents-review', name: 'agents-review', component: AgentsReviewView, meta: { title: '代理审核' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]
 

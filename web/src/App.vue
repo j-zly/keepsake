@@ -26,8 +26,9 @@
                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" v-html="m.icon" />
             </span>
             <span class="txt">{{ m.label }}</span>
-            <!-- 待审徽标：>0 才显示；数字复用 reviewCounts 全库口径。
-                 审核项=晋升候选+退居建议之和；知识库›审核项=kb_pending。
+            <!-- 待审徽标：>0 才显示；数字复用全库口径。
+                 审核项=晋升候选+退居建议之和；知识库›审核项=kb_pending；
+                 代理›审核项=代理待审数（pending_count）。
                  样式零新色：底色/文字全走既有 token（与 .chip--danger 同款）。 -->
             <span v-if="badgeFor(m.path)" class="item-badge"
               :aria-label="`待审 ${badgeFor(m.path)}`">{{ badgeFor(m.path) }}</span>
@@ -149,11 +150,12 @@ const ICON = {
     '<circle cx="5.4" cy="10.6" r="2.9"/><path d="M7.6 8.4 13.4 2.6"/><path d="M11.2 4.8 12.6 6.2"/><path d="M9.8 6.2 11.2 7.6"/>',
 }
 
-// 侧栏分组：总览（看板）· 记忆（审核 / 常驻层 / 记忆条目 / 记忆维护 / 代理治理）· 知识库（审核 / 知识库）
+// 侧栏分组：总览（看板）· 记忆（常驻层 / 记忆条目 / 记忆维护 / 代理登记 / 代理审核 / 审核）· 知识库（知识库 / 审核）
 // 看板是总览入口，业界惯例 Overview 置顶，所以它单独成组排第一。
 // 面包屑也从这份结构取，所以两处永远说同一句话（看板页：总览 › 看板）。
-// 审核排记忆组第一：它是「有东西要处理」的高频动作，不该埋在分组深处（候选量一多
-// 记忆维护页太长，审核入口也被合并/遗忘这些危险操作淹没）。
+// 组内顺序（2026-10-18 用户口径）：业务页在前、审核收尾 —— 记忆组的「审核」与知识库组的
+// 「审核」都排在各自组的最后；代理治理拆成「代理登记 / 代理审核」两页后同守这条口径
+// （徽标只挂在审核项上，业务页不挂）。
 const GROUPS = [
   {
     title: '总览',
@@ -165,7 +167,9 @@ const GROUPS = [
       { path: '/core', label: '常驻层', icon: ICON.layers },
       { path: '/fragments', label: '记忆条目', icon: ICON.search },
       { path: '/maintenance', label: '记忆维护', icon: ICON.broom },
-      { path: '/agents', label: '代理治理（登记/审核）', icon: ICON.users },
+      // 代理治理拆两页（2026-10-20）：登记 = 业务页在上，审核 = 审核在下（同组口径）
+      { path: '/agents', label: '代理登记', icon: ICON.users },
+      { path: '/agents-review', label: '代理审核', icon: ICON.check },
       // 审核排组尾：与知识库组同口径（用户指定「业务页在上、审核在下」，2026-10-18）；徽标随项走
       { path: '/review', label: '审核', icon: ICON.check },
     ],
@@ -192,12 +196,17 @@ const crumb = computed(() => {
 // - 审核项徽标 = promote + demote 合计（晋升候选 + 退居建议均在 ReviewView
 //   「记忆审核」页里审）；
 // - 知识库›审核项徽标 = kb_pending（子代理提交待批的知识文档数，在 KbReviewView
-//   「知识库审核」页里审）。「知识库」浏览页不再挂徽标 —— 待审数不是浏览页的事。
+//   「知识库审核」页里审）。「知识库」浏览页不再挂徽标 —— 待审数不是浏览页的事；
+// - 代理›审核项徽标 = 代理待审数（`GET /api/v1/agents` 的 pending_count，在
+//   AgentsReviewView「代理审核」页里审）。review/counts 里**没有**代理这一项，
+//   而后端一行不许改，所以这条走自己的端点：只要那个数，列表取一条就够。
 // 拉一次 + 每 60s 静默刷新（与 AgentsView 的 10s 节奏同款但更宽：徽标是
 // 「记得处理一下」的提示，秒级滞后也能接受，省流量）。登录页/初始化页免拉
 // —— 那两页连壳都套不上，轮询纯属自扰。
 const REVIEW_POLL_MS = 60000
 const reviewCounts = ref({ promote_candidates: 0, demote_candidates: 0, kb_pending: 0 })
+/** 代理待审数（pending_count，全库口径，不随 q / page 变）。 */
+const agentsPending = ref(0)
 let reviewTimer = null
 
 function reviewBadge() {
@@ -209,11 +218,28 @@ function kbBadge() {
   const n = reviewCounts.value?.kb_pending || 0
   return n > 0 ? n : 0
 }
+/** 代理审核徽标 = 待审代理数（pending_count）。 */
+function agentsBadge() {
+  const n = agentsPending.value || 0
+  return n > 0 ? n : 0
+}
 /** 给定路径返回 0 / 数字（与模板的 `v-if` 配套）。null/undefined 与负数都退 0。 */
 function badgeFor(path) {
   if (path === '/review') return reviewBadge()
   if (path === '/kb-review') return kbBadge()
+  if (path === '/agents-review') return agentsBadge()
   return 0
+}
+
+/** 代理待审数：GET /api/v1/agents 的 pending_count（全库口径，不随 q / page 变）。
+ *  只取第一页一条 —— 要的是那个数，不是列表。 */
+async function loadAgentsPending() {
+  try {
+    const data = await api.listAgents({ page: 1, page_size: 1 })
+    agentsPending.value = Number(data?.pending_count) || 0
+  } catch (_) {
+    // 失败保持旧值（避免一次抖动把 `N` 清成 `0`，用户以为已清空）
+  }
 }
 
 async function loadReviewCounts() {
@@ -229,6 +255,8 @@ async function loadReviewCounts() {
   } catch (_) {
     // 失败保持旧值（避免一次抖动把 `N` 清成 `0`，用户以为已清空）
   }
+  // 代理那枚徽标走自己的端点（review/counts 里没有代理这一项）
+  await loadAgentsPending()
 }
 
 if (typeof window !== 'undefined') {
