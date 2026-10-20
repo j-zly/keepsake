@@ -1605,18 +1605,42 @@ class SqliteStorage(StorageBase):
             cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (?, ?)", rows)
         return len(rows)
 
+    def record_hits_repeat(self, key: str, times: int) -> int:
+        """给一个 key 补 N 条命中事件（**一条多行 INSERT**，按参数上限分块）。
+
+        分块口径与本模块其它批量写一致（`_chunks` + `SQL_PARAM_CHUNK`）：
+        每行 2 个参数 ⇒ 一块 200 行 = 400 参数（SQLite 上限 999，留足余量）。
+        """
+        n = int(times or 0)
+        if not key or n <= 0:
+            return 0
+        ts = datetime.now(timezone.utc).isoformat()
+        total = 0
+        with self._write() as cur:
+            for chunk in _chunks([(key, ts)] * n, SQL_PARAM_CHUNK // 2):
+                placeholders = ", ".join("(?, ?)" for _ in chunk)
+                params = [v for row in chunk for v in row]
+                cur.execute(f"INSERT INTO ks_hit_event (key, ts) VALUES {placeholders}",
+                            params)
+                total += len(chunk)
+        return total
+
     def hits_stats(
         self,
         window_days: int = 7,
         min_hits: int = 5,
         keys: Optional[List[str]] = None,
         limit: int = 500,
+        since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。"""
-        since = (datetime.now(timezone.utc)
-                 - timedelta(days=int(window_days))).isoformat()
+        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。
+
+        `since` 给了就以它为窗口起点（绝对时刻），否则是「现在减 window_days」。
+        """
+        start = (since if since is not None else
+                 datetime.now(timezone.utc) - timedelta(days=int(window_days)))
         sql = "SELECT key, count(*) AS hits, max(ts) FROM ks_hit_event WHERE ts >= ?"
-        params: List[Any] = [since]
+        params: List[Any] = [start.isoformat()]
         # 同 PG 侧：给了 keys 就只算这些 key，且**不再套 min_hits 门槛**
         # （调用方已知候选集，热度阈值是它自己的判断）
         wanted = list(dict.fromkeys(k for k in keys if k)) if keys else []

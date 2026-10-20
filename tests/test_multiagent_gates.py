@@ -5,7 +5,8 @@
      `shared`，但**召回不到别的 agent 的私有条目**（PG/Redis/SQLite 三后端同口径）
   2. **写闸**：非 primary 写 `tags="core"` 落库必须是 `core_candidate`（审核前不进
      常驻层）；标签判据是逗号边界的完整标签相等（`core_x` 不算命中）；
-     primary 写 core 原样放行；其余标签原样保留
+     **primary 写 core 也不再直通**（2026-10 常驻层入口改革：落候选 + 提名日戳），
+     只有人工显式直写（`core_direct=True`）才原样放行；其余标签原样保留
   3. **主脑检索噪音排除**：`retrieval.exclude_tags` 缺省排除 `core_candidate`，
      显式空串 = 不排除；`search()` / `prefetch()` 两个出口同一份实现
 
@@ -208,15 +209,105 @@ def test_write_gate_keeps_other_tags():
     assert st2.store_calls[0]["tags"] == "core_x", st2.store_calls[0]
 
 
-def test_write_gate_primary_untouched():
-    """primary 写 core 原样落库；非 core 标签两边都原样。"""
+def test_write_gate_primary_也不再直通常驻层():
+    """🔴 2026-10 常驻层入口改革：**primary 写 core 也不再直通**。
+
+    旧语义（primary 原样放行）作废：常驻层从此只有两个入口 —— 审核页人工批准、
+    候选满观察期自动通过。写 core 意图 ⇒ 落普通记忆条目 + 候选标 + 提名日戳。
+
+    提名日戳（`tier:auto-hot:<日>`）是这条**进入 7 天观察期**的凭据：没有它，
+    班车规则二压根不会审它（子代理降级路径就不带这个戳，两条分支的差别就在这）。
+    """
     st = _FakeStorage()
     _provider(st, is_primary=True).add("主脑写常驻记忆", tags="core,foo")
+    tags = st.store_calls[0]["tags"]
+    assert _has_tag(tags, CORE_CANDIDATE_TAG), tags
+    assert not _has_tag(tags, "core"), tags
+    assert _has_tag(tags, "foo"), "其余标签原样保留"
+    assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+
+
+def test_write_gate_非primary降级不带提名日戳():
+    """子代理写 core 落候选但**没有提名日**：它不是「提名」，班车不自动审它。"""
+    st = _FakeStorage()
+    _provider(st, is_primary=False).add("子代理写常驻记忆", tags="core")
+    tags = st.store_calls[0]["tags"]
+    assert _has_tag(tags, CORE_CANDIDATE_TAG), tags
+    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+
+
+def test_write_gate_人工显式直写放行():
+    """人工显式直写（`core_direct=True`，MCP `memory_add` 显式 core）⇒ 原样放行。
+
+    那是「人在批」的等价动作（控制台 promote / CoreView 新增同理）；
+    自动管线与通用协议路径不带这个标志 ⇒ 走候选。
+    """
+    st = _FakeStorage()
+    _provider(st, is_primary=True).add("人写的常驻记忆", tags="core,foo",
+                                        core_direct=True)
     assert st.store_calls[0]["tags"] == "core,foo", st.store_calls[0]
 
+    # 非 primary 仍然降级：显式直写**不能**绕过治理（子代理对常驻层只读）
+    st2 = _FakeStorage()
+    _provider(st2, is_primary=False).add("子代理想直写", tags="core",
+                                         core_direct=True)
+    assert _has_tag(st2.store_calls[0]["tags"], CORE_CANDIDATE_TAG), st2.store_calls[0]
+
+
+def test_write_gate_primary_非core标签原样():
+    """非 core 标签两边都原样（写闸只认完整标签 `core`）。"""
     st2 = _FakeStorage()
     _provider(st2, is_primary=False).add("子代理写普通记忆", tags="foo,bar")
     assert st2.store_calls[0]["tags"] == "foo,bar", st2.store_calls[0]
+
+
+def test_write_gate_primary_写core_落候选并补召回基数(tmp_path, monkeypatch):
+    """真 SQLite：primary 写 core ⇒ 落**普通条目**（候选标）+ 补 3000 条召回基数。
+
+    三条断言各钉一件事：① 不进常驻层（常驻层是注入源，候选不进）；
+    ② 候选标在（审核页看得到）；③ 基数在（7 天窗内被数到的命中 ≥3000 ——
+    候选要撑满 7 天观察期，光靠自然召回打点攒不够）。
+    """
+    monkeypatch.setenv("KEEPSAKE_CONFIG", str(tmp_path / "no-config.json"))
+    st = SqliteStorage(path=str(tmp_path / "gate.db"), is_primary=True)
+    try:
+        assert st.ensure_index() is True
+        key = _provider(st, is_primary=True).add("主脑写一条常驻记忆", tags="core")
+        assert key, "add 应返回 key"
+
+        row = st.get_fragment(key) or {}
+        assert _has_tag(row.get("tags", ""), CORE_CANDIDATE_TAG), row
+        assert not _has_tag(row.get("tags", ""), "core"), row
+        assert st.list_by_tag("core") == [], "候选不进常驻层"
+
+        hits = st.hits_stats(window_days=7, min_hits=1, keys=[key])
+        assert hits and hits[0]["hits"] >= 3000, hits
+    finally:
+        st.close()
+
+
+def test_write_gate_同内容重写_基数不补在归档旧条上(tmp_path, monkeypatch):
+    """同内容重写 ⇒ 存储层**版本化**（新条走 `key:epoch`，旧条归档）。
+
+    这时 provider 手算的 key 指向的是**归档旧条** ⇒ 基数补在它身上 = 给一条
+    归档条目凭空加热（还会被班车当成热门条目提名进审核队列）。所以重复内容
+    不再补第二份基数。
+    """
+    monkeypatch.setenv("KEEPSAKE_CONFIG", str(tmp_path / "no-config.json"))
+    st = SqliteStorage(path=str(tmp_path / "dup.db"), is_primary=True)
+    try:
+        assert st.ensure_index() is True
+        p = _provider(st, is_primary=True)
+        key = p.add("同一条常驻记忆", tags="core")
+        assert key
+        p.add("同一条常驻记忆", tags="core")          # 同内容 ⇒ 版本化
+        with st._lock:                                 # noqa: SLF001
+            rows = st._db().execute(                  # noqa: SLF001
+                "SELECT key, count(*) FROM ks_hit_event GROUP BY key").fetchall()
+        total = sum(int(c) for k, c in rows if str(k).startswith(key))
+        assert total == 3000, f"重复内容不该再补一份基数：{rows}"
+    finally:
+        st.close()
 
 
 # ---------------------------------------------------------------------------

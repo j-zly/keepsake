@@ -217,3 +217,17 @@ def forget_core_budget_cache() -> None:
         invalidate_core_budget_cache()
     except Exception:       # noqa: BLE001 —— provider 不可导入时没有缓存可失效
         pass
+
+
+def forget_tiering_cache() -> None:
+    """改完 config.json 后丢弃 provider 侧的**提名基数**缓存（写完必须调）。
+
+    与 `forget_core_budget_cache` 同款理由（指纹在同尺寸改值时可能一字不变），
+    失效的键是 `tiering.nominate_backfill_hits`（写闸补基数时读的那个）。
+    """
+    try:
+        from keepsake.adapters.hermes.provider import invalidate_tiering_cache
+
+        invalidate_tiering_cache()
+    except Exception:       # noqa: BLE001 —— provider 不可导入时没有缓存可失效
+        pass

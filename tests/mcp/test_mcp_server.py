@@ -355,6 +355,21 @@ def test_mcp_非primary写core降候选(tmp_path, monkeypatch):
         prov_mod._CORE_CACHE.update({"ts": 0.0, "frags": None})
 
 
+def test_mcp_显式写core_人工直写例外保留(server):
+    """🔴 人工显式直写**仍是直写**：MCP `memory_add(tags="core")` 是「人在批」的
+    等价动作（用户/助手在对话里明确要求记这一条）⇒ 仍进常驻层。
+
+    2026-10 常驻层入口改革只动**自动管线**与**写闸的 is_primary 直通**；
+    MCP 这条「显式人工写入」路径按用户拍板保持原样（控制台 promote /
+    CoreView 新增同理）。与上面 `test_常驻层列表与core资源同源` 同源：
+    那条钉「常驻层列表读的是同一个 provider」，这条钉「显式直写没被改成候选」。
+    """
+    key = call(server, "memory_add", text="主脑显式常驻 乙", tags="core")["key"]
+    assert "core" in call(server, "memory_get", key=key)["tags"]
+    assert "core_candidate" not in call(server, "memory_get", key=key)["tags"]
+    assert call(server, "memory_core_list")["count"] == 1
+
+
 def test_单条资源返回全文(server):
     key = call(server, "memory_add", text="单条资源 探针")["key"]
     assert json.loads(read_resource(server, f"memory://fragment/{key}"))["content"] == "单条资源 探针"

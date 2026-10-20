@@ -226,6 +226,59 @@ def invalidate_core_budget_cache() -> None:
     _CORE_BUDGET_CACHE.clear()
 
 
+#: `tiering.nominate_backfill_hits` 的进程内缓存 `{配置路径: (指纹, 条数)}`。
+#: 指纹口径与 `_CORE_BUDGET_CACHE` 同款（mtime_ns, size）——同一个 config.json、
+#: 同一条「改完下一轮热生效」的纪律。
+_TIERING_BACKFILL_CACHE: Dict[str, Any] = {}
+
+
+def _nominate_backfill_hits() -> int:
+    """提名基数回填条数 —— 读 config.json 的 `tiering.nominate_backfill_hits`。
+
+    口径只有一份：缺省值与值域判据都在 `core.tiering`（`resolve_tiering`），
+    这里**不另存一份常量、也不另写一份区间** —— 写闸与班车读的是同一个键。
+
+    🔴 缓存指纹是 (mtime_ns, size)：同尺寸改值在 mtime 粒度粗的文件系统上
+    可能指纹不变 ⇒ **写配置的一侧必须调 `invalidate_tiering_cache()`**
+    （控制台 PUT /api/v1/settings/tiering 已调）。
+    """
+    from ...core import tiering as tiering_mod
+
+    path = config_path()
+    key = str(path)
+    try:
+        st = os.stat(path)
+        fp = (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+    except OSError:
+        fp = None
+
+    hit = _TIERING_BACKFILL_CACHE.get(key)
+    if hit is not None and hit[0] == fp:
+        return hit[1]
+
+    count = int(tiering_mod.DEFAULTS["nominate_backfill_hits"])
+    if fp is not None:
+        try:
+            with open(path) as f:
+                raw = json.load(f) or {}
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            logger.warning("keepsake: config 读取失败（%s: %s），提名基数回落 %d",
+                           path, e, count)
+        else:
+            try:
+                count = int(tiering_mod.resolve_tiering(raw)["nominate_backfill_hits"])
+            except (TypeError, ValueError, KeyError):
+                logger.warning("keepsake: tiering.nominate_backfill_hits 非法，回落 %d",
+                               count)
+    _TIERING_BACKFILL_CACHE[key] = (fp, count)
+    return count
+
+
+def invalidate_tiering_cache() -> None:
+    """丢弃 `_nominate_backfill_hits()` 的进程内缓存（改完 config.json 的一侧必须调）。"""
+    _TIERING_BACKFILL_CACHE.clear()
+
+
 def _has_tag(tags: Any, tag: str) -> bool:
     """`tags` 字段（逗号串）里是否含 `tag` —— **逗号边界的完整标签相等**。
 
@@ -1459,26 +1512,46 @@ class KeepsakeProvider(MemoryProvider):
         except Exception as e:      # noqa: BLE001 —— 计数是遥测，不是账本
             logger.debug("keepsake: 活动计数失败（忽略）: %s: %s", type(e).__name__, e)
 
-    def _apply_write_gate(self, tags: str) -> str:
-        """写闸：非 primary 写 `core` 一律降级为 `core_candidate`（多代理治理第二条）。
+    def _apply_write_gate(self, tags: str, *, core_direct: bool = False
+                          ) -> Tuple[str, bool]:
+        """写闸：写 `core` 一律**不直通**常驻层（多代理治理第二条 + 2026-10 常驻层入口改革）。
 
         🔴 2026-10 ks_agent_registry：判定源已从 config 自报的 `_is_primary`
         切到 **registry 的角色**（`self._registry_is_primary()`，5s 缓存；
         注册表不可达时 fail-closed 按 sub —— 见那处的三条纪律）。
 
-        子代理对常驻层**只读** —— 它写 `core` 不能直接进常驻层，只能落候选，
-        经审核后由主脑转正。标签判据是**逗号边界的完整标签相等**（复用 `_has_tag`，
-        `core_x` / `xcore` 不算命中），其余标签原样保留、顺序不变。
-        primary 原样放行；返回 key 语义不受影响。
+        三条分支（标签判据是**逗号边界的完整标签相等**，复用 `_has_tag`，
+        `core_x` / `xcore` 不算命中；其余标签原样保留、顺序不变）：
+
+        * **非 primary** 写 `core` ⇒ 降级为 `core_candidate`（既有行为，本单不动：
+          子代理对常驻层只读，经审核后由主脑转正）；
+        * **primary** 写 `core` ⇒ **不再直通**：落 `core_candidate` + 提名日戳
+          （2026-10 常驻层入口改革：常驻层从此只有「审核页人工批准」与
+          「候选满观察期自动通过」两个入口）；
+        * **人工显式直写**（`core_direct=True`，MCP `memory_add` 显式 core）
+          ⇒ primary 原样放行 —— 那是「人在批」的等价动作（控制台 promote /
+          CoreView 新增同理，都不走这里）。
+
+        返回 `(改写后的 tags, 是否提名)`：第二个值为 True 时，这条是**新提名的
+        候选**（⇒ 写闸负责补召回基数，见 `core.tiering.backfill_nominate_hits`）。
         """
-        if self._registry_is_primary() or not _has_tag(tags, _CORE_TAG):
-            return tags
-        parts = [t.strip() for t in str(tags).split(",") if t.strip()]
-        kept = [CORE_CANDIDATE_TAG if t == _CORE_TAG else t for t in parts]
+        if not _has_tag(tags, _CORE_TAG):
+            return tags, False
+        from ...core import tiering as tiering_mod
+
+        if self._registry_is_primary():
+            if core_direct:
+                return tags, False          # 人工显式直写：原样放行
+            new_tags = tiering_mod.candidate_tags(tags, datetime.now(timezone.utc))
+            logger.warning(
+                "keepsake: primary 写 core 不再直通常驻层，落候选（tags: %r → %r）",
+                tags, new_tags)
+            return new_tags, True
+        new_tags = tiering_mod.candidate_tags(tags)
         logger.warning(
             "keepsake: 非 primary 写 core 降级为 %s（tags: %r → %r）",
-            CORE_CANDIDATE_TAG, tags, ",".join(kept))
-        return ",".join(kept)
+            CORE_CANDIDATE_TAG, tags, new_tags)
+        return new_tags, False
 
     def add(
         self,
@@ -1486,18 +1559,36 @@ class KeepsakeProvider(MemoryProvider):
         *,
         tags: str = "",
         meta: Optional[Dict[str, Any]] = None,
+        core_direct: bool = False,
     ) -> str:
         """写入一条记忆，返回它的 key；写入失败返回空串（falsy）。
 
         `meta` 目前只承载 `source` / `category` / `fragment_type` 三个字段 ——
         它是契约里预留的扩展位，不认识的键直接忽略，不报错。
+
+        🔴 `core_direct=True` = **人工显式直写**（MCP `memory_add` 显式写 core）：
+        这是「人在批」的等价动作，primary 写 `core` 时仍直通常驻层。
+        自动管线与通用协议路径**不传**这个标志 ⇒ 写 core 一律落候选
+        （2026-10 常驻层入口改革，判据见 `_apply_write_gate`）。
         """
         meta = meta or {}
         try:
             storage = self._require_storage()
+            gated_tags, nominated = self._apply_write_gate(tags, core_direct=core_direct)
+            key = self._fragment_key_for(text)
+            # 同内容已存在 ⇒ 存储层会**版本化**（新条走 `key:epoch` 独立 key，
+            # 旧条归档）。那种情况下本函数返回的 key 指向的是归档旧条 ⇒
+            # 基数不能补在它身上（那会给一条归档条目凭空加热、还会被班车
+            # 当成热门提名）。所以先问一句「这条内容是不是新的」。
+            duplicated = False
+            if nominated:
+                try:
+                    duplicated = bool(storage.fragment_exists(key))
+                except Exception as e:      # noqa: BLE001 —— 查不到就当新的
+                    logger.debug("keepsake: fragment_exists 失败（按新条目处理）: %s", e)
             ok = storage.store(
                 text,
-                tags=self._apply_write_gate(tags),
+                tags=gated_tags,
                 category=str(meta.get("category", "")),
                 source=str(meta.get("source", "")),
                 fragment_type=str(meta.get("fragment_type", "")),
@@ -1509,7 +1600,13 @@ class KeepsakeProvider(MemoryProvider):
             logger.warning("keepsake: add 未落库（fail-closed，返回空串）")
             return ""
         self._touch("write")     # 落库成功才记：写失败的尝试不是写入活动
-        return self._fragment_key_for(text)
+        if nominated and not duplicated:
+            # 提名即带基数（2026-10 常驻层入口改革）：这条刚进了候选队列 ⇒
+            # 补上召回基数，让它「看起来够热」（补失败不影响这次写入）。
+            from ...core import tiering as tiering_mod
+
+            tiering_mod.backfill_nominate_hits(storage, key, _nominate_backfill_hits())
+        return key
 
     def update(
         self,

@@ -276,6 +276,57 @@ def test_prune_删旧留新(lite):
 
 
 # ---------------------------------------------------------------------------
+# 一之二、提名基数回填（`record_hits_repeat`）：同一个 key 补 N 条事件
+# ---------------------------------------------------------------------------
+
+def test_基数回填_同一个key补N条事件(lite):
+    """基数回填要的是「同一个 key 落 N 行」—— `record_hits` 按 key 去重，
+    一次调用同一个 key 只落一行，所以另开一个原语（不许拿 record_hits 顶替）。
+    """
+    assert lite.record_hits_repeat("memory:frag:hot", 3000) == 3000
+    rows = [r for r in _hit_rows(lite) if r[0] == "memory:frag:hot"]
+    assert len(rows) == 3000, "基数必须是 3000 条事件行（规则二数的是行数）"
+    stats = lite.hits_stats(window_days=7, min_hits=1, keys=["memory:frag:hot"])
+    assert stats and stats[0]["hits"] == 3000, stats
+
+
+def test_基数回填_零条与空key不写(lite):
+    assert lite.record_hits_repeat("memory:frag:x", 0) == 0
+    assert lite.record_hits_repeat("", 100) == 0
+    assert _hit_rows(lite) == []
+
+
+# ---------------------------------------------------------------------------
+# 一之三、窗口锚点 `since`：绝对时刻（分级班车复核「自提名日起」要用）
+# ---------------------------------------------------------------------------
+
+def test_stats_since_绝对锚点替代滚动窗(lite):
+    """🔴 `since` = 窗口锚点：给了就从那一刻起算（`window_days` 作废）。
+
+    这是分级班车复核口径「**自提名日起**累计命中」的存储层原语 ——
+    滚动窗表达不了它（每条候选的挂龄不同，窗口长度得跟着走，还得靠挂钟对齐）。
+    """
+    now = datetime.now(timezone.utc)
+    _insert_hits(lite, "old", now - timedelta(days=30), n=5)
+    _insert_hits(lite, "new", now - timedelta(days=2), n=3)
+
+    # 滚动 7 天窗：只数得到 2 天前那 3 条
+    got = {it["key"]: it["hits"]
+           for it in lite.hits_stats(window_days=7, keys=["old", "new"])}
+    assert got == {"new": 3}, got
+
+    # 锚点挪到 30 天前 ⇒ 8 条全数（「对历史命中不封顶」）
+    got = {it["key"]: it["hits"]
+           for it in lite.hits_stats(since=now - timedelta(days=30), keys=["old", "new"])}
+    assert got == {"old": 5, "new": 3}, got
+
+    # 锚点挪到 29 天前 ⇒ 30 天前那 5 条不在窗口内（起点就是锚点）
+    got = {it["key"]: it["hits"]
+           for it in lite.hits_stats(since=now - timedelta(days=29), keys=["old", "new"])}
+    assert got == {"new": 3}, got
+
+
+# ---------------------------------------------------------------------------
 # 二、Redis：假 client（zset + hash 计数），不连真 Redis
 # ---------------------------------------------------------------------------
 
@@ -369,6 +420,36 @@ def test_redis_记点与统计(rstore):
     items = s.hits_stats(window_days=7, min_hits=5)
     assert [(it["key"], it["hits"]) for it in items] == [("a", 5)]
     assert items[0]["last_hit"], "last_hit 必须来自 zset 的 score"
+
+
+def test_redis_基数回填_一次HINCRBY补N次(rstore):
+    """Redis 侧命中口径是「hash 累计计数」，所以补 N 次 = 一次 HINCRBY N
+    （与行表侧「补 N 行」同义，且只一次往返）。"""
+    s, client = rstore
+    assert s.record_hits_repeat("a", 3000) == 3000
+    assert client.counter == {"a": 3000}
+    assert "a" in client.zset, "zset 的最近时刻也要刷（窗口筛只看它）"
+    items = s.hits_stats(window_days=7, min_hits=1, keys=["a"])
+    assert items and items[0]["hits"] == 3000, items
+    assert s.record_hits_repeat("a", 0) == 0
+    assert s.record_hits_repeat("", 10) == 0
+
+
+def test_redis_since_绝对锚点筛掉更早的key(rstore):
+    """Redis 侧 `since` 同样改窗口起点（zset 的最近时刻早于锚点 ⇒ 不在窗口内）。
+
+    🔴 已知口径差（与本模块其它 Redis 用例同款）：计数取自 hash 的**累计**次数，
+    `since` 只筛「最近一次命中在不在窗口内」。
+    """
+    s, client = rstore
+    client.zset["old"] = time.time() - 40 * 86400
+    client.zset["new"] = time.time() - 2 * 86400
+    client.counter["old"] = 5
+    client.counter["new"] = 3
+    anchor = datetime.now(timezone.utc) - timedelta(days=30)
+    got = {it["key"]: it["hits"]
+           for it in s.hits_stats(since=anchor, keys=["old", "new"])}
+    assert got == {"new": 3}, got
 
 
 def test_redis_白名单与阈值(rstore):
@@ -469,6 +550,25 @@ def test_pg_stats_窗口阈值白名单(pgs):
            for it in pgs.hits_stats(window_days=7, keys=["warm", "hot", "nope"])}
     assert got == {"hot": 5, "warm": 4}
     assert pgs.hits_stats(window_days=7, min_hits=99) == []
+
+
+def test_pg_since_绝对锚点(pgs):
+    """PG 侧 `since` 走**绝对时刻参数**（不是 `now() - interval` 表达式）——
+    锚点是调用方给的时刻（提名日），不受数据库挂钟与注入时钟的漂移影响。
+    """
+    for _ in range(5):
+        assert pgs.record_hits(["old"]) == 1
+    now = datetime.now(timezone.utc)
+    with pgs._tx() as cur:                             # noqa: SLF001
+        cur.execute("UPDATE ks_hit_event SET ts = %s WHERE key = %s",
+                    (now - timedelta(days=30), "old"))
+    got = {it["key"]: it["hits"]
+           for it in pgs.hits_stats(since=now - timedelta(days=30), keys=["old"])}
+    assert got == {"old": 5}, got
+    # 锚点挪到 29 天前 ⇒ 30 天前那 5 条不在窗口内
+    got = {it["key"]: it["hits"]
+           for it in pgs.hits_stats(since=now - timedelta(days=29), keys=["old"])}
+    assert got == {}, got
 
 
 def test_pg_prune_删旧留新(pgs):

@@ -975,6 +975,7 @@ def set_tiering(body: TieringBody) -> Dict[str, Any]:
     new = dict(raw)                          # 顶层保序
     new["tiering"] = clean                   # 节内由 validate_tiering 补齐成完整一份
     _write_config_or_reject(new, action, target)
+    config.forget_tiering_cache()   # 同尺寸改值时指纹可能不变 ⇒ 主动失效
 
     audit.record(action, target, ok=True,
                  reason=f"enabled={current} -> {clean['enabled']}; backup={backup}")

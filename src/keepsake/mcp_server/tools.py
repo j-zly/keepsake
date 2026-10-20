@@ -34,6 +34,7 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from typing import Any, Dict, List, Protocol, Tuple, runtime_checkable
 
@@ -180,13 +181,35 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS) -> 
 
 
 def memory_add(provider: Any, text: str, tags: str = "") -> Dict[str, Any]:
-    """写入一条记忆并返回它的 key。写层 fail-closed：失败抛错，不谎报成功。"""
+    """写入一条记忆并返回它的 key。写层 fail-closed：失败抛错，不谎报成功。
+
+    🔴 **本工具的写入是「显式人工写入」**（人/助手在对话里明确要求记这一条），
+    所以 provider 支持 `core_direct` 时一律带上 —— 常驻层（`core` 标签）只认
+    两条入口：人工显式直写、审核通过。自动管线与通用协议路径不带这个标志，
+    写 core 一律落候选（2026-10 常驻层入口改革）。
+    """
     if not text or not text.strip():
         raise ToolError("text 不能为空")
-    key = provider.add(text.strip(), tags=tags or "")
+    key = _add_memory(provider, text.strip(), tags or "")
     if not key:
         raise ToolError("写入失败：provider 未返回 key（fail-closed）")
     return {"key": key, "tags": tags or ""}
+
+
+def _add_memory(provider: Any, text: str, tags: str) -> str:
+    """调 `provider.add`；provider 支持 `core_direct` 就带上（可选扩展）。
+
+    `core_direct` **不在通用契约里**（契约不该为某一个宿主的「显式直写」开洞），
+    所以这里先看签名再决定带不带：别的记忆系统没有这个参数 ⇒ 照常调，
+    不猜、不用 try/except 吞异常（那会把 provider 自己的写失败吞成「没写进去」）。
+    """
+    try:
+        params = inspect.signature(provider.add).parameters
+    except (TypeError, ValueError):       # 签名取不到（内置/C 扩展）⇒ 按不支持处理
+        params = {}
+    if "core_direct" in params:
+        return provider.add(text, tags=tags, core_direct=True)
+    return provider.add(text, tags=tags)
 
 
 def memory_remove(provider: Any, key: str, confirm: bool = False) -> Dict[str, Any]:

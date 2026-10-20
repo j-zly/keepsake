@@ -258,6 +258,103 @@ def test_规则一_batch_cap封顶(storage):
 
 
 # ---------------------------------------------------------------------------
+# 提名基数（2026-10 常驻层入口改革）：提名即带基数
+#
+# 为什么要有基数：候选「够不够热」本来只看自然召回打点，而实测流量下
+# 3000/7 天几乎不可达 ⇒ 提名的候选永远攒不够热度、复核时自然被驳回。
+# 基数把「它至少这么热」写成**可被规则二数到的事件行**（hits 数的是行数）。
+# ---------------------------------------------------------------------------
+
+def _hit_event_rows(storage, key: str) -> int:
+    """打点表里某个 key 的**事件行数**（直查表，绕开窗口口径 ⇒ 与挂钟无关）。"""
+    with storage._write() as cur:      # noqa: SLF001 —— 测试直查打点表
+        row = cur.execute("SELECT count(*) FROM ks_hit_event WHERE key = ?",
+                           (key,)).fetchone()
+    return int(row[0] if row else 0)
+
+
+def test_提名基数_提名后7天窗内计数至少3000(storage):
+    """提名成功的瞬间给该 key 补 3000 条命中事件 ⇒ 提名后 7 天窗内计数 ≥3000。
+
+    判据用「窗内计数」（规则二数的就是这个），不是「表里有多少行」。
+    """
+    key = "memory:frag:hot"
+    _seed(storage, [{"key": key, "content": "热门条目" * 10, "tags": "demo"}])
+    _seed_hits(storage, key, 5)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["nominate"]["count"] == 1
+    assert stats["nominate"]["backfill_hits"] == 3000
+    hits = storage.hits_stats(window_days=7, min_hits=1, keys=[key])
+    assert hits and hits[0]["hits"] >= 3000, hits
+
+
+def test_提名基数_关掉时一条打点都不写(storage):
+    """`nominate_backfill_hits=0`（关闭）⇒ 提名照提，打点一条都不许多写。"""
+    key = "memory:frag:hot"
+    _seed(storage, [{"key": key, "content": "热门条目" * 10, "tags": "demo"}])
+    _seed_hits(storage, key, 5)
+    before = _hit_event_rows(storage, key)
+    cfg = {"tiering": {"enabled": True, "nominate_backfill_hits": 0,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["nominate"]["count"] == 1
+    assert stats["nominate"]["backfill_hits"] == 0
+    assert _hit_event_rows(storage, key) == before, "关闭时一条打点都不许写"
+
+
+def test_提名基数_dry_run不写打点(storage):
+    """dry 只算不写：候选标不打，基数也不打。"""
+    key = "memory:frag:hot"
+    _seed(storage, [{"key": key, "content": "热门条目" * 10, "tags": "demo"}])
+    _seed_hits(storage, key, 5)
+    before = _hit_event_rows(storage, key)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=True, now=NOW)
+
+    assert stats["nominate"]["count"] == 1
+    assert _hit_event_rows(storage, key) == before
+    assert _tags(storage, key) == ["demo"], "dry 只算不写"
+
+
+def test_驳回不删打点_基数是历史事实(storage):
+    """驳回只摘候选标（条目留检索层），**打点一条都不许删**。
+
+    召回是已经发生过的历史事实，不是可撤销的额度：驳回 = 「这条不适合进
+    常驻层」，不是「这条从没被召回过」。
+    """
+    from keepsake.core.tiering import AUTO_REJECTED_PREFIX
+
+    key = "memory:frag:weak"
+    _seed(storage, [_candidate_row(key, nominated_days_ago=10)])
+    _seed_hits(storage, key, 2)
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert stats["auto_review"]["rejected_count"] == 1
+    tags = _tags(storage, key)
+    assert CANDIDATE_TAG not in tags, "驳回必须摘候选标"
+    assert f"{AUTO_REJECTED_PREFIX}:{NOW:%Y-%m-%d}" in tags
+    assert _hit_event_rows(storage, key) == 2, "驳回不许删打点"
+    assert storage.get_fragment(key) is not None, "条目留在检索层"
+
+
+# ---------------------------------------------------------------------------
 # 规则二：自动审核（候选满 review_window_days → 通过/驳回 二选一）
 # ---------------------------------------------------------------------------
 
@@ -425,6 +522,66 @@ def test_规则二_默认阈值边界_4999驳回_5000通过(storage):
     assert review["rejected"] == ["memory:frag:edge_below"], review
     assert "memory:frag:edge_on" in _core_keys(storage)
     assert CANDIDATE_TAG not in _tags(storage, "memory:frag:edge_on")
+
+
+def test_规则二_复核口径_自提名日起累计_基数在复核时仍计入(storage):
+    """🔴 复核的命中口径 = 「**自提名日起累计命中**」（窗口锚点是提名日）。
+
+    这条是两种口径的**判别式**：基数（提名瞬间补的 3000 条命中事件）打在
+    **提名那天**，而复核发生在提名满 7 天之后 ——
+      * 旧口径（滚动 7 天窗）：那 3000 条早滑出窗口 ⇒ 数到 0 ⇒ 驳回；
+      * 新口径（锚点 = 提名日）：基数**仍然计入** ⇒ 数到 3000 ⇒ 批准。
+
+    阈值数字一个没动（这里把 `promote_approve_hits` 显式压到 3000 = 基数条数，
+    是「基数条数本身够不够门槛」的判据，不是改判定阈值）。
+    """
+    key = "memory:frag:hot"
+    nominated_day = (NOW - timedelta(days=8)).date()
+    _seed(storage, [{"key": key, "content": "热门条目" * 10,
+                     "tags": f"demo,{CANDIDATE_TAG},"
+                             f"{AUTO_HOT_PREFIX}:{nominated_day.isoformat()}",
+                     "created": (NOW - timedelta(days=9)).isoformat()}])
+    _seed_hits(storage, key, 3000, days_ago=8)      # 基数：提名那一刻补的 3000 条
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3000}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    review = stats["auto_review"]
+    assert review["approved"] == [key], review
+    assert review["rejected_count"] == 0, review
+    assert CORE_TAG in _tags(storage, key)
+
+
+def test_规则二_复核口径_提名之前的命中不计入(storage):
+    """反向钉死锚点：**提名日之前**的命中不算数。
+
+    「窗口对历史命中不封顶」说的是**不设上限**（从提名日往回数到今天），
+    不是「往回也没有起点」—— 起点就是提名日。基数打在提名**之前**（老数据
+    的残留热度）⇒ 复核时数到 0 ⇒ 驳回。
+    """
+    key = "memory:frag:old_heat"
+    nominated_day = (NOW - timedelta(days=8)).date()
+    _seed(storage, [{"key": key, "content": "老热条目" * 10,
+                     "tags": f"demo,{CANDIDATE_TAG},"
+                             f"{AUTO_HOT_PREFIX}:{nominated_day.isoformat()}",
+                     "created": (NOW - timedelta(days=9)).isoformat()}])
+    _seed_hits(storage, key, 3000, days_ago=10)     # 提名**之前**的 3000 条
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 3000},
+                       "promote_auto": {"review_window_days": 7,
+                                        "promote_approve_hits": 3000}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    review = stats["auto_review"]
+    assert review["approved_count"] == 0, review
+    assert review["rejected"] == [key], review
+    assert CANDIDATE_TAG not in _tags(storage, key)
 
 
 def test_规则二_旧auto_promote段保留停用_防旧解析崩(storage):
@@ -739,6 +896,26 @@ def test_校验_缺省补齐成完整一份():
     assert clean["promote_nominate"] == {"window_days": 7, "nominate_min_hits": 3000}
     assert clean["promote_auto"] == {"review_window_days": 7, "promote_approve_hits": 5000}
     assert clean["batch_cap"] == 50
+    assert clean["nominate_backfill_hits"] == 3000
+
+
+def test_配置_提名基数缺省3000_0是关闭_非法值回落缺省():
+    """基数配置：缺省 3000；**0 = 关闭**（合法值）；越界/非数回落缺省。"""
+    assert resolve_tiering({})["nominate_backfill_hits"] == 3000
+    assert resolve_tiering({"tiering": {"nominate_backfill_hits": 0}})["nominate_backfill_hits"] == 0
+    assert resolve_tiering({"tiering": {"nominate_backfill_hits": 500}})["nominate_backfill_hits"] == 500
+    for bad in (-1, 100001, "abc", True):
+        assert resolve_tiering({"tiering": {"nominate_backfill_hits": bad}})[
+            "nominate_backfill_hits"] == 3000, bad
+
+
+def test_校验_提名基数():
+    """0 合法（关闭）；负数/越界/非数一律 400 拒收（不许半截值落盘）。"""
+    assert validate_tiering({"nominate_backfill_hits": 0})["nominate_backfill_hits"] == 0
+    assert validate_tiering({"nominate_backfill_hits": 100000})["nominate_backfill_hits"] == 100000
+    for bad in (-1, 100001, "abc", True):
+        with pytest.raises(ValueError):
+            validate_tiering({"nominate_backfill_hits": bad})
 
 
 def test_校验_非法值与未知键拒收():
@@ -857,6 +1034,97 @@ def test_settings_写config只动tiering一键且先备份(client, tmp_path):
     backups = list((tmp_path / "backup").rglob("config.tiering.*.json"))
     assert backups, "写前必须整份备份 config.json"
     assert json.loads(backups[0].read_text(encoding="utf-8"))["tiering"]["enabled"] is False
+
+
+def test_settings_提名基数可改且热生效(client, tmp_path):
+    """控制台能改提名基数（0 = 关闭），写进 config.json 且 status 立刻回读得到。"""
+    c, cfg_path = client
+    r = c.put("/api/v1/settings/tiering",
+              json={"tiering": {"enabled": True, "nominate_backfill_hits": 0},
+                    "confirm": "false"}, headers=AUTH)
+    assert r.status_code == 200
+    after = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert after["tiering"]["nominate_backfill_hits"] == 0
+    body = c.get("/api/v1/tiering/status", headers=AUTH).json()
+    assert body["settings"]["nominate_backfill_hits"] == 0
+
+    # 越界值 400 拒收（半截阈值不许落盘）
+    bad = c.put("/api/v1/settings/tiering",
+                json={"tiering": {"nominate_backfill_hits": -1}, "confirm": "true"},
+                headers=AUTH)
+    assert bad.status_code == 400
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["tiering"][
+        "nominate_backfill_hits"] == 0
+
+
+class _BackfillSpy:
+    """只记 `record_hits_repeat` 的最小 fake（钉「补了多少条」这个数）。"""
+
+    def __init__(self):
+        self.store_calls: List[Dict[str, Any]] = []
+        self.repeats: List[Any] = []
+
+    def store(self, text, tags="", category="", source="", fragment_type="", **_kw):
+        self.store_calls.append({"text": text, "tags": tags})
+        return True
+
+    def fragment_exists(self, key):
+        return False            # 每条都是新内容（不触发「重复内容不补第二份」）
+
+    def record_hits_repeat(self, key, times):
+        self.repeats.append((key, int(times)))
+        return int(times)
+
+
+def _primary_provider(storage: Any) -> Any:
+    """一个 primary 身份的 provider（裸实例：没装注册表 ⇒ 写闸回落到 `_is_primary`）。"""
+    from keepsake import KeepsakeProvider
+
+    p = object.__new__(KeepsakeProvider)
+    p._config = {}
+    p._storage = storage
+    p._tag_filter = ""
+    p._is_primary = True
+    p._exclude_tags = ()
+    return p
+
+
+def test_settings_提名基数从config到写闸全链通(client):
+    """🔴 「提名即带基数」的条数**只有一个真值源**：config.json 的
+    `tiering.nominate_backfill_hits`（默认 3000，0 = 关闭）。
+
+    这条把整条链一次钉死：控制台 PUT（写 config.json + 主动失效缓存）
+      → 写闸（provider）读同一份配置 → 下一条写 core 补的条数跟着变。
+
+    🔴 **同尺寸改值时文件指纹（mtime_ns, size）可能一字不变** ⇒ 写配置的一侧
+    必须调 `forget_tiering_cache()`（控制台 PUT 已调），否则「界面说改成功了、
+    写闸还在按老条数补基数」。
+    """
+    c, cfg_path = client
+    spy = _BackfillSpy()
+    p = _primary_provider(spy)
+
+    # 缺省 3000（config 里没这个键 ⇒ 回落缺省）
+    p.add("第一条常驻记忆", tags="core")
+    assert spy.repeats[-1][1] == 3000, spy.repeats
+
+    # 控制台改成 5 ⇒ 下一条就按 5 补（热生效：写侧主动失效了缓存）
+    r = c.put("/api/v1/settings/tiering",
+              json={"tiering": {"enabled": True, "nominate_backfill_hits": 5},
+                    "confirm": "false"}, headers=AUTH)
+    assert r.status_code == 200
+    p.add("第二条常驻记忆", tags="core")
+    assert spy.repeats[-1][1] == 5, spy.repeats
+
+    # 关掉（0 = 关闭）⇒ 一条都不补（提名照提）
+    r = c.put("/api/v1/settings/tiering",
+              json={"tiering": {"enabled": True, "nominate_backfill_hits": 0},
+                    "confirm": "true"}, headers=AUTH)
+    assert r.status_code == 200
+    before = len(spy.repeats)
+    p.add("第三条常驻记忆", tags="core")
+    assert len(spy.repeats) == before, "关闭时一条打点都不许写"
+    assert "core_candidate" in spy.store_calls[-1]["tags"], spy.store_calls[-1]
 
 
 def test_settings_开关真生效后status变true(client):

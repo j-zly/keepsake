@@ -3346,19 +3346,48 @@ class PgStorage(StorageBase):
             cur.executemany("INSERT INTO ks_hit_event (key, ts) VALUES (%s, %s)", rows)
         return len(rows)
 
+    def record_hits_repeat(self, key: str, times: int) -> int:
+        """给一个 key 补 N 条命中事件（**一条多行 INSERT**，分块见 `_insert_many`）。
+
+        走 `_insert_many`（多行写的唯一出口）⇒ 参数上限按 `SAFE_PARAM_CAP`
+        自动切块，3000 条 = 一条语句 6000 个参数，不逐条 insert。
+        """
+        n = int(times or 0)
+        if not key or n <= 0:
+            return 0
+        ts = datetime.now(timezone.utc)
+        rows = [(key, ts)] * n
+        in_worker = threading.current_thread() is not threading.main_thread()
+        self._tls.in_worker = in_worker
+        try:
+            with self._tx() as cur:
+                self._insert_many(cur, "ks_hit_event", ("key", "ts"), rows, "")
+        finally:
+            self._tls.in_worker = False
+        return n
+
     def hits_stats(
         self,
         window_days: int = 7,
         min_hits: int = 5,
         keys: Optional[List[str]] = None,
         limit: int = 500,
+        since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。"""
-        sql = (
-            "SELECT key, count(*) AS hits, max(ts) AS last_hit FROM ks_hit_event "
-            "WHERE ts >= now() - (%s * interval '1 day')"
-        )
-        params: List[Any] = [int(window_days)]
+        """窗口内 `count(*)` 统计（见 StorageBase.hits_stats 的口径约定）。
+
+        `since` 给了就以它为窗口起点（绝对时刻），否则是「现在减 window_days」。
+        """
+        if since is not None:
+            sql = ("SELECT key, count(*) AS hits, max(ts) AS last_hit "
+                   "FROM ks_hit_event WHERE ts >= %s")
+            params: List[Any] = [since]
+        else:
+            sql = (
+                "SELECT key, count(*) AS hits, max(ts) AS last_hit FROM ks_hit_event "
+                "WHERE ts >= now() - (%s * interval '1 day')"
+            )
+            params = [int(window_days)]
         if keys:
             # 给了 keys 就只算这些 key，且**不再套 min_hits 门槛** ——
             # 调用方（下一单 core_tiering）已知候选集，要的是「各多少热度」，

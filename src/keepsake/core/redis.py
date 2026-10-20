@@ -1300,12 +1300,32 @@ class RedisStorage(StorageBase):
         pipe.execute()
         return len(uniq)
 
+    def record_hits_repeat(self, key: str, times: int) -> int:
+        """给一个 key 补 N 次命中（hash 计数 +N + zset 刷最近时刻）。
+
+        Redis 侧的命中口径本来就是「hash 累计计数 + zset 最近时刻」
+        （见 `hits_stats` 的已知口径差说明），所以「补 N 次」= 一次
+        `HINCRBY key N` —— 与行表侧「补 N 行」同义，且**一次往返**。
+        """
+        n = int(times or 0)
+        if not key or n <= 0:
+            return 0
+        client = self._get_client()
+        if not client:
+            return 0
+        pipe = client.pipeline()
+        pipe.zadd(HITS_ZSET, {key: time.time()}, gt=True)
+        pipe.hincrby(HITS_COUNT_HASH, key, n)
+        pipe.execute()
+        return n
+
     def hits_stats(
         self,
         window_days: int = 7,
         min_hits: int = 5,
         keys: Optional[List[str]] = None,
         limit: int = 500,
+        since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """窗口内命中统计（形状见 StorageBase.hits_stats）。
 
@@ -1313,12 +1333,14 @@ class RedisStorage(StorageBase):
         而「窗口内」只由 zset 的最近时刻筛（zset 每 key 只有最近一次）——
         与行表口径相比，跨窗口的累计会略高。因为上游已按 300 秒去抖、
         且本单只作「热不热」的粗信号，够用不追求精确（任务书口径）。
+        `since` 给了就以它为窗口起点（绝对时刻），否则是「现在减 window_days」。
         """
         client = self._get_client()
         if not client:
             return []
-        since = time.time() - int(window_days) * 86400
-        raw = client.zrangebyscore(HITS_ZSET, since, "+inf", withscores=True)
+        floor = (since.timestamp() if since is not None
+                 else time.time() - int(window_days) * 86400)
+        raw = client.zrangebyscore(HITS_ZSET, floor, "+inf", withscores=True)
         scores = {
             (m.decode("utf-8") if isinstance(m, bytes) else str(m)): float(s)
             for m, s in (raw or [])

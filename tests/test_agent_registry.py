@@ -340,21 +340,37 @@ class _BoomRegistry(Registry):
 
 
 def test_写闸按注册表角色而非自报is_primary(lite):
-    """🔴 治理收口的核心一行：config 自报 primary，但注册表说是 sub ⇒ 照降级。"""
+    """🔴 治理收口的核心一行：config 自报 primary，但注册表说是 sub ⇒ 照降级。
+
+    子代理写 core 落候选但**不带提名日戳**（它不是「提名」，班车不自动审它）。
+    """
     lite.register("worker-1")
     spy = _StoreSpy()
     _provider(spy, registry=lite).add("子代理写常驻", tags="core")
-    assert "core_candidate" in spy.store_calls[0]["tags"]
+    tags = spy.store_calls[0]["tags"]
+    assert "core_candidate" in tags
+    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
 
-def test_写闸在注册表里是primary时原样放行(lite):
+def test_写闸在注册表里是primary时落候选带提名戳(lite):
+    """注册表说 primary（自报 sub）⇒ 以注册表为准。
+
+    🔴 2026-10 常驻层入口改革：**primary 写 core 也不再直通**（常驻层只剩
+    「审核页人工批准」与「候选满观察期自动通过」两个入口），落候选 + 提名日戳。
+    两条分支（primary 有戳 / 子代理没戳）的差别，正是「判定源是注册表角色」
+    在改革后仍可观测的证据。
+    """
     lite.register("main")
     lite.bootstrap_local("main", as_primary=True)
     spy = _StoreSpy()
     p = _provider(spy, registry=lite, agent_id="main")
     p._is_primary = False              # 自报 sub，注册表说 primary ⇒ 以注册表为准
     p.add("主脑写常驻", tags="core,foo")
-    assert spy.store_calls[0]["tags"] == "core,foo"
+    tags = spy.store_calls[0]["tags"]
+    assert "core_candidate" in tags, tags
+    assert "foo" in tags, tags
+    assert not tags.startswith("core,"), tags
+    assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
 
 def test_注册表不可达时fail_closed按sub(lite):

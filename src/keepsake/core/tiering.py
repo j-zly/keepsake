@@ -27,12 +27,15 @@
    🟡 阈值取 3000 是口语碎片凭高频检索打点也能进的现实压力 —— 现流量下基本
    等于关死本轨，但核心层手动 promote 端点不受影响（人批走另一条路）。
 2. **自动审核通过 / 驳回（替换旧 auto_promote）**：候选自提名日起满
-   `promote_auto.review_window_days` 天（默认 7），评估提名后同一窗内
-   （提名日→今）命中 ≥ `promote_auto.promote_approve_hits`（默认 5000）⇒
+   `promote_auto.review_window_days` 天（默认 7），评估**自提名日起累计命中**
+   ≥ `promote_auto.promote_approve_hits`（默认 5000）⇒
    **自动打 core**（与手动 promote 同一存储路径 `_with_core`+`_apply`，加
    `tier:auto-promoted` 痕迹）；不足 ⇒ **自动驳回**：摘 `core_candidate`、
    保留 `tier:auto-hot:<提名日>` 历史戳、加 `tier:auto-rejected:<驳回日>`
    短戳，条目留检索层。未满窗的候选**不动**（人也可手动先批/驳）。
+   🔴 **命中窗口的锚点是提名日**（`hits_stats(since=提名日)`），不是
+   「现在减 7 天」的滚动窗 —— 见下「基数与复核口径」；阈值数字不动，
+   动的只是**数哪一段**。
    **预算护栏**：自动批准的那一步 `used + len(content) > budget` ⇒ 本轮
    跳过、留在队列里等下一轮 —— 绝不硬塞；驳回不耗预算、不受这条护栏约束。
 3.
@@ -55,6 +58,37 @@
      （`tier:auto-promoted`）**不豁免** —— 它是机器放进来的，机器也该能请出去。
      🔴 豁免挡的是**自动动作**（强降），不挡**提名**：信号轨对手写条目照样提名
      （见上），否则「这条误导」这句人话在常驻层里没人听得到。
+
+## 2026-10 常驻层入口改革：core 不再直写 + 提名即带基数
+
+用户拍板的两条新规矩（**阈值一律不动**：提名 3000 / 自动批 5000 / 观察窗 7 天）：
+
+1. **任何写入都不直接进 core**：写 `core` 意图 ⇒ 落普通记忆条目 + 打候选标，
+   进既有的待审核队列。常驻层从此只有两个入口：**审核页人工批准**、
+   **候选满观察期自动通过**。
+   写闸在 `adapters/hermes/provider.py::_apply_write_gate`（本模块只提供
+   候选标与提名函数，**判据不在两处各写一份**）：
+   * 非 primary 写 core ⇒ `core_candidate`（既有降级行为，本单不动）；
+   * primary 写 core ⇒ 也落 `core_candidate` + 提名日戳（**不再直通**）；
+   * 人工显式直写（控制台 promote / CoreView / MCP `memory_add` 显式 core）
+     ⇒ 仍是直写 —— 那是「人在批」的等价动作。
+2. **提名即带基数**（`tiering.nominate_backfill_hits`，默认 3000，0 = 关闭）：
+   成为候选的**瞬间**给该 key 补写这么多条**命中事件**（批量 INSERT，
+   分块，不逐条）。为什么是「打点」而不是「打个标」：规则二判的是
+   **窗口内命中数**（`hits_stats` 数的是事件行数），基数必须是它能数到的东西。
+   驳回摘候选标时**基数不回滚** —— 打点是历史事实，不是可撤销的额度。
+
+🟢 **基数与复核口径**（2026-10 主脑裁定，**阈值数字一个没动**）：
+复核数的是「**自提名日起累计命中**」，窗口锚点是**提名日**
+（`hits_stats(since=提名日)`），不是「现在减 7 天」的滚动窗。
+为什么必须这样：复核发生在「提名满 7 天」之后，若还数滚动 7 天窗，
+提名那刻补的 3000 条基数**早已滑出窗口** ⇒ 基数白补、候选永远攒不到
+批准门槛（5000）。改成「提名日→今」后，基数在复核那一刻**仍然计入**，
+对历史命中**不封顶**。改的是**数哪一段**，不是「判多热」——
+3000/5000/7 天三个数字原封不动。
+
+（此前这里记的是「基数滑出窗口、自动批准仍看真实命中」那个边界；
+主脑已裁定按上面这条口径执行，边界取消。）
 
 ## 为什么降级建议**不进** `retrieval.exclude_tags`（与晋升候选方向相反）
 
@@ -140,6 +174,10 @@ DEFAULTS: Dict[str, Any] = {
     "demote_pressure": {"warn_ratio": 0.90, "release_ratio": 0.80, "force_at_full": True},
     "demote_exempt": {"explicit_core": True},
     "batch_cap": 50,
+    # 提名基数（2026-10 常驻层入口改革）：成为候选的瞬间给该 key 补写的
+    # 命中事件条数。默认 3000（与提名阈值同量级）＝「这条至少这么热」；
+    # 0 = 关闭（只提名，不补基数）。见模块 docstring「提名即带基数」。
+    "nominate_backfill_hits": 3000,
 }
 
 #: 各值域（校验与回落用同一份，PUT 与读配置两条路径不许各写一套区间）。
@@ -153,6 +191,8 @@ BOUNDS = {
     "warn_ratio": (0.01, 1.0, float),
     "release_ratio": (0.0, 1.0, float),
     "batch_cap": (1, 10000, int),
+    # 基数条数：下限 **0**（0 = 关闭补基数，是合法取值不是非法值）
+    "nominate_backfill_hits": (0, 100000, int),
 }
 
 #: 压力轨的排序窗口（命中数 / last_hit 都看这么远）。90 天 = 打点事件的保留期，
@@ -269,6 +309,9 @@ def resolve_tiering(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         },
         "batch_cap": _parse_num(raw.get("batch_cap"), "batch_cap",
                                 DEFAULTS["batch_cap"]),
+        "nominate_backfill_hits": _parse_num(raw.get("nominate_backfill_hits"),
+                                             "nominate_backfill_hits",
+                                             DEFAULTS["nominate_backfill_hits"]),
     }
 
 
@@ -442,26 +485,123 @@ def read_state() -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _hits_by_key(storage: Any, keys: List[str], window_days: int) -> Tuple[Dict[str, int], Dict[str, str]]:
+def _hits_since_nomination(storage: Any, rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """每条候选「**自提名日起**累计命中」→ `{key: hits}`。
+
+    🔴 **窗口锚点是提名日，不是「现在减 review_window_days」**（2026-10 主脑裁定）：
+
+    * 复核发生在「提名满 review_window_days」之后，若还数滚动 7 天窗，
+      提名那刻补的基数（`tiering.nominate_backfill_hits`，默认 3000 条）
+      早已滑出窗口 ⇒ 基数白补，候选永远攒不到批准门槛；
+    * 改成「提名日→今」⇒ 基数在复核那一刻**仍然计入**，
+      阈值数字（3000/5000/7 天）一个不动，改的只是**数哪一段**；
+    * 「对历史命中不封顶」：窗口不设上限，名义上从提名日至今都算数。
+
+    实现按**提名日分组**发查询（提名日戳是日期粒度，组数很少），
+    每组一次 `hits_stats(since=提名日)` —— 锚点是**绝对时刻**，
+    不受「挂钟 vs 注入的 now」的漂移影响（滚动窗做不到这点）。
+
+    没有提名日戳的（老数据 / 子代理降级落的候选）⇒ 不在本函数里算数，
+    调用方按「仍待审」处理（它们本来也不该被自动批）。
+    """
+    groups: Dict[datetime, List[str]] = {}
+    for row in rows:
+        key = str(row.get("key") or "")
+        nominated = nominated_on(row)
+        if not key or nominated is None:
+            continue
+        groups.setdefault(nominated, []).append(key)
+    hits: Dict[str, int] = {}
+    for nominated, group in groups.items():
+        got, _ = _hits_by_key(storage, group, since=nominated)
+        hits.update(got)
+    return hits
+
+
+def _hits_by_key(storage: Any, keys: List[str], window_days: Optional[int] = None,
+                 since: Optional[datetime] = None) -> Tuple[Dict[str, int], Dict[str, str]]:
     """一批 key 的窗口命中数 / 最近命中时刻 → `({key: hits}, {key: last_hit})`。
 
     🔴 **分块问存储层**：三个后端的 `hits_stats(keys=...)` 都把 keys 摊成一条
     `IN (?,?,…)`，而 SQLite 的参数上限是 999（PG/Redis 同理有上限）。一次把上千个
     常驻条目的 key 丢过去 ⇒ 查询直接炸 ⇒ 班车一整个跑不起来。常驻层上百条时
     平时不炸，正是「平时没事、攒够就整轮挂掉」的那种坏，所以这里固定分块。
+
+    `since`（绝对时刻）= 窗口锚点，给了就从那一刻起算（`window_days` 作废）；
+    不给才是「现在减 window_days」的滚动窗（规则一提名、降级排序用滚动窗）。
     """
     hits: Dict[str, int] = {}
     last_hit: Dict[str, str] = {}
     uniq = [k for k in dict.fromkeys(keys) if k]
     for i in range(0, len(uniq), HITS_KEY_CHUNK):
-        rows = storage.hits_stats(window_days=window_days, keys=uniq[i:i + HITS_KEY_CHUNK],
-                                  limit=HITS_KEY_CHUNK) or []
+        kwargs: Dict[str, Any] = {"keys": uniq[i:i + HITS_KEY_CHUNK],
+                                  "limit": HITS_KEY_CHUNK}
+        if since is not None:
+            kwargs["since"] = since
+        else:
+            kwargs["window_days"] = int(window_days or 0)
+        rows = storage.hits_stats(**kwargs) or []
         for row in rows:
             key = str(row.get("key") or "")
             if key:
                 hits[key] = int(row.get("hits") or 0)
                 last_hit[key] = str(row.get("last_hit") or "")
     return hits, last_hit
+
+
+# --------------------------------------------------------------------------
+# 候选标 / 提名基数（写闸与班车共用的两个原语）
+#
+# 为什么放这里而不是各写一份：候选标签的字面量（`core_candidate`）与
+# `tier:auto-hot:<提名日>` 的格式**只有一份定义**，写闸（provider）与
+# 班车（本模块）都必须用同一份 —— 两处各写一遍，迟早出现「一边打了标、
+# 另一边按另一个名字找」的漂移（打上了但审核页看不见）。
+# --------------------------------------------------------------------------
+
+def candidate_tags(tags: Any, now: Optional[datetime] = None) -> str:
+    """候选标签形态：`core` → `core_candidate`；给了 `now` 就补提名日戳。
+
+    * `now=None` ⇒ **只换标签不补戳**（子代理写 core 的降级路径：它没有
+      提名日，班车规则二就不会去自动审它 —— 保持既有语义不动）；
+    * 给了 `now` ⇒ 追加 `tier:auto-hot:<提名日>`（规则二判「挂多久了」与
+      审核页显示「哪来的申请」都靠这个戳）。
+
+    其余标签原样保留、顺序不变（只把 `core` 那一项换掉）。
+    """
+    parts = [t.strip() for t in str(tags or "").split(",") if t.strip()]
+    kept = [CANDIDATE_TAG if t == CORE_TAG else t for t in parts]
+    if CANDIDATE_TAG not in kept:
+        kept.append(CANDIDATE_TAG)
+    if now is not None:
+        stamp = f"{AUTO_HOT_PREFIX}:{now:%Y-%m-%d}"
+        if stamp not in kept:
+            kept.append(stamp)
+    return ",".join(kept)
+
+
+def backfill_nominate_hits(storage: Any, key: str, count: int) -> int:
+    """提名基数：给 `key` 补 `count` 条命中事件，返回实际写入条数。
+
+    🔴 **批量写，不逐条 insert**：`storage.record_hits_repeat` 一次落
+    N 行（PG 走多行 INSERT 并按参数上限分块，SQLite 同款，Redis 一次
+    HINCRBY）。逐条 insert 3000 次 = 3000 次往返，班车一轮 50 条提名
+    就是 15 万次往返 —— 那不是「慢」，那是把定时任务变成事故。
+
+    **fail-open**：后端不可达 / 未实现该原语 ⇒ warning + 返回 0，
+    绝不把「补基数失败」升级成「提名失败」（提名已经落库了，基数是附属品）。
+    """
+    try:
+        n = int(count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0 or not key:
+        return 0
+    try:
+        return int(storage.record_hits_repeat(key, n) or 0)
+    except Exception as e:      # noqa: BLE001 —— 附属品失败不许掀翻主流程
+        logger.warning("keepsake: 提名基数回填失败（忽略，key=%s）: %s: %s",
+                       key, type(e).__name__, e)
+        return 0
 
 
 # --------------------------------------------------------------------------
@@ -525,6 +665,7 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
     """窗口内够热 ⇒ 打候选标（进既有审核队列，不直接升常驻）。"""
     cfg = t["promote_nominate"]
     cap = t["batch_cap"]
+    backfill = int(t.get("nominate_backfill_hits") or 0)
     limit = max(HOT_SCAN_MIN, cap * HOT_SCAN_FACTOR)
     hot = storage.hits_stats(window_days=cfg["window_days"],
                              min_hits=cfg["nominate_min_hits"],
@@ -533,6 +674,7 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
     rows = storage.get_fragments_batch(keys) if keys else {}
     picked: List[str] = []
     skipped_candidate = 0
+    backed_up = 0
     for key in keys:
         row = rows.get(key) or {}
         tags = tag_list(row.get("tags"))
@@ -551,9 +693,15 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
                 picked.pop()
                 stats["failed"].append({"rule": "nominate", "key": key,
                                         "reason": type(e).__name__})
+                continue
+            # 提名即带基数（2026-10 常驻层入口改革）：打标成功后才补打点 ——
+            # 没进候选队列的条目不该凭空多出 3000 次召回。
+            if backfill > 0:
+                backed_up += backfill_nominate_hits(storage, key, backfill)
     stats["nominate"] = {"count": len(picked), "keys": picked[:DETAIL_KEYS],
                          "already": skipped_candidate, "window_days": cfg["window_days"],
                          "nominate_min_hits": cfg["nominate_min_hits"],
+                         "backfill_hits": backfill, "backfilled": backed_up,
                          "dry_run": dry_run}
 
 
@@ -566,9 +714,12 @@ def _rule_auto_review(storage: Any, t: Dict[str, Any], now: datetime, *,
                       stats: Dict[str, Any]) -> int:
     """候选自提名日起满 review_window_days ⇒ **自动审核**（批 / 驳 二选一）。
 
-    * 同一窗内（提名日→今）命中 ≥ `promote_approve_hits` ⇒ 自动打 core
+    * **自提名日起累计命中** ≥ `promote_approve_hits` ⇒ 自动打 core
       （走手动 promote 同一条存储路径：`_with_core` + `_apply` + 加
-      `tier:auto-promoted`），与规则三的「机器放进来的不豁免」天然兼容；
+      `tier:auto-promoted`），与规则三的「机器放进来的不豁免」天然兼容）；
+      🔴 命中口径的窗口锚点是**提名日**（`_hits_since_nomination`），
+      不是「现在减 review_window_days」—— 基数（提名瞬间补的那 3000 条）
+      在复核那一刻**仍然计入**；
     * 不足 ⇒ 自动驳回：摘 `core_candidate`、保留 `tier:auto-hot:<提名日>`
       历史戳、加 `tier:auto-rejected:<驳回日>`，**条目留检索层**（不进降级队列、
       不打 `tier:demote-candidate`）—— 驳回与降级是两件事；
@@ -581,8 +732,7 @@ def _rule_auto_review(storage: Any, t: Dict[str, Any], now: datetime, *,
     review_days = int(cfg["review_window_days"])
     approve_hits = int(cfg["promote_approve_hits"])
     rows = [r for r in storage.list_by_tag(CANDIDATE_TAG) or [] if r.get("key")]
-    keys = [str(r["key"]) for r in rows]
-    recent = _hits_by_key(storage, keys, review_days)[0] if keys else {}
+    recent = _hits_since_nomination(storage, rows)
     used_now = used
     approved: List[str] = []
     rejected: List[str] = []

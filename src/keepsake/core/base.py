@@ -25,6 +25,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("keepsake.storage_base")
@@ -355,12 +356,25 @@ class StorageBase(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} 未实现 record_hits")
 
+    def record_hits_repeat(self, key: str, times: int) -> int:
+        """给**同一个 key** 补 `times` 条命中事件，返回写入条数。
+
+        🔴 **为什么不能复用 `record_hits`**：它按 key 去重（同一批里同一个 key
+        只落一行），而「提名基数」要的正是**同一个 key 落 N 行** —— 自动审核
+        （规则二）数的是**事件行数**，一行不够。
+
+        与 `record_hits` 同款纪律：**纯追加**，不碰碎片主表；**批量写**
+        （一次多行 INSERT，不逐条 insert）。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 未实现 record_hits_repeat")
+
     def hits_stats(
         self,
         window_days: int = 7,
         min_hits: int = 5,
         keys: Optional[List[str]] = None,
         limit: int = 500,
+        since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """窗口内命中统计 → `[{key, hits, last_hit}]`，`hits` 降序。
 
@@ -368,6 +382,12 @@ class StorageBase(ABC):
         不给就返回窗口内 `hits >= min_hits` 的全部（`limit` 封顶）。
         空表返回空列表 —— 这是「真的没命中过」，不是错误。
         `hits` 口径 = 事件行数；受 300 秒去抖影响，允许 ±5 分钟误差。
+
+        🔴 `since`（UTC 绝对时刻）= **窗口锚点**：给了就从那一刻起算，
+        `window_days` 作废；不给才是「现在减 window_days」的滚动窗。
+        为什么需要它：分级班车的复核口径是「**自提名日起**累计命中」，
+        锚点是提名日（不是「现在减 7 天」）—— 用滚动窗表达这件事，
+        窗口长度就得跟着每条候选的挂龄走，还得靠挂钟对齐，边界必然漂。
         """
         raise NotImplementedError(f"{type(self).__name__} 未实现 hits_stats")
 
