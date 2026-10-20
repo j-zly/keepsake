@@ -36,6 +36,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: 端点（批准 / 驳回子代理提交的知识文档 —— 只接控制台会话，不接代理身份），
 #: keepsake_agent_setid 起再加 1 条代理治理端点（改代理 id = 换主键 + 归属级联），
 #: ks_messages_console 起再加 1 条私信开关端点（dm_enabled —— 投递偏好，不是治理动作）。
+#: ks_agent_delete 起再加 3 条代理治理端点（停凭据 revoke_credential +
+#: 整行删除 DELETE /api/v1/agents/{agent_id} 及其 POST 别名 .../delete）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -76,6 +78,11 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/set_id",
     # 消息中心加私信开关一条（ks_messages_console）：投递偏好，不是治理动作
     "/api/v1/agents/{agent_id}/dm",
+    # 代理治理再加两条（ks_agent_delete）：停凭据（只废钥匙，状态不动）
+    # 与整行删除（DELETE + POST 别名同一条路，primary 拒删）
+    "/api/v1/agents/{agent_id}/revoke_credential",
+    "/api/v1/agents/{agent_id}",
+    "/api/v1/agents/{agent_id}/delete",
 } | AUTH_POST_PATHS
 
 
@@ -482,13 +489,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_30条业务加4条认证():
+def test_写面白名单全量断点_33条业务加4条认证():
     app = create_app()
     write = {r.path for r in app.routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 34
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 30
+    assert len(ALLOWED_POST_PATHS) == 37
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 33
 
 
 def test_P1只读路由未被写面影响(client):

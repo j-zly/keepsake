@@ -24,7 +24,7 @@ from keepsake.api.deps import get_storage
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
-#: 七条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
+#: 九条写端点（写面枚举的另一半在 tests/api/test_api_readonly.py）
 WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/approve",
     "/api/v1/agents/{agent_id}/revoke",
@@ -33,6 +33,13 @@ WRITE_PATHS = (
     "/api/v1/agents",
     "/api/v1/agents/{agent_id}/rename",
     "/api/v1/agents/{agent_id}/set_id",
+    "/api/v1/agents/{agent_id}/revoke_credential",
+    "/api/v1/agents/{agent_id}/delete",
+)
+
+#: 非 POST 的写端点（DELETE 与 POST 别名是同一条路，只是方法不同）。
+DELETE_PATHS = (
+    "/api/v1/agents/{agent_id}",
 )
 
 
@@ -80,6 +87,15 @@ def test_无token_401(env):
 def test_写端点无token_逐条401(env, path):
     client, _ = env
     assert client.post(path.format(agent_id="a"), json={"confirm": True}).status_code == 401
+
+
+@pytest.mark.parametrize("path", DELETE_PATHS)
+def test_delete端点无token_逐条401(env, path):
+    """🔴 DELETE 也一样要过会话闸（方法换了，闸不许跟着消失）。"""
+    client, _ = env
+    # httpx 的 `delete()` 不带 body 参数 ⇒ 走 request()（DELETE 也能带 JSON 体）
+    r = client.request("DELETE", path.format(agent_id="a"), json={"confirm": "a"})
+    assert r.status_code == 401
 
 
 def test_列表形状与pending计数(env):
@@ -542,11 +558,11 @@ def test_写前备份落盘(env, tmp_path):
 
 # ---------------------------------------------------------------- 写面枚举
 
-def test_写面枚举_七条agents写端点都在(env):
+def test_写面枚举_九条agents写端点都在(env):
     """与 tests/api/test_api_readonly.py 的白名单互为反面：少挂一条依赖就红。
 
     （代理治理原有四条 approve / revoke / role / exclude，登记与改名两条，
-    本次再加改 id 一条 —— 换主键 + 记忆归属级联。）
+    改 id 一条 —— 换主键 + 记忆归属级联，停凭据与整行删除两条。）
     """
     app = create_app()
     paths = {getattr(r, "path", "") for r in app.routes}
@@ -557,6 +573,14 @@ def test_写面枚举_七条agents写端点都在(env):
         route = next(r for r in app.routes
                      if getattr(r, "path", "") == p
                      and "POST" in getattr(r, "methods", set()))
+        names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
+        assert any("require_session" in n for n in names), p
+        assert any("write_guard" in n for n in names), p
+    # 🔴 DELETE 那条同样要过两道闸（方法换了，闸不许跟着消失）
+    for p in DELETE_PATHS:
+        route = next(r for r in app.routes
+                     if getattr(r, "path", "") == p
+                     and "DELETE" in getattr(r, "methods", set()))
         names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
         assert any("require_session" in n for n in names), p
         assert any("write_guard" in n for n in names), p
@@ -780,3 +804,148 @@ def test_set_id_级联失败仍报改成功但说清楚(env, monkeypatch):
     assert body["moved_memories"] == 0
     assert "归属" in body["note"]              # 说清楚哪一步没成
     assert reg.get("worker-2") is not None     # 换 id 确实生效了
+
+
+# ---------------------------------------------------------------- 停凭据 / 整行删除
+#
+# 三级语义（互不替代，各钉各的）：
+#   revoke            = 停权限留记录（status=revoked）
+#   revoke_credential = 只废那把钥匙（行还在、状态不动）
+#   delete            = 整行抹掉（删前备份，可人工复原）
+
+def test_停凭据_凭据立即作废但状态与角色一个都不动(env):
+    """🔴 停凭据 = **只废那把钥匙**：凭据当场作废，status/role/name 都不动。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    credential = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                             json={"confirm": True}).json()["credential"]
+    assert reg.verify_any(credential)["ok"] is True
+    r = client.post("/api/v1/agents/worker-1/revoke_credential", headers=AUTH,
+                    json={"confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["cleared"] is True
+    # 凭据当场作废（旧凭据再也认不出来）
+    assert reg.verify_any(credential)["ok"] is False
+    assert reg.verify("worker-1", credential)["ok"] is False
+    # 🔴 状态 / 角色 / 备注一个都不动 —— 这正是与 revoke 的分界
+    after = reg.get("worker-1")
+    assert after["status"] == "approved" and after["role"] == "sub"
+    assert after["name"] == "worker-1"
+    assert after["credential_hint"] == ""
+    # 行还在册（列表里查得到）
+    ids = [a["agent_id"] for a in client.get("/api/v1/agents", headers=AUTH).json()["items"]]
+    assert "worker-1" in ids
+
+
+def test_停凭据_没有凭据可停时ok_false不是500(env):
+    """🔴 「本来就没有凭据」是正常状态 ⇒ 报 ok=false + 人话，**不许 500**。"""
+    client, reg = env
+    _seed(reg, "worker-1")            # pending 行：从来没批准过 ⇒ 没有凭据
+    r = client.post("/api/v1/agents/worker-1/revoke_credential", headers=AUTH,
+                    json={"confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is False and body["cleared"] is False
+    assert "没有凭据" in body["note"]      # 人话，不是异常堆栈
+    # 幂等：再点一次还是同一句话（不报错、不改状态）
+    again = client.post("/api/v1/agents/worker-1/revoke_credential", headers=AUTH,
+                        json={"confirm": True})
+    assert again.status_code == 200 and again.json()["ok"] is False
+    assert reg.get("worker-1")["status"] == "pending"
+
+
+def test_停凭据_缺confirm闸400且不生效(env):
+    """停凭据也要显式二次确认（confirm=true）—— 少一闸就是「点一下真作废」。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    credential = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                             json={"confirm": True}).json()["credential"]
+    r = client.post("/api/v1/agents/worker-1/revoke_credential", headers=AUTH, json={})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "confirm_required"
+    assert reg.verify_any(credential)["ok"] is True    # 没确认 ⇒ 凭据还好着
+
+
+def test_整行删除_成功后列表里那一行没了(env):
+    """删除 = 整行抹掉：列表里查不到、库里那一行也不在了。"""
+    client, reg = env
+    _seed(reg, "worker-1", "worker-2")
+    r = client.request("DELETE", "/api/v1/agents/worker-1", headers=AUTH,
+                      json={"confirm": "worker-1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["deleted"] is True
+    assert body["agent_id"] == "worker-1"
+    # 回包带**被删行的完整快照**（人工复原要看它）
+    assert body["row"]["agent_id"] == "worker-1"
+    assert body["row"]["status"] == "pending"
+    assert body["row"]["role"] == "sub"
+    # 删前备份落盘了（与备份目录同款）
+    saved = json.loads(open(body["backup"], encoding="utf-8").read())
+    assert saved["agent_id"] == "worker-1"
+    # 库里的行真的没了，别的行不受影响
+    assert reg.get("worker-1") is None
+    assert reg.get("worker-2") is not None
+    ids = [a["agent_id"] for a in client.get("/api/v1/agents", headers=AUTH).json()["items"]]
+    assert "worker-1" not in ids and "worker-2" in ids
+
+
+def test_整行删除_confirm必须是完整agent_id(env):
+    """🔴 删除的确认闸比吊销高一档：要**完整 agent_id**，传 true / 前缀都不行。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    for bad in (True, "worker", "worker-1 ", "写错了"):
+        r = client.request("DELETE", "/api/v1/agents/worker-1", headers=AUTH, json={"confirm": bad})
+        assert r.status_code == 400, bad
+        assert r.json()["detail"]["error"] in ("confirm_required", "confirm_mismatch"), bad
+    assert reg.get("worker-1") is not None      # 一次都不许生效
+
+
+def test_整行删除_primary拒删400且有专属文案(env):
+    """🔴 主代理不可删除（400 + 专属文案）：删掉它全库就没有主脑可写了。"""
+    client, reg = env
+    _primary(reg, "main")
+    r = client.request("DELETE", "/api/v1/agents/main", headers=AUTH, json={"confirm": "main"})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "primary_not_deletable"
+    assert "主代理不可删除" in detail["message"]
+    assert reg.get("main") is not None          # 没删掉
+
+
+def test_整行删除_未知代理404(env):
+    """删一个不存在的代理 ⇒ 404（不谎报「删掉了」）。"""
+    client, reg = env
+    r = client.request("DELETE", "/api/v1/agents/不存在", headers=AUTH, json={"confirm": "不存在"})
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "agent_not_found"
+
+
+def test_整行删除_POST别名与DELETE同一条路(env):
+    """POST .../delete 与 DELETE /api/v1/agents/{id} 是同一条路（前端用 POST 别名）。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    r = client.post("/api/v1/agents/worker-1/delete", headers=AUTH,
+                    json={"confirm": "worker-1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True
+    assert reg.get("worker-1") is None
+
+
+def test_停凭据与删除_审计留痕且不记任何凭据内容(env, tmp_path):
+    """审计两次都留痕（ok=true）；**凭据明文与 hint 一个字都不许进审计**。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    credential = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                             json={"confirm": True}).json()["credential"]
+    client.post("/api/v1/agents/worker-1/revoke_credential", headers=AUTH,
+                json={"confirm": True})
+    client.request("DELETE", "/api/v1/agents/worker-1", headers=AUTH, json={"confirm": "worker-1"})
+    lines = _audit_lines(tmp_path)
+    actions = {(l["action"], l["ok"]) for l in lines}
+    assert ("agents.revoke_credential", True) in actions
+    assert ("agents.delete", True) in actions
+    blob = json.dumps(lines, ensure_ascii=False)
+    assert credential not in blob
+    assert credential[:8] not in blob      # 连 hint 都不记

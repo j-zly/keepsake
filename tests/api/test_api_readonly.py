@@ -33,7 +33,7 @@ AUTH_POST_PATHS = {
 
 #: 写面白名单（P2 + keepsake_memory_crud_be + keepsake_kb_crud_be +
 #: keepsake_budget_io_templates + keepsake_cron_manage）：非 GET 路由
-#: **恰好**是这 30 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
+#: **恰好**是这 33 条写操作（增 / 真删 / 导入 为 crud 单新增，KB 四条写端点为
 #: kb_crud 单新增，PUT 预算设置与勾选批量 bulk / bulk-export 为 budget 单新增，
 #: 定时任务暂停/恢复/改调度 3 条为 cron_manage 单新增，代理治理 7 条
 #: register / approve / revoke / role / exclude / rename / set_id 为
@@ -75,6 +75,11 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/set_id",
     # 消息中心加私信开关一条（ks_messages_console）：投递偏好，不是治理动作
     "/api/v1/agents/{agent_id}/dm",
+    # 代理治理再加三条（ks_agent_delete）：停凭据（只废钥匙，状态不动）
+    # 与整行删除（DELETE + POST 别名同一条路，primary 拒删）
+    "/api/v1/agents/{agent_id}/revoke_credential",
+    "/api/v1/agents/{agent_id}",
+    "/api/v1/agents/{agent_id}/delete",
 } | AUTH_POST_PATHS
 
 

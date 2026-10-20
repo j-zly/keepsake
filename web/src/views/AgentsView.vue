@@ -33,6 +33,10 @@
       <p class="page-sub">
         新接入的代理默认待审 —— 待审那一摞在「代理审核」页；未批准与已吊销的代理读写全拒。
       </p>
+      <p class="page-sub">
+        三级语义别混：吊销 = 停权限、留一条吊销记录；停凭据 = 只废那把钥匙（代理照旧在册）；
+        删除 = 整行抹掉（删前会备份一份，可人工复原）。
+      </p>
       <!-- 页头操作区：登记 = 「还没连上就先占个位」的那一步（批准在审核页） -->
       <div class="head-acts">
         <el-button type="primary" @click="openRegister">登记新代理</el-button>
@@ -193,7 +197,34 @@
                     {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
                   </button>
                   <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
+                  <!--
+                    停凭据：**只废那把钥匙**（凭据哈希与提示清掉；状态 / 角色 / 备注一个都不动）——
+                    与「吊销」的分界就在状态上：吊销 = 停权限并留一条吊销记录，
+                    停凭据 = 代理照旧在册、只是再也连不上（凭据泄露时先止血用这个）。
+                    🔴 门只开在「有凭据提示」的行上（credential_hint 非空）：没凭据的行没有可停的东西。
+                  -->
+                  <button
+                    v-if="a.credential_hint"
+                    class="act-btn"
+                    :disabled="busy"
+                    @click="ask('clearcred', a)"
+                  >
+                    停凭据
+                  </button>
                 </template>
+                <!--
+                  删除：**整行抹掉**（删前会备份一份，可人工复原）。
+                  🔴 只给**已吊销**的行 —— approved 的行不给这个钮：先吊销（停权限）
+                  再删，两步隔离「心误删活代理」（那个正在跑的）。
+                -->
+                <button
+                  v-if="a.status === 'revoked'"
+                  class="act-btn act-btn--danger"
+                  :disabled="busy"
+                  @click="ask('delete', a)"
+                >
+                  删除
+                </button>
               </template>
               <!--
                 编辑：一张卡**一个**编辑入口（代理 ID + 备注名同框）。
@@ -734,6 +765,8 @@ const dlgTitle = computed(() => {
   if (dlgKind.value === 'rotate') return `重新生成 ${id} 的凭据？`
   if (dlgKind.value === 'revoke') return `吊销 ${id}？`
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
+  if (dlgKind.value === 'clearcred') return `停掉 ${id} 的凭据？`
+  if (dlgKind.value === 'delete') return `删除 ${id}？`
   return `${dlgRow.value?.exclude_from_primary ? '加入' : '移出'}主脑上下文？`
 })
 
@@ -742,14 +775,18 @@ const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'rotate') return '重新生成凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
+  if (dlgKind.value === 'clearcred') return '停凭据'
+  if (dlgKind.value === 'delete') return '确认删除'
   return '确认修改'
 })
 
-/** 三道手输闸的口径：吊销 / 换发 = 前 8 位，改角色 = 完整 agent_id。 */
+/** 手输闸的口径：吊销 / 换发 / 停凭据 = 前 8 位，改角色 / 删除 = 完整 agent_id。 */
 const dlgExpect = computed(() => {
   if (dlgKind.value === 'revoke') return revokePrefix.value
   if (dlgKind.value === 'rotate') return revokePrefix.value
+  if (dlgKind.value === 'clearcred') return revokePrefix.value
   if (dlgKind.value === 'role') return dlgRow.value?.agent_id || ''
+  if (dlgKind.value === 'delete') return dlgRow.value?.agent_id || ''
   return ''
 })
 
@@ -759,7 +796,11 @@ const dlgDoneText = computed(() => {
   return dlgKind.value === 'rotate' ? `已重新生成凭据：${id}` : `已批准：${id}`
 })
 
-const dlgTone = computed(() => (dlgKind.value === 'revoke' || dlgKind.value === 'role' ? 'danger' : 'primary'))
+const dlgTone = computed(() =>
+  dlgKind.value === 'revoke' || dlgKind.value === 'role' || dlgKind.value === 'delete'
+    ? 'danger'
+    : 'primary',
+)
 
 const dlgConsequences = computed(() => {
   const row = dlgRow.value
@@ -791,6 +832,20 @@ const dlgConsequences = computed(() => {
       '全库只有一个主代理：原来的主代理会自动降为子代理（可在列表里核对）。',
       '只有主代理能改常驻层；被降下去的那位之后写常驻会被拦成候选，等人审。',
       '改前会备份整份注册表（含被降级的那一行），可人工复原。',
+    ]
+  }
+  if (dlgKind.value === 'clearcred') {
+    return [
+      `凭据哈希与提示一并清掉：${id} 手里那条凭据立刻作废，连不上也写不进任何记忆。`,
+      '代理行留在册，状态 / 角色 / 备注一个都不动（还是「已批准」，只是没钥匙了）。',
+      '要恢复：重新生成凭据（换一把新的）即可 —— 这一步不吊销、不改权限。',
+    ]
+  }
+  if (dlgKind.value === 'delete') {
+    return [
+      '整行抹掉：这个代理从注册表里消失（列表里也查不到了）。',
+      '它此前写入的记忆条目不删除 —— 只删这一行。',
+      '删前会备份这一行（备份目录里那份 JSON 就是原行），可人工复原。',
     ]
   }
   return row.exclude_from_primary
@@ -835,9 +890,22 @@ async function doAction(typed) {
           ? `已设为主代理：${row.agent_id}（原主 ${r.demoted.join('、')} 已降为子代理）`
           : `已设为主代理：${row.agent_id}`,
       )
-    } else {
+    } else if (kind === 'exclude') {
       await api.setAgentExclude(row.agent_id, !row.exclude_from_primary)
       showToast(`${row.exclude_from_primary ? '已加入' : '已移出'}主脑上下文：${row.agent_id}`)
+    } else if (kind === 'clearcred') {
+      // 🔴 停凭据 = 只废那把钥匙：confirm 是 true（后端那侧才敢承诺状态不动）
+      const r = await http
+        .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/revoke_credential`, { confirm: true })
+        .then((res) => res.data)
+      if (r?.ok) showToast(`已停凭据：${row.agent_id}（代理行仍在册，状态没动）`)
+      else showToast(r?.note || '这个代理没有凭据可停', 'warning')
+    } else if (kind === 'delete') {
+      // 🔴 整行抹掉：确认串 = 完整 agent_id（比吊销高一档），后端 primary 拒删
+      await http
+        .delete(`/api/v1/agents/${encodeURIComponent(row.agent_id)}`, { data: { confirm: typed } })
+        .then((res) => res.data)
+      showToast(`已删除：${row.agent_id}（备份已落盘，可人工复原）`)
     }
     // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
     load(true)

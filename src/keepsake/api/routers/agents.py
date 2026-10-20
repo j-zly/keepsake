@@ -7,7 +7,8 @@
 * **写前备份**：改角色会连带把另一个代理降级、改批准会顶掉旧凭据 —— 这两样
   都不可逆到「回滚靠记忆」的程度，先 `audit.backup_json` 落一份改前快照；
 * **显式二次确认**：approve/exclude 要 `confirm=true`，role 要手输整个 agent_id，
-  revoke 要手输 agent_id 前 8 位（与 ops 归档/真删同一道闸）；
+  revoke 要手输 agent_id 前 8 位（与 ops 归档/真删同一道闸），
+  revoke_credential 要 `confirm=true`，delete 要手输**整个** agent_id（最高一档）；
 * **一次审计**：被拒绝的写也记一行 `ok=false`（`_reject`）。
 
 🔴 **凭据纪律**：明文只在 `approve` 的响应体里出现**一次**，之后库里只有 sha256。
@@ -17,6 +18,11 @@
 🔴 **现役 primary 的三道闸**（`revoke` / `role` / `exclude` 一律 409）：前端
 不给那三个钮只是「不让人看见」，绕开 UI 直接打 API 一样能点进来 —— 所以同一道
 闸必须在后端再挡一次，判据与理由见 `_need_not_primary`。
+
+🔴 **三级语义**（三档后果不同、确认闸也不同高，前端要分开说）：
+* `revoke` = **停权限留记录**（`status=revoked`，读写全拒）；
+* `revoke_credential` = **只废那把钥匙**（行留在册、状态与角色一个都不动）；
+* `delete` = **整行抹掉**（删前备份一份，可人工复原；**primary 拒删** 400）。
 """
 
 from __future__ import annotations
@@ -99,6 +105,16 @@ class AgentSetIdBody(BaseModel):
     confirm: Any = False
 
 
+class AgentDeleteBody(BaseModel):
+    """`DELETE /api/v1/agents/{agent_id}`（及 POST 别名）的请求体：整行删除。
+
+    🔴 `confirm` 必须是**完整 agent_id 字符串**（不是 `true`）—— 这道闸比
+    吊销（手输前 8 位）高一档：吊销只作废一把钥匙，删除是整行抹掉。
+    """
+
+    confirm: Any = ""
+
+
 def _valid_agent_id(agent_id: str) -> bool:
     """agent_id 是否合规（口径单点：前后端各写一份正则就会漂）。
 
@@ -151,6 +167,15 @@ PRIMARY_ID_LOCKED_NOTE = (
 #: 并给出下一步（换一个 / 先去列表里找它）。
 AGENT_EXISTS_NOTE = (
     "已经有代理叫 {new_id} 了 —— 换一个别的 id，或者先去列表里找找它是不是已经改过名了。"
+)
+
+#: 删除 primary 时的回显（400 的 detail 共用这一句口径）。
+#: 🔴 与 `PRIMARY_LOCKED_NOTE`（吊销/降级/排除）不是一回事：那三条是「别动
+#: 现役主代理的权限」，这一条是「主代理这一行不许删」—— 删掉它 = 全库没有
+#: 主脑可写了，换主的唯一安全路径仍是「先把另一个设成 primary」。
+PRIMARY_DELETE_NOTE = (
+    "主代理不可删除 —— 删掉它全库就没有主脑可写了；"
+    "先把另一个代理设为主代理，再回来删这个。"
 )
 
 
@@ -248,6 +273,75 @@ def revoke_agent(agent_id: str, body: AgentActionBody,
     registry.revoke(agent_id)
     audit.record(action, agent_id, ok=True, reason=f"backup={backup}")
     return {"ok": True, "agent_id": agent_id, "status": STATUS_REVOKED, "backup": backup}
+
+
+@router.post("/api/v1/agents/{agent_id}/revoke_credential",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def revoke_credential(agent_id: str, body: AgentActionBody,
+                      storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**只停凭据**（停钥匙）：清掉凭据哈希与提示，代理行**留在册**。
+
+    🔴 三级语义里最轻的一档 —— 与 `revoke` 的分界是**状态**：
+      * `revoke` = **停权限留记录**：`status` 置 revoked，代理读写全拒，
+        列表里留一条「已吊销」；
+      * `revoke_credential` = **只废那把钥匙**：`status` / `role` / `name` /
+        `meta` 一个都不动（还是 approved、还在册），只是它手里那条凭据
+        当场作废 —— 泄露了、想先止血又不想把代理从册子上抹掉时用这个。
+
+    🔴 **没有凭据可停 ⇒ 报 `ok=false` + 人话**（不是 500）：「本来就没有」
+    是正常状态（没批准过 / 已经停过了），不是故障 —— 也不该被当成成功。
+    🔴 审计里**不记任何凭据内容**（连 hint 都不记，只记动作本身）。
+    """
+    action = "agents.revoke_credential"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才停凭据')
+    if not row.get("credential_hint"):
+        # 本来就没有凭据可停（没批准过 / 已经停过）⇒ 幂等地报「没东西可停」，
+        # 留一行 ok=false 的痕（没生效的写也要留痕）。
+        audit.record(action, agent_id, ok=False, reason="no_credential")
+        return {"ok": False, "agent_id": agent_id, "cleared": False,
+                "note": "这个代理现在没有凭据可停（没批准过，或已经停过了）"}
+    backup = _backup("revoke_credential", row)
+    if not registry.clear_credential(agent_id):
+        # 竞态：行在读与写之间消失 ⇒ 409，不谎报「已停凭据」
+        _reject(409, "agent_race", "代理在停凭据的过程中消失，请重试", action, agent_id)
+    audit.record(action, agent_id, ok=True, reason="credential cleared")
+    return {"ok": True, "agent_id": agent_id, "cleared": True,
+            "status": row.get("status", ""), "backup": backup,
+            "note": "凭据已作废（代理行仍在册，状态与角色一个都没动）"}
+
+
+@router.delete("/api/v1/agents/{agent_id}",
+               dependencies=[Depends(require_session), Depends(write_guard)])
+@router.post("/api/v1/agents/{agent_id}/delete",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def delete_agent(agent_id: str, body: AgentDeleteBody,
+                 storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**整行删除**：这一行从注册表里消失（凭据哈希一起没）。
+
+    🔴 三级语义里最重的一档：`revoke` 停权限留记录、`revoke_credential`
+    只废钥匙，删除是**整行抹掉**（删前备份一份，误删可人工复原）。
+
+    🔴 **确认串 = 完整 agent_id**（比吊销的手输前 8 位高一档）：删的是一整行，
+    打错一个字符就不该生效；传 `true` 一律 400。
+    🔴 **primary 拒删**（400）：删掉主代理 = 全库没有主脑可写了（见
+    `PRIMARY_DELETE_NOTE`）。未知代理 ⇒ 404。
+    """
+    action = "agents.delete"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    if row.get("role") == ROLE_PRIMARY:
+        _reject(400, "primary_not_deletable", PRIMARY_DELETE_NOTE, action, agent_id)
+    _need_text(body.confirm, agent_id, action, agent_id, f"完整 agent_id（{agent_id}）")
+    # 删前备份**这一行**（人工复原的依据：备份目录里那份 JSON 就是原行）。
+    backup = _backup("delete", row)
+    if not registry.delete(agent_id):
+        # 权威判定在 Registry.delete 里（并发 / 角色已变）⇒ 这里只补区分文案。
+        _reject(409, "agent_race", "代理在删除过程中消失或角色已变，请重试", action, agent_id)
+    audit.record(action, agent_id, ok=True, reason=f"deleted=1; backup={backup}")
+    return {"ok": True, "agent_id": agent_id, "deleted": True,
+            "row": row, "backup": backup}
 
 
 @router.post("/api/v1/agents/{agent_id}/role",

@@ -466,6 +466,18 @@ class _SqlBackend(_SqlBase):
                 return False
             raise
 
+    def delete(self, agent_id: str) -> bool:
+        """**整行删除**（`DELETE FROM ks_agent WHERE agent_id = ?`）。命中即 True。
+
+        🔴 删的是**整行**（含凭据哈希）—— 真删，备份由调用方在删前落。
+        行不存在 ⇒ False（调用方 404，不谎报「删掉了」）。
+        """
+        def _fn(cur: Any) -> bool:
+            cur.execute(f"DELETE FROM {TABLE} WHERE agent_id = {self.ph}", (agent_id,))
+            return cur.rowcount > 0
+
+        return bool(self.write(_fn))
+
 
 class _RedisBackend:
     """Redis：`keepsake:agent:<id>` hash。字段名与 `AGENT_FIELDS` 同名。"""
@@ -552,6 +564,14 @@ class _RedisBackend:
             return False          # 新 id 已被占用 ⇒ 换名失败，绝不覆盖
         client.hset(self.key(new_id), "agent_id", new_id)
         return True
+
+    def delete(self, agent_id: str) -> bool:
+        """**整行删除**（`DEL keepsake:agent:<id>`：整个 hash 连凭据哈希一起没）。
+
+        行不存在 ⇒ False（调用方 404）。🔴 Redis 的 `DEL` 不看 role ——
+        「primary 不许删」那道闸在 `Registry.delete` 里（语义层），不在这层。
+        """
+        return bool(self._client().delete(self.key(agent_id)))
 
 
 def _text(value: Any) -> str:
@@ -685,6 +705,35 @@ class Registry:
         self._be.update(aid, {"status": STATUS_REVOKED,
                               "credential_hash": "", "credential_hint": ""})
         return True
+
+    def clear_credential(self, agent_id: str) -> bool:
+        """**只停凭据**：清掉 `credential_hash` / `credential_hint` 两列，代理行留在册。
+
+        🔴 `status` / `role` / `name` / `meta` / 计数**一个都不碰** ——
+        这是「只废钥匙」与「吊销」的分界：吊销把 `status` 置 revoked
+        （读写全拒、留一条吊销记录），停凭据只让那把钥匙当场作废，
+        代理本身照旧留在册、状态照旧。行不存在 ⇒ False（调用方 404）。
+        """
+        aid = (agent_id or "").strip()
+        if not self._be.load(aid):
+            return False
+        self._be.update(aid, {"credential_hash": "", "credential_hint": ""})
+        return True
+
+    def delete(self, agent_id: str) -> bool:
+        """**整行删除**：这一行从注册表里消失（凭据哈希一起没）。命中即 True。
+
+        🔴 **primary 角色拒删**（返回 False）：删掉主代理 = 全库没有主脑可写了
+        —— 要换主先把另一个设成 primary，再回来删这个（路由层给专属文案）。
+        行不存在 ⇒ False（调用方 404，不谎报「删掉了」）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        if row["role"] == ROLE_PRIMARY:
+            return False
+        return self._be.delete(aid)
 
     def set_role(self, agent_id: str, role: str) -> List[str]:
         """设角色；置 primary 时**其余 primary 自动降 sub**。返回被降级者 id 列表。

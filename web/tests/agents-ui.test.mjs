@@ -88,10 +88,13 @@ test('三道确认闸接在 ConfirmDialog 上，串由用户手输', () => {
   // approve / exclude 不手输，后端要的是 confirm: true —— 手输串留空即可
   assert.match(VIEW, /@confirm="doAction"/, '确认回调统一收手输串')
   const body = VIEW.slice(VIEW.indexOf('async function doAction'))
-  assert.match(body.slice(0, 900), /api\.approveAgent\(row\.agent_id\)/, '批准走 approveAgent')
-  assert.match(body.slice(0, 900), /api\.revokeAgent\(row\.agent_id, typed\)/, '吊销把用户手输的串原样发出去')
-  assert.match(body.slice(0, 900), /api\.setAgentRole\(row\.agent_id, 'primary', typed\)/, '设主代理发 role=primary')
-  assert.match(body.slice(0, 900), /api\.setAgentExclude\(row\.agent_id, !row\.exclude_from_primary\)/, '上下文开关是 toggle')
+  // 🔴 窗口从 900 放宽到 1400：doAction 多了「停凭据 / 删除」两条分支，函数变长了。
+  //    判据是「这四个调用都在 doAction 里、各自带对参数」，不是「函数有多长」——
+  //    窗口卡死 900 只会逼着人把分支往回塞，那才是真的把代码写歪。
+  assert.match(body.slice(0, 1400), /api\.approveAgent\(row\.agent_id\)/, '批准走 approveAgent')
+  assert.match(body.slice(0, 1400), /api\.revokeAgent\(row\.agent_id, typed\)/, '吊销把用户手输的串原样发出去')
+  assert.match(body.slice(0, 1400), /api\.setAgentRole\(row\.agent_id, 'primary', typed\)/, '设主代理发 role=primary')
+  assert.match(body.slice(0, 1400), /api\.setAgentExclude\(row\.agent_id, !row\.exclude_from_primary\)/, '上下文开关是 toggle')
 })
 
 test('主代理行不给「设为主代理」按钮', () => {
@@ -403,4 +406,85 @@ test('primary 行：ID 输入框 disabled（能改备注名，不能改 ID）', 
   assert.match(VIEW, /const editPrimary = computed\(\(\) => editRow\.value\?\.role === 'primary'\)/,
     'primary 由角色判定（不能只看当前页有没有 primary）')
   assert.match(VIEW, /主代理 ID 不可改/, '要说清为什么锁死')
+})
+
+// ---------------------------------------------------------------------------
+// 停凭据 / 删除（ks_agent_delete）：三级语义的后两档
+// ---------------------------------------------------------------------------
+//
+//   吊销   = 停权限、留一条吊销记录
+//   停凭据 = 只废那把钥匙（代理照旧在册、状态不动）
+//   删除   = 整行抹掉（删前备份，可人工复原）
+
+/** 「停凭据」按钮那一段（从 <button 标签到它的 @click）。 */
+function clearCredButton() {
+  const at = VIEW.indexOf("ask('clearcred', a)")
+  assert.ok(at !== -1, '没有「停凭据」入口')
+  const start = VIEW.lastIndexOf('<button', at)
+  assert.ok(start !== -1, '入口不是按钮')
+  return VIEW.slice(start, at + "ask('clearcred', a)".length)
+}
+
+/** 「删除」按钮那一段。 */
+function deleteButton() {
+  const at = VIEW.indexOf("ask('delete', a)")
+  assert.ok(at !== -1, '没有「删除」入口')
+  const start = VIEW.lastIndexOf('<button', at)
+  assert.ok(start !== -1, '入口不是按钮')
+  return VIEW.slice(start, at + "ask('delete', a)".length)
+}
+
+/** 已批准那一块（`<template v-if="a.status === 'approved'">` 到底）。 */
+function approvedBlock() {
+  const actions = actionsBlock()
+  const open = actions.indexOf(`<template v-if="a.status === 'approved'">`)
+  assert.ok(open !== -1, '找不到已批准分支')
+  const end = templateBranchEnd(actions, `<template v-if="a.status === 'approved'">`)
+  assert.ok(end > open, '找不到已批准分支的闭合')
+  return actions.slice(open, end)
+}
+
+test('停凭据：只有「有凭据提示」的行才渲染这个钮', () => {
+  const btn = clearCredButton()
+  assert.match(btn, /v-if="a\.credential_hint"/, '门开在 credential_hint 非空的行上（没凭据没得停）')
+  assert.match(btn, /class="act-btn"/, '走普通 act-btn 样式')
+  // 它挂在「已批准」分支里：没批准的行压根没有凭据可停
+  assert.ok(approvedBlock().includes("ask('clearcred', a)"), '停凭据钮要在已批准分支内')
+  // 反钉：别把它写成「所有行都有」
+  assert.doesNotMatch(btn, /v-if="a\.status === 'approved'"/,
+    '停凭据的门是凭据提示，不是光看状态')
+})
+
+test('删除钮只给已吊销的行：approved 的行绝不给删除钮', () => {
+  const btn = deleteButton()
+  assert.match(btn, /v-if="a\.status === 'revoked'"/, '删除钮只挂在已吊销行上')
+  assert.match(btn, /class="act-btn act-btn--danger"/, '删除是危险色那一档')
+  // 🔴 反钉：approved 的行（在跑的活代理）绝不能出现删除入口 —— 先吊销再删，两步隔离
+  assert.doesNotMatch(approvedBlock(), /ask\('delete'/, 'approved 的行不许有删除入口')
+})
+
+test('两道新手输闸：停凭据 = 前 8 位，删除 = 完整 agent_id', () => {
+  assert.match(VIEW, /if \(dlgKind\.value === 'clearcred'\) return revokePrefix\.value/,
+    '停凭据复用吊销那道闸（agent_id 前 8 位）')
+  assert.match(VIEW, /if \(dlgKind\.value === 'delete'\) return dlgRow\.value\?\.agent_id \|\| ''/,
+    '删除要手输完整 agent_id（比吊销高一档）')
+  assert.match(VIEW, /dlgKind\.value === 'delete'[\s\S]{0,80}\? 'danger'/, '删除是 danger 那一档')
+})
+
+test('两条新端点各自打各自的：confirm 口径与后端逐字一致', () => {
+  const body = VIEW.slice(VIEW.indexOf('async function doAction'))
+  assert.match(body, /revoke_credential`, \{ confirm: true \}/, '停凭据发 confirm=true')
+  assert.match(
+    body,
+    /\.delete\(`\/api\/v1\/agents\/\$\{encodeURIComponent\(row\.agent_id\)\}`, \{ data: \{ confirm: typed \} \}\)/,
+    '删除发的是用户手输的完整 agent_id',
+  )
+  assert.match(body, /load\(true\)/, '改完重拉列表（状态以服务器为准）')
+})
+
+test('页面说明写清三级语义（吊销 / 停凭据 / 删除）', () => {
+  assert.match(VIEW, /吊销 = 停权限、留一条吊销记录/, '说清吊销是什么')
+  assert.match(VIEW, /停凭据 = 只废那把钥匙/, '说清停凭据是什么')
+  assert.match(VIEW, /删除 = 整行抹掉/, '说清删除是什么')
+  assert.match(VIEW, /可人工复原/, '说清删了还能救回来')
 })
