@@ -234,49 +234,75 @@ test('无裸 alert / confirm', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 改代理 ID（keepsake_agent_setid 的控制台面）
+// 编辑入口（代理 ID + 备注名**同框**，一个弹框）
 // ---------------------------------------------------------------------------
 //
-// 这页多了一个**能改 id** 的入口，所以这两条是它的护栏：
-//   1) 弹框必须**说清后果**（凭据不变 + 记忆归属跟着搬），否则操作者会以为
-//      「改 id = 换个名字」；回车能提交（这一页其它动作都回车提交）。
-//   2) 🔴 primary 行**不给**这个钮：主脑的引导配置绑在 id 上，改了等于换了个
-//      主代理（后端同口径 400）。前端不给只是不让人看见，后端还要再挡一次。
+// 两个铅笔（id 旁 + 备注名旁）合并成卡片操作区的一个「编辑」按钮：
+//   1) 一张卡**一个**编辑入口 —— 行内不再有铅笔钮（复制钮还在，它不是编辑）；
+//   2) 弹框里 ID 与备注名同框，回车提交（不提交表单）；🔴 提交顺序是先
+//      set_id 再 rename —— 改完 id 旧 key 就没了，rename 必须打新 id；
+//   3) 🔴 primary 行的 ID 输入框 disabled：主脑的引导配置绑在 id 上（后端同口径
+//      400），但备注名照改 —— primary 只锁 id，不锁名字。
 
-test('改代理 ID：铅笔钮 + 弹框 + 后果说明 + 回车提交 + toast 带搬动条数', () => {
-  // 铅笔钮在 id 旁，**复制钮保留**（复制 id 仍是最常用操作）
-  assert.match(VIEW, /class="copy-btn id-edit"/, '改 id 的铅笔钮要与复制钮并存')
-  assert.match(VIEW, /@click="openSetId\(a\)"/, '铅笔钮打开改 id 弹框')
-  assert.match(VIEW, /title="改代理 ID"/, '铅笔钮要有 title 说明它干什么')
+/** doEdit 的函数体（截到下一个顶层声明为止）：别把 doAction 混进来。 */
+function doEditBody() {
+  const start = VIEW.indexOf('async function doEdit')
+  const end = VIEW.indexOf('const dlgOpen', start)
+  assert.ok(start !== -1 && end > start, 'doEdit 函数不在预期位置')
+  return VIEW.slice(start, end)
+}
 
-  // 弹框：预填当前 id + 回车提交 + 后果说明
-  assert.match(VIEW, /<el-dialog[\s\S]*?v-model="setIdOpen"[\s\S]*?title="改代理 ID"/,
-    '改 id 弹框要渲染')
-  assert.match(VIEW, /v-model="setIdValue"/, '弹框里要有新 id 的输入框')
-  assert.match(VIEW, /@keyup\.enter="doSetId"/, '回车提交')
-  assert.match(VIEW, /凭据与权限不变/, '要说清凭据与权限不变（不用重配客户端）')
-  assert.match(VIEW, /历史记忆的归属会一起搬/, '要说清历史记忆归属会一起搬')
-  assert.match(VIEW, /:close-on-click-modal="false"/, '弹框禁遮罩关闭')
-
-  // 提交 → toast（带搬动条数）→ 重拉列表；报错原样透出后端文案
-  const body = VIEW.slice(VIEW.indexOf('async function doSetId'))
-  assert.match(body.slice(0, 900), /\/set_id`/, '打到 set_id 端点')
-  assert.match(body.slice(0, 900), /new_id: newId/, '带上新 id')
-  assert.match(body.slice(0, 900), /confirm: true/, '带 confirm 闸')
-  assert.match(body.slice(0, 900), /已改 ID：/, '成功 toast 说得清改了什么')
-  assert.match(body.slice(0, 900), /moved_memories/, 'toast 里带搬动条数')
-  assert.match(body.slice(0, 900), /load\(true\)/, '改完重拉列表')
-  assert.match(body.slice(0, 900), /showError\(`改 ID 失败：\$\{e\.message\}`\)/,
-    '后端的人话文案原样透出（别吞成「请求失败」）')
+test('卡片操作区有「编辑」入口，行内不再有第二支铅笔', () => {
+  const actions = actionsBlock()
+  assert.match(actions, /class="act-btn"[^>]*@click="openEdit\(a\)"/, '操作区要有「编辑」入口')
+  assert.match(actions, />编辑</, '按钮上写「编辑」')
+  // 反钉：旧的两个行内铅笔（改 id / 改名）都不许留 —— 一张卡一个编辑入口
+  assert.doesNotMatch(VIEW, /id-edit/, 'id 旁的铅笔钮已并入「编辑」')
+  assert.doesNotMatch(VIEW, /name-edit/, '备注名旁的铅笔钮已并入「编辑」')
+  assert.doesNotMatch(VIEW, /openSetId|openRename/, '旧的两个编辑入口函数不许留')
+  // 复制钮保留（复制 id 仍是最常用操作 —— 它不是编辑）
+  assert.match(VIEW, /class="copy-btn" title="复制 agent_id"/, '复制钮保留')
 })
 
-test('primary 行没有改 ID 的铅笔钮', () => {
-  // 铅笔钮自己带 v-if 判角色（主代理不给）
-  const cellKey = VIEW.slice(VIEW.indexOf('<div class="cell-key">'))
-  const block = cellKey.slice(0, cellKey.indexOf('</div>'))
-  assert.match(block, /class="copy-btn id-edit"/, 'id 旁要有铅笔钮')
-  assert.match(block, /v-if="a\.role !== 'primary'"/, 'primary 行不给改 id 钮')
-  // 反钉：primary 分支（分流点之前）不许出现改 id 的入口
-  const primaryBranch = block.slice(0, block.indexOf('v-if="a.role !== \'primary\'"'))
-  assert.doesNotMatch(primaryBranch, /openSetId/, 'primary 行不许出现改 id 入口')
+test('编辑弹框：ID + 备注名同框，两字段预填当前值 + 回车提交', () => {
+  assert.match(VIEW, /<el-dialog[\s\S]*?v-model="editOpen"[\s\S]*?title="编辑代理"/,
+    '合并弹框要渲染')
+  assert.match(VIEW, /v-model="editId"/, '字段一：代理 ID')
+  assert.match(VIEW, /v-model="editName"/, '字段二：备注名')
+  assert.match(VIEW, /editId\.value = row\?\.agent_id \|\| ''/, 'ID 预填当前值')
+  assert.match(VIEW, /editName\.value = row\?\.name \|\| ''/, '备注名预填当前值')
+  assert.match(VIEW, /@keyup\.enter\.prevent="doEdit"/, '回车提交（且不提交表单）')
+  assert.match(VIEW, /:close-on-click-modal="false"/, '弹框禁遮罩关闭')
+  // 后果说明两段都在（凭据不变 + 记忆归属跟着搬）
+  assert.match(VIEW, /凭据与权限不变/, '要说清凭据与权限不变（不用重配客户端）')
+  assert.match(VIEW, /历史记忆的归属会一起搬/, '要说清历史记忆归属会一起搬')
+})
+
+test('提交：先 set_id 再 rename；set_id 失败即中止；toast 合并说一条', () => {
+  const body = doEditBody()
+  const idAt = body.indexOf('/set_id`')
+  const renameAt = body.indexOf('/rename`')
+  assert.ok(idAt !== -1 && renameAt !== -1, '两个端点都要打')
+  assert.ok(idAt < renameAt, '🔴 必须先 set_id 再 rename（改完 id 旧 key 就没了）')
+  assert.match(body, /new_id: newId/, '带上新 id')
+  assert.match(body, /confirm: true/, '带 confirm 闸')
+  assert.match(body, /encodeURIComponent\(targetId\)\}\/rename/, 'rename 打的是**新** id')
+  // toast 合并说一条（按实际发生的部分拼）
+  assert.match(body, /已更新：/, '成功 toast 合并说一条')
+  assert.match(body, /ID 已改为/, 'toast 里说得清 id 改成什么')
+  assert.match(body, /moved_memories/, 'toast 里带搬动条数')
+  assert.match(body, /备注名已保存/, 'toast 里说得清备注名改了')
+  assert.match(body, /load\(true\)/, '改完重拉列表')
+  // set_id 失败（409/400）：红条透出后端 message 并**中止**（不许接着 rename）
+  const idBlock = body.slice(body.indexOf('if (idChanged)'), body.indexOf('if (nameChanged)'))
+  assert.match(idBlock, /showError\(`改 ID 失败：\$\{e\.message\}`\)/,
+    '后端的人话文案原样透出（别吞成「请求失败」）')
+  assert.match(idBlock, /return/, 'set_id 失败必须中止（对旧 id 做 rename 是错操作）')
+})
+
+test('primary 行：ID 输入框 disabled（能改备注名，不能改 ID）', () => {
+  assert.match(VIEW, /:disabled="editPrimary"/, '主代理的 ID 输入框要锁死')
+  assert.match(VIEW, /const editPrimary = computed\(\(\) => editRow\.value\?\.role === 'primary'\)/,
+    'primary 由角色判定（不能只看当前页有没有 primary）')
+  assert.match(VIEW, /主代理 ID 不可改/, '要说清为什么锁死')
 })

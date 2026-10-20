@@ -2,7 +2,7 @@
   代理登记（keepsake_agent_registry 的控制台面 · 业务页）。
 
   2026-10-20 拆页：待审队列从本页整段搬去 /agents-review（代理审核）。
-  本页只管**已批准代理的日常维护**（改名 / 设角色 / 上下文过滤 / 吊销 / 重新批准）
+  本页只管**已批准代理的日常维护**（编辑 ID 与备注名 / 设角色 / 上下文过滤 / 吊销 / 重新批准）
   +「登记新代理」；pending 的行不在本页出现（去审核页看）。
   两页共用一次性凭据弹框（components/CredentialDialog.vue）—— **一份实现，不复制**。
 
@@ -10,9 +10,10 @@
   （<CredentialDialog @closed="forget" />）。不进 URL、不进浏览器存储、不进日志；
   页面里的复制只到剪贴板为止，转交由人自己走别的渠道。
 
-  🔴 主代理保护：primary 行**不给任何动作按钮**（approve/revoke/role/exclude 全无），
-  只留一句「不可吊销 / 不可排除」。换主的唯一路径是给别的行点「设为主代理」——
-  那次会自动把旧主降级。后端同口径 409，绕开 UI 打 API 也一样被挡。
+  🔴 主代理保护：primary 行**不给任何治理动作按钮**（approve/revoke/role/exclude 全无），
+  只留一句「不可吊销 / 不可排除」+ 一个「编辑」（能改备注名，id 被后端锁死）。
+  换主的唯一路径是给别的行点「设为主代理」—— 那次会自动把旧主降级。
+  后端同口径 409，绕开 UI 打 API 也一样被挡。
 
   ponytail: 后端 GET /api/v1/agents 不按 status 过滤（零后端改动约束），所以本页的
   分页与计数是**全状态口径** —— pending 行占着页位却不渲染（它去审核页）。
@@ -45,8 +46,8 @@
     <div class="filter-panel">
       <div class="filter-title">代理列表</div>
       <p class="filter-desc">
-        按 agent_id 或名称搜索；清空回全量。🔴 主代理行没有动作按钮 —— 吊销它等于把主脑降级，
-        要换主请用别行的「设为主代理」。
+        按 agent_id 或名称搜索；清空回全量。🔴 主代理行没有治理动作按钮（只留一个「编辑」改备注名）
+        —— 吊销它等于把主脑降级，要换主请用别行的「设为主代理」。
       </p>
       <div class="filter-ctl">
         <el-input
@@ -131,42 +132,13 @@
                 </svg>
               </button>
               <!--
-                改 id 的铅笔钮：与备注名那支同款小图标钮（复制钮**保留** ——
-                复制 id 仍是最常用的操作）。🔴 primary 行不给：主脑的引导配置
-                绑在这个 id 上，改了等于换了个主代理（后端同口径 400）。
+                行内只留复制钮（复制 id 仍是最常用的操作）；改 id 与改备注名
+                一起收进卡片操作区的「编辑」弹框 —— 一张卡一个编辑入口。
               -->
-              <button
-                v-if="a.role !== 'primary'"
-                class="copy-btn id-edit"
-                :disabled="busy"
-                title="改代理 ID"
-                aria-label="改代理 ID"
-                @click="openSetId(a)"
-              >
-                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
-                  <path d="M9.4 4.2l2.4 2.4" />
-                </svg>
-              </button>
             </div>
 
             <div class="aname">
               <span class="aname-txt" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
-              <!-- 改名钮：复用现成的小图标钮（.copy-btn 那套尺寸），只改备注名 -->
-              <button
-                class="copy-btn name-edit"
-                :disabled="busy"
-                title="改名"
-                aria-label="改名"
-                @click="openRename(a)"
-              >
-                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M10.7 2.9l2.4 2.4-6.9 6.9-3 .6.6-3 6.9-6.9z" />
-                  <path d="M9.4 4.2l2.4 2.4" />
-                </svg>
-              </button>
               <span class="chip">{{ a.role === 'primary' ? '主代理' : '子代理' }}</span>
             </div>
 
@@ -219,6 +191,12 @@
                   <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
                 </template>
               </template>
+              <!--
+                编辑：一张卡**一个**编辑入口（代理 ID + 备注名同框）。
+                放在分流链**外面** —— primary 行不给的是「危险治理动作」，
+                改备注名它照样要能改（后端同口径：primary 只锁 id）。
+              -->
+              <button class="act-btn" :disabled="busy" @click="openEdit(a)">编辑</button>
             </template>
           </ItemCard>
         </div>
@@ -303,10 +281,15 @@
       </template>
     </el-dialog>
 
-    <!-- 改代理 ID：换主键 —— 凭据与权限不变，历史记忆的归属跟着一起搬 -->
+    <!--
+      编辑代理：**代理 ID + 备注名同框**（一张卡一个编辑入口，两个铅笔合并到这儿）。
+      🔴 改 ID 是换主键（凭据与权限不变，历史记忆的归属跟着一起搬）；
+      改备注名只动人看的标签（状态 / 角色 / 已发的凭据一律不碰）。
+      primary 行的 ID 输入框锁死 —— 主脑的引导配置绑在这个 id 上（后端同口径 400）。
+    -->
     <el-dialog
-      v-model="setIdOpen"
-      title="改代理 ID"
+      v-model="editOpen"
+      title="编辑代理"
       width="460px"
       align-center
       :close-on-click-modal="false"
@@ -315,67 +298,43 @@
       append-to-body
     >
       <el-form label-position="top">
-        <el-form-item label="新 agent_id（必填）">
+        <el-form-item label="代理 ID">
           <el-input
-            v-model="setIdValue"
+            v-model="editId"
+            :disabled="editPrimary"
             placeholder="如 worker-2"
             autocomplete="off"
             spellcheck="false"
-            @keyup.enter="doSetId"
+            @keyup.enter.prevent="doEdit"
           />
+          <p v-if="editPrimary" class="tip">主代理 ID 不可改（备注名照常可以改）。</p>
         </el-form-item>
-      </el-form>
-      <p class="tip">
-        凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
-        历史记忆的归属会一起搬过去（它写过的记忆仍归它）。
-        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
-      </p>
-      <template #footer>
-        <el-button :disabled="busy" @click="setIdOpen = false">取消</el-button>
-        <el-button
-          type="primary"
-          :loading="busy"
-          :disabled="!setIdValue.trim() || setIdValue.trim() === (setIdRow?.agent_id || '')"
-          @click="doSetId"
-        >
-          改 ID
-        </el-button>
-      </template>
-    </el-dialog>
-
-    <!-- 改名：只改备注名 —— 状态 / 角色 / 已发的凭据一律不碰 -->
-    <el-dialog
-      v-model="renameOpen"
-      title="改备注名"
-      width="440px"
-      align-center
-      :close-on-click-modal="false"
-      :close-on-press-escape="!busy"
-      :show-close="!busy"
-      append-to-body
-    >
-      <el-form label-position="top">
-        <el-form-item label="新备注名（必填）">
+        <el-form-item label="备注名">
           <el-input
-            v-model="renameName"
+            v-model="editName"
+            placeholder="给人看的名字"
             autocomplete="off"
             spellcheck="false"
-            @keyup.enter="doRename"
+            @keyup.enter.prevent="doEdit"
           />
         </el-form-item>
       </el-form>
       <p class="tip">
-        只改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
+        改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
+        历史记忆的归属会一起搬过去（它写过的记忆仍归它）。
+        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
+        <br />
+        改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
       </p>
       <template #footer>
-        <el-button :disabled="busy" @click="renameOpen = false">取消</el-button>
+        <el-button :disabled="busy" @click="editOpen = false">取消</el-button>
         <el-button
           type="primary"
           :loading="busy"
-          :disabled="!renameName.trim()"
-          @click="doRename"
+          :disabled="!editId.trim()"
+          @click="doEdit"
         >
-          改名
+          保存
         </el-button>
       </template>
     </el-dialog>
@@ -569,75 +528,92 @@ async function doRegister() {
   }
 }
 
-// 改名：只改备注名（状态 / 角色 / 凭据都不动）
-const renameOpen = ref(false)
-const renameRow = ref(null)
-const renameName = ref('')
+// ---------------------------------------------------------------------------
+// 编辑：代理 ID + 备注名**同框**（一张卡一个编辑入口）
+// ---------------------------------------------------------------------------
 
-function openRename(row) {
-  renameRow.value = row
-  renameName.value = row?.name || ''
-  renameOpen.value = true
+const editOpen = ref(false)
+const editRow = ref(null)
+const editId = ref('')
+const editName = ref('')
+/** 主代理不能改 id（后端同口径 400）：输入框直接锁死，备注名照改。 */
+const editPrimary = computed(() => editRow.value?.role === 'primary')
+
+function openEdit(row) {
+  editRow.value = row
+  editId.value = row?.agent_id || ''
+  editName.value = row?.name || ''
+  editOpen.value = true
 }
 
-async function doRename() {
-  const row = renameRow.value
-  const name = (renameName.value || '').trim()
-  if (!row || !name) return
-  busy.value = true
-  try {
-    const r = await http
-      .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/rename`, {
-        name,
-        confirm: true,
-      })
-      .then((res) => res.data)
-    renameOpen.value = false
-    // 🔴 同名提醒**原样透出**（后端只在真撞名时给 note）—— 备注名不拦，
-    // 但列表里两个一样的名字要看得见（唯一性反馈要在页面上看得见）。
-    showToast(r.note ? `已改名：${row.agent_id} · ${r.note}` : `已改名：${row.agent_id}`)
-    // 同上：改完重拉，状态由后端说了算
-    load(true)
-  } catch (e) {
-    showError(`改名失败：${e.message}`)
-  } finally {
-    busy.value = false
+async function doEdit() {
+  const row = editRow.value
+  if (!row) return
+  const oldId = row.agent_id
+  const newId = (editId.value || '').trim()
+  const oldName = (row.name || '').trim()
+  const newName = (editName.value || '').trim()
+  const idChanged = !editPrimary.value && newId !== oldId
+  const nameChanged = newName !== oldName
+  // 什么都没改：关窗，一个请求都不发
+  if (!idChanged && !nameChanged) {
+    editOpen.value = false
+    return
   }
-}
-
-// 改代理 ID：换主键（凭据不动、记忆归属跟着搬）
-const setIdOpen = ref(false)
-const setIdRow = ref(null)
-const setIdValue = ref('')
-
-function openSetId(row) {
-  setIdRow.value = row
-  setIdValue.value = row?.agent_id || ''
-  setIdOpen.value = true
-}
-
-async function doSetId() {
-  const row = setIdRow.value
-  const newId = (setIdValue.value || '').trim()
-  if (!row || !newId) return
   busy.value = true
+  const done = []   // 已经生效的部分（toast 按实际发生的拼）
+  const notes = []  // 后端的话（同名提醒 / 归属没搬动）
+  let targetId = oldId
   try {
-    const r = await http
-      .post(`/api/v1/agents/${encodeURIComponent(row.agent_id)}/set_id`, {
-        new_id: newId,
-        confirm: true,
-      })
-      .then((res) => res.data)
-    setIdOpen.value = false
-    showToast(
-      `已改 ID：${row.agent_id} → ${r.agent_id}（搬动 ${r.moved_memories ?? 0} 条记忆）` +
-        (r.note ? ` · ${r.note}` : ''),
-    )
+    if (idChanged) {
+      let r
+      try {
+        r = await http
+          .post(`/api/v1/agents/${encodeURIComponent(oldId)}/set_id`, {
+            new_id: newId,
+            confirm: true,
+          })
+          .then((res) => res.data)
+      } catch (e) {
+        // 🔴 set_id 失败（409 已被占用 / 400 形态不合规）：红条透出后端 message 并**中止** ——
+        // 旧 id 这时还在，接着 rename 只会改了个名字却把 id 留在半路。
+        showError(`改 ID 失败：${e.message}`)
+        return
+      }
+      // 换 id **已生效**（不可回滚）：新值即当前主键，后面的 rename 必须打新 id
+      targetId = r.agent_id || newId
+      done.push(`ID 已改为 ${targetId}（搬动 ${r.moved_memories ?? 0} 条记忆）`)
+      if (r.note) notes.push(r.note)
+    }
+    if (nameChanged) {
+      let r
+      try {
+        r = await http
+          .post(`/api/v1/agents/${encodeURIComponent(targetId)}/rename`, {
+            name: newName,
+            confirm: true,
+          })
+          .then((res) => res.data)
+      } catch (e) {
+        if (idChanged) {
+          // ID 已经改了 —— 说清「改了一半」，别让人以为全没生效
+          editOpen.value = false
+          showToast(`已更新：${done.join('，')}；但备注名没改：${e.message}`, 'warning')
+          load(true)
+        } else {
+          showError(`改名失败：${e.message}`)
+        }
+        return
+      }
+      done.push('备注名已保存')
+      // 🔴 同名提醒**原样透出**（后端只在真撞名时给 note）—— 备注名不拦，
+      // 但列表里两个一样的名字要看得见（唯一性反馈要在页面上看得见）。
+      if (r.note) notes.push(r.note)
+    }
+    editOpen.value = false
+    showToast(`已更新：${done.join('，')}${notes.length ? ` · ${notes.join(' ')}` : ''}`)
     // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
     load(true)
-  } catch (e) {
-    // 🔴 后端的人话文案原样透出（409「已被占用」/ 400「primary 不能改」都在里面）
-    showError(`改 ID 失败：${e.message}`)
   } finally {
     busy.value = false
   }
@@ -782,12 +758,6 @@ async function doAction(typed) {
   font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-/* 改名钮 / 改 id 钮：沿用全局 .copy-btn 的小图标钮尺寸，只补一条禁用态（复制钮从不禁用） */
-.name-edit:disabled,
-.id-edit:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 .kv .row .v.mono {
   font-family: var(--mono);
