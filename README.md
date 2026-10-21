@@ -182,6 +182,19 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   // Query expansion (optional, on by default) — background LLM synonyms when BM25 hits < min_results
   "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
 
+  // Private-message push consumer (optional, OFF by default) — the provider hangs
+  // an SSE stream on GET {base_url}/events so a fresh private message is noticed
+  // at once instead of at the next conversation turn.
+  // 🔴 The credential NEVER lives here: this section only names its SOURCE.
+  //     enabled=false ⇒ zero threads, zero connections (behaviour byte-identical).
+  //     ⚠️ Read at process start (the thread is loaded with the gateway) —
+  //        changing it needs a gateway restart, there is no mtime hot reload.
+  // "push_consumer": {
+  //   "enabled": true,
+  //   "base_url": "http://127.0.0.1:8210",              // SSE server root; /events is appended
+  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"      // or "credential_file": "/path/to/secret"
+  // },
+
   // Auto maintenance
   "consolidate_min_group": 3,
   "consolidate_min_overlap": 3,
@@ -228,6 +241,7 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
 | `OPENAI_API_KEY` | `embedder.api_key` | Embedding API key |
+| `KEEPSAKE_PUSH_CREDENTIAL` | `push_consumer.credential_env` | Credential for the private-message push consumer (**the default env name — the name itself is configurable**) |
 
 > **Every other config item is `config.json`-only — there is no environment variable for it.** In particular `bm25_limit`, `decay_half_days`, `hot_topic_decay_half_days`, `embed_cache_ttl`, `storage.backend`, `embed_dim`, `consolidate_min_group`, `consolidate_min_overlap`, `consolidate_max_age_hours`, `forget_max_age_days`, `forget_dry_run` and `emotion_intensity_factor` are read from the config file only. See the [Configuration Reference](#configuration-reference) table below for defaults.
 
@@ -374,6 +388,9 @@ Then reference it in config.json:
 | `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search |
 | `entity_cooc_min_count` | — | `2` | Min co-occurrence for entity association |
 | `retrieval.exclude_tags` | — | `core_candidate` | Tags (comma-separated) excluded from retrieval. Empty string = gate off. Resolved once in `initialize()` ⇒ **restart to apply**. See [Multi-Agent Memory Governance](#multi-agent-memory-governance) |
+| `push_consumer.enabled` | — | `false` | Whether the provider hangs an SSE stream (the private-message push consumer). Off = zero threads, zero connections. Read at process start ⇒ **restart the gateway to apply** |
+| `push_consumer.base_url` | — | `""` | SSE server root address (the consumer appends `/events` itself) |
+| `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | **Env var name** holding the stream credential (the credential value never lives in `config.json`). `push_consumer.credential_file` points at a secrets file instead |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -802,6 +819,60 @@ Console → *Message Center → by recipient*:
 Backing endpoints: `POST /api/v1/messages/nudge` (body
 `{agents: ["id1", ...]}`, 1–50, de-duplicated) and
 `POST /api/v1/agents/{agent_id}/push` (the switch).
+
+### Provider-side consumer (the last metre)
+
+2026-10 ks_push_consumer. The server side was already there; this is the
+**client** — keepsake's own provider hangs one SSE stream and listens, so a
+private message is noticed **at once** instead of at the next conversation turn.
+
+**Off by default.** `push_consumer.enabled=false` ⇒ **zero threads, zero
+connections**, behaviour byte-identical to before.
+
+```json
+"push_consumer": {
+  "enabled": true,
+  "base_url": "http://127.0.0.1:8210",
+  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"
+}
+```
+
+* 🔴 **the credential never lives in `config.json`** — the section only names its
+  *source* (`credential_env`, or `credential_file` for a secrets file). The
+  value goes in through the environment.
+* ⚠️ **read at process start**: the thread is loaded together with the gateway,
+  so changing the section needs a gateway restart (no mtime hot reload — stated
+  here rather than implied);
+* `base_url` is the **server root**; the consumer appends `/events` itself.
+
+What a received frame does — and nothing more:
+
+1. **the unread-watermark cache is invalidated** ⇒ the next `prefetch`
+   re-queries the mailbox and reminds immediately, instead of waiting out the
+   60s de-duplication window;
+2. **one `logger.info` line** with the event summary (`event` / `seq` / `from`
+   / `unread`) — **no body, ever**;
+3. **the host's optional callback** `on_push_event(fn)` receives the same
+   summary dict (`{"event", "seq", "from", "unread"}`) — **no body, ever**
+   (the body stays in the mailbox, fetched with `message_inbox`).
+
+```python
+provider.on_push_event(lambda summary: print(summary["unread"]))
+```
+
+The callback runs **on the consumer thread** ⇒ keep it short and swallow your
+own exceptions (the implementation already catches them: a raising callback
+only logs a warning).
+
+Robustness: a failed connect or a dropped stream ⇒ **exponential backoff**
+(5s, doubling, capped at 5min) and reconnect. The consumer is **fail-open**:
+nothing it does can break the provider — not even a failure to start
+(`initialize()` never fails because of it), and the thread is a daemon that
+dies with the process.
+
+One stream per process: the server allows at most 2 streams per agent (the new
+one kicks the old), and Hermes may build one provider per session — so the
+consumer and the callback table live at module level, not per instance.
 
 ## Multi-Agent Memory Governance
 

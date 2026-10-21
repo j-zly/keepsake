@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
-from .capabilities import CapabilityNotSupported, Capabilities, KeepsakeContractError
-from .protocol import MemoryProvider
+from .capabilities import CapabilityNotSupported, Capabilities, KeepsakeContractError, PushEvent
+from .protocol import MemoryProvider, PushEventConsumer
 
 __all__ = [
     "MemoryProvider",
+    "PushEventConsumer",
+    "PushEvent",
     "Capabilities",
     "KeepsakeContractError",
     "CapabilityNotSupported",

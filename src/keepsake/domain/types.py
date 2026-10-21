@@ -40,6 +40,22 @@ class Fragment(TypedDict, total=False):
     touch_count: str
 
 
+#: 一条推送事件的**摘要**（消费者交给宿主的形状）。
+#:
+#: 🔴 **没有正文**：帧里只有元数据（谁发来的 / 第几条 / 未读几条）——
+#: 私信正文永远走信箱本体（`message_inbox`），进推送层就等于进了日志。
+#:
+#: 用**函数式**写法而不是 class 体：`from` 是 Python 关键字，写不成注解。
+#: 键名与线上帧逐字一致（`event` / `seq` / `from` / `unread`），
+#: 宿主可以直接把帧映射成这个形状，不用二次翻译。
+PushEvent = TypedDict("PushEvent", {
+    "event": str,     # "dm"（有人投了私信）/ "dm-nudge"（人工点了提醒）
+    "seq": int,       # 信箱序号
+    "from": str,      # 最近一个发件人
+    "unread": int,    # 当前未读条数
+})
+
+
 class Hit(TypedDict, total=False):
     """一条检索命中：在 Fragment 之上叠了排序信号。
 
@@ -79,6 +95,13 @@ class Capabilities:
     dry_run_merge: bool = False
     """merge() 是否支持 dry_run（只统计不写）；False = 调用方不许传 dry_run。"""
 
+    push_consumer: bool = False
+    """是否带**推送消费者**（2026-10 ks_push_consumer）：provider 侧会挂一条
+    SSE 长连接，收私信元数据帧。
+
+    True = 宿主可以注册 `on_push_event(fn)` 拿事件摘要；
+    False = 只剩寄生层的对话轮提醒（既有行为，逐字不变）。"""
+
     version: str = "v1"
     """契约版本号。"""
 
@@ -98,6 +121,7 @@ class CapabilityNotSupported(KeepsakeContractError):
 __all__ = [
     "Fragment",
     "Hit",
+    "PushEvent",
     "Capabilities",
     "KeepsakeContractError",
     "CapabilityNotSupported",

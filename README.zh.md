@@ -175,6 +175,17 @@ pip install git+https://github.com/j-zly/keepsake.git
 
   // 查询扩展（可选，默认开）— BM25 命中 < min_results 时后台 LLM 生成同义短词入缓存
   "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
+
+  // 私信推送消费者（可选，**缺省关**）— provider 侧挂一条 SSE 流
+  // （GET {base_url}/events），新私信**立刻**被看见，不必等下一轮对话。
+  // 🔴 凭据**绝不落这里**：本节只写凭据的**来源**。
+  //     enabled=false ⇒ 零线程零连接（行为逐字不变）。
+  //     ⚠️ **进程启动时读**（线程随网关装载）— 改了要重启网关，没有 mtime 热生效。
+  // "push_consumer": {
+  //   "enabled": true,
+  //   "base_url": "http://127.0.0.1:8210",              // SSE 服务端根地址；/events 由消费者自己拼
+  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"      // 或 "credential_file": "/path/to/secret"
+  // },
   
   // 自动维护配置
   "consolidate_min_group": 3,
@@ -218,6 +229,7 @@ pip install git+https://github.com/j-zly/keepsake.git
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
 | `OPENAI_API_KEY` | `embedder.api_key` | 嵌入 API 密钥 |
+| `KEEPSAKE_PUSH_CREDENTIAL` | `push_consumer.credential_env` | 私信推送消费者的建流凭据（**默认环境变量名 —— 名字本身可配**） |
 
 > **其余配置项一律只走 `config.json`，没有对应环境变量。** 特别是 `bm25_limit`、`decay_half_days`、`hot_topic_decay_half_days`、`embed_cache_ttl`、`storage.backend`、`embed_dim`、`consolidate_min_group`、`consolidate_min_overlap`、`consolidate_max_age_hours`、`forget_max_age_days`、`forget_dry_run`、`emotion_intensity_factor` 都只从配置文件读。默认值见下方[配置参考](#配置参考)表。
 
@@ -360,6 +372,9 @@ yeah
 | `entity_cooc_top_n` | — | `3` | 搜索时扩展多少个关联实体 |
 | `entity_cooc_min_count` | — | `2` | 实体共现几次才算有效关联 |
 | `retrieval.exclude_tags` | — | `core_candidate` | 检索时要排除的标签（逗号分隔）。写空串 = 关闸。在 `initialize()` 里解析一次 ⇒ **改它要重启**。见「多代理记忆治理」节 |
+| `push_consumer.enabled` | — | `false` | provider 侧是否挂 SSE 流（私信推送消费者）。关 = 零线程零连接。**进程启动时读** ⇒ 改它要重启网关 |
+| `push_consumer.base_url` | — | `""` | SSE 服务端根地址（消费者自己拼 `/events`） |
+| `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | 建流凭据的**环境变量名**（**凭据真值不落 config.json**）。另有 `push_consumer.credential_file` 指 secrets 文件 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -682,6 +697,51 @@ data: {"seq": 12, "from": "worker-1", "unread": 3}
 
 对应后端端点：`POST /api/v1/messages/nudge`（body `{agents: ["id1", ...]}`，1~50 个去重）、
 `POST /api/v1/agents/{agent_id}/push`（开关）。
+
+### provider 侧挂流消费者（补齐最后一米）
+
+2026-10 ks_push_consumer。服务端早就有了，缺的是**客户端** —— keepsake 自己的
+provider 挂一条 SSE 流听着，于是新私信**立刻**被看见，不必等下一轮对话。
+
+**缺省关**：`push_consumer.enabled=false` ⇒ **零线程零连接**，行为与上线前逐字相同。
+
+```json
+"push_consumer": {
+  "enabled": true,
+  "base_url": "http://127.0.0.1:8210",
+  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"
+}
+```
+
+* 🔴 **凭据绝不落 `config.json`** —— 本节只写凭据的**来源**（`credential_env`，
+  或 `credential_file` 指 secrets 文件）；真值经环境变量注入；
+* ⚠️ **进程启动时读**：线程随网关装载 ⇒ 改这一节要**重启网关**（没有 mtime 热生效，
+  这里如实写明，不让人以为改完就通）；
+* `base_url` 是**服务端根地址**，`/events` 由消费者自己拼。
+
+收到一帧只做三件事（**仅此而已**）：
+
+1. **未读水位缓存失效** ⇒ 下一轮 `prefetch` 必重新查库并提醒，不用干等那个
+   60s 去重窗口；
+2. `logger.info` 记**一行**事件摘要（`event` / `seq` / `from` / `unread`）——
+   **永远没有正文**；
+3. 宿主可选注册的回调 `on_push_event(fn)` 收到同一个摘要 dict
+   （`{"event", "seq", "from", "unread"}`）—— **永远没有正文**
+   （正文仍在信箱里，用 `message_inbox` 取）。
+
+```python
+provider.on_push_event(lambda summary: print(summary["unread"]))
+```
+
+回调在**消费者线程**里被调用 ⇒ 要短、要自己吞异常（实现已经兜了一层：
+回调抛异常只记 warning，不影响其余回调与主路径）。
+
+健壮性：连不上 / 断流 ⇒ **指数退避**重连（5s 起、翻倍、封顶 5min）；消费者整体
+**fail-open**：起不来也不影响 provider（`initialize()` 绝不因它失败），线程是
+daemon，随进程亡。
+
+**一个进程一条流**：服务端每代理最多 2 条并发流（新的踢旧的），而 Hermes 可能按
+session 造多个 provider —— 所以消费者与回调表挂在**模块级**，不是实例级。
 
 ## 多代理记忆治理
 

@@ -21,10 +21,11 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -179,6 +180,187 @@ _DM_SENDER_LIMIT = 3
 #: 进程级缓存 `{"ts": 时刻, "key": 水位}`（照抄 `_CORE_CACHE` 那套模式，不造新机制）。
 #: 水位 = (未读条数, 发件人集合) —— 条数相同但换人发，也是新消息，照样该提醒。
 _DM_HINT_CACHE: Dict[str, Any] = {"ts": 0.0, "key": None}
+
+
+# ---------------------------------------------------------------------------
+# 私信推送消费者（2026-10 ks_push_consumer）—— provider 侧挂流（最后一米）
+#
+# 服务端 `GET /events`（SSE）推的是**元数据帧**（seq / from / unread，无正文）。
+# 本模块是那一端的**消费者**：一条守护线程挂着流，收到帧做三件事：
+#
+#   ① 让未读私信提醒的**水位缓存失效** —— 下一轮 prefetch 必重新查库并提醒，
+#      不必等那个 60s 去重窗口（否则「刚到的信」最多晚一分钟才被看见）；
+#   ② `logger.info` 记**一行**事件摘要（无正文）；
+#   ③ 通知宿主可选注册的回调 `on_push_event(fn)`（摘要 dict，无正文）。
+#
+# 三条纪律：
+#   * **fail-open**：消费者的任何异常都不许碰主路径 —— provider 初始化
+#     **不因它失败**，记忆读写更不受影响（推送层坏了只是少一条快车道）；
+#   * **克制，不吵宿主**：帧里只有元数据，日志一行，回调只给摘要；
+#   * **凭据不落配置**：凭据从环境变量 / secrets 文件读，config.json 只写来源。
+#
+# 🔴 **一条流是进程级的**：服务端每代理最多 2 条并发流（新的踢旧的），
+# 而 Hermes 可能为多 session 造多个 provider 实例 —— 各挂一条只会互相踢。
+# 所以消费者与回调表都挂在**模块级**（同进程一个代理，够用）。
+# ---------------------------------------------------------------------------
+
+#: 重连退避（秒）：5s 起、翻倍、封顶 5min（指数退避，别把服务端打爆）。
+_PUSH_RECONNECT_BASE_S = 5.0
+_PUSH_RECONNECT_MAX_S = 300.0
+
+#: 进程级消费者与回调表（**一条流** —— 见上节末段）。
+_PUSH_LOCK = threading.Lock()
+_PUSH_CONSUMER: Optional["_PushConsumer"] = None
+_PUSH_CALLBACKS: List[Callable[[Dict[str, Any]], None]] = []
+
+
+def _as_int(value: Any) -> int:
+    """值 → int（**非法值回落 0**，不许因为一个脏字段把整帧丢掉）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _push_credential(settings: dict) -> str:
+    """取推送凭据 —— **只从环境变量 / secrets 文件读**，config.json 不落真值。
+
+    顺序：`credential_env` 指名的环境变量 → `credential_file` 指的文件内容。
+    两处都没有 ⇒ 空串（调用方据此**不挂流**，而不是拿空凭据去连）。
+    """
+    env_name = str(settings.get("credential_env") or "").strip() \
+        or "KEEPSAKE_PUSH_CREDENTIAL"
+    token = (os.environ.get(env_name) or "").strip()
+    if token:
+        return token
+    path = str(settings.get("credential_file") or "").strip()
+    if path:
+        try:
+            return Path(path).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.warning("keepsake: 推送凭据文件读取失败（%s）", type(e).__name__)
+    return ""
+
+
+def _dispatch_push_event(event: str, raw: str) -> None:
+    """处理一帧推送（进程级）：失效水位 → 记一行摘要 → 通知宿主回调。
+
+    🔴 **帧里只有元数据**（seq / from / unread）：私信正文永远走信箱本体。
+    这里连日志都只记这几个字段 —— 正文进日志 = 私信进了日志。
+    """
+    if event not in ("dm", "dm-nudge"):
+        return
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    summary = {
+        "event": event,
+        "seq": _as_int(data.get("seq")),
+        "from": str(data.get("from") or ""),
+        "unread": _as_int(data.get("unread")),
+    }
+    # ① 水位失效：下一轮 prefetch 必重新查库并提醒（不等 60s 去重窗口）
+    _DM_HINT_CACHE.update({"ts": 0.0, "key": None})
+    # ② 一行摘要日志（无正文）
+    logger.info("keepsake: 收到推送事件 %s（seq=%d, from=%s, unread=%d）",
+                summary["event"], summary["seq"], summary["from"] or "-",
+                summary["unread"])
+    # ③ 宿主回调（一个炸了不许连累其余，更不许碰主路径）
+    for fn in list(_PUSH_CALLBACKS):
+        try:
+            fn(dict(summary))
+        except Exception as e:      # noqa: BLE001 —— 宿主的回调不许反噬宿主
+            logger.warning("keepsake: 推送回调异常（已吞掉）: %s: %s",
+                           type(e).__name__, e)
+
+
+class _PushConsumer:
+    """挂着 SSE 流的守护线程（provider 侧消费者）。
+
+    线程体只做三件事：连上去 → 读帧 → 收帧交给 `_dispatch_push_event`。
+    任何异常都在 `_loop` 里被吃掉并退避重连（**fail-open**：推送层坏了不许
+    影响记忆读写）。线程 `daemon=True` —— 随进程亡，不留孤儿。
+    """
+
+    def __init__(self, base_url: str, credential: str) -> None:
+        self._url = base_url.rstrip("/") + "/events"
+        self._credential = credential
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ---- 生命周期 ----
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="keepsake-push",
+                                        daemon=True)
+        self._thread.start()
+
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ---- 线程体 ----
+
+    def _loop(self) -> None:
+        """连 → 读 → 断 → 退避 → 再连（直到被 stop）。"""
+        delay = _PUSH_RECONNECT_BASE_S
+        while not self._stop.is_set():
+            try:
+                self._connect_once()
+                delay = _PUSH_RECONNECT_BASE_S      # 连上过 ⇒ 退避复位
+                logger.info("keepsake: 推送流结束，将重连")
+            except Exception as e:      # noqa: BLE001 —— 推送层永远 fail-open
+                logger.warning("keepsake: 推送流异常（%s: %s），%.0fs 后重连",
+                               type(e).__name__, e, delay)
+            if self._stop.wait(delay):
+                return
+            delay = min(delay * 2, _PUSH_RECONNECT_MAX_S)
+
+    def _connect_once(self) -> None:
+        """连一次流、读到断为止（返回 = 服务端收尾；重连由 `_loop` 管）。"""
+        import httpx                   # 延迟 import：没装 httpx 也不影响记忆功能
+
+        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream(
+                "GET", self._url,
+                headers={"Authorization": f"Bearer {self._credential}",
+                         "Accept": "text/event-stream"},
+            ) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"建流被拒（HTTP {resp.status_code}）")
+                logger.info("keepsake: 推送流已建立（%s）", self._url)
+                event_name = ""
+                data_lines: List[str] = []
+                for line in resp.iter_lines():
+                    if self._stop.is_set():
+                        return
+                    if not line:
+                        # 空行 = 一帧结束（SSE 的帧分隔）
+                        if event_name:
+                            _dispatch_push_event(event_name, "\n".join(data_lines))
+                        event_name, data_lines = "", []
+                        continue
+                    if line.startswith(":"):
+                        continue         # 注释帧（心跳）—— 客户端忽略
+                    if line.startswith("event:"):
+                        event_name = line[len("event:"):].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[len("data:"):].strip())
+
+
+def _stop_push_consumer() -> None:
+    """停掉进程级推送消费者（幂等；停不掉也不影响进程退出 —— 它是 daemon）。"""
+    global _PUSH_CONSUMER
+    with _PUSH_LOCK:
+        consumer, _PUSH_CONSUMER = _PUSH_CONSUMER, None
+    if consumer is not None:
+        consumer.stop()
 
 
 def config_path() -> Path:
@@ -502,6 +684,17 @@ class KeepsakeProvider(MemoryProvider):
                     "cache_ttl": 86400,
                 },
             },
+            # 2026-10 ks_push_consumer：provider 侧挂 SSE 流（私信推送最后一米）。
+            # 🔴 **缺省关**（零线程零连接）；凭据**只从环境变量 / secrets 文件读**
+            # （`credential_env` / `credential_file`），config.json 不落真值。
+            # 🔴 **mtime 热生效不强求**：这一节是**进程启动时**读的（线程随网关
+            #    重启装载）；改了 config.json 要重启网关才生效（如实写在这里，
+            #    别让人以为改完就通）。
+            "push_consumer": {
+                "enabled": False,
+                "base_url": "",          # SSE 服务端根地址（消费者自己拼 /events）
+                "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
+            },
         }
 
         # 2. JSON 配置文件覆盖
@@ -617,6 +810,11 @@ class KeepsakeProvider(MemoryProvider):
         # 深拷贝：防后续步骤或外部测试修改 cfg 时反向污染 _config 链
         # （测试里 monkeypatch inline 后再 resolve 会得到新 dict，本属性不变）
         self._resolved_config = copy.deepcopy(cfg)
+
+        # 2026-10 ks_push_consumer：推送消费者（可选）。**放在存储装配之前** ——
+        # SSE 是服务端的能力，跟本地存储通不通无关；存储还没就绪时更该早点挂上。
+        # fail-open：起不来只记日志，**绝不让 provider 初始化失败**。
+        self._init_push_consumer(cfg)
 
         # 加载/重载 jieba 自定义词典（发 /new 时生效）
         from ...domain.splitter import init_domain_dict
@@ -1033,6 +1231,65 @@ class KeepsakeProvider(MemoryProvider):
         src = ("（来自: " + "、".join(senders) + "）") if senders else ""
         return f"📩 你有 {count} 条未读私信{src}。请调用 message_inbox 处理。"
 
+    # ------------------------------------------------------------------
+    # 推送消费者（2026-10 ks_push_consumer）—— **可选**扩展
+    #
+    # 契约在 `adapters/generic/protocol.py` 的 `PushEventConsumer`（可选契约，
+    # 不在基础契约里 —— 宿主不实现也不影响任何既有行为）。
+    # ------------------------------------------------------------------
+
+    def on_push_event(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        """注册推送事件回调（**可选**能力；不注册也不影响任何行为）。
+
+        回调收到的是一个**摘要 dict**：`{"event", "seq", "from", "unread"}`
+        —— 🔴 **没有正文**（私信正文永远走信箱本体 `message_inbox`；
+        正文进推送层 = 正文进了日志与代理内存）。
+
+        🔴 回调在**消费者线程**里被调用 ⇒ 它必须快、必须自己吞异常
+        （本实现已经替它兜了一层：抛异常只记 warning，不影响其余回调、
+        不影响主路径）。同一个回调重复注册只算一次。
+        """
+        if not callable(fn):
+            raise TypeError("on_push_event 需要一个可调用对象")
+        with _PUSH_LOCK:
+            if fn not in _PUSH_CALLBACKS:
+                _PUSH_CALLBACKS.append(fn)
+
+    def _init_push_consumer(self, cfg: dict) -> None:
+        """按配置起推送消费者（**fail-open**：失败只记日志，绝不影响初始化）。
+
+        配置节 `push_consumer`：
+          * `enabled`（缺省 **false**）—— 关着就是**零线程零连接**；
+          * `base_url` —— SSE 服务端根地址（消费者自己拼 `/events`）；
+          * `credential_env` / `credential_file` —— 凭据来源（**不落真值**）。
+
+        🔴 进程级**一条流**：多个 provider 实例（Hermes 多 session）各挂一条
+        只会互相踢（服务端每代理最多 2 条并发流，新的踢旧的）。
+        """
+        global _PUSH_CONSUMER
+        try:
+            settings = (cfg or {}).get("push_consumer") or {}
+            if not isinstance(settings, dict):
+                return
+            if not bool(settings.get("enabled", False)):
+                return                      # 缺省关 ⇒ 零线程零连接
+            base_url = str(settings.get("base_url") or "").strip()
+            credential = _push_credential(settings)
+            if not base_url or not credential:
+                logger.warning("keepsake: 推送消费者已开启，但 base_url / 凭据缺失（不挂流）")
+                return
+            with _PUSH_LOCK:
+                if _PUSH_CONSUMER is not None and _PUSH_CONSUMER.alive():
+                    logger.info("keepsake: 推送消费者已在运行（复用现有流）")
+                    return
+                consumer = _PushConsumer(base_url, credential)
+                consumer.start()
+                _PUSH_CONSUMER = consumer
+            logger.info("keepsake: 推送消费者已启动（%s/events）", base_url)
+        except Exception as e:      # noqa: BLE001 —— 推送层永远 fail-open
+            logger.warning("keepsake: 推送消费者启动失败（fail-open，不影响主路径）: %s: %s",
+                           type(e).__name__, e)
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
         # 未读私信提醒：独立于检索（一次 SELECT COUNT，成本可忽略）⇒ 放在
@@ -1339,6 +1596,12 @@ class KeepsakeProvider(MemoryProvider):
                 pipeline.stop(drain=True, timeout=5.0)
             except Exception as e:
                 logger.warning("keepsake: pipeline stop failed: %s", e)
+        # 2026-10 ks_push_consumer：停掉推送线程（幂等；它是 daemon，停不掉
+        # 也不影响进程退出 —— 留着只会白连一个不存在的服务端）。
+        try:
+            _stop_push_consumer()
+        except Exception as e:
+            logger.warning("keepsake: push consumer stop failed: %s", e)
         if self._storage:
             self._storage.close()
         logger.info("keepsake memory provider shutdown")
@@ -1914,5 +2177,11 @@ class KeepsakeProvider(MemoryProvider):
         return self._forgetter.forget(force=not dry_run)
 
     def capabilities(self) -> Capabilities:
-        """能力声明。core 层与 KNN 是 keepsake 的既定能力，开箱即有。"""
-        return Capabilities(core_tier=True, knn=True, dry_run_merge=True, version="v1")
+        """能力声明。core 层与 KNN 是 keepsake 的既定能力，开箱即有。
+
+        `push_consumer=True` 表示**能**接推送（实现了可选契约
+        `PushEventConsumer`）—— 是否真的挂流由 `push_consumer.enabled` 决定
+        （缺省关 ⇒ 行为与上线前逐字相同）。
+        """
+        return Capabilities(core_tier=True, knn=True, dry_run_merge=True,
+                            push_consumer=True, version="v1")

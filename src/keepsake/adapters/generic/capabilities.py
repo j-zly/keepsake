@@ -9,6 +9,11 @@
 
 from __future__ import annotations
 
-from ...domain.types import CapabilityNotSupported, Capabilities, KeepsakeContractError
+from ...domain.types import (
+    CapabilityNotSupported,
+    Capabilities,
+    KeepsakeContractError,
+    PushEvent,
+)
 
-__all__ = ["Capabilities", "KeepsakeContractError", "CapabilityNotSupported"]
+__all__ = ["Capabilities", "KeepsakeContractError", "CapabilityNotSupported", "PushEvent"]

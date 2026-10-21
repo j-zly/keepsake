@@ -27,13 +27,20 @@
 --------------------------------------------------------------------------
 `tests/contract/test_provider_protocol.py` 做双向契约测试：
 正向拿 Fake 与真 `SqliteStorage` 各跑一遍，反向故意违反必须被检出。
+
+--------------------------------------------------------------------------
+可选扩展
+--------------------------------------------------------------------------
+`PushEventConsumer` 是**另立的一份可选契约**（推送事件回调注册）——
+基础契约 `MemoryProvider` 一个成员都不许为它让路（那会让所有第三方实现
+跟着改）。宿主想接推送，就额外实现这一份；不实现，一切照旧。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
-from ...domain.types import Capabilities, Fragment, Hit
+from ...domain.types import Capabilities, Fragment, Hit, PushEvent
 
 
 @runtime_checkable
@@ -96,4 +103,25 @@ class MemoryProvider(Protocol):
         ...
 
 
-__all__ = ["MemoryProvider", "Capabilities", "Fragment", "Hit"]
+@runtime_checkable
+class PushEventConsumer(Protocol):
+    """**可选**扩展：推送事件回调的注册口（2026-10 ks_push_consumer）。
+
+    🔴 **刻意不进 `MemoryProvider` 基础契约**：基础契约只许长出「每个实现
+    都必须实现」的东西 —— 塞一个可选方法进来，第三方实现与
+    `tests/contract/test_provider_protocol.py` 里的 Fake 会当场翻红。
+    这里另立一份**可选**契约：宿主实现了它就能收推送摘要，没实现一切照旧
+    （推送层只是少一个出口，记忆读写一行都不变）。
+
+    事件摘要的形状见 `domain.types.PushEvent`：`{event, seq, from, unread}`
+    —— **没有正文**（私信正文永远走信箱本体）。
+
+    🔴 回调在消费者线程里被调用 ⇒ 实现必须快、必须自己吞异常。
+    """
+
+    def on_push_event(self, fn: Callable[[PushEvent], None]) -> None:
+        """注册推送事件回调（同一个回调重复注册只算一次）。"""
+        ...
+
+
+__all__ = ["MemoryProvider", "PushEventConsumer", "Capabilities", "Fragment", "Hit", "PushEvent"]
