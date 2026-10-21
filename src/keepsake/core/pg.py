@@ -111,6 +111,7 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     rerank_with_decay,
     scoring_now_ts,
     tag_match_sql,
+    visibility_filter_sql,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
     accumulate_co_occurrence,
     accumulate_word_freq,
@@ -1546,6 +1547,10 @@ class PgStorage(StorageBase):
         `tag_filter` 非空时召回恒 0、非主脑的 agent 隔离恒 0（实测见
         /tmp/ks_tag_pre.txt）。多标签此前还被拼成**一个** `strpos(…, p1 || p2)`
         的相邻子串（要求库里出现 `|a,b|` 这种连续形态），一并改成 OR 并集。
+
+        🔴 2026-10 ks_search_core_filter：非 primary 的**可见性**片段不再由本文件
+        自己拼 —— 口径单点挪到 `storage_shared.visibility_filter_sql`（core 与
+        普通条目同一把尺子：按归属判；无归属的老 core 条目仍可见）。
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -1553,16 +1558,17 @@ class PgStorage(StorageBase):
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        # 非主脑：只能搜 agent 自己的 / shared / core 的碎片
-        # （多代理治理：子代理对常驻层**只读**——检索要能召回 core 条目，
-        #  与 Redis/SQLite 同口径；写侧的降级闸在 provider.add()）
+        # 非主脑：只能搜**自己可见**的那些碎片（口径见 `storage_shared.visibility_filter_sql`）
+        # 🔴 2026-10 ks_search_core_filter：core（常驻层）**不再无条件放行** ——
+        #    旧口径「凡带 core 标签的条目人人可搜」绕过了归属过滤（非 primary 能搜到
+        #    别人的常驻记忆）。现在 core 与普通条目同一把尺子：按归属判；
+        #    **没有归属的老条目**仍可见（与 core_list 侧同口径，守住「现状不变」）。
         if not effective_is_primary:
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
                           if effective_agent_id else [])
             # 共享集（2026-10 ks_share_memory）：这些代理的记忆对本次调用方可见
             agent_tags += [self._clean_tag(f"agent:{a}") for a in (visible_agents or []) if a]
-            agent_tags += ["shared", "core"]
-            sql, args = tag_match_sql("tags", agent_tags, "%s", pos_fn="strpos")
+            sql, args = visibility_filter_sql("tags", agent_tags, "%s", pos_fn="strpos")
             clauses.append(sql)
             params.extend(args)
 

@@ -476,3 +476,144 @@ def test_老库没有这一列按关处理(tmp_path):
         assert reg.get("old-row")["share_memory"] is False
     finally:
         st.close()
+
+
+# ---------------------------------------------------------------------------
+# ⑧ 检索路径的 core 特例收紧（2026-10 ks_search_core_filter）
+# ---------------------------------------------------------------------------
+#
+# 🔴 缺陷：存储层检索 WHERE 里非 primary 的可见标签白名单是
+#    `agent:<自己> + agent:<共享集> + "shared" + "core"` —— **裸 `core` 人人放行**
+#    ⇒ 凡带 core 标签的条目不论归属都能被非 primary 搜到（实测：非 primary 搜一条
+#    命中 10 条，其中 9 条是 `core,...,agent:main-brain`）。
+#
+#    修完的口径（与 core_list 侧 `visible_core_fragments` 同口径）：
+#    非 primary 看得见一行 ⇔ ① 可见归属 ② `shared` ③ **无归属的** `core`。
+#
+#    ③ 那一档是「现状不变」硬回归线：老库里没有 `agent:` 标签的常驻条目继续
+#    可见（core_list 侧也放行它们 —— 两边必须给同一个答案）。
+
+#: 检索语料：(正文后缀, 落库 tags) —— 用**没有 agent_id 的**存储写，
+#: 这样 `agent:agent-a` 这类归属标签能原样落库（存储层 store() 会把 agent:
+#: 改写成自己的归属，见 `_agent_tags`）。
+CORE_CORPUS: Tuple[Tuple[str, str], ...] = (
+    ("甲", "core,agent:agent-a"),      # A 的常驻条目（**有归属**）
+    ("乙", "core,agent:agent-b"),      # B 自己的常驻条目
+    ("丙", "agent:agent-b"),           # B 自己的普通条目
+    ("丁", "core"),                    # 老数据：常驻层但**没有归属**
+)
+
+
+def _core_corpus_db(tmp_path) -> str:
+    """种一份带归属的常驻层语料，返回库路径。"""
+    from keepsake.core.sqlite import SqliteStorage
+
+    path = str(tmp_path / "core_filter.db")
+    seed = SqliteStorage(path=path)
+    assert seed.ensure_index() is True
+    for suffix, tags in CORE_CORPUS:
+        assert seed.store(text=f"{QUERY} {suffix}", tags=tags,
+                          category="probe", source="probe") is True
+    seed.close()
+    return path
+
+
+def test_检索不泄漏别人的core条目(tmp_path):
+    """🔴 非 primary 搜不到**别人的**常驻条目（core 标签不再是通行证）。
+
+    这是本单的核心判据：**含 core 标签的条目**也算「A 的条目」——
+    旧口径下它会被裸 `core` 放行 ⇒ 这里必红，修完转绿。
+    """
+    from keepsake.core.sqlite import SqliteStorage
+
+    path = _core_corpus_db(tmp_path)
+    st = SqliteStorage(path=path, agent_id="agent-b", is_primary=False)
+    try:
+        assert st.ensure_index() is True
+        who = _suffixes(st.search(QUERY))
+        assert "甲" not in who, who              # A 的常驻条目（A 没开共享）
+        assert who == {"乙", "丙", "丁"}, who    # 自己的 + 无归属的老数据
+    finally:
+        st.close()
+
+
+def test_共享打开后能搜到别人的core条目(tmp_path):
+    """A 开了共享 ⇒ B 能搜到 A 的常驻条目（core 按归属判，不是一刀切看不见）。"""
+    from keepsake.core.sqlite import SqliteStorage
+
+    path = _core_corpus_db(tmp_path)
+    st = SqliteStorage(path=path, agent_id="agent-b", is_primary=False)
+    try:
+        assert st.ensure_index() is True
+        who = _suffixes(st.search(QUERY, visible_agents=["agent-a"]))
+        assert "甲" in who, who
+        assert who == {"甲", "乙", "丙", "丁"}, who
+    finally:
+        st.close()
+
+
+def test_primary检索仍是全量_含别人的core(tmp_path):
+    """🔴 primary 全量硬回归线：别人的常驻条目照样看得见（现状逐字不变）。"""
+    from keepsake.core.sqlite import SqliteStorage
+
+    path = _core_corpus_db(tmp_path)
+    st = SqliteStorage(path=path, agent_id="primary", is_primary=True)
+    try:
+        assert st.ensure_index() is True
+        who = _suffixes(st.search(QUERY))
+        assert who == {"甲", "乙", "丙", "丁"}, who
+    finally:
+        st.close()
+
+
+def test_无归属的老常驻条目仍可见(tmp_path):
+    """🔴 「现状不变」硬回归线：老库里没有 `agent:` 标签的常驻条目**继续可见**。
+
+    老数据写它的时候存储还没注入归属标签 ⇒ 谁写的不明 ⇒ 不按谁的算
+    （core_list 侧 `visible_core_fragments` 也是这个口径，两边必须一致）。
+    """
+    from keepsake.core.sqlite import SqliteStorage
+
+    path = _core_corpus_db(tmp_path)
+    st = SqliteStorage(path=path, agent_id="agent-b", is_primary=False)
+    try:
+        assert st.ensure_index() is True
+        assert "丁" in _suffixes(st.search(QUERY))
+    finally:
+        st.close()
+
+
+def test_可见性判据三后端同一份():
+    """🔴 Redis 侧判据（Python 侧那一把尺子）与 SQL 侧口径逐条一致。
+
+    Redis 的 RediSearch 查询语言表达不了「有 core 且没有 agent:」这一档
+    ⇒ 取回后在 Python 侧判（`row_visible_after_core_narrow`，判据本体是
+    `row_visible_to_non_primary`）。这里把两把尺子的四档判据都钉死：
+    三后端同一份口径，不许各自漂。
+    """
+    from keepsake.core.shared import (
+        row_visible_after_core_narrow,
+        row_visible_to_non_primary,
+    )
+
+    owners = {"agent-b"}
+    # ① 可见归属（自己 / 共享集）
+    assert row_visible_to_non_primary("agent:agent-b", owners) is True
+    assert row_visible_to_non_primary("core,agent:agent-b", owners) is True
+    assert row_visible_to_non_primary("agent:agent-a", owners) is False
+    assert row_visible_to_non_primary("core,agent:agent-a", owners) is False
+    # ② 共享层字面量
+    assert row_visible_to_non_primary("shared", owners) is True
+    # ③ 无归属的老 core 条目
+    assert row_visible_to_non_primary("core", owners) is True
+    # 别的标签、无归属 ⇒ 看不见（现状不变）
+    assert row_visible_to_non_primary("foo", owners) is False
+
+    # Redis 侧那一把尺子：只收 core 那一档的归属（其余两档由查询式的标签并集负责）
+    assert row_visible_after_core_narrow("core,agent:agent-a", owners) is False
+    assert row_visible_after_core_narrow("core,agent:agent-b", owners) is True
+    assert row_visible_after_core_narrow("core", owners) is True
+    assert row_visible_after_core_narrow("core,agent:agent-a,shared", owners) is True
+    # 不带 core 的行 ⇒ 放行（查询式已按归属/shared 收过）
+    assert row_visible_after_core_narrow("agent:agent-a", owners) is True
+    assert row_visible_after_core_narrow("", owners) is True

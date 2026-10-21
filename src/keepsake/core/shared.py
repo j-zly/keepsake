@@ -41,7 +41,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
@@ -446,9 +446,15 @@ def tag_match_sql(col: str, tags: List[str], placeholder: str,
 #   端点同样无权直打 `core`（进常驻必须走既有条目的 promote 或候选审核）。
 #   两处各写一份 set = 迟早漂一份，而漂的那份就是「假申请」的入口。
 
+#: 常驻层标签（core）—— 检索可见性判据用（`RESERVED_TAG_EXACT` 里的同一个词）。
+CORE_TAG = "core"
+
+#: 共享层标签（shared）—— 共享层本来就是给人看的，检索侧一直放行。
+SHARED_TAG = "shared"
+
 #: 精确相等的保留标签（逗号边界上的完整标签，不做子串误伤：
 #: `core_x` / `ycore` / `kind:fact` 都不是保留字）。
-RESERVED_TAG_EXACT = frozenset({"core", "core_candidate", "shared"})
+RESERVED_TAG_EXACT = frozenset({CORE_TAG, "core_candidate", SHARED_TAG})
 
 #: 前缀即保留的标签族（代理归属由存储层按 `_agent_id` 注入，不是调用方能填的）。
 RESERVED_TAG_PREFIX = "agent:"
@@ -547,6 +553,119 @@ def replace_agent_tag(tags: str, old_id: str, new_id: str) -> str:
         return tags or ""
     parts[parts.index(old_tag)] = new_tag
     return ",".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 检索可见性（非 primary）—— 三后端共用一份口径
+# ---------------------------------------------------------------------------
+#
+# 🔴 **口径**（2026-10 ks_search_core_filter，与 core_list 侧
+#    `govern/visibility.py::visible_core_fragments` **同口径**）：
+#
+#     非 primary 看得见一行 ⇔
+#         ① 行带 `agent:<X>` 标签，且 X ∈ {自己} ∪ {share_memory=1 的代理}
+#         ② 行带 `shared` 标签（共享层字面量：共享层本来就是给人看的）
+#         ③ 行带 `core` 标签**且没有归属**（老库里还没有 `agent:` 标签的常驻条目）
+#
+#     core（常驻层）**不再无条件放行** —— 旧口径「凡带 `core` 标签的条目人人可搜」
+#     绕过了归属过滤：非 primary 能搜到**别人的**常驻记忆（实测：非 primary 搜一条
+#     命中 10 条，其中 9 条是 `core,...,agent:main-brain`）。现在 core 与普通条目
+#     用**同一把尺子**：按归属判（对称规则：谁都不许白拿别人的）。
+#
+#     ③ 那一档是「现状不变」硬回归线：core_list 侧也放行**无归属**的老数据
+#     （老库写它的时候存储还没注入归属标签），两边必须一致 —— 检索侧与 core_list
+#     侧对同一条老条目给同一个答案，否则「常驻层看得见、检索看不见」这种
+#     半拉子状态最难查。
+#
+# 🔴 **为什么落在这里**：判据散在三个后端各写一份，第三份迟早漏掉前两份的收紧
+#    （PG/SQLite 走 SQL 片段、Redis 的 RediSearch 查询语言表达不了 ③ 那一档 ⇒
+#    只能取回后在 Python 侧过同一把尺子）。这里是**唯一**那份口径。
+
+def visibility_filter_sql(col: str, visible_agent_tags: List[str], placeholder: str,
+                          pos_fn: str = "instr") -> Tuple[str, List[Any]]:
+    """非 primary 的**可见性** WHERE 片段（PG / SQLite 共用同一份口径）。
+
+    `visible_agent_tags`：可见的归属标签（`agent:<id>`，**已按 `_clean_tag` 清理**）。
+    `placeholder`：驱动占位符（PG `%s` / SQLite `?`）；`pos_fn`：取子串位置的
+    函数名（PG `strpos` / SQLite `instr`）—— 与 `tag_match_sql` 同一套约定。
+
+    口径见本节上面的注释：① 可见归属 ② `shared` ③ **无归属的** `core`。
+    """
+    hay = _TAG_COL_NORM.format(col=col)
+    params: List[Any] = []
+    parts: List[str] = []
+
+    # ① 可见归属 + ② 共享层字面量（tag_match_sql 产出的是「任一命中」的并集）
+    direct_sql, direct_args = tag_match_sql(
+        col, list(visible_agent_tags) + [SHARED_TAG], placeholder, pos_fn=pos_fn)
+    parts.append(direct_sql)
+    params.extend(direct_args)
+
+    # ③ core 且**没有归属**：归一化后的标签串里没有 `,agent:` ⇒ 这一行没有归属
+    #    （存储层保证一行至多一个归属标签 —— `_agent_tags` 会先剔掉所有旧的
+    #    `agent:` 再补一个，`replace_agent_tag` 只换一个）
+    core_sql, core_args = tag_match_sql(col, [CORE_TAG], placeholder, pos_fn=pos_fn)
+    owner_sql = f"{pos_fn}({hay}, {placeholder}) = 0"
+    parts.append(f"({core_sql} AND {owner_sql})")
+    params.extend(core_args)
+    params.append(f",{RESERVED_TAG_PREFIX}")
+
+    return "(" + " OR ".join(parts) + ")", params
+
+
+def _split_tags(tags: Any) -> Tuple[set, set]:
+    """`tags` 逗号串 → `(标签集合, 归属代理 id 集合)`。
+
+    归属标签按 `agent:` 前缀取（与 `govern/visibility.py::fragment_owner` 同意图：
+    逗号边界上的完整标签；分隔容错同款）。
+    """
+    tag_set: set = set()
+    owners: set = set()
+    for part in str(tags or "").replace("|", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        tag_set.add(part)
+        if part.startswith(RESERVED_TAG_PREFIX):
+            owners.add(part[len(RESERVED_TAG_PREFIX):].strip())
+    return tag_set, owners
+
+
+def row_visible_to_non_primary(tags: Any, visible_owners: Iterable[str]) -> bool:
+    """非 primary 看得见这一行吗？（`visibility_filter_sql` 那条 SQL 片段的
+    **行级镜像** —— 判据逐条一致：① 可见归属 ② `shared` ③ 无归属的 `core`）。
+
+    `visible_owners`：看得见的归属代理 id 集合（= {自己} ∪ {共享集}）。
+    """
+    tag_set, owners = _split_tags(tags)
+    if SHARED_TAG in tag_set:                       # ② 共享层
+        return True
+    if owners & {a for a in visible_owners if a}:    # ① 可见归属
+        return True
+    return (not owners) and CORE_TAG in tag_set      # ③ 无归属的 core
+
+
+def row_visible_after_core_narrow(tags: Any, visible_owners: Iterable[str]) -> bool:
+    """**core 那一档**的归属收窄（Redis 侧专用 —— 判据就是
+    `row_visible_to_non_primary`，不多不少）。
+
+    🔴 为什么只收 core 那一档：RediSearch 的查询语言只能做「标签并集」，
+    表达不了 ③ ——「有 `core` **且**没有 `agent:`」不是并集，是**差集**（索引又
+    没有 `WITHSUFFIXTRIE` ⇒ `agent:*` 前缀匹配用不了）⇒ core 的归属收窄只能
+    在候选取回后做。**其余两档（可见归属 / `shared`）由查询式里的标签并集负责**
+    ⇒ 非 core 的行这里一律放行（它们能进候选集，本来就过了查询式的收窄）。
+
+    两条合起来与 PG/SQLite 的 SQL 片段等价：
+      * core + 别人的归属 + 非共享 ⇒ 丢（SQL：core 分支不成立，且不属可见归属）
+      * core + 自己的/共享集的归属 ⇒ 留
+      * core + **无归属**（老数据）⇒ 留
+      * core + 共享层 ⇒ 留（SQL 的 `shared` 分支）
+      * 不带 core ⇒ 留（查询式已按归属/shared 收过）
+    """
+    tag_set, _ = _split_tags(tags)
+    if CORE_TAG not in tag_set:
+        return True
+    return row_visible_to_non_primary(tags, visible_owners)
 
 
 def fragment_key_for(text: str) -> str:

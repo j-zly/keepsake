@@ -140,6 +140,7 @@ from .shared import (
     synonym_rows,
     synonym_words,
     tag_match_sql,
+    visibility_filter_sql,
     # 分词口径单源 + 确定性 tiebreaker（2026-10 ks_recall_v1，见 storage_shared 的说明）
     query_lexemes,
     tiebreak_by_key,
@@ -1699,7 +1700,12 @@ class SqliteStorage(StorageBase):
         error`，p2.1 实测过）。
 
         `visible_agents`（2026-10 ks_share_memory）：**额外**可见的归属代理
-        （共享集）。缺省 / 空 ⇒ 可见标签与开关上线前逐字相同。
+        （共享集）。缺省 / 空 ⇒ 共享集那一档为空（其余口径见
+        `storage_shared.visibility_filter_sql`）。
+
+        🔴 2026-10 ks_search_core_filter：非 primary 的**可见性**片段不再由本文件
+        自己拼 —— 口径单点挪到 `storage_shared.visibility_filter_sql`（core 与
+        普通条目同一把尺子：按归属判；无归属的老 core 条目仍可见）。
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -1707,13 +1713,16 @@ class SqliteStorage(StorageBase):
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
         if not effective_is_primary:
-            # 多代理治理：子代理对常驻层只读 ⇒ 检索侧放开 core（PG/Redis 同口径）
+            # 🔴 2026-10 ks_search_core_filter：core（常驻层）**不再无条件放行** ——
+            #    旧口径「凡带 core 标签的条目人人可搜」绕过了归属过滤（非 primary 能搜到
+            #    别人的常驻记忆）。口径单点在 `storage_shared.visibility_filter_sql`：
+            #    可见归属 ∪ `shared` ∪ **无归属的** core（后者与 core_list 侧同口径，
+            #    守住「现状不变」硬回归线）。
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
                           if effective_agent_id else [])
             # 共享集：这些代理的记忆对本次调用方可见（标签口径与检索过滤同款）
             agent_tags += [self._clean_tag(f"agent:{a}") for a in (visible_agents or []) if a]
-            agent_tags += ["shared", "core"]
-            sql, args = tag_match_sql("tags", agent_tags, "?")
+            sql, args = visibility_filter_sql("tags", agent_tags, "?")
             clauses.append(sql)
             params.extend(args)
 

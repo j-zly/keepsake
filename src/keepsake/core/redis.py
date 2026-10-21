@@ -45,6 +45,7 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
+    row_visible_after_core_narrow,
     tiebreak_by_key,
 )
 from ..domain.splitter import extract_keywords, extract_entities, segment_query
@@ -1864,6 +1865,30 @@ class RedisStorage(StorageBase):
     # BM25 全文检索（默认，零成本）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _visible_rows(fragments: List[Dict[str, Any]], agent_id: str, is_primary: bool,
+                      visible_agents: Optional[Iterable[str]]) -> List[Dict[str, Any]]:
+        """非 primary 的可见性**后过滤**（2026-10 ks_search_core_filter）。
+
+        🔴 为什么 Redis 侧要事后判：RediSearch 的查询语言只能做「标签并集」，
+        表达不了「有 `core` **且**没有 `agent:`」这一档（索引没有 WITHSUFFIXTRIE
+        ⇒ `agent:*` 前缀匹配用不了）⇒ core 的**归属收窄**只能在候选取回后做。
+
+        判据与 PG/SQLite 的 SQL 片段（`storage_shared.visibility_filter_sql`）
+        **同一把尺子**（`storage_shared.row_visible_after_core_narrow`）：
+        ① 可见归属 ② `shared` ③ **无归属的** `core`；其中 ①② 由查询式的标签
+        并集负责，这里只收 ③ 那一档的归属（见该函数 docstring 的逐条对照）。
+
+        ponytail: 代价是「被收窄掉的候选占掉了 RediSearch 的 LIMIT 名额」——
+        这是 RediSearch 查询语言表达力不足的必然成本（PG/SQLite 在 WHERE 里
+        收窄，名额不被占）。
+        """
+        if is_primary:
+            return fragments
+        owners = {a for a in ([agent_id] + list(visible_agents or [])) if a}
+        return [f for f in fragments
+                if row_visible_after_core_narrow(f.get("tags", ""), owners)]
+
     def search_bm25(
         self,
         query: str,
@@ -1987,7 +2012,12 @@ class RedisStorage(StorageBase):
             filter_clause = ""
             if not effective_is_primary and effective_agent_id:
                 # 只能搜索 agent 指定的碎片 / shared / core 标签的碎片
-                # （多代理治理：子代理对常驻层只读 ⇒ 检索侧放开 core，与 PG/SQLite 同口径）
+                # 🔴 2026-10 ks_search_core_filter：**core 不再无条件放行** ——
+                #    RediSearch 的查询语言表达不了「有 core 且没有 agent:」这一档
+                #    （索引没有 WITHSUFFIXTRIE ⇒ `agent:*` 前缀匹配用不了），
+                #    所以查询里仍带着 core，**归属收窄在取回后做**
+                #    （`storage_shared.row_visible_after_core_narrow`，与 PG/SQLite 的
+                #    SQL 片段同一把尺子）。
                 # 2026-09-14: agent id 可能含 `-`/`:`，TAG 花括号内裸 `-` 会报语法错 → 过 _tag_safe
                 agent_filter = f"@tags:{{agent:{_tag_safe(effective_agent_id)}}}"
                 shared_filter = f"@tags:{{shared}}"
@@ -2087,6 +2117,9 @@ class RedisStorage(StorageBase):
                     frag["_bm25_score"] = float(getattr(doc, "score", 0.0))
                     fragments.append(frag)
 
+            # 🔴 非 primary 的可见性收窄（core 按归属判）——见 `_visible_rows`
+            fragments = self._visible_rows(fragments, effective_agent_id,
+                                           effective_is_primary, visible_agents)
             fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
             # 🔴 2026-10 ks_recall_v1：Redis 侧此前**没有** tiebreaker（PG/SQLite 早就有）。
             # 共用重排只按一个分字段排，而分是浮点连乘、同分极常见 ⇒ 同分行的相对名次
@@ -2172,19 +2205,22 @@ class RedisStorage(StorageBase):
             effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
             if not effective_is_primary and effective_agent_id:
-                # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
-                # （🔴 这一路**不含 core** —— 与 BM25 路的历史差异保持原样，
-                #  本单只**加**共享集，不顺手改既有口径）
+                # 只能搜索 agent 指定的碎片 / shared / core 标签的碎片
+                # 🔴 2026-10 ks_search_core_filter：这一路**补上 core**（与 BM25 路
+                #    同口径 —— 两条路此前一个带 core 一个不带，是历史差异不是语义），
+                #    但 core 的**归属收窄**在取回后做（查询语言表达不了「有 core 且
+                #    没有 agent:」那一档 —— 判据见 `storage_shared.row_visible_after_core_narrow`）。
                 agent_filter = f"@tags:{{agent:{_tag_safe(effective_agent_id)}}}"
                 shared_filter = "@tags:{shared}"
-                # 两者之一即可（+ 共享集：这些代理的记忆对本次调用方可见）
+                core_filter = "@tags:{core}"
+                # 三者之一即可（+ 共享集：这些代理的记忆对本次调用方可见）
                 vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
-                query_expr = ("(" + " || ".join([agent_filter, shared_filter] + vis)
-                              + f") AND {query_expr}")
+                query_expr = ("(" + " || ".join([agent_filter, shared_filter, core_filter]
+                                                + vis) + f") AND {query_expr}")
             elif not effective_is_primary and not effective_agent_id:
-                # 如果没有 agent_id，只搜索 shared 标签（+ 共享集）
+                # 如果没有 agent_id，只搜索 shared / core 标签（+ 共享集）
                 vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
-                query_expr = ("(" + " || ".join(["@tags:{shared}"] + vis)
+                query_expr = ("(" + " || ".join(["@tags:{shared}", "@tags:{core}"] + vis)
                               + f") AND {query_expr}")
 
             q = (
@@ -2238,6 +2274,9 @@ class RedisStorage(StorageBase):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))
                     fragments.append(frag)
 
+            # 🔴 非 primary 的可见性收窄（core 按归属判）——与 BM25 路同口径
+            fragments = self._visible_rows(fragments, effective_agent_id,
+                                           effective_is_primary, visible_agents)
             fragments = self._rerank_with_decay(fragments, score_key="_knn_score", is_knn=True)
             return fragments[: self._final_limit]
 

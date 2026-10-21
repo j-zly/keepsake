@@ -2,7 +2,10 @@
 
 🔴 **本文件锁死的是三条语义**，不是某个实现细节：
   1. **非 primary 对常驻层只读（检索侧）**：子代理能召回 `core` 条目 + 自己域 +
-     `shared`，但**召回不到别的 agent 的私有条目**（PG/Redis/SQLite 三后端同口径）
+     `shared`，但**召回不到别的 agent 的私有条目**（PG/Redis/SQLite 三后端同口径）。
+     🔴 2026-10 ks_search_core_filter 追加一档：**带归属的** core 条目（`core,agent:x`）
+     按归属判 —— 非 primary 召回不到别人的常驻条目（裸 `core` 不再是通行证）；
+     **无归属的**老常驻条目仍可见（现状不变硬回归线）
   2. **写闸**：非 primary 写 `tags="core"` 落库必须是 `core_candidate`（审核前不进
      常驻层）；标签判据是逗号边界的完整标签相等（`core_x` 不算命中）；
      **primary 写 core 也不再直通**（2026-10 常驻层入口改革：落候选 + 提名日戳），
@@ -83,6 +86,36 @@ def test_non_primary_still_isolated_from_other_agent(lite_seeded):
                      s.search_bm25(QUERY, tag_filter="", agent_id="worker",
                                    is_primary=False))
         assert "丁" not in who, who
+    finally:
+        s.close()
+
+
+def test_non_primary_recalls_no_foreign_owned_core(tmp_path):
+    """🔴 2026-10 ks_search_core_filter：**带归属的** core 条目对非 primary 零命中。
+
+    旧口径（裸 `core` 人人放行）⇒ 子代理能搜到**别人的**常驻记忆（实测：一次搜索
+    命中 10 条，其中 9 条是 `core,...,agent:main-brain`）。现在 core 与普通条目
+    同一把尺子：按归属判（共享集里的代理除外）。
+
+    「**无归属的**老常驻条目仍然可见」——见上面的 `test_non_primary_recalls_core`
+    （现状不变硬回归线，两条一起才是完整口径）。
+    """
+    path = str(tmp_path / "owned_core.db")
+    st = SqliteStorage(path=path, is_primary=True)     # 无 agent_id ⇒ 归属标签原样落库
+    try:
+        assert st.ensure_index() is True
+        assert st.store(text=f"{QUERY} 甲", tags="core,agent:other",
+                        category="probe", source="probe") is True
+    finally:
+        st.close()
+
+    s = SqliteStorage(path=path, is_primary=True)
+    try:
+        assert s.ensure_index() is True
+        who = sorted(r["content"][-1] for r in
+                     s.search_bm25(QUERY, tag_filter="", agent_id="worker",
+                                   is_primary=False))
+        assert who == [], who
     finally:
         s.close()
 
