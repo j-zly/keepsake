@@ -7,32 +7,37 @@
   绝不被背着开小会）。按代理 / 线程 / 关键词筛，服务端分页，按 seq 倒序。
 * `POST /api/v1/agents/{agent_id}/dm` —— 每个代理的 `dm_enabled` 开关
   （关掉的代理收不到私信）。
+* `POST /api/v1/messages/nudge` —— **手动 / 批量触发提醒**：给选中的收件代理
+  推一帧 `dm-nudge` 事件（SSE 快车道）。只推**元数据**（未读数 + 最近发件人），
+  **没有正文**；没挂着流就如实回报 `delivered=false`（提醒**不补发**）。
 
-🔴 **只读治理面**：两个端点都不回显任何凭据字段（明文 / 哈希都不出现）。
+🔴 **只读治理面**：这些端点都不回显任何凭据字段（明文 / 哈希都不出现）。
 消息正文按原样返回 —— 那是治理面要看的东西，不是秘密。
 
 🔴 **列表端点一个字段都不改**（尤其不动 `read_at`）：控制台里「看一眼历史」
 不许把对方的信标成已读（收信即消费是收件人的动作，不是旁观者的）。
 口令在 `govern/messaging.py` 的 `list_messages` 里同款纪律。
 
-写端点（dm 开关）与 `agents.py` 其余写端点**同一套样板**：
+写端点（dm 开关、nudge）与 `agents.py` 其余写端点**同一套样板**：
 `require_session` + `write_guard` + 改前备份 + 一次审计（含被拒绝的写）。
+nudge **不改任何数据**（只是推一帧事件）⇒ 没有「改前快照」可备份，只留审计。
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
+from keepsake.govern.events import publish_nudge
 from keepsake.govern.messaging import LIMIT_MAX, Messaging
 
 from .. import audit
 from ..deps import get_storage, require_session
 from .agents import _backup, _need_agent, _registry
-from .ops import _need_flag, write_guard
+from .ops import _need_flag, _reject, write_guard
 
 router = APIRouter(tags=["messages"])
 
@@ -41,6 +46,9 @@ logger = logging.getLogger("keepsake.api.messages")
 
 #: 每页默认条数（信箱量级小：几十条对话，一页 50 条足够看一片）。
 DEFAULT_SIZE = 50
+
+#: 一次 nudge 最多点名几个代理（1~50，去重后计）。
+NUDGE_MAX_AGENTS = 50
 
 
 class AgentDmBody(BaseModel):
@@ -53,6 +61,31 @@ class AgentDmBody(BaseModel):
 
     enabled: bool = Field(..., description="true = 接收私信；false = 不收（别人投不进来）")
     confirm: Any = False
+
+
+class NudgeBody(BaseModel):
+    """`POST /api/v1/messages/nudge` 的请求体：点名要提醒的收件代理。
+
+    🔴 `agents` 是**收件代理 id 列表**（1~NUDGE_MAX_AGENTS 个，**去重后**计）。
+    不带 `confirm`：本端点**不改任何数据**（只是推一帧事件）⇒ 没有「改坏
+    什么」可回滚，也就没有二次确认这道闸；确认放在**界面**上（弹框 + 显示
+    目标当前未读数）。
+    """
+
+    agents: List[str] = Field(default_factory=list, description="要提醒的收件代理 id（1~50 个）")
+
+
+def _dedupe_agents(raw: List[str]) -> List[str]:
+    """去重 + 去空白 + 保序（同一个代理点两次只提醒一次）。"""
+    out: List[str] = []
+    seen = set()
+    for item in raw or []:
+        aid = str(item or "").strip()
+        if not aid or aid in seen:
+            continue
+        seen.add(aid)
+        out.append(aid)
+    return out
 
 
 def _item(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -91,7 +124,10 @@ def list_messages(
     box = Messaging(storage)
     data = box.list_messages(agent=agent, thread=thread, q=q, page=page, size=size)
     return {"items": [_item(r) for r in data.get("items") or []],
-            "total": int(data.get("total") or 0)}
+            "total": int(data.get("total") or 0),
+            # 每个收件人的**未读条数**（`{agent_id: count}`）—— 前端「按收件代理
+            # 分组」那栏的未读数就来自这里（🔴 计数只由后端给，前端不自己数）。
+            "unread": box.unread_by_agent()}
 
 
 @router.post("/api/v1/agents/{agent_id}/dm",
@@ -118,3 +154,54 @@ def set_agent_dm(agent_id: str, body: AgentDmBody,
                  reason=f"dm_enabled={bool(body.enabled)} (changed={changed}); backup={backup}")
     return {"ok": True, "agent_id": agent_id, "dm_enabled": bool(body.enabled),
             "changed": bool(changed), "backup": backup}
+
+
+@router.post("/api/v1/messages/nudge",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def nudge_messages(body: NudgeBody,
+                   storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """给点名的收件代理**推一帧提醒**（`dm-nudge` 事件，走 SSE 快车道）。
+
+    逐代理如实回报：`{agent_id, delivered, reason, unread}`。
+
+    * `delivered=true` ＝ 该代理当前**挂着 SSE 流**，帧已经推出去；
+    * `delivered=false` ＝ 没挂着流（`reason=no_stream`）／该代理关了推送
+      （`reason=push_disabled`）／代理不存在（`reason=unknown_agent`）。
+      🔴 **提醒不补发**：没连着就没有快车道，寄生层（对话轮提醒）与
+      `unread_dm` 水位仍在 —— 这里**如实**说没送到，不谎报送达。
+    * 帧里**只有元数据**（未读数 + 最近发件人），**没有正文**。
+
+    🔴 本端点**不改任何数据**（只是推一帧事件）⇒ 没有「改前快照」可备份，
+    只留一行审计（控制台写操作纪律的另一半）。
+    """
+    action = "messages.nudge"
+    ids = _dedupe_agents(list(body.agents or []))
+    if not ids:
+        _reject(400, "no_agents", "至少点名一个收件代理", action, "")
+    if len(ids) > NUDGE_MAX_AGENTS:
+        _reject(400, "too_many_agents",
+                f"一次最多提醒 {NUDGE_MAX_AGENTS} 个代理（收到 {len(ids)} 个）",
+                action, ",".join(ids[:NUDGE_MAX_AGENTS]))
+    registry = _registry(storage)
+    box = Messaging(storage)
+    results: List[Dict[str, Any]] = []
+    for aid in ids:
+        if not registry.get(aid):
+            results.append({"agent_id": aid, "delivered": False,
+                            "reason": "unknown_agent", "unread": 0})
+            continue
+        snap = box.unread_snapshot(aid)
+        unread = int(snap.get("count") or 0)
+        if not registry.push_enabled(aid):
+            results.append({"agent_id": aid, "delivered": False,
+                            "reason": "push_disabled", "unread": unread})
+            continue
+        delivered = publish_nudge(aid, unread=unread,
+                                  from_id=str(snap.get("last_from") or ""),
+                                  seq=int(snap.get("max_seq") or 0)) > 0
+        results.append({"agent_id": aid, "delivered": bool(delivered),
+                        "reason": "" if delivered else "no_stream", "unread": unread})
+    ok_count = sum(1 for r in results if r["delivered"])
+    audit.record(action, ",".join(ids), ok=True,
+                 reason=f"delivered={ok_count}/{len(results)}")
+    return {"ok": True, "results": results}

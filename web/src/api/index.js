@@ -177,6 +177,15 @@ export const api = {
   // （这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据。
   setAgentShare: (agentId, enabled) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/share`, { enabled, confirm: true }).then((r) => r.data),
+  // 私信实时推送开关（push_enabled）：confirm 恒为 true；只改「能不能被连上来」
+  // （SSE 长连接的建流闸），不碰状态 / 角色 / 凭据。
+  setAgentPush: (agentId, enabled) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/push`, { enabled, confirm: true }).then((r) => r.data),
+  // 手动 / 批量触发提醒：给点名的收件代理推一帧 `dm-nudge` 事件（只元数据）。
+  // 🔴 回包里逐代理的 `delivered` 是**后端如实回报**的 —— 没挂着流就是 false，
+  //   前端不许自己乐观成「已送达」。
+  nudgeMessages: (agents) =>
+    http.post('/api/v1/messages/nudge', { agents }).then((r) => r.data),
   // per-agent 注入预算（core_budget_chars）：confirm 恒为 true；只改**一个阈值**，
   // 不碰状态 / 角色 / 凭据。传 null = 清空 ⇒ 沿用全局默认（不是「预算 0」）。
   setAgentBudget: (agentId, coreBudgetChars) =>

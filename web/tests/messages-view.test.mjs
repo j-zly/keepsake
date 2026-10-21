@@ -76,8 +76,13 @@ test('空态说人话：全库空与筛空是两套话', () => {
 
 test('这页只有拉、没有改：绝不替用户动消息', () => {
   const calls = [...VIEW.matchAll(/api\.(\w+)\(/g)].map((m) => m[1])
-  assert.deepEqual([...new Set(calls)].sort(), ['listAgents', 'listMessages'], '本页只许拉，不许改')
+  // 🆕 ks_dm_sse：多了一个 nudgeMessages —— 它**不改任何消息**（只推一帧事件
+  //   摘要），页面仍然不删、不改、不标已读（用户铁律：绝不替用户动消息）。
+  assert.deepEqual([...new Set(calls)].sort(), ['listAgents', 'listMessages', 'nudgeMessages'],
+    '本页只许拉 + 推提醒，不许改消息')
   assert.doesNotMatch(VIEW, /\balert\(|window\.confirm/, '禁原生弹框')
+  // 消息本体一个字段都不许被这页动（没有删除 / 标已读 / 改正文的接口）
+  assert.doesNotMatch(VIEW, /api\.(delete|update|remove|markRead)\w*\(/, '不许动消息本体')
 })
 
 test('正文超 160 字截断，点开看全文；已读/未读走 chip 徽标', () => {

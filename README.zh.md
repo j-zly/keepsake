@@ -609,6 +609,80 @@ server.run("stdio")                         # 任何 MCP 客户端连上就能�
 
 **传输。** `stdio` 是缺省。`http`（streamable-http）**只听 `127.0.0.1`** —— 绑非回环地址直接以退出码 2 终止，不启动。记忆库没有自带认证，把它暴露到网络上等于把一个人的长期记忆公开读；要对外请走反向代理。CLI：`python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`。
 
+## 私信实时推送（SSE 长连接）
+
+2026-10 ks_dm_sse。私信实时性分**三层**，逐层递降、互为兜底：
+
+| 层 | 什么时候动 | 拿到什么 | 代价 |
+|----|-----------|---------|------|
+| **SSE 长连接** | 服务端 `message_send` 落库 COMMIT 成功后**顺原流**推一帧 | `seq` / `from` / `unread`（**只有元数据，没有正文**） | 客户端要常驻一条长连接 |
+| **重连追帧** | 建流成功的那一刻 | 当前未读水位（有未读就立刻推一帧） | 无 |
+| **`unread_dm` 水位** | 每轮对话（寄生提醒行）/ 主动查 | 未读条数 | 只能轮询，延迟一轮 |
+
+SSE 端点挂在 **MCP 的 http 传输同进程同端口**（默认 `127.0.0.1:8210`）：`GET /events`。
+
+### 建流要过三道闸
+
+`Authorization: Bearer <ksk_凭据>` → 注册表**按凭据反查**代理 → `status=approved` **且** `push_enabled=1`（控制台「代理登记 → 编辑 → 私信实时推送」里开）。任一不满足 ⇒ **401 / 403，不建流**。
+
+```bash
+# curl（-N = 不缓冲，逐帧看）
+curl -N -H "Authorization: Bearer ksk_..." http://127.0.0.1:8210/events
+```
+
+```python
+import httpx
+
+with httpx.Client(timeout=None) as client:
+    with client.stream(
+        "GET",
+        "http://127.0.0.1:8210/events",
+        headers={"Authorization": "Bearer ksk_..."},
+    ) as resp:
+        for line in resp.iter_lines():      # event: / data: 逐行到
+            print(line)
+```
+
+### 事件格式（两类）
+
+帧的形状一样：`event:` 行 + `data:` 行 + 一个空行。
+
+```
+event: dm
+data: {"seq": 12, "from": "worker-1", "unread": 3}
+
+event: dm-nudge
+data: {"seq": 12, "from": "worker-1", "unread": 3}
+```
+
+* `dm` —— 有人给你投了私信（`message_send` 落库后推的那一帧）；
+* `dm-nudge` —— 人工在控制台点「触发提醒」推的（消息中心 → 按收件代理 → 触发提醒 / 批量提醒）。
+
+🔴 **帧里没有正文**：正文永远走信箱本体（`message_inbox` 拿）—— 推正文等于把私信复制进日志与代理内存。
+
+### 边界与保活
+
+* **心跳**：每 25s 一行 `: ping` 注释帧（客户端忽略即可）；
+* **并发**：单代理最多 **2** 条流，**新的踢旧的**（客户端自己会重连）；
+* **挂起上限**：默认 30 分钟到点**服务端主动断**（客户端自会重连）；
+* **吊销生效边界 = 一个心跳间隔（≤25s）**：每个心跳复核一次建流资格 ——
+  凭据被吊销或 `push_enabled` 被关之后，已挂着的那条流**最多再活 25s**；
+* **进程内总线**：事件走**进程内**总线（`dict[agent_id → list[asyncio.Queue]]`）⇒
+  控制台进程与 MCP 进程**分开跑**时，控制台的「触发提醒」推不到 MCP 侧挂着的那条流
+  （回包**如实**说 `delivered=false`，不谎报；寄生层仍在）。
+  `ponytail:` 真要跨进程，把这一层换成 Redis pub/sub 即可。
+
+### 手动 / 批量触发提醒
+
+控制台「消息中心 → 按收件代理」：
+
+* 每个收件代理一行，显示它当前未读数 + 「触发提醒」按钮（弹框确认）；
+* 勾选多个 → 工具条「批量提醒已选 N 个」（全选 / 清空与常驻层页、记忆条目页同一口径）；
+* 逐代理回报 **✓送达 / ⚠离线**（离线 = 对方没挂着流，**提醒不补发**，不谎报送达）。
+
+对应后端端点：`POST /api/v1/messages/nudge`（body `{agents: ["id1", ...]}`，1~50 个去重）、
+`POST /api/v1/agents/{agent_id}/push`（开关）。
+
 ## 多代理记忆治理
 
 四道闸，均已在生产生效：

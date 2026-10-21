@@ -713,6 +713,96 @@ server.run("stdio")                         # any MCP client connects and is don
 
 **Transport.** `stdio` is the default. `http` (streamable-http) listens on `127.0.0.1` only — a non-loopback bind address exits with code 2 rather than starting. The memory store has no authentication of its own, so exposing it on the network is equivalent to publishing a person's long-term memory; put a reverse proxy in front of it instead. CLI: `python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`.
 
+## Private-Message Push over SSE
+
+2026-10 ks_dm_sse. Private-message freshness has **three layers**, each one
+falling back to the next:
+
+| Layer | Fires when | What it delivers | Cost |
+|-------|-----------|------------------|------|
+| **SSE long connection** | the server pushes one frame right after `message_send` commits | `seq` / `from` / `unread` (**metadata only — never the body**) | the client keeps a connection open |
+| **Catch-up frame on reconnect** | the moment the stream is established | the current unread watermark (one frame if anything is unread) | none |
+| **`unread_dm` watermark** | every conversation turn (the reminder line) / on demand | the unread count | polling only, one turn of latency |
+
+The SSE endpoint lives on the **MCP http transport, same process and port**
+(`127.0.0.1:8210` by default): `GET /events`.
+
+### Building a stream takes three gates
+
+`Authorization: Bearer <ksk_credential>` → the registry **looks the agent up by
+credential** → `status=approved` **and** `push_enabled=1` (console: *Agent
+Registry → Edit → Private-message push*). Anything else ⇒ **401 / 403, no
+stream**.
+
+```bash
+# curl (-N = unbuffered, frame by frame)
+curl -N -H "Authorization: Bearer ksk_..." http://127.0.0.1:8210/events
+```
+
+```python
+import httpx
+
+with httpx.Client(timeout=None) as client:
+    with client.stream(
+        "GET",
+        "http://127.0.0.1:8210/events",
+        headers={"Authorization": "Bearer ksk_..."},
+    ) as resp:
+        for line in resp.iter_lines():      # event: / data: line by line
+            print(line)
+```
+
+### Event format (two kinds)
+
+Same frame shape: an `event:` line, a `data:` line, then a blank line.
+
+```
+event: dm
+data: {"seq": 12, "from": "worker-1", "unread": 3}
+
+event: dm-nudge
+data: {"seq": 12, "from": "worker-1", "unread": 3}
+```
+
+* `dm` — somebody sent you a private message (pushed after the commit);
+* `dm-nudge` — a human pressed *Nudge* in the console (Message Center → by
+  recipient).
+
+🔴 **No message body ever travels in a frame**: the body is fetched from the
+mailbox itself (`message_inbox`) — pushing bodies would copy private messages
+into logs and agent memory.
+
+### Limits and keep-alive
+
+* **Heartbeat**: one `: ping` comment frame every 25s (clients ignore it);
+* **Concurrency**: at most **2** streams per agent, **the new one kicks the
+  old one** (clients reconnect on their own);
+* **Hang ceiling**: 30 minutes by default, after which **the server closes the
+  stream** (clients reconnect on their own);
+* **Revocation takes effect within one heartbeat (≤25s)**: every heartbeat
+  re-checks the stream's admission — a revoked credential or a disabled
+  `push_enabled` ends the open stream within 25s;
+* **The bus is in-process** (`dict[agent_id → list[asyncio.Queue]]`) ⇒ when the
+  console and the MCP server run as separate processes, a console *nudge*
+  cannot reach the stream held by the MCP process (the reply honestly says
+  `delivered=false`; the reminder layer still runs).
+  `ponytail:` cross-process means swapping this layer for Redis pub/sub.
+
+### Manual and batch nudges
+
+Console → *Message Center → by recipient*:
+
+* one row per recipient with its current unread count and a *Nudge* button
+  (confirmed in a dialog);
+* tick several → the toolbar shows *Nudge the N selected* (select-all / clear
+  follow the same convention as the resident-layer and memory-entry pages);
+* per-agent feedback: **✓ delivered / ⚠ offline** (offline = nobody is
+  listening — the nudge is **not** replayed, and the reply never lies).
+
+Backing endpoints: `POST /api/v1/messages/nudge` (body
+`{agents: ["id1", ...]}`, 1–50, de-duplicated) and
+`POST /api/v1/agents/{agent_id}/push` (the switch).
+
 ## Multi-Agent Memory Governance
 
 Four gates, all live in production:

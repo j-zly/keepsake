@@ -2,7 +2,7 @@
   代理登记（keepsake_agent_registry 的控制台面 · 业务页）。
 
   2026-10-20 拆页：待审队列从本页整段搬去 /agents-review（代理审核）。
-  本页只管**已批准代理的日常维护**（编辑 ID 与备注名 / 设角色 / 上下文过滤 / 吊销 / 重新批准 / 换发凭据）
+  本页只管**已批准代理的日常维护**（编辑 ID 与备注名 / 注入预算 / 私信实时推送 / 设角色 / 上下文过滤 / 吊销 / 重新批准 / 换发凭据）
   +「登记新代理」；pending 的行不在本页出现（去审核页看）。
   两页共用一次性凭据弹框（components/CredentialDialog.vue）—— **一份实现，不复制**。
 
@@ -427,6 +427,22 @@
             @keyup.enter.prevent="doEdit"
           />
         </el-form-item>
+        <!--
+          私信实时推送（SSE 快车道）：开着 = 这个代理可以挂一条 SSE 长连接，
+          别人给它投私信时服务端顺这条流推一帧**元数据**（未读数 / 最近发件人）。
+          🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个入口。
+          🔴 与私信开关 / 共享开关**同一档**：只改投递偏好，不碰状态 / 角色 / 凭据。
+        -->
+        <el-form-item label="私信实时推送（SSE 长连接）">
+          <el-switch
+            v-model="editPush"
+            :title="editPush ? '已开启：允许挂 SSE 长连接收私信提醒' : '已关闭：别人连不上它的提醒通道'"
+          />
+          <p class="tip">
+            开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
+            有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
+          </p>
+        </el-form-item>
       </el-form>
       <p class="tip">
         改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
@@ -436,6 +452,8 @@
         改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
         <br />
         改注入预算：只改这个代理自己的注入阈值（留空 = 沿用全局默认），改完立刻生效。
+        <br />
+        私信实时推送：只改「能不能被连上来」，状态 / 角色 / 凭据一个都不动。
       </p>
       <template #footer>
         <el-button :disabled="busy" @click="editOpen = false">取消</el-button>
@@ -748,6 +766,8 @@ const editId = ref('')
 const editName = ref('')
 /** 注入预算输入框（字符串）：留空 = 沿用全局默认（提交时转成 null）。 */
 const editBudget = ref('')
+/** 私信实时推送开关（布尔）：缺省**关**（往外放行的开关，缺省必须最严）。 */
+const editPush = ref(false)
 /** 主代理不能改 id（后端同口径 400）：输入框直接锁死，备注名照改。 */
 const editPrimary = computed(() => editRow.value?.role === 'primary')
 
@@ -756,6 +776,7 @@ function openEdit(row) {
   editId.value = row?.agent_id || ''
   editName.value = row?.name || ''
   editBudget.value = row?.core_budget_chars == null ? '' : String(row.core_budget_chars)
+  editPush.value = row?.push_enabled === true
   editOpen.value = true
   loadGlobalBudget()      // placeholder 里的「当前全局」顺手刷一次（fire-and-forget）
 }
@@ -818,8 +839,11 @@ async function doEdit() {
   }
   const oldBudget = row.core_budget_chars ?? null
   const budgetChanged = wantBudget !== oldBudget
+  // 私信实时推送：与其它几项同一档（只改投递偏好，不碰状态 / 角色 / 凭据）
+  const wantPush = !!editPush.value
+  const pushChanged = wantPush !== (row.push_enabled === true)
   // 什么都没改：关窗，一个请求都不发
-  if (!idChanged && !nameChanged && !budgetChanged) {
+  if (!idChanged && !nameChanged && !budgetChanged && !pushChanged) {
     editOpen.value = false
     return
   }
@@ -891,6 +915,25 @@ async function doEdit() {
         return
       }
       done.push(wantBudget === null ? '注入预算已沿用全局' : `注入预算已设为 ${wantBudget} 字符`)
+      if (r.note) notes.push(r.note)
+    }
+    if (pushChanged) {
+      // 私信实时推送：开 = 允许挂 SSE 长连接；关 = 别人连不上它的提醒通道。
+      let r
+      try {
+        r = await api.setAgentPush(targetId, wantPush)
+      } catch (e) {
+        if (idChanged) {
+          // ID 已经改了 —— 说清「改了一半」，别让人以为全没生效
+          editOpen.value = false
+          showToast(`已更新：${done.join('，')}；但私信实时推送没改：${e.message}`, 'warning')
+          load(true)
+        } else {
+          showError(`私信实时推送开关保存失败：${e.message}`)
+        }
+        return
+      }
+      done.push(wantPush ? '已开启私信实时推送' : '已关闭私信实时推送')
       if (r.note) notes.push(r.note)
     }
     editOpen.value = false

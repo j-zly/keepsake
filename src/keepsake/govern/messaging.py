@@ -50,6 +50,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
+from .events import publish_dm
 from .registry import (
     _SqlBase,
     _backend_of,
@@ -292,6 +293,32 @@ class _MsgSqlBackend(_SqlBase):
             senders = [str(r[0]) for r in srows if r and r[0]]
         return {"count": count, "senders": senders}
 
+    def unread_snapshot(self, agent_id: str) -> Dict[str, Any]:
+        """未读私信的**水位快照**：条数 + 最大 seq + 最近一个发件人（**不取正文**）。
+
+        SSE 重连追帧用的就是这一份（见 `mcp_server/events.py`）：
+        客户端刚连上就立刻知道「我有多少条没读、最新那条是谁发的」。
+        """
+        where = f"to_id = {self.ph} AND read_at IS NULL"
+        rows = self.read(
+            f"SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM {TABLE} WHERE {where}",
+            (agent_id,))
+        count = int(rows[0][0]) if rows and rows[0] else 0
+        max_seq = int(rows[0][1]) if rows and rows[0] and rows[0][1] is not None else 0
+        last_from = ""
+        if count > 0:
+            frows = self.read(
+                f"SELECT from_id FROM {TABLE} WHERE {where} ORDER BY seq DESC LIMIT 1",
+                (agent_id,))
+            last_from = str(frows[0][0]) if frows and frows[0] else ""
+        return {"count": count, "max_seq": max_seq, "last_from": last_from}
+
+    def unread_by_agent(self) -> Dict[str, int]:
+        """**每个收件人**的未读条数（`{agent_id: count}`）—— 控制台「按收件代理分组」用。"""
+        rows = self.read(
+            f"SELECT to_id, COUNT(*) FROM {TABLE} WHERE read_at IS NULL GROUP BY to_id")
+        return {str(r[0]): int(r[1]) for r in rows if r and r[0]}
+
     # -- 治理面只读列表 -------------------------------------------------
     def list_messages(self, agent: str, thread: str, q: str,
                       page: int, size: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -451,6 +478,39 @@ class _RedisBackend:
                         break
         return {"count": count, "senders": senders}
 
+    def unread_snapshot(self, agent_id: str) -> Dict[str, Any]:
+        """未读私信的水位快照（条数 + 最大 seq + 最近发件人）。
+
+        Redis 侧的**未读队列本身就是未读集合**（见模块 docstring 的取舍），
+        所以条数 = `LLEN`，最近那条 = 队尾（`LINDEX -1`）。
+        """
+        client = self._client()
+        key = self.inbox_key(agent_id)
+        count = int(client.llen(key) or 0)
+        max_seq = 0
+        last_from = ""
+        if count > 0:
+            try:
+                row = _norm_row(json.loads(_text(client.lindex(key, -1))))
+                max_seq = int(row.get("seq") or 0)
+                last_from = str(row.get("from_id") or "")
+            except (TypeError, ValueError):
+                pass
+        return {"count": count, "max_seq": max_seq, "last_from": last_from}
+
+    def unread_by_agent(self) -> Dict[str, int]:
+        """每个收件人的未读条数（`{agent_id: count}`）—— 控制台「按收件代理分组」用。"""
+        client = self._client()
+        out: Dict[str, int] = {}
+        for key in client.scan_iter(match=f"{REDIS_KEY_INBOX}*"):
+            name = _text(key)
+            if not name.startswith(REDIS_KEY_INBOX):
+                continue
+            agent_id = name[len(REDIS_KEY_INBOX):]
+            if agent_id:
+                out[agent_id] = int(client.llen(key) or 0)
+        return out
+
     # -- 治理面只读列表 -------------------------------------------------
     def list_messages(self, agent: str, thread: str, q: str,
                       page: int, size: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -552,7 +612,19 @@ class Messaging:
         if len(body) > CONTENT_MAX:
             raise ValueError(f"content 超长（{len(body)} > {CONTENT_MAX} 字符）")
         self._ready()
-        return int(self._be.send(sender, target, body, (thread_id or "").strip()))
+        seq = int(self._be.send(sender, target, body, (thread_id or "").strip()))
+        # ---- 投递钩子（2026-10 ks_dm_sse）：落库 COMMIT 成功后顺原流推一帧元数据 ----
+        # 🔴 **只推元数据**（seq / from / unread），正文永远走信箱本体；
+        #   **没有挂着连接 = 静默丢弃**（不重试、不轰炸）—— 补偿在下一层
+        #   （SSE 重连追帧 + unread_dm 水位），不在这一层做。
+        #   推送失败**不许**把已经落库的消息说成没投出去（消息已经送到了）。
+        try:
+            publish_dm(target, seq=seq, from_id=sender,
+                       unread=self.unread_count(target))
+        except Exception as e:      # noqa: BLE001 —— 推送失败不影响已落库的消息
+            logger.warning("keepsake: 私信推送失败（消息已落库，不重试）：%s: %s",
+                           type(e).__name__, e)
+        return seq
 
     # ---- 读 -----------------------------------------------------------
     def fetch_inbox(self, agent_id: str, unread_only: bool = True,
@@ -589,6 +661,23 @@ class Messaging:
     def unread_count(self, agent_id: str) -> int:
         """还有几条没读（收件箱里未读的消息条数）。"""
         return int(self.unread_summary(agent_id).get("count") or 0)
+
+    def unread_snapshot(self, agent_id: str) -> Dict[str, Any]:
+        """未读私信的水位快照：`{count, max_seq, last_from}`（**不取正文**）。
+
+        SSE **重连追帧**用的就是这一份 —— 客户端刚连上就立刻知道
+        「我有多少条没读、最新那条是谁发的」（帧里同样只有元数据）。
+        """
+        aid = (agent_id or "").strip()
+        if not aid:
+            return {"count": 0, "max_seq": 0, "last_from": ""}
+        self._ready()
+        return dict(self._be.unread_snapshot(aid))
+
+    def unread_by_agent(self) -> Dict[str, int]:
+        """**每个收件人**的未读条数（`{agent_id: count}`）—— 控制台「按收件代理分组」用。"""
+        self._ready()
+        return dict(self._be.unread_by_agent())
 
     # ---- 治理面只读列表（控制台「消息中心」用）------------------------
     def list_messages(self, agent: str = "", thread: str = "", q: str = "",

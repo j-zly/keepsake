@@ -86,6 +86,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/share",
     # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
     "/api/v1/agents/{agent_id}/budget",
+    # 私信实时推送开关一条（ks_dm_sse）：只改「能不能被连上来」，不是治理动作
+    "/api/v1/agents/{agent_id}/push",
+    # 消息中心手动 / 批量触发提醒一条（ks_dm_sse）：推一帧事件，不改数据
+    "/api/v1/messages/nudge",
 } | AUTH_POST_PATHS
 
 

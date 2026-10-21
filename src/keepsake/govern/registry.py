@@ -107,7 +107,7 @@ REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
-    "meta", "dm_enabled", "share_memory", "core_budget_chars",
+    "meta", "dm_enabled", "share_memory", "core_budget_chars", "push_enabled",
 )
 
 #: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -131,6 +131,19 @@ SHARE_ENABLED_VALUES: Tuple[str, ...] = ("1", "true", "yes", "on")
 #: `share_memory` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
 SHARE_COLUMN = "share_memory"
 SHARE_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
+
+#: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: 🔴 与 `share_memory` 同一档：**缺省是关**（'0'）——「实时推送」是**往外放行**
+#: 的开关（别人能连上来推事件给你），缺省必须是最严的那一档（老行没有这一列
+#: ⇒ 一律当关，语义不变）。
+PUSH_ENABLED_ON = "1"
+PUSH_DISABLED_ON = "0"
+#: 认作「开」的值（其余一切（含空 / 缺列）都当关）。
+PUSH_ENABLED_VALUES: Tuple[str, ...] = ("1", "true", "yes", "on")
+
+#: `push_enabled` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
+PUSH_COLUMN = "push_enabled"
+PUSH_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 
 #: `core_budget_chars` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
 #: 🔴 **可空**：NULL = 「沿用全局的注入预算」，有值 = 该代理**自己**的预算。
@@ -172,7 +185,11 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     -- NULL = 沿用全局默认（config.json 的 retrieval.core_char_budget，缺省回退，
     -- 不改存量语义）；有值 = 该代理专用（正整数）。
     -- 老库补列落 NULL ⇒ 存量行一个都没被改过。
-    core_budget_chars    integer NULL
+    core_budget_chars    integer NULL,
+    -- 2026-10 ks_dm_sse：是否允许这个代理接 SSE 长连接（私信实时推送快车道）。
+    -- 默认 '0'（关）—— 与 share_memory 同一档：往外放行的开关，缺省最严；
+    -- 老库补列落 '0' ⇒ 存量行的语义不变（谁也没被连上来过）。
+    push_enabled         text NOT NULL DEFAULT '0'
 )
 """
 
@@ -273,6 +290,10 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     # 「新增字段不许改存量语义」：老行一个都没被共享出去）。
     share = str(row.get("share_memory") or "").strip()
     row["share_memory"] = share if share else SHARE_DISABLED_ON
+    # push_enabled：缺列 / 空值 ⇒ 默认**关**（与 DDL 的 DEFAULT '0' 同口径，
+    # 「新增字段不许改存量语义」：老行一个都没被连上过）。
+    push = str(row.get("push_enabled") or "").strip()
+    row["push_enabled"] = push if push else PUSH_DISABLED_ON
     # core_budget_chars：缺列 / 空值 ⇒ None（**沿用全局**）；脏值（0 / 负数 /
     # 非整数）也当 None —— 非法预算回落全局，比回落 0 安全得多（0 = 全被截掉）。
     row["core_budget_chars"] = _norm_budget(row.get("core_budget_chars"))
@@ -324,6 +345,16 @@ def _share_is_on(row: Optional[Dict[str, Any]]) -> bool:
     return value in SHARE_ENABLED_VALUES
 
 
+def _push_is_on(row: Optional[Dict[str, Any]]) -> bool:
+    """`push_enabled` 这一列的**唯一判读口**（默认**关**）。
+
+    🔴 与 `_share_is_on` 同一档：缺省最严（老行没有这一列 ⇒ 一律当关）。
+    查无此代理（空行）也当关 —— 「代理存不存在」是**另一道闸**（由建流侧先判）。
+    """
+    value = str((row or {}).get("push_enabled") or PUSH_DISABLED_ON).strip().lower()
+    return value in PUSH_ENABLED_VALUES
+
+
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     """对外形状（控制台 GET 与判定方共用的字段集）。
 
@@ -348,6 +379,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         # 记忆共享开关：true = 这个代理的记忆进**别的**已批准代理的检索可见范围。
         # 判读口径与 `Registry.share_memory` 同一个（`_share_is_on`）。
         "share_memory": _share_is_on(row),
+        # 私信实时推送开关（SSE 快车道）：true = 允许这个代理接 SSE 长连接。
+        # 判读口径与 `Registry.push_enabled` 同一个（`_push_is_on`）。
+        "push_enabled": _push_is_on(row),
         # 这个代理**自己**的注入字符预算：None = 沿用全局（缺省回退）。
         # 判读口径与 `Registry.core_budget_chars` 同一个（`_norm_budget`）。
         "core_budget_chars": row.get("core_budget_chars"),
@@ -446,7 +480,7 @@ class _SqlBackend(_SqlBase):
     # -- ks_agent 专用 --------------------------------------------------
     def ensure_schema(self) -> bool:
         """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` /
-        `share_memory` / `core_budget_chars` 列。
+        `share_memory` / `core_budget_chars` / `push_enabled` 列。
 
         🔴 补列走「先查后补」（`_SqlBase.has_column`）：列已在 ⇒ **一条 DDL 都不发**
         （PG 的 `ADD COLUMN IF NOT EXISTS` 列已存在也要拿 ACCESS EXCLUSIVE，
@@ -456,7 +490,8 @@ class _SqlBackend(_SqlBase):
             return False
         for column, decl in ((DM_COLUMN, DM_COLUMN_DECL),
                              (SHARE_COLUMN, SHARE_COLUMN_DECL),
-                             (BUDGET_COLUMN, BUDGET_COLUMN_DECL)):
+                             (BUDGET_COLUMN, BUDGET_COLUMN_DECL),
+                             (PUSH_COLUMN, PUSH_COLUMN_DECL)):
             try:
                 if not self.has_column(column):
                     self.add_column(column, decl)
@@ -757,6 +792,7 @@ class Registry:
             # 🔴 登记**不碰**预算：新建的行一律沿用全局（NULL）——
             # 「谁都没登记过预算」是缺省态，不是某个开/关档位。
             "core_budget_chars": None,
+            "push_enabled": PUSH_DISABLED_ON,
         })
         return self.get(aid) or {}
 
@@ -871,6 +907,37 @@ class Registry:
         if str(row.get("dm_enabled") or DM_ENABLED_ON).strip() == want:
             return False
         self._be.update(aid, {"dm_enabled": want})
+        return True
+
+    # ---- 私信实时推送开关（SSE 快车道）--------------------------------
+    def push_enabled(self, agent_id: str) -> bool:
+        """这个代理**是否允许接 SSE 长连接**（`push_enabled` 开关）。默认**关**。
+
+        🔴 查不到代理 / 老行没有这一列 ⇒ 一律 False：
+        「新增字段必须兼容旧数据」—— 存量行的语义不许因为加了一列而变
+        （谁也没被连上过）。这是**往外放行**的开关，缺省必须最严
+        （与 `share_memory` 同一档，与 `dm_enabled` 相反）。
+        """
+        row = self._be.load((agent_id or "").strip())
+        if not row:
+            return False
+        return _push_is_on(row)
+
+    def set_push_enabled(self, agent_id: str, flag: bool) -> bool:
+        """开关「这个代理能不能接 SSE 长连接」。返回**值是否真的变了**。
+
+        🔴 行不存在 ⇒ False（调用方 404）；`status` / `role` / 凭据 / 记忆归属
+        **一个都不碰** —— 能不能被连上来推事件是**投递偏好**，不是治理动作
+        （与 `set_dm_enabled` / `set_share_memory` 同纪律）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        want = PUSH_ENABLED_ON if flag else PUSH_DISABLED_ON
+        if str(row.get("push_enabled") or PUSH_DISABLED_ON).strip() == want:
+            return False
+        self._be.update(aid, {"push_enabled": want})
         return True
 
     # ---- 记忆共享开关（读可见性）-------------------------------------

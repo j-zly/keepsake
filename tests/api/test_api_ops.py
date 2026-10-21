@@ -92,6 +92,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/share",
     # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
     "/api/v1/agents/{agent_id}/budget",
+    # 私信实时推送开关一条（ks_dm_sse）：只改「能不能被连上来」，不是治理动作
+    "/api/v1/agents/{agent_id}/push",
+    # 消息中心手动 / 批量触发提醒一条（ks_dm_sse）：推一帧事件，不改数据
+    "/api/v1/messages/nudge",
 } | AUTH_POST_PATHS
 
 
@@ -498,13 +502,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_34条业务加4条认证():
+def test_写面白名单全量断点_37条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 39
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 35
+    assert len(ALLOWED_POST_PATHS) == 41
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 37
 
 
 def test_P1只读路由未被写面影响(client):

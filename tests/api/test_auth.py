@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是三十五条业务写端点加四条auth_POST():
+def test_写面仍是三十七条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -691,6 +691,9 @@ def test_写面仍是三十五条业务写端点加四条auth_POST():
     不是治理动作。
     🆕 per-agent 注入预算再加一条（34 → 35）：预算开关（`core_budget_chars`）——
     只改**一个阈值**，不是治理动作。
+    🆕 私信实时推送再加两条（35 → 37）：推送开关（`push_enabled`，只改「能不能
+    被连上来」）+ 消息中心手动/批量触发提醒（`POST /api/v1/messages/nudge`，
+    推一帧事件、**不改数据**）。
     """
     app = create_app()
     write = {r.path for r in flat_routes(app)
@@ -723,6 +726,9 @@ def test_写面仍是三十五条业务写端点加四条auth_POST():
         "/api/v1/agents/{agent_id}/share",
         # per-agent 注入预算：只改一个阈值，不是治理动作
         "/api/v1/agents/{agent_id}/budget",
+        # 私信实时推送：开关 + 手动/批量触发提醒
+        "/api/v1/agents/{agent_id}/push",
+        "/api/v1/messages/nudge",
     }, sorted(write)
 
 

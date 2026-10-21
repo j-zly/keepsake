@@ -28,6 +28,10 @@
 `http`（streamable-http）**只听 127.0.0.1**，默认端口 8210；
 绑非回环地址一律拒绝启动 —— 记忆库没有它自己那套认证，
 暴露到网络上等于把一个人的长期记忆公开读。
+
+http 传输上**另挂一条 SSE 长连接**（`GET /events`，同进程同端口）：
+私信实时推送的快车道（别人给我投信 ⇒ 顺这条流推一帧**元数据**，
+**不推正文**）。见 `events.py`。
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 
 from ..govern.registry import CREDENTIAL_HINT_LEN, is_connection_error
+from .events import register_events_route
 from .factory import DEFAULT_AGENT_ID, default_provider
 from .resources import register_resources
 from .tools import ToolError, register_tools
@@ -507,6 +512,9 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
     gate = AgentGate.for_provider(provider, server)
     register_tools(server, provider, gate=gate, govern=govern)
     register_resources(server, provider, gate=gate)
+    # 私信实时推送的 SSE 端点（`GET /events`）—— 与 streamable-http **同进程同端口**。
+    # 建流要过三道闸（凭据反查 → approved → push_enabled=1），见 `events.py`。
+    register_events_route(server, gate)
     # 闸门句柄挂在 server 上（探针 / 运维脚本看「现在放不放行」用；工具调用本身
     # 走 `gate.check`，不经过这个属性 —— 改它不会放松任何一道闸）。
     server.agent_gate = gate

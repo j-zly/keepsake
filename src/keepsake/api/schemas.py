@@ -337,6 +337,10 @@ class AgentItem(BaseModel):
     #: 的检索可见范围。默认**关**（老行缺列也算关 —— 共享是放宽权限的开关，
     #: 缺省必须最严）。
     share_memory: bool = Field(False, description="是否共享记忆给其他已批准代理（默认关）")
+    #: 私信实时推送开关（`push_enabled`）：true = 允许这个代理接 SSE 长连接
+    #: （有人给它投私信时顺流推一帧**元数据**）。默认**关**（老行缺列也算关 ——
+    #: 往外放行的开关，缺省必须最严）。
+    push_enabled: bool = Field(False, description="是否允许接 SSE 长连接（默认关）")
     #: 这个代理**自己**的常驻层注入字符预算：None = 沿用全局默认
     #: （新增字段不许改存量语义：老行没有这一列 ⇒ 一律沿用全局）。
     core_budget_chars: Optional[int] = Field(

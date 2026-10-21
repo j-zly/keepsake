@@ -14,6 +14,10 @@
 
   样式守 web/DESIGN.md：浅色默认、卡片（1px 描边 + --shadow-card）、
   徽标走 .chip（未读用 .chip--accent 强调，已读用中性灰）、零硬编码色值。
+
+  2026-10 ks_dm_sse：本页多了一栏「按收件代理」—— 每个收件代理一行
+  「触发提醒」（快车道 SSE 的一帧**元数据**事件）。
+  🔴 送达与否**由后端如实回报**（delivered），页面不许自己乐观成「已送达」。
 -->
 <template>
   <div>
@@ -77,6 +81,59 @@
       </div>
     </div>
 
+    <!--
+      按收件代理分组：每个收件代理一行「触发提醒」。
+      🔴 与上面的「按线程分组」是**两个视图**：线程看的是「这件事聊到哪了」，
+      这一栏看的是「谁还没看信」—— 提醒是**按收件人**发的。
+      🔴 帧里**只有元数据**（未读数 + 最近发件人），**没有正文**。
+      🔴 没挂着流就如实显示「⚠ 离线」：提醒**不补发**，不谎报送达。
+    -->
+    <div class="filter-panel">
+      <div class="filter-title">按收件代理</div>
+      <p class="filter-desc">
+        每个收件代理一行，显示它当前未读数；点「触发提醒」推一帧事件摘要
+        （<b>只有元数据，没有正文</b>）。对方没挂着流就如实标「⚠ 离线」——
+        提醒不补发（寄生层的提醒仍在）。
+      </p>
+      <SelectionBar
+        :count="selCount"
+        :page-count="recipients.length"
+        :page-selected="pageSelected"
+        @select-all="selectAll"
+        @clear="clearSel"
+      >
+        <el-button
+          :disabled="!selCount || nudging"
+          :loading="nudging"
+          @click="askBatchNudge"
+        >
+          批量提醒已选 {{ selCount }} 个
+        </el-button>
+      </SelectionBar>
+      <p v-if="!recipients.length" class="filter-desc">
+        还没有收件代理 —— 代理之间用 MCP 的 message_send 互传消息后，这里会出现。
+      </p>
+      <div v-else class="rcpt-list">
+        <div v-for="r in recipients" :key="r.agent_id" class="rcpt-row">
+          <el-checkbox
+            :model-value="isSel(r.agent_id)"
+            @change="toggleSel(r.agent_id, $event)"
+          />
+          <span class="rcpt-id" :title="r.agent_id">{{ r.agent_id }}</span>
+          <span class="chip" :class="r.unread ? 'chip--accent' : ''">{{ r.unread }} 条未读</span>
+          <button class="soft-btn" :disabled="nudging" @click="askNudge(r)">触发提醒</button>
+          <span
+            v-if="nudgeResults[r.agent_id]"
+            class="chip"
+            :class="nudgeResults[r.agent_id].delivered ? 'chip--accent' : ''"
+            :title="nudgeReasonText(nudgeResults[r.agent_id])"
+          >
+            {{ nudgeChip(nudgeResults[r.agent_id]) }}
+          </span>
+        </div>
+      </div>
+    </div>
+
     <div v-if="loading && !items.length" class="panel pad">
       <el-skeleton :rows="4" animated />
     </div>
@@ -126,8 +183,9 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import PagerBar from '../components/PagerBar.vue'
+import SelectionBar from '../components/SelectionBar.vue'
 import { api } from '../api'
-import { showError } from '../utils/dialog'
+import { showConfirm, showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
 import { isStale } from '../utils/kb'
 
@@ -209,6 +267,134 @@ function toggleMsg(seq) {
   if (next.has(seq)) next.delete(seq)
   else next.add(seq)
   opened.value = next
+}
+
+// ---------------------------------------------------------------------------
+// 按收件代理分组 + 手动 / 批量触发提醒（快车道 SSE）
+// ---------------------------------------------------------------------------
+
+//: 已勾选的收件代理（跨页保留，与常驻层页 / 记忆条目页同一口径）
+const sel = ref(new Set())
+/** 逐代理的提醒回报（`{agent_id: {delivered, reason}}`）—— 只由后端给。 */
+const nudgeResults = ref({})
+/** 提醒请求在飞（防连点）。 */
+const nudging = ref(false)
+
+/**
+ * 收件代理清单（**按收件人**分组，不是按线程）。
+ *
+ * 🔴 未读数**只由后端给**（`GET /api/v1/messages` 的 `unread` 映射）——
+ * 前端不自己数（自己数 = 与后端两个口径，数字必然对不上）。
+ * 清单 = 「有未读的代理」∪「本页出现过的收件人」。
+ */
+const recipients = computed(() => {
+  const map = new Map()
+  const unread = data.value?.unread || {}
+  for (const id of Object.keys(unread)) map.set(id, Number(unread[id]) || 0)
+  for (const m of items.value) {
+    if (m.to_id && !map.has(m.to_id)) map.set(m.to_id, 0)
+  }
+  return [...map.entries()]
+    .map(([agent_id, unread]) => ({ agent_id, unread }))
+    .sort((a, b) => a.agent_id.localeCompare(b.agent_id))
+})
+
+/** 已选个数（跨页累计）。 */
+const selCount = computed(() => sel.value.size)
+/** 本页已选个数（半选态的判定基准）。 */
+const pageSelected = computed(() => recipients.value.filter((r) => sel.value.has(r.agent_id)).length)
+
+function isSel(agentId) {
+  return sel.value.has(agentId)
+}
+
+function toggleSel(agentId, on) {
+  const next = new Set(sel.value)
+  if (on) next.add(agentId)
+  else next.delete(agentId)
+  sel.value = next
+}
+
+/** 全选 / 取消全选：**只动当前这一页**的代理（与另两页同一口径）。 */
+function selectAll(on) {
+  const next = new Set(sel.value)
+  for (const r of recipients.value) {
+    if (on) next.add(r.agent_id)
+    else next.delete(r.agent_id)
+  }
+  sel.value = next
+}
+
+function clearSel() {
+  sel.value = new Set()
+}
+
+/**
+ * 提醒结果的徽标文案 —— **按后端给的 reason 如实说**，不笼统说「失败」。
+ *
+ * * `✓ 已送达` —— 对方挂着流，帧推出去了；
+ * * `⚠ 未开推送` —— 那个代理关了「私信实时推送」（治理页的开关）；
+ * * `⚠ 代理不存在` —— 注册表里没这一行；
+ * * `⚠ 离线` —— 没挂着流，提醒**不补发**。
+ */
+function nudgeChip(result) {
+  if (!result) return ''
+  if (result.delivered) return '✓ 已送达'
+  if (result.reason === 'push_disabled') return '⚠ 未开推送'
+  if (result.reason === 'unknown_agent') return '⚠ 代理不存在'
+  return '⚠ 离线'
+}
+
+/** 徽标的悬浮说明（把 reason 翻成人话）。 */
+function nudgeReasonText(result) {
+  if (!result) return ''
+  if (result.delivered) return `已送达（对方当前未读 ${result.unread ?? 0} 条）`
+  if (result.reason === 'push_disabled') return '该代理未开启私信实时推送（到治理页开启后再试）'
+  if (result.reason === 'unknown_agent') return '注册表里没有这个代理'
+  return '对方当前没挂着事件流 —— 提醒不补发（寄生层仍在）'
+}
+
+/** 推提醒：逐代理的结果**原样**收下（后端说没送到就是没送到）。 */
+async function sendNudge(ids) {
+  if (!ids.length || nudging.value) return
+  nudging.value = true
+  try {
+    const body = await api.nudgeMessages(ids)
+    const results = {}
+    for (const r of body?.results || []) results[r.agent_id] = r
+    nudgeResults.value = { ...nudgeResults.value, ...results }
+    const list = body?.results || []
+    const okCount = list.filter((r) => r.delivered).length
+    showToast(`已提醒 ${ids.length} 个代理：${okCount} 个送达，${ids.length - okCount} 个未送达`)
+  } catch (e) {
+    error.value = `触发提醒失败：${e.message}`
+    showError(error.value)
+  } finally {
+    nudging.value = false
+  }
+}
+
+/** 单个代理的提醒：弹框确认，**显示目标当前未读数**。 */
+async function askNudge(row) {
+  const ok = await showConfirm(
+    `给「${row.agent_id}」触发提醒？\n当前未读 ${row.unread} 条。\n`
+    + '（只推元数据摘要，不推正文；对方没挂着流就送不到，提醒不补发）',
+    '触发提醒',
+  )
+  if (!ok) return
+  await sendNudge([row.agent_id])
+}
+
+/** 批量提醒已选的 N 个。 */
+async function askBatchNudge() {
+  const ids = [...sel.value]
+  if (!ids.length) return
+  const ok = await showConfirm(
+    `给已选的 ${ids.length} 个代理各触发一次提醒？\n（只推元数据摘要，不推正文）`,
+    '批量触发提醒',
+  )
+  if (!ok) return
+  await sendNudge(ids)
 }
 
 // 请求序号：连续改词/翻页时旧响应只丢弃，不覆盖新结果（照抄 AgentsView 的收口口径）
@@ -338,6 +524,30 @@ onMounted(() => {
 }
 .thread-body {
   padding: 0 16px;
+}
+/* 收件代理一行：勾选 | id | 未读数 | 触发提醒 | 送达回报 */
+.rcpt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.rcpt-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.rcpt-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 一条消息：时间 | 发件 → 收件 | 已读徽标 | 正文（正文占剩余宽度，可换行） */
 .msg {

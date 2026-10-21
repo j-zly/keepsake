@@ -28,6 +28,10 @@
 **读可见性**（这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据 ——
 与私信开关（`dm`）同一档，不是治理动作。
 
+🔴 **私信实时推送开关**（`push`，2026-10 ks_dm_sse）：`POST .../push` 只改
+**能不能被连上来**（SSE 长连接的建流闸），不碰状态 / 角色 / 凭据 ——
+与私信开关（`dm`）、共享开关（`share`）同一档，不是治理动作。
+
 🔴 **per-agent 注入预算**（`budget`，2026-10 ks_agent_budget）：
 `POST .../budget` 只改这一个阈值（`core_budget_chars`），NULL = 沿用全局默认。
 同样不是治理动作 —— 状态 / 角色 / 凭据一个都不碰。
@@ -190,6 +194,18 @@ def _budget_value(raw: Any, action: str, target: str) -> Optional[int]:
                 f"注入预算必须在 {BUDGET_MIN}~{BUDGET_MAX} 字符之间，本次 {value}",
                 action, target)
     return value
+
+
+class AgentPushBody(BaseModel):
+    """`POST /api/v1/agents/{agent_id}/push` 的请求体：私信实时推送开关 + 显式确认。
+
+    🔴 `enabled` 是**投递偏好**（能不能被连上来推事件），不是治理动作 ——
+    它不碰 `status` / `role` / 已发的凭据（与私信开关 `dm`、共享开关 `share`
+    同一档）。`confirm` 要 `true`（与本文件其余写端点同一道闸）。
+    """
+
+    enabled: bool = Field(..., description="true = 允许接 SSE 长连接；false = 不许连")
+    confirm: Any = False
 
 
 def _valid_agent_id(agent_id: str) -> bool:
@@ -524,6 +540,32 @@ def set_agent_budget(agent_id: str, body: AgentBudgetBody,
     audit.record(action, agent_id, ok=True,
                  reason=f"core_budget_chars={value} (changed={changed}); backup={backup}")
     return {"ok": True, "agent_id": agent_id, "core_budget_chars": value,
+            "changed": bool(changed), "backup": backup}
+
+
+@router.post("/api/v1/agents/{agent_id}/push",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_push(agent_id: str, body: AgentPushBody,
+                   storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """开关「这个代理**能不能接 SSE 长连接**」（`push_enabled`）。
+
+    关着 = 拿它的凭据来 `GET /events` 一律被拒（403）；
+    开着 = 建流成功，别人给它投私信时服务端会顺这条流推一帧**元数据**
+    （`seq` / `from` / `unread`，**没有正文**）。
+
+    🔴 **不是治理动作**：`status` / `role` / 已发的凭据 / 记忆归属一个都不碰
+    （与私信开关 `dm`、共享开关 `share` 同一档）。
+    🔴 未知代理 ⇒ 404；没带 `confirm` ⇒ 400 且**不改**。
+    """
+    action = "agents.push"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改推送开关')
+    backup = _backup("push", row)
+    changed = registry.set_push_enabled(agent_id, bool(body.enabled))
+    audit.record(action, agent_id, ok=True,
+                 reason=f"push_enabled={bool(body.enabled)} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": agent_id, "push_enabled": bool(body.enabled),
             "changed": bool(changed), "backup": backup}
 
 
