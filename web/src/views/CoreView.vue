@@ -29,6 +29,7 @@
       <div class="filter-title">常驻记忆</div>
       <p class="filter-desc">
         卡片给 3 行摘要，悬停看完整正文；点 key 旁的图标复制，「查看全文 ↗」进抽屉看全文与编辑。
+        卡片上的代理 chip 是这条常驻记忆的归属代理（没有归属的显示「无归属」）。
       </p>
       <div class="filter-ctl">
         <el-input
@@ -49,12 +50,30 @@
             </span>
           </template>
         </el-input>
+        <el-select
+          v-model="agents"
+          class="sel sel--agents"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          placeholder="按代理筛选（不选＝全部）"
+          clearable
+          title="只看选中代理名下的记忆（可多选）"
+          @change="search"
+        >
+          <el-option
+            v-for="a in agentOptions"
+            :key="a.id"
+            :label="a.name ? `${a.id}（${a.name}）` : a.id"
+            :value="a.id"
+          />
+        </el-select>
         <el-button type="primary" :loading="loading" @click="search">查询</el-button>
       </div>
       <div class="filter-result">
         <span>共 {{ count }} 条匹配 · 每页 {{ pageSize }}</span>
         <div class="acts">
-          <button class="soft-btn" :disabled="!dirty" @click="onClear">清除筛选</button>
+          <button class="soft-btn" :disabled="!dirty" @click="clearAll">清除筛选</button>
           <button class="ghost-btn" :disabled="loading" @click="load">刷新</button>
           <button class="ghost-btn" :disabled="loading" @click="doExport('jsonl')">导出 JSONL</button>
           <button class="ghost-btn" :disabled="loading" @click="doExport('csv')">导出 CSV</button>
@@ -130,6 +149,10 @@
         <p class="card-body" :title="row.content">{{ row.content }}</p>
 
         <template #tags>
+          <!-- 归属代理 chip：一眼看出这条常驻记忆是谁的（无归属走灰色 chip） -->
+          <span class="tag" :class="ownerOf(row.tags) ? 'tag--owner' : ''" :title="ownerTitle(row)">
+            {{ ownerText(row) }}
+          </span>
           <span v-for="t in splitTags(row.tags)" :key="t" class="tag">{{ t }}</span>
         </template>
 
@@ -297,6 +320,7 @@ import PagerBar from '../components/PagerBar.vue'
 import SelectionBar from '../components/SelectionBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { filterByOwners, loadAgentOptions, ownerLabel, ownerOf } from '../utils/agents'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
 import { downloadFile, downloadTemplate, exportKeys } from '../utils/export'
@@ -313,6 +337,13 @@ const loading = ref(false)
 const error = ref('')
 const drawer = ref(false)
 const detail = ref(null)
+
+// ---- 代理筛选（多选下拉）：选项来自 /api/v1/agents（注册表）----
+/** 选中的 agent_id 列表（空 = 全部 = 现状不变）。 */
+const agents = ref([])
+const agentOptions = ref([])
+/** agent_id → 显示名（注册表备注名）；拿不到显示名就显示裸 id。 */
+const agentNames = computed(() => Object.fromEntries(agentOptions.value.map((a) => [a.id, a.name])))
 
 // ---- 单条真删（与记忆条目页同一口径：手输 key 末 8 位，删前备份由后端做）----
 const deleting = ref(false)
@@ -492,7 +523,7 @@ async function doExportSelected() {
 }
 
 /** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它 */
-const dirty = computed(() => !!(q.value || '').trim())
+const dirty = computed(() => !!(q.value || '').trim() || agents.value.length > 0)
 
 /** 占用越高越红：80% 起转蓝（与主色同一套），过 100% 红 —— 超预算注入会截断。 */
 const budgetTone = computed(() => {
@@ -523,13 +554,16 @@ async function load() {
       // q 只透传，匹配语义在服务端（正文+标签子串，大小写不敏感）
       api.coreList({
         q: (q.value || '').trim() || undefined,
+        // 代理筛选**服务端过滤**（这条列表是服务端分页的，前端只切当前页就是漏筛）
+        agents: agents.value.length ? agents.value.join(',') : undefined,
         page: page.value,
         page_size: pageSize.value,
       }),
       api.coreStats(),
     ])
     if (isStale(seq, reqSeq)) return
-    items.value = list.items
+    // 后端已按 agents 过滤过；这里再过同一把尺子（屏上不许出现别的代理的记忆）
+    items.value = filterByOwners(list.items, agents.value)
     count.value = list.count
     stats.value = st
   } catch (e) {
@@ -545,10 +579,37 @@ function search() {
   page.value = 1
   load()
 }
-/** 清空 ✕ / 「清除筛选」：无条件回全量常驻层（不是空态），与 KbView 的清空口径一致 */
+/** 输入框里的 ✕：只清关键词（代理筛选不动）。 */
 function onClear() {
   q.value = ''
   search()
+}
+/** 「清除筛选」：关键词与代理一起清 ⇒ 回全量常驻层（不是空态）。 */
+function clearAll() {
+  q.value = ''
+  agents.value = []
+  search()
+}
+
+/** 代理下拉的选项（来自 /api/v1/agents；只取 id 与显示名）。 */
+async function loadAgents() {
+  try {
+    agentOptions.value = await loadAgentOptions(api.listAgents)
+  } catch (e) {
+    // 下拉空着也能用（不筛代理照样看全部）—— 不在这里报错打断页面
+    agentOptions.value = []
+  }
+}
+
+/** 卡片上那个归属 chip 的文字：显示名（拿不到就裸 id）· 没有归属就「无归属」。 */
+function ownerText(row) {
+  return ownerLabel(row?.tags, agentNames.value)
+}
+
+/** 归属 chip 的悬浮说明：有归属给 id，没有归属就说清「没有归属」。 */
+function ownerTitle(row) {
+  const id = ownerOf(row?.tags)
+  return id ? `归属代理：${id}` : '这条记忆没有归属代理'
 }
 
 function onPage(p) {
@@ -711,7 +772,10 @@ async function doImportRun(typed) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadAgents()
+})
 </script>
 
 <style scoped>

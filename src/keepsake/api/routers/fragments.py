@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import config
+from ..agent_filter import filter_rows_by_agents, parse_agent_ids, rows_by_agent_tags
 from ..deps import get_storage, require_session
 from ..schemas import FragmentDetail, FragmentItem, FragmentList
 
@@ -70,33 +71,46 @@ def _to_item(row: Dict[str, Any]) -> FragmentItem:
     )
 
 
-def _collect(storage: Any, q: str, tag: str, page: int,
+def _collect(storage: Any, q: str, tag: str, agent_ids: List[str], page: int,
              page_size: int) -> Tuple[List[Dict[str, Any]], Optional[int], bool, str]:
-    """按 (q, tag) 选数据源并切出当前页。返回 `(rows, total, has_more, count_reason)`。
+    """按 (q, tag, agents) 选数据源并切出当前页。返回 `(rows, total, has_more, count_reason)`。
 
     * `q` 非空 → BM25/KNN 融合检索（`storage.search`）：count 是候选池条数
     * `q` 空、`tag` 非空 → 按标签列（`storage.list_by_tag`）：count 是该标签全量条数
-    * 两者都空 → 全库浏览：keyset 扫描出**真实总数**（本库几千行，可接受）；
+    * `q`/`tag` 都空、`agents` 非空 → 按归属标签取并集（`storage.list_by_tag`）
+    * 三个都空 → 全库浏览：keyset 扫描出**真实总数**（本库几千行，可接受）；
       扫到 `RETRIEVAL_SCAN_CAP` 触顶时 count=null + `count_reason=scan_capped`，
       **不谎报总数，也不默默给 null**。
+
+    🔴 `agents` 的过滤**一律发生在切页之前**（`filter_rows_by_agents`）：
+    只筛当前页 = 「看着筛了、其实漏了」，count 与翻页都会骗人。
 
     ponytail: 全库浏览分支用「从头扫 page*page_size 条」把页码映射到 keyset 游标，
     O(page*page_size)、深翻页线性变慢；存储层暂无 count/offset 原语，
     真要深翻页时给存储层加 `(created,key)` 游标即可，前端契约不用动。
     """
     if q:
-        rows = list(storage.search(q, tag_filter=tag))
+        rows = filter_rows_by_agents(list(storage.search(q, tag_filter=tag)), agent_ids)
         total: Optional[int] = len(rows)
         start = (page - 1) * page_size
         page_rows = rows[start:start + page_size]
         return page_rows, total, start + len(page_rows) < total, "search_candidates"
 
     if tag:
-        rows = list(storage.list_by_tag(tag))
+        rows = filter_rows_by_agents(list(storage.list_by_tag(tag)), agent_ids)
         total = len(rows)
         start = (page - 1) * page_size
         page_rows = rows[start:start + page_size]
         return page_rows, total, start + len(page_rows) < total, "tag_exact"
+
+    if agent_ids:
+        # 没有 q 也没有 tag 时，归属筛选自己就是取数口径（`list_by_tag` 的标签匹配
+        # 与 `storage_shared.tag_match_sql` 同一判据）
+        rows = rows_by_agent_tags(storage, agent_ids)
+        total = len(rows)
+        start = (page - 1) * page_size
+        page_rows = rows[start:start + page_size]
+        return page_rows, total, start + len(page_rows) < total, "agent_tags"
 
     cursor, keys = storage.scan_fragment_keys("", page * page_size)
     # 总数单独扫一次（有上限）：只扫到本页深度时扫不干净，count 就会是 null。
@@ -114,12 +128,17 @@ def _collect(storage: Any, q: str, tag: str, page: int,
 def list_fragments(
     q: str = Query("", description="检索词；为空则退化为按 tag 浏览"),
     tag: str = Query("", description="标签精确过滤（逗号边界匹配，与存储层同判据）"),
+    agents: str = Query("", description="按归属代理过滤：逗号分隔 agent_id 列表（并集）；为空即全量"),
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
     storage: Any = Depends(get_storage),
 ) -> FragmentList:
-    """记忆条目列表（服务端分页；BM25 走 `storage.search`）。"""
-    rows, total, has_more, reason = _collect(storage, q.strip(), tag.strip(), page, page_size)
+    """记忆条目列表（服务端分页；BM25 走 `storage.search`）。
+
+    `agents` 是控制台「按代理筛选」的服务端口径（**服务端过滤**，不是前端切当前页）。
+    """
+    rows, total, has_more, reason = _collect(storage, q.strip(), tag.strip(),
+                                              parse_agent_ids(agents), page, page_size)
     return FragmentList(
         items=[_to_item(r) for r in rows],
         count=total,

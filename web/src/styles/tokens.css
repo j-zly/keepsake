@@ -472,6 +472,10 @@ html.dark {
 .filter-ctl .sel {
   width: 180px;
 }
+/* 代理多选下拉：比 .sel 宽一档（agent_id 较长，多选折叠后也放得下第一个 +N） */
+.filter-ctl .sel--agents {
+  width: 240px;
+}
 /* 搜索框左侧图标：走 el-input 的 prefix 插槽，跟文字同一行 */
 .search-ico {
   display: inline-flex;
@@ -633,6 +637,13 @@ html.dark {
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.7;
+}
+/* 归属代理 chip：复用 .tag 的描边 chip，只把底色换成强调色 ——
+   「一眼看出这条记忆是谁的」；没有归属的那条走普通 .tag（灰）。 */
+.tag--owner {
+  background: var(--accent-soft);
+  border-color: var(--accent-3);
+  color: var(--accent);
 }
 .chip {
   display: inline-block;

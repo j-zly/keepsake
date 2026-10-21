@@ -9,7 +9,10 @@
 
     <div class="filter-panel">
       <div class="filter-title">检索记忆条目</div>
-      <p class="filter-desc">正文走 BM25 全文检索（keepsake storage.search）；留空即全库浏览。</p>
+      <p class="filter-desc">
+        正文走 BM25 全文检索（keepsake storage.search）；留空即全库浏览。
+        卡片上的代理 chip 是这条记忆的归属代理（没有归属的显示「无归属」）。
+      </p>
       <div class="filter-ctl">
         <el-input
           v-model="q"
@@ -37,6 +40,24 @@
           default-first-option
           clearable
         />
+        <el-select
+          v-model="agents"
+          class="sel sel--agents"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          placeholder="按代理筛选（不选＝全部）"
+          clearable
+          title="只看选中代理名下的记忆（可多选）"
+          @change="search"
+        >
+          <el-option
+            v-for="a in agentOptions"
+            :key="a.id"
+            :label="a.name ? `${a.id}（${a.name}）` : a.id"
+            :value="a.id"
+          />
+        </el-select>
         <el-button type="primary" :loading="loading" @click="search">查询</el-button>
       </div>
       <div class="filter-result">
@@ -95,7 +116,7 @@
           <circle cx="10.5" cy="10.5" r="6" />
           <path d="m15 15 4.5 4.5" stroke-linecap="round" />
         </svg>
-        <p v-if="dirty"><b>没召回到记忆条目</b>换个词试试，或把标签清空做全库浏览。</p>
+        <p v-if="dirty"><b>没召回到记忆条目</b>换个词试试，或点「清除筛选」回全库浏览。</p>
         <p v-else><b>这里什么都没有</b>上方输入关键词召回，或直接翻页浏览全库。</p>
       </div>
     </div>
@@ -128,6 +149,10 @@
         <p class="card-body" :title="row.content">{{ row.content }}</p>
 
         <template #tags>
+          <!-- 归属代理 chip：一眼看出这条记忆是谁的（无归属走灰色 chip） -->
+          <span class="tag" :class="ownerOf(row.tags) ? 'tag--owner' : ''" :title="ownerTitle(row)">
+            {{ ownerText(row) }}
+          </span>
           <span v-for="t in splitTags(row.tags)" :key="t" class="tag">{{ t }}</span>
         </template>
 
@@ -297,6 +322,7 @@ import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
 import SelectionBar from '../components/SelectionBar.vue'
 import http, { api, getToken } from '../api'
+import { filterByOwners, loadAgentOptions, ownerLabel, ownerOf } from '../utils/agents'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
 import { downloadTemplate, exportKeys } from '../utils/export'
@@ -320,6 +346,13 @@ const loading = ref(false)
 const error = ref('')
 const drawer = ref(false)
 const detail = ref(null)
+
+// ---- 代理筛选（多选下拉）：选项来自 /api/v1/agents（注册表）----
+/** 选中的 agent_id 列表（空 = 全部 = 现状不变）。 */
+const agents = ref([])
+const agentOptions = ref([])
+/** agent_id → 显示名（注册表备注名）；拿不到显示名就显示裸 id。 */
+const agentNames = computed(() => Object.fromEntries(agentOptions.value.map((a) => [a.id, a.name])))
 
 // 归档确认（危险操作）走 ConfirmDialog：红色竖条 + 逐条后果 + 手输 key 末 8 位
 const archiving = ref(false)
@@ -495,7 +528,7 @@ async function doExportSelected() {
 }
 
 /** 有筛选条件在生效吗：空态文案与「清除筛选」按钮都看它 */
-const dirty = computed(() => !!(q.value || tag.value))
+const dirty = computed(() => !!(q.value || tag.value) || agents.value.length > 0)
 
 /** tags 是逗号分隔的一串，拆成一个个 chip 展示 */
 function splitTags(s) {
@@ -522,11 +555,14 @@ async function load() {
       // el-select 被清空时给的是 undefined 而不是 ''，统一兜一层再 trim
       q: (q.value || '').trim() || undefined,
       tag: (tag.value || '').trim() || undefined,
+      // 代理筛选**服务端过滤**（这条列表是服务端分页的，前端只切当前页就是漏筛）
+      agents: agents.value.length ? agents.value.join(',') : undefined,
       page: page.value,
       page_size: pageSize.value,
     })
     if (isStale(seq, reqSeq)) return
-    items.value = data.items
+    // 后端已按 agents 过滤过；这里再过同一把尺子（屏上不许出现别的代理的记忆）
+    items.value = filterByOwners(data.items, agents.value)
     count.value = data.count
     hasMore.value = data.has_more
   } catch (e) {
@@ -542,10 +578,33 @@ function search() {
   page.value = 1
   load()
 }
+/** 「清除筛选」：词 / 标签 / 代理一起清 ⇒ 回全库浏览。 */
 function reset() {
   q.value = ''
   tag.value = ''
+  agents.value = []
   search()
+}
+
+/** 代理下拉的选项（来自 /api/v1/agents；只取 id 与显示名）。 */
+async function loadAgents() {
+  try {
+    agentOptions.value = await loadAgentOptions(api.listAgents)
+  } catch (e) {
+    // 下拉空着也能用（不筛代理照样看全部）—— 不在这里报错打断页面
+    agentOptions.value = []
+  }
+}
+
+/** 卡片上那个归属 chip 的文字：显示名（拿不到就裸 id）· 没有归属就「无归属」。 */
+function ownerText(row) {
+  return ownerLabel(row?.tags, agentNames.value)
+}
+
+/** 归属 chip 的悬浮说明：有归属给 id，没有归属就说清「没有归属」。 */
+function ownerTitle(row) {
+  const id = ownerOf(row?.tags)
+  return id ? `归属代理：${id}` : '这条记忆没有归属代理'
 }
 function onPage(p) {
   page.value = p
@@ -779,7 +838,10 @@ async function doExport() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadAgents()
+})
 </script>
 
 <style scoped>

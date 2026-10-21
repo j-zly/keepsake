@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, Query
 
 from .. import config
+from ..agent_filter import filter_rows_by_agents, parse_agent_ids
 from ..deps import get_storage, require_session
 from ..schemas import CoreItem, CoreList, CoreStats
 
@@ -49,6 +50,7 @@ def _matches(row: Dict[str, Any], needle: str) -> bool:
 @router.get("/api/v1/core", response_model=CoreList, dependencies=[Depends(require_session)])
 def list_core(
     q: str = Query("", description="搜索词：正文+标签大小写不敏感子串过滤；为空即全量"),
+    agents: str = Query("", description="按归属代理过滤：逗号分隔 agent_id 列表（并集）；为空即全量"),
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
     storage: Any = Depends(get_storage),
@@ -57,11 +59,15 @@ def list_core(
 
     `q` 非空时先在**全量 core 行**上过滤再分页，`count` 是过滤后的条数
     （与不带 q 时的 count 同一口径：都是「本次结果的总数」，前端不另算）。
+
+    `agents` 同理：按归属代理过滤，**在切页之前**过滤（`filter_rows_by_agents`）——
+    常驻层这条列表是服务端分页的，只筛当前页就是「看着筛了、其实漏了」。
     """
     rows = _core_rows(storage)
     needle = q.strip().lower()
     if needle:
         rows = [r for r in rows if _matches(r, needle)]
+    rows = filter_rows_by_agents(rows, parse_agent_ids(agents))
     start = (page - 1) * page_size
     page_rows = rows[start:start + page_size]
     return CoreList(
