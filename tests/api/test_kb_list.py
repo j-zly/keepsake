@@ -22,6 +22,8 @@ from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.api.routers import kb as kb_router
 
+from conftest import flat_routes
+
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 FAKE_DSN = "postgresql://fake/fake"          # 假串、无口令，只为让 _dsn() 通过
@@ -365,7 +367,7 @@ def test_既有接口零变化_仍是三条原路径(client, kb_env, monkeypatch
     """/kb/summary 与 /kb/search 的存在与必填口径不许因新增接口而变。"""
     _install_fake_pg2(monkeypatch)
     app = create_app()
-    paths = {r.path for r in app.routes}
+    paths = {r.path for r in flat_routes(app)}
     assert {"/api/v1/kb/summary", "/api/v1/kb/search"} <= paths
     # search 的 q 仍然必填：不带 q ⇒ 422（不是被新接口「顺手」改成可选）
     assert client.get("/api/v1/kb/search", headers=AUTH).status_code == 422

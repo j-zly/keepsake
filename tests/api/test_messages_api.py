@@ -24,6 +24,8 @@ from keepsake.api.deps import get_storage
 from keepsake.govern.messaging import Messaging
 from keepsake.govern.registry import Registry
 
+from conftest import flat_routes
+
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -218,7 +220,7 @@ def test_dm无token_401(env):
 def test_dm写端点要挂认证与写闸(env):
     """判据看依赖表：少挂一道闸就是「绕过 UI 直接打 API 也能改」。"""
     app = create_app()
-    route = next(r for r in app.routes
+    route = next(r for r in flat_routes(app)
                  if getattr(r, "path", "") == "/api/v1/agents/{agent_id}/dm")
     names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
     assert any("require_session" in n for n in names)

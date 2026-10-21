@@ -32,7 +32,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .registry import (
     AGENT_TAG_PREFIX,
@@ -45,6 +45,7 @@ __all__ = [
     "shared_agent_ids",
     "fragment_owner",
     "visible_core_fragments",
+    "truncate_core_fragments",
 ]
 
 
@@ -164,3 +165,37 @@ def visible_core_fragments(
         if not owner or owner in allowed:
             out.append(row)
     return out
+
+
+def truncate_core_fragments(
+    fragments: Iterable[Dict[str, Any]],
+    budget: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按注入字符预算**从头截** core 条目。返回 `(留下的, 被丢的条数)`。
+
+    🔴 **core 层的两把尺子都在本模块**：一把是「归属可见性」
+    （`visible_core_fragments`），一把是「注入预算」（本函数）——
+    注入路径（`provider._core_block`）与 MCP 的 core 列表用**同一个函数**，
+    两处各写一份必然漂（漂了就是「注入截了、列表没截」）。
+
+    量的是**正文长度**（`content`），与注入时渲染的 `- 正文` 行一一对应。
+
+    从头截的理由：core 层按稳定顺序（updated_at 升序、key 升序）排，老条目是
+    常驻记忆里最该被无条件看到的那部分，末尾超预算的条目才丢。
+    """
+    rows = list(fragments or [])
+    try:
+        cap = int(budget)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        return rows, 0
+    kept: List[Dict[str, Any]] = []
+    total = 0
+    for row in rows:
+        size = len(str(row.get("content", "") or ""))
+        if total + size > cap:
+            break
+        kept.append(row)
+        total += size
+    return kept, len(rows) - len(kept)

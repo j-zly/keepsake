@@ -27,13 +27,17 @@
 🔴 **记忆共享开关**（`share`，2026-10 ks_share_memory）：`POST .../share` 只改
 **读可见性**（这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据 ——
 与私信开关（`dm`）同一档，不是治理动作。
+
+🔴 **per-agent 注入预算**（`budget`，2026-10 ks_agent_budget）：
+`POST .../budget` 只改这一个阈值（`core_budget_chars`），NULL = 沿用全局默认。
+同样不是治理动作 —— 状态 / 角色 / 凭据一个都不碰。
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -129,6 +133,63 @@ class AgentShareBody(BaseModel):
 
     enabled: bool = Field(..., description="true = 共享记忆给其他已批准代理；false = 不共享")
     confirm: Any = False
+
+
+class AgentBudgetBody(BaseModel):
+    """`POST /api/v1/agents/{agent_id}/budget` 的请求体：per-agent 注入预算。
+
+    🔴 `core_budget_chars` 声明成 `Any`（不是 `int`）：pydantic 的类型错误会变成
+    **422**，而本模块的写端点一律用 **400** 报「为什么不行」（前端红条只认这个
+    口径）。所以这里只收形状，值域判读放在路由里做（`_budget_value`）。
+
+    * `null` / 空串 ⇒ **清空**（回到 NULL = 沿用全局默认）；
+    * 正整数 ⇒ 该代理**专用**的注入字符预算；
+    * 0 / 负数 / 非整数 ⇒ **400**（拒，不静默当默认值）。
+    """
+
+    core_budget_chars: Any = Field(
+        None, description="正整数 = 该代理专用预算；null / 空 = 沿用全局默认")
+    confirm: Any = False
+
+
+#: per-agent 注入预算的取值区间。
+#: 🔴 **下限只到 1**（不是全局那个 1000）：per-agent 的语义是「这个代理只吃
+#: 这么多」，小到 100 字符也是人明确要的（只想让它记住一两句话）。
+#: 上限 500000 与全局同档：再大就是「不设预算」。
+BUDGET_MIN = 1
+BUDGET_MAX = 500000
+
+
+def _budget_value(raw: Any, action: str, target: str) -> Optional[int]:
+    """把请求体里的预算值判读成 `int` 或 `None`（None = 清空 ⇒ 沿用全局）。
+
+    🔴 **非法值一律 400，绝不静默当默认值**：0 / 负数 / 非整数 / 布尔都拒 ——
+    静默回落全局的话，操作者以为改成了，其实没改（这正是这套治理要拔掉的
+    「以为改成了」）。空串与 null 一样 = **清空**（前端清空输入框就是这个意思）。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):           # bool 是 int 的子类 ⇒ 先单独拒
+        _reject(400, "bad_core_budget",
+                f"注入预算必须是正整数（收到 {raw!r}）", action, target)
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None                   # 空串 = 清空
+        if not text.lstrip("-").isdigit():
+            _reject(400, "bad_core_budget",
+                    f"注入预算必须是正整数（收到 {raw!r}）", action, target)
+        value = int(text)
+    else:
+        _reject(400, "bad_core_budget",
+                f"注入预算必须是正整数（收到 {raw!r}）", action, target)
+    if not (BUDGET_MIN <= value <= BUDGET_MAX):
+        _reject(400, "core_budget_out_of_range",
+                f"注入预算必须在 {BUDGET_MIN}~{BUDGET_MAX} 字符之间，本次 {value}",
+                action, target)
+    return value
 
 
 def _valid_agent_id(agent_id: str) -> bool:
@@ -435,6 +496,34 @@ def set_agent_share(agent_id: str, body: AgentShareBody,
     audit.record(action, agent_id, ok=True,
                  reason=f"share_memory={bool(body.enabled)} (changed={changed}); backup={backup}")
     return {"ok": True, "agent_id": agent_id, "share_memory": bool(body.enabled),
+            "changed": bool(changed), "backup": backup}
+
+
+@router.post("/api/v1/agents/{agent_id}/budget",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_budget(agent_id: str, body: AgentBudgetBody,
+                     storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """设 / 清这个代理**自己**的常驻层注入字符预算（`core_budget_chars`）。
+
+    🔴 **不是治理动作**：它只改一个阈值 —— `status` / `role` / 已发的凭据 /
+    记忆归属一个都不碰（与 `share` / `dm` 同一档）。
+    🔴 **NULL = 沿用全局默认**（`retrieval.core_char_budget`）：清空输入框就是
+    回到全局，不是「预算 0」。
+    🔴 非法值（0 / 负数 / 非整数）⇒ **400 且不改**（`_budget_value`）。
+    🔴 **改完立刻生效**：读路径不缓存这一列（`Registry.core_budget_chars` 每次
+    读一次库），不存在「改了要等一会儿」。
+    未知代理 ⇒ 404；没带 `confirm` ⇒ 400 且**不改**。
+    """
+    action = "agents.budget"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改注入预算')
+    value = _budget_value(body.core_budget_chars, action, agent_id)
+    backup = _backup("budget", row)
+    changed = registry.set_core_budget_chars(agent_id, value)
+    audit.record(action, agent_id, ok=True,
+                 reason=f"core_budget_chars={value} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": agent_id, "core_budget_chars": value,
             "changed": bool(changed), "backup": backup}
 
 

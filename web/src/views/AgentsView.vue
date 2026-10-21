@@ -167,6 +167,8 @@
 
             <template #tags>
               <span v-if="a.exclude_from_primary" class="tag">不进主脑上下文</span>
+              <!-- 配了自己的注入预算才亮（没配 = 沿用全局默认，不必标） -->
+              <span v-if="a.core_budget_chars" class="tag">注入预算 {{ a.core_budget_chars }} 字符</span>
             </template>
 
             <template #actions>
@@ -371,9 +373,10 @@
     </el-dialog>
 
     <!--
-      编辑代理：**代理 ID + 备注名同框**（一张卡一个编辑入口，两个铅笔合并到这儿）。
+      编辑代理：**代理 ID + 备注名 + 注入预算同框**（一张卡一个编辑入口，两个铅笔合并到这儿）。
       🔴 改 ID 是换主键（凭据与权限不变，历史记忆的归属跟着一起搬）；
-      改备注名只动人看的标签（状态 / 角色 / 已发的凭据一律不碰）。
+      改备注名只动人看的标签（状态 / 角色 / 已发的凭据一律不碰）；
+      改注入预算只改这一个代理的注入阈值（留空 = 沿用全局默认）。
       primary 行的 ID 输入框锁死 —— 主脑的引导配置绑在这个 id 上（后端同口径 400）。
     -->
     <el-dialog
@@ -407,6 +410,23 @@
             @keyup.enter.prevent="doEdit"
           />
         </el-form-item>
+        <!--
+          注入预算（per-agent）：留空 = 沿用全局默认。
+          🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个编辑入口。
+          这里的「当前」是**全局默认**值（控制台「全局默认注入预算」那张卡）。
+        -->
+        <el-form-item label="注入预算（字符，留空 = 沿用全局）">
+          <el-input
+            v-model="editBudget"
+            type="number"
+            min="1"
+            step="1000"
+            :placeholder="`留空 = 沿用全局（当前 ${globalBudget}）`"
+            autocomplete="off"
+            spellcheck="false"
+            @keyup.enter.prevent="doEdit"
+          />
+        </el-form-item>
       </el-form>
       <p class="tip">
         改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
@@ -414,6 +434,8 @@
         agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
         <br />
         改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
+        <br />
+        改注入预算：只改这个代理自己的注入阈值（留空 = 沿用全局默认），改完立刻生效。
       </p>
       <template #footer>
         <el-button :disabled="busy" @click="editOpen = false">取消</el-button>
@@ -556,6 +578,7 @@ const REFRESH_MS = 10000
 let timer = null
 onMounted(() => {
   load()
+  loadGlobalBudget()
   timer = setInterval(() => load(true), REFRESH_MS)
 })
 onUnmounted(() => {
@@ -716,13 +739,15 @@ async function doRegister() {
 }
 
 // ---------------------------------------------------------------------------
-// 编辑：代理 ID + 备注名**同框**（一张卡一个编辑入口）
+// 编辑：代理 ID + 备注名 + 注入预算**同框**（一张卡一个编辑入口）
 // ---------------------------------------------------------------------------
 
 const editOpen = ref(false)
 const editRow = ref(null)
 const editId = ref('')
 const editName = ref('')
+/** 注入预算输入框（字符串）：留空 = 沿用全局默认（提交时转成 null）。 */
+const editBudget = ref('')
 /** 主代理不能改 id（后端同口径 400）：输入框直接锁死，备注名照改。 */
 const editPrimary = computed(() => editRow.value?.role === 'primary')
 
@@ -730,7 +755,43 @@ function openEdit(row) {
   editRow.value = row
   editId.value = row?.agent_id || ''
   editName.value = row?.name || ''
+  editBudget.value = row?.core_budget_chars == null ? '' : String(row.core_budget_chars)
   editOpen.value = true
+  loadGlobalBudget()      // placeholder 里的「当前全局」顺手刷一次（fire-and-forget）
+}
+
+/**
+ * 输入框里的预算 → 要提交的值（`null` = 清空 ⇒ 沿用全局）。
+ * 非法值（0 / 负数 / 非整数）返回 `undefined`（= 不该提交，由调用方报错）。
+ */
+function parseBudget(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return null
+  const n = Number(text)
+  if (!Number.isInteger(n) || n <= 0) return undefined
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// 全局默认注入预算（per-agent 的缺省兜底值）
+// ---------------------------------------------------------------------------
+
+/** 全局默认注入预算（字符）。只用于编辑弹框的 placeholder 提示。 */
+const globalBudget = ref('-')
+
+/**
+ * 拉一次全局默认预算（弹框 placeholder 要显示「当前全局是多少」）。
+ *
+ * 🔴 **不跟 10 秒轮询一起拉**：`core/stats` 会全量扫一遍常驻层 —— 代理列表
+ * 每 10 秒刷一次就够了，没必要把常驻层也拖着刷。打开编辑弹框时顺手刷一次。
+ */
+async function loadGlobalBudget() {
+  try {
+    const stats = await api.coreStats()
+    globalBudget.value = stats?.budget ?? '-'
+  } catch {
+    globalBudget.value = '-'          // 读不到就显示占位符（只是个提示，不红条）
+  }
 }
 
 async function doEdit() {
@@ -748,8 +809,17 @@ async function doEdit() {
     showError('备注名不能为空（留空就分不清是哪一个代理了）')
     return
   }
+  // 注入预算：留空 = 沿用全局（null）；非法值（0 / 负数 / 非整数）前端先拦 ——
+  // 后端也会 400，但那时前面的改动可能已经生效了（会落成「改了一半」）。
+  const wantBudget = parseBudget(editBudget.value)
+  if (wantBudget === undefined) {
+    showError('注入预算必须是正整数（留空 = 沿用全局）')
+    return
+  }
+  const oldBudget = row.core_budget_chars ?? null
+  const budgetChanged = wantBudget !== oldBudget
   // 什么都没改：关窗，一个请求都不发
-  if (!idChanged && !nameChanged) {
+  if (!idChanged && !nameChanged && !budgetChanged) {
     editOpen.value = false
     return
   }
@@ -801,6 +871,26 @@ async function doEdit() {
       done.push('备注名已保存')
       // 🔴 同名提醒**原样透出**（后端只在真撞名时给 note）—— 备注名不拦，
       // 但列表里两个一样的名字要看得见（唯一性反馈要在页面上看得见）。
+      if (r.note) notes.push(r.note)
+    }
+    if (budgetChanged) {
+      // 注入预算：只改这一个代理的阈值（null = 沿用全局默认）。改 id 成功后
+      // 必须打**新 id**（预算挂在代理行上，行已经换了）。
+      let r
+      try {
+        r = await api.setAgentBudget(targetId, wantBudget)
+      } catch (e) {
+        if (idChanged) {
+          // ID 已经改了 —— 说清「改了一半」，别让人以为全没生效
+          editOpen.value = false
+          showToast(`已更新：${done.join('，')}；但注入预算没改：${e.message}`, 'warning')
+          load(true)
+        } else {
+          showError(`注入预算保存失败：${e.message}`)
+        }
+        return
+      }
+      done.push(wantBudget === null ? '注入预算已沿用全局' : `注入预算已设为 ${wantBudget} 字符`)
       if (r.note) notes.push(r.note)
     }
     editOpen.value = false

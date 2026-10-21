@@ -23,6 +23,8 @@ from keepsake.api import auth as auth_mod
 from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 
+from conftest import flat_routes
+
 #: 旧静态 token（兼容路径）；与 test_api_readonly.TOKEN 不同名，两边各写一遍
 LEGACY_TOKEN = "p3-legacy-static-token-not-a-real-secret"
 LEGACY = {"Authorization": f"Bearer {LEGACY_TOKEN}"}
@@ -677,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是三十四条业务写端点加四条auth_POST():
+def test_写面仍是三十五条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -687,9 +689,11 @@ def test_写面仍是三十四条业务写端点加四条auth_POST():
     🆕 代理治理再加三条（30 → 33）：停凭据一条 + 整行删除（DELETE + POST 别名）。
     🆕 记忆共享再加一条（33 → 34）：共享开关（`share_memory`）—— 只改**读可见性**，
     不是治理动作。
+    🆕 per-agent 注入预算再加一条（34 → 35）：预算开关（`core_budget_chars`）——
+    只改**一个阈值**，不是治理动作。
     """
     app = create_app()
-    write = {r.path for r in app.routes
+    write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == {
         "/api/v1/auth/setup", "/api/v1/auth/login", "/api/v1/auth/logout",
@@ -717,6 +721,8 @@ def test_写面仍是三十四条业务写端点加四条auth_POST():
         "/api/v1/agents/{agent_id}/delete",
         # 记忆共享开关：只改读可见性，不是治理动作
         "/api/v1/agents/{agent_id}/share",
+        # per-agent 注入预算：只改一个阈值，不是治理动作
+        "/api/v1/agents/{agent_id}/budget",
     }, sorted(write)
 
 
@@ -741,7 +747,7 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/agents/{agent_id}/approve", "/api/v1/agents/{agent_id}/revoke",
                  "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
                  "/api/v1/agents/{agent_id}/set_id"}
-    for r in app.routes:
+    for r in flat_routes(app):
         if getattr(r, "path", "") in protected:
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
             assert any("require_session" in n for n in names), r.path

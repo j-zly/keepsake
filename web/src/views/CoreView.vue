@@ -10,7 +10,7 @@
     <div class="stat-grid">
       <StatCard label="条数" :value="stats?.count ?? '-'" unit="条" />
       <StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" />
-      <StatCard label="注入预算" :value="stats?.budget ?? '-'" unit="字符" />
+      <StatCard label="全局默认注入预算" :value="stats?.budget ?? '-'" unit="字符" hint="没单独设预算的代理都用它" />
       <!-- 包一层：StatCard 的 hint 是纯字符串 prop，放不下可点的「设置」入口，
            而 StatCard.vue 不在本次改动范围内。卡撑满格高，入口贴在卡下沿。 -->
       <div class="budget-cell">
@@ -21,7 +21,7 @@
           :tone="budgetTone"
           :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
         />
-        <button class="soft-btn" @click="openBudget">设置注入预算…</button>
+        <button class="soft-btn" @click="openBudget">设置全局默认注入预算…</button>
       </div>
     </div>
 
@@ -159,7 +159,7 @@
     <!-- 设置注入预算：数字 + 手输当前生效值 confirm（改的是全局阈值，回退影响每轮注入） -->
     <el-dialog
       v-model="budgeting"
-      title="设置常驻层注入预算"
+      title="设置全局默认注入预算"
       width="460px"
       align-center
       :close-on-click-modal="false"
@@ -168,7 +168,7 @@
       append-to-body
     >
       <el-form label-position="top">
-        <el-form-item label="注入预算（字符，可设 1000 ~ 500000）">
+        <el-form-item label="全局默认注入预算（字符，可设 1000 ~ 500000）">
           <el-input v-model="draftBudget" type="number" :min="1000" :max="500000" step="1000" />
         </el-form-item>
         <el-form-item :label="`手输当前生效值 ${stats?.budget ?? '-'} 以确认`">
@@ -178,6 +178,9 @@
       <p class="tip">
         预算即每轮 system_prompt 注入常驻层的字符上限，超出的老条目从尾部截断（并标注截断）。
         改完立刻热生效，不必重启服务。
+        <br />
+        这是全局默认：没有单独设预算的代理都用它；要在「代理登记」页给某个代理
+        单独设预算，去那张卡的「编辑」弹框里填「注入预算」（留空 = 沿用这里）。
       </p>
       <template #footer>
         <el-button :disabled="busyBudget" @click="budgeting = false">取消</el-button>

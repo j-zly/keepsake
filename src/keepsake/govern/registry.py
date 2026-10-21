@@ -107,7 +107,7 @@ REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
-    "meta", "dm_enabled", "share_memory",
+    "meta", "dm_enabled", "share_memory", "core_budget_chars",
 )
 
 #: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -131,6 +131,13 @@ SHARE_ENABLED_VALUES: Tuple[str, ...] = ("1", "true", "yes", "on")
 #: `share_memory` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
 SHARE_COLUMN = "share_memory"
 SHARE_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
+
+#: `core_budget_chars` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
+#: 🔴 **可空**：NULL = 「沿用全局的注入预算」，有值 = 该代理**自己**的预算。
+#: 与 `dm_enabled` / `share_memory` 那两个「NOT NULL + 默认值」不同 ——
+#: 这里「没有值」本身就是一种状态（缺省回退全局），不是某个开/关档位。
+BUDGET_COLUMN = "core_budget_chars"
+BUDGET_COLUMN_DECL = "integer NULL"
 
 #: 计数与布尔列（SQL 里是 integer，Redis hash 里存字符串 —— 规范化时统一成 int/bool）
 _INT_FIELDS = ("reads", "writes")
@@ -160,7 +167,12 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     -- 2026-10 ks_share_memory：是否把这个代理的记忆共享给**别的**已批准代理。
     -- 默认 '0'（关）—— 这是**放宽**权限的开关，缺省必须是最严的那一档；
     -- 老库补列时也落 '0'，存量行的语义不变（谁也没被共享出去）。
-    share_memory         text NOT NULL DEFAULT '0'
+    share_memory         text NOT NULL DEFAULT '0',
+    -- 2026-10 ks_agent_budget：这个代理**自己**的常驻层注入字符预算。
+    -- NULL = 沿用全局默认（config.json 的 retrieval.core_char_budget，缺省回退，
+    -- 不改存量语义）；有值 = 该代理专用（正整数）。
+    -- 老库补列落 NULL ⇒ 存量行一个都没被改过。
+    core_budget_chars    integer NULL
 )
 """
 
@@ -261,12 +273,34 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     # 「新增字段不许改存量语义」：老行一个都没被共享出去）。
     share = str(row.get("share_memory") or "").strip()
     row["share_memory"] = share if share else SHARE_DISABLED_ON
+    # core_budget_chars：缺列 / 空值 ⇒ None（**沿用全局**）；脏值（0 / 负数 /
+    # 非整数）也当 None —— 非法预算回落全局，比回落 0 安全得多（0 = 全被截掉）。
+    row["core_budget_chars"] = _norm_budget(row.get("core_budget_chars"))
     # 脏数据不许悄悄当权威：角色/状态只认枚举内的值
     if row["role"] not in ROLES:
         row["role"] = ROLE_SUB
     if row["status"] not in STATUSES:
         row["status"] = STATUS_PENDING
     return row
+
+
+def _norm_budget(value: Any) -> Optional[int]:
+    """`core_budget_chars` 这一列的**唯一判读口**（None = 沿用全局）。
+
+    🔴 脏数据（0 / 负数 / 非整数 / 空串）一律当**没有值**（None）：预算非法时
+    回落全局，比回落 0 安全得多（0 = 常驻层全被截掉，等于把这一层关掉）。
+    bool 也拒（`int(True)` = 1 = 1 字符预算，那不是人填的数）。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        n = int(text)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
 
 def _dm_is_on(row: Optional[Dict[str, Any]]) -> bool:
@@ -314,6 +348,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         # 记忆共享开关：true = 这个代理的记忆进**别的**已批准代理的检索可见范围。
         # 判读口径与 `Registry.share_memory` 同一个（`_share_is_on`）。
         "share_memory": _share_is_on(row),
+        # 这个代理**自己**的注入字符预算：None = 沿用全局（缺省回退）。
+        # 判读口径与 `Registry.core_budget_chars` 同一个（`_norm_budget`）。
+        "core_budget_chars": row.get("core_budget_chars"),
     }
 
 
@@ -408,7 +445,8 @@ class _SqlBackend(_SqlBase):
 
     # -- ks_agent 专用 --------------------------------------------------
     def ensure_schema(self) -> bool:
-        """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` / `share_memory` 列。
+        """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` /
+        `share_memory` / `core_budget_chars` 列。
 
         🔴 补列走「先查后补」（`_SqlBase.has_column`）：列已在 ⇒ **一条 DDL 都不发**
         （PG 的 `ADD COLUMN IF NOT EXISTS` 列已存在也要拿 ACCESS EXCLUSIVE，
@@ -417,7 +455,8 @@ class _SqlBackend(_SqlBase):
         if not super().ensure_schema():
             return False
         for column, decl in ((DM_COLUMN, DM_COLUMN_DECL),
-                             (SHARE_COLUMN, SHARE_COLUMN_DECL)):
+                             (SHARE_COLUMN, SHARE_COLUMN_DECL),
+                             (BUDGET_COLUMN, BUDGET_COLUMN_DECL)):
             try:
                 if not self.has_column(column):
                     self.add_column(column, decl)
@@ -619,6 +658,8 @@ def _text(value: Any) -> str:
 
 def _hash_field(value: Any) -> Any:
     """写进 Redis hash 的值形态（int / bool / dict 统一成字符串，读时 `_norm` 再转回来）。"""
+    if value is None:
+        return ""            # NULL 列在 Redis 上落空串（读回时 `_norm_budget` 判成 None）
     if isinstance(value, bool):
         return "1" if value else "0"
     if isinstance(value, (dict, list)):
@@ -713,6 +754,9 @@ class Registry:
             "meta": {},
             "dm_enabled": DM_ENABLED_ON,
             "share_memory": SHARE_DISABLED_ON,
+            # 🔴 登记**不碰**预算：新建的行一律沿用全局（NULL）——
+            # 「谁都没登记过预算」是缺省态，不是某个开/关档位。
+            "core_budget_chars": None,
         })
         return self.get(aid) or {}
 
@@ -856,6 +900,37 @@ class Registry:
         if str(row.get("share_memory") or SHARE_DISABLED_ON).strip() == want:
             return False
         self._be.update(aid, {"share_memory": want})
+        return True
+
+    # ---- 注入预算（per-agent）----------------------------------------
+    def core_budget_chars(self, agent_id: str) -> Optional[int]:
+        """这个代理**自己**的常驻层注入字符预算；**没有 ⇒ None**（沿用全局）。
+
+        🔴 查无此代理 / 老库没这一列 / 值为空 ⇒ 一律 None（= 沿用全局）：
+        「新增字段必须兼容旧数据」—— 存量行的语义不许因为加了一列而变。
+        🔴 **不缓存**（照 `visibility.shared_agent_ids` 的纪律）：改完预算必须
+        **立刻生效**，缓存一加就有「改了没生效」的窗口 —— 那种故障最难查。
+        """
+        row = self._be.load((agent_id or "").strip())
+        if not row:
+            return None
+        return row.get("core_budget_chars")
+
+    def set_core_budget_chars(self, agent_id: str, value: Optional[int]) -> bool:
+        """设 / 清这个代理的注入预算（`None` ⇒ 清空 ⇒ 沿用全局）。
+
+        返回**值是否真的变了**（与 `set_share_memory` 同款语义）。
+        🔴 行不存在 ⇒ False（调用方 404）；`status` / `role` / 凭据**一个都不碰**
+        —— 预算只是注入阈值的偏好，不是治理动作。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        want = None if value is None else int(value)
+        if row.get("core_budget_chars") == want:
+            return False
+        self._be.update(aid, {"core_budget_chars": want})
         return True
 
     def rename(self, agent_id: str, name: str) -> bool:

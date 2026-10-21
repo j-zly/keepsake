@@ -21,6 +21,8 @@ from keepsake.govern.registry import CREDENTIAL_PREFIX, Registry
 from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 
+from conftest import flat_routes
+
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -37,6 +39,8 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
+    # per-agent 注入预算（ks_agent_budget）：只改一个阈值，不是治理动作
+    "/api/v1/agents/{agent_id}/budget",
 )
 
 #: 非 POST 的写端点（DELETE 与 POST 别名是同一条路，只是方法不同）。
@@ -107,9 +111,12 @@ def test_列表形状与pending计数(env):
     assert body["count"] == 2 and body["pending_count"] == 2
     item = body["items"][0]
     # 🆕 多了 dm_enabled（私信开关）：控制台的「私信开关」读的就是这个字段
+    # 🆕 多了 core_budget_chars（per-agent 注入预算）：None = 沿用全局默认
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
-                         "credential_hint", "meta", "dm_enabled", "share_memory"}
+                         "credential_hint", "meta", "dm_enabled", "share_memory",
+                         "core_budget_chars"}
+    assert item["core_budget_chars"] is None      # 缺省 = 沿用全局
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文
     assert "credential_hash" not in json.dumps(body)
@@ -565,15 +572,16 @@ def test_写面枚举_十条agents写端点都在(env):
 
     （代理治理原有四条 approve / revoke / role / exclude，登记与改名两条，
     改 id 一条 —— 换主键 + 记忆归属级联，停凭据与整行删除两条，
-    记忆共享开关一条 —— 只改读可见性。）
+    记忆共享开关一条 —— 只改读可见性，per-agent 注入预算一条 —— 只改阈值。）
     """
     app = create_app()
-    paths = {getattr(r, "path", "") for r in app.routes}
+    routes = flat_routes(app)
+    paths = {getattr(r, "path", "") for r in routes}
     assert set(WRITE_PATHS) <= paths
     for p in WRITE_PATHS:
         # 🔴 按 **方法** 挑路由：`/api/v1/agents` 同时挂着 GET（列表）与 POST（登记），
         # 只按 path 挑会挑到先注册的那条 GET，判据就落在错误的路由上了。
-        route = next(r for r in app.routes
+        route = next(r for r in routes
                      if getattr(r, "path", "") == p
                      and "POST" in getattr(r, "methods", set()))
         names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
@@ -581,7 +589,7 @@ def test_写面枚举_十条agents写端点都在(env):
         assert any("write_guard" in n for n in names), p
     # 🔴 DELETE 那条同样要过两道闸（方法换了，闸不许跟着消失）
     for p in DELETE_PATHS:
-        route = next(r for r in app.routes
+        route = next(r for r in routes
                      if getattr(r, "path", "") == p
                      and "DELETE" in getattr(r, "methods", set()))
         names = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}

@@ -17,6 +17,8 @@ from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.api.routers import kb as kb_router
 
+from conftest import flat_routes
+
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -82,6 +84,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
+    # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
+    "/api/v1/agents/{agent_id}/budget",
 } | AUTH_POST_PATHS
 
 
@@ -216,10 +220,11 @@ def test_只读路由断言():
     多一条（比如漏加 require_session 依赖的临时端点）同样会被这里抓住。
     """
     app = create_app()
-    write = {r.path for r in app.routes
+    routes = flat_routes(app)      # 兼容 FastAPI ≥0.156 的懒 include_router
+    write = {r.path for r in routes
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    paths = {getattr(r, "path", "") for r in app.routes}
+    paths = {getattr(r, "path", "") for r in routes}
     assert {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
             "/api/v1/fragments/{key}", "/api/v1/kb/summary", "/api/v1/kb/search",
             "/api/v1/kb/pending", "/api/v1/stats", "/api/v1/crons",
@@ -237,7 +242,7 @@ def test_写路由全部需要token():
     不是依赖函数叫什么名字。
     """
     app = create_app()
-    for r in app.routes:
+    for r in flat_routes(app):     # 兼容 FastAPI ≥0.156 的懒 include_router
         if getattr(r, "path", "") in (ALLOWED_POST_PATHS - AUTH_POST_PATHS):
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
             assert any("require_session" in n or "writer_identity" in n

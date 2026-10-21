@@ -49,6 +49,7 @@ from ...govern.messaging import Messaging
 # 记忆共享开关的可见性过滤器（2026-10 ks_share_memory）：**唯一**那份口径。
 from ...govern.visibility import (
     fragment_owner,
+    truncate_core_fragments,
     visible_agent_ids,
     visible_core_fragments,
 )
@@ -936,27 +937,55 @@ class KeepsakeProvider(MemoryProvider):
             return frags
         return visible_core_fragments(frags, self._registry, scope.caller_id)
 
+    def core_budget_for(self, caller_agent_id: str = "") -> int:
+        """**本次读取方代理**的注入字符预算（per-agent 优先，缺省回退全局）。
+
+        * `caller_agent_id` 非空 ⇒ **MCP 远端调用方**（身份由闸门按凭据反查）
+          ⇒ 取注册表里**它那一行**的 `core_budget_chars`；
+        * `caller_agent_id` 为空 ⇒ **本进程自己**（主脑进程；它的 agent_id 就是
+          `main-brain`）⇒ 取注册表里**本进程那一行**的值。
+
+        🔴 **不缓存**：改完预算必须**立刻生效**（照 `share_memory` 那条纪律）——
+        代理数是个位数，一次小查询足够；缓存一加就有「改了没生效」的窗口。
+        🔴 那一行没有预算（NULL）/ 注册表不可用 ⇒ 回退全局 `_core_budget()`
+        （老库补列落 NULL ⇒ 存量行一个都没被改过）。
+        """
+        registry = getattr(self, "_registry", None)
+        aid = str(caller_agent_id or getattr(self, "_agent_id", "") or "").strip()
+        if registry is not None and aid:
+            getter = getattr(registry, "core_budget_chars", None)
+            if callable(getter):
+                try:
+                    value = getter(aid)
+                except Exception as e:      # noqa: BLE001 —— 读不到就回退全局
+                    logger.warning("keepsake: 代理 %s 的注入预算读取失败（回退全局）: %s",
+                                   aid, type(e).__name__)
+                    value = None
+                if value:
+                    return int(value)
+        return _core_budget()
+
     def _core_block(self, caller_agent_id: str = "", caller_role: str = "") -> str:
-        """渲染 `<keepsake-core>…</keepsake-core>` 块；无内容时返回空串（不留空行）。"""
+        """渲染 `<keepsake-core>…</keepsake-core>` 块；无内容时返回空串（不留空行）。
+
+        🔴 预算按**本次读取方代理**取（`core_budget_for`）：该代理自己配了
+        `core_budget_chars` 就用它的，没配才回退全局。
+        """
         if not self._storage:
             return ""
         frags = self._core_fragments(caller_agent_id, caller_role)
         if not frags:
             return ""
-        lines = [f"- {f.get('content', '')}" for f in frags]
-        budget = _core_budget()
-        if sum(len(x) for x in lines) > budget:
-            # 按 list_by_tag 的稳定顺序（updated_at 升序、key 升序）**从头截** ——
-            # 老条目是常驻记忆里最该被无条件看到的那部分，末尾的超预算条目才丢。
-            kept, total = [], 0
-            for line in lines:
-                if total + len(line) > budget:
-                    break
-                kept.append(line)
-                total += len(line)
-            lines = kept + [f"[core 层已截断：共 {len(frags)} 条，本次注入 {len(kept)} 条]"]
+        budget = self.core_budget_for(caller_agent_id)
+        kept, dropped = truncate_core_fragments(frags, budget)
+        if dropped:
+            # 超预算 ⇒ 截断 + **一行可见说明**（不许静默丢条目）。
+            lines = [f"- {str(f.get('content', ''))}" for f in kept]
+            lines.append(f"[core 层已截断：共 {len(frags)} 条，本次注入 {len(kept)} 条]")
             logger.warning("keepsake: core 层超 %d 字符预算，截断为 %d 条",
                            budget, len(kept))
+        else:
+            lines = [f"- {str(f.get('content', ''))}" for f in frags]
         return "\n".join(["<keepsake-core>", *lines, "</keepsake-core>"])
 
     # ------------------------------------------------------------------

@@ -32,6 +32,8 @@ from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.core.sqlite import SqliteStorage
 
+from conftest import flat_routes
+
 TOKEN = "bulk-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -132,7 +134,7 @@ def test_bulk挂写闸_bulk_export不挂():
     """
     app = create_app()
     deps = {r.path: {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
-            for r in app.routes if getattr(r, "dependant", None)}
+            for r in flat_routes(app) if getattr(r, "dependant", None)}
     assert "write_guard" in deps[BULK]
     assert "require_session" in deps[BULK]
     assert "write_guard" not in deps[BULK_EXPORT]

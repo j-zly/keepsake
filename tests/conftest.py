@@ -46,6 +46,24 @@ def _install_stubs() -> None:
 _install_stubs()
 
 
+def flat_routes(app) -> list:
+    """把 app 的**全部**路由摊平（兼容 FastAPI ≥ 0.156 的懒 include_router）。
+
+    🔴 FastAPI 0.156 起 `include_router` 不再把子路由摊进 `app.routes`，
+    而是放一个 `_IncludedRouter` 壳 —— 只看 `app.routes` 会误判成「路由没挂上」
+    （枚举写面路径的用例会集体假红）。这里两种版本都取全：壳里有
+    `original_router` 就取它的 routes，没有就当普通路由。
+    """
+    out = []
+    for r in getattr(app, "routes", []):
+        inner = getattr(r, "original_router", None)
+        if inner is not None:
+            out.extend(getattr(inner, "routes", []) or [])
+        else:
+            out.append(r)
+    return out
+
+
 @pytest.fixture(autouse=True)
 def _reset_pg_snapshots():
     """每个用例前后清空 PG 检索快照（`_SNAPSHOTS`）。

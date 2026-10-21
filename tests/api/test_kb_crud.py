@@ -35,6 +35,8 @@ from keepsake.api.deps import get_storage
 from keepsake.api.routers import kb as kb_router
 from keepsake.kb.ingest import chunk_document, link_body, split_chunks
 
+from conftest import flat_routes
+
 TOKEN = "kbcrud-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -288,7 +290,7 @@ def test_写端点守卫齐():
                     "/api/v1/kb/documents/{id}/approve",
                     "/api/v1/kb/documents/{id}/reject", EXPORT)
     seen = set()
-    for r in app.routes:
+    for r in flat_routes(app):
         path = getattr(r, "path", "")
         if path not in want:
             continue

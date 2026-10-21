@@ -20,6 +20,8 @@ from fastapi.testclient import TestClient
 from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 
+from conftest import flat_routes
+
 TOKEN = "p2-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -39,7 +41,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: ks_agent_delete 起再加 3 条代理治理端点（停凭据 revoke_credential +
 #: 整行删除 DELETE /api/v1/agents/{agent_id} 及其 POST 别名 .../delete），
 #: ks_share_memory 起再加 1 条记忆共享开关端点（share_memory —— 只改读可见性，
-#: 不是治理动作）。
+#: 不是治理动作），ks_agent_budget 起再加 1 条 per-agent 注入预算端点
+#: （core_budget_chars —— 只改一个阈值，不是治理动作）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -87,6 +90,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
+    # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
+    "/api/v1/agents/{agent_id}/budget",
 } | AUTH_POST_PATHS
 
 
@@ -495,11 +500,11 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 def test_写面白名单全量断点_34条业务加4条认证():
     app = create_app()
-    write = {r.path for r in app.routes
+    write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 38
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 34
+    assert len(ALLOWED_POST_PATHS) == 39
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 35
 
 
 def test_P1只读路由未被写面影响(client):

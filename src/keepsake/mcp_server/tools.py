@@ -49,6 +49,8 @@ from ..govern.registry import (
     STATUS_APPROVED,
     STATUS_REVOKED,
 )
+# core 层的两把尺子（归属可见性 + 注入预算）—— 与注入路径同一份口径。
+from ..govern.visibility import truncate_core_fragments
 
 logger = logging.getLogger("keepsake.mcp_server.tools")
 
@@ -96,6 +98,25 @@ def _list_core(provider: Any, caller_agent_id: str = "",
     """列 core 层条目（带调用方可见性 —— provider 支持才传身份参数）。"""
     lister = _introspect(provider).list_core
     return list(lister(**_caller_kwargs(lister, caller_agent_id, caller_role)))
+
+
+def _core_budget_of(provider: Any, caller_agent_id: str = "") -> Optional[int]:
+    """本次读取方的**注入字符预算**（**可选**扩展：provider 有就提供，没有 ⇒ 不截）。
+
+    🔴 这是 keepsake 自己的可选扩展（不是 `MemoryProvider` 契约的一部分 ——
+    别的记忆系统 provider 没有它 ⇒ 照常列，不猜、不 try/except 吞异常）。
+    provider 侧的口径见 `adapters/hermes/provider.py::core_budget_for`：
+    调用方在注册表里配了自己的 `core_budget_chars` ⇒ 用它的；没配 ⇒ 全局。
+    """
+    fn = getattr(provider, "core_budget_for", None)
+    if not callable(fn):
+        return None
+    try:
+        return int(fn(caller_agent_id or ""))
+    except Exception as e:      # noqa: BLE001 —— 读不到预算就不截（照旧全量列出）
+        logger.warning("keepsake MCP: 注入预算读取失败（不截断）: %s: %s",
+                       type(e).__name__, e)
+        return None
 
 
 def _count_fragments(provider: Any) -> int:
@@ -240,10 +261,20 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
 
     🔴 非 primary 只拿得到自己的 core + 已共享代理的 core（同口径；primary 的
     core 要 primary 自己开共享才外露 —— 对称规则）。
+
+    🔴 **注入预算按本次读取方取**（2026-10 ks_agent_budget）：调用方在注册表里
+    配了自己的 `core_budget_chars` ⇒ 列表按**它**的预算截；没配 ⇒ 走全局。
+    口径与注入路径（`system_prompt_block` → `_core_block`）同一把尺子
+    （`govern.visibility.truncate_core_fragments`）—— 注入截了、列表没截就是漂了。
+    截断**必带一行可见说明**（不许静默丢条目）。
     """
     preview_chars = max(1, min(int(preview_chars), 2000))
     rows = _list_core(provider, caller_agent_id, caller_role)
-    return {
+    budget = _core_budget_of(provider, caller_agent_id)
+    total = len(rows)
+    if budget is not None:
+        rows, _dropped = truncate_core_fragments(rows, budget)
+    out: Dict[str, Any] = {
         "count": len(rows),
         "chars": sum(len(str(r.get("content", "") or "")) for r in rows),
         "items": [
@@ -255,6 +286,12 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
             for r in rows
         ],
     }
+    if len(rows) < total:
+        out["truncated"] = True
+        out["note"] = f"[core 层已截断：共 {total} 条，本次列出 {len(rows)} 条]"
+    if budget is not None:
+        out["budget"] = budget
+    return out
 
 
 def memory_add(provider: Any, text: str, tags: str = "",

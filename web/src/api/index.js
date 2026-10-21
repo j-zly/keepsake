@@ -177,6 +177,11 @@ export const api = {
   // （这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据。
   setAgentShare: (agentId, enabled) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/share`, { enabled, confirm: true }).then((r) => r.data),
+  // per-agent 注入预算（core_budget_chars）：confirm 恒为 true；只改**一个阈值**，
+  // 不碰状态 / 角色 / 凭据。传 null = 清空 ⇒ 沿用全局默认（不是「预算 0」）。
+  setAgentBudget: (agentId, coreBudgetChars) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/budget`,
+      { core_budget_chars: coreBudgetChars ?? null, confirm: true }).then((r) => r.data),
 
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。

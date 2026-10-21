@@ -18,6 +18,8 @@ from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.core.shared import fragment_key_for
 
+from conftest import flat_routes
+
 TOKEN = "review-counts-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -170,7 +172,7 @@ def test_路径在_get_routes里_且方法仅GET(client):
     那是只读端点，write_guard 没挂它就是 fail-open 的写入口。"""
     app = client.app
     methods = set()
-    for r in app.routes:
+    for r in flat_routes(app):
         if getattr(r, "path", "") == "/api/v1/review/counts":
             methods = getattr(r, "methods", set()) or set()
     assert methods == {"GET"}, f"review/counts 必须是仅 GET，实际 {methods}"
@@ -180,7 +182,7 @@ def test_挂的是require_session_不是write_guard(client):
     """🔴 只读端点不许挂 write_guard（这是写端点的统一前置闸门）。
     少挂 require_session 也会红，但正向断言有了，下面只验 write_guard 不挂。"""
     app = client.app
-    for r in app.routes:
+    for r in flat_routes(app):
         if getattr(r, "path", "") == "/api/v1/review/counts":
             names = {getattr(d.call, "__name__", "") for d in r.dependant.dependencies}
             assert "require_session" in names, "review/counts 必须挂 require_session"

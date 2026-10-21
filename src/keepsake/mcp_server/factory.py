@@ -47,12 +47,16 @@ class KeepsakeMCPProvider(KeepsakeProvider):
         `GET /api/v1/core` 同一个原语，所以两边条数永远一致。
 
         刻意**不走** `KeepsakeProvider._core_fragments()`：那个带 60s 进程级缓存
-        且超预算就返回空，MCP 是显式取数接口，缓存与预算兜底都会让调用方
+        且读失败就返回空，MCP 是显式取数接口，缓存与预算兜底都会让调用方
         拿到「与库里不一致」的结果。
 
         🔴 **可见性同口径**（2026-10 ks_share_memory）：非 primary 只拿得到
         自己的 core + 已共享代理的 core（判据在 `govern.visibility`；primary 的
         core 也要 primary 自己开共享才外露 —— 对称规则）。
+
+        🔴 **这里不按注入预算截**（2026-10 ks_agent_budget）：截断由**工具面**
+        （`memory_core_list`）做 —— 那边能顺带给出「截了多少」的可见说明，
+        而这里保持「与库里一致」（显式取数接口的既有语义）。
         """
         frags = list(self._require_storage().list_by_tag("core"))
         scope = self._visibility_scope(caller_agent_id, caller_role)

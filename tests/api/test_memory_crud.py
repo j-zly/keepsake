@@ -33,6 +33,8 @@ from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
 from keepsake.api.routers import ops as ops_module
 
+from conftest import flat_routes
+
 TOKEN = "crud-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -154,7 +156,7 @@ def test_导出是只读端点_三写端点带write_guard():
             "/api/v1/fragments/{key}/delete": ({"POST"}, True),
             IMPORT: ({"POST"}, True)}
     seen = set()
-    for r in app.routes:
+    for r in flat_routes(app):
         path = getattr(r, "path", "")
         if path not in want:
             continue
