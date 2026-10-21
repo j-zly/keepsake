@@ -584,6 +584,21 @@ def test_pg_prune_删旧留新(pgs):
     assert pgs.prune_hit_events(days=90) == 0
 
 
+def test_pg_hits_基数回填_同一个key补N条事件(pgs):
+    """🔴 2026-10 ks_pg_tls_fix：`record_hits_repeat` 原来读 `self._tls.in_worker`
+    —— PgStorage 全类**没有** `_tls`（从 Redis 抄来的残留）⇒ 真库上恒抛
+    `AttributeError: 'PgStorage' object has no attribute '_tls'`，被调用方吞掉
+    ⇒ 提名基数回填失效（自动提名永远攒不满基数）。
+
+    本用例钉住两件事：返回条数 = N，且**真的落 N 行** `ks_hit_event`。
+    """
+    assert pgs.record_hits_repeat("memory:frag:pgbackfill", 3000) == 3000
+    rows = [r for r in _pg_rows(pgs) if r[0] == "memory:frag:pgbackfill"]
+    assert len(rows) == 3000, "基数回填必须真的落 3000 行事件（规则二数的是行数）"
+    items = pgs.hits_stats(window_days=7, min_hits=1, keys=["memory:frag:pgbackfill"])
+    assert items and items[0]["hits"] == 3000, items
+
+
 # ---------------------------------------------------------------------------
 # 四、API：只读 + 认证 + 出参形状
 # ---------------------------------------------------------------------------

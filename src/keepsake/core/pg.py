@@ -3373,13 +3373,8 @@ class PgStorage(StorageBase):
             return 0
         ts = datetime.now(timezone.utc)
         rows = [(key, ts)] * n
-        in_worker = threading.current_thread() is not threading.main_thread()
-        self._tls.in_worker = in_worker
-        try:
-            with self._tx() as cur:
-                self._insert_many(cur, "ks_hit_event", ("key", "ts"), rows, "")
-        finally:
-            self._tls.in_worker = False
+        with self._tx() as cur:
+            self._insert_many(cur, "ks_hit_event", ("key", "ts"), rows, "")
         return n
 
     def hits_stats(

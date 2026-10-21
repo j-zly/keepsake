@@ -270,3 +270,38 @@ def test_坏DSN立刻报连接类异常而不是等池超时(monkeypatch):
     with pytest.raises(OperationalError):
         st._build_pool()          # noqa: SLF001
     assert st._conn_pool is None  # noqa: SLF001 —— 建不起来就不留半个池子
+
+
+# --------------------------------------------------------------------------
+# ④ 写路径不许读未定义属性（2026-10 ks_pg_tls_fix）
+# --------------------------------------------------------------------------
+
+def test_hits_基数回填不读未定义属性_没有_tls():
+    """🔴 `record_hits_repeat` 原来读 `self._tls.in_worker` —— **PgStorage 全类
+    没有 `_tls`**（从 Redis 抄来的残留）⇒ 真库上恒抛
+    `AttributeError: 'PgStorage' object has no attribute '_tls'`，被调用方吞掉
+    ⇒ 提名基数回填失效、自动提名永远攒不满基数。
+
+    本用例**不连库**（假池 + 假游标）⇒ 没 PG 的 CI 上也能钉住这条线。
+    """
+    class _KeepConnPool(_FakePool):
+        """把借出去的连接留下来，好断言真的发过 INSERT。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.conns: List[_FakeConn] = []
+
+        def getconn(self, timeout: Optional[float] = None) -> _FakeConn:
+            conn = super().getconn(timeout=timeout)
+            self.conns.append(conn)
+            return conn
+
+    st = _storage()
+    pool = _KeepConnPool()
+    _with_pool(st, pool)
+    assert st.record_hits_repeat("memory:frag:x", 3) == 3
+    stmts = pool.conns[0].cur.stmts
+    assert len(stmts) == 1, "3 行 = 一条多行 INSERT（不许逐条 insert）"
+    sql, params = stmts[0]
+    assert sql.startswith("INSERT INTO ks_hit_event (key, ts)"), sql
+    assert len(params) == 6, "3 行 × 2 列 = 6 个绑定参数"
