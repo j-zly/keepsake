@@ -381,6 +381,7 @@ yeah
 | `push_consumer.notify_url` | — | `""` | 通知出口的渠道 webhook 地址（例：飞书群机器人）。**空 = 功能关** ⇒ 零外呼 |
 | `push_consumer.notify_min_interval_s` | — | `120` | 通知出口的限频窗口（秒）：**同一未读数**在窗口内只喊一次；水位升高立刻再喊 |
 | `push_consumer.notify_format` | — | `generic` | 通知载荷形状：`generic`（`{"text": …}`）或 `feishu`（`{"msg_type": "text", "content": {"text": …}}`） |
+| `nudge.publish_endpoint` | — | `http://127.0.0.1:8210/internal/publish` | 控制台把提醒帧 **POST** 到哪儿（跨进程投递 —— 流挂在 MCP 进程里）。env 覆盖：`KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`。见「nudge 跨进程投递」节 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -689,9 +690,9 @@ data: {"seq": 12, "from": "worker-1", "unread": 3}
 * **吊销生效边界 = 一个心跳间隔（≤25s）**：每个心跳复核一次建流资格 ——
   凭据被吊销或 `push_enabled` 被关之后，已挂着的那条流**最多再活 25s**；
 * **进程内总线**：事件走**进程内**总线（`dict[agent_id → list[asyncio.Queue]]`）⇒
-  控制台进程与 MCP 进程**分开跑**时，控制台的「触发提醒」推不到 MCP 侧挂着的那条流
-  （回包**如实**说 `delivered=false`，不谎报；寄生层仍在）。
-  `ponytail:` 真要跨进程，把这一层换成 Redis pub/sub 即可。
+  控制台进程与 MCP 进程**分开跑**时，控制台的「触发提醒」改走下面的
+  **内部端点**投递（由**真正挂着流的那台进程**去推；控制台自己不再在本进程推帧）。
+  `ponytail:` 真要更通用的跨进程，把这一层换成 Redis pub/sub 即可。
 
 ### 手动 / 批量触发提醒
 
@@ -703,6 +704,46 @@ data: {"seq": 12, "from": "worker-1", "unread": 3}
 
 对应后端端点：`POST /api/v1/messages/nudge`（body `{agents: ["id1", ...]}`，1~50 个去重）、
 `POST /api/v1/agents/{agent_id}/push`（开关）。
+
+### nudge 跨进程投递
+
+SSE 流挂在 **MCP 进程**（8210）的内存总线上；控制台是**另一个进程**（8200），
+它自己那台总线**一个订阅者都没有** ⇒ 控制台点「触发提醒」若在本进程推帧，
+**恒** `delivered=false`（如实，但功能是坏的）。
+
+现在补上了那缺的一米 —— 控制台把帧 **POST** 给**真正挂着流的那个进程**：
+
+```
+控制台 (8200) ──POST /internal/publish──▶ mcp-http (8210) ──▶ BUS ──▶ SSE 流
+```
+
+* **端点**：`POST /internal/publish`，挂在 **MCP 的 http 传输同进程同端口**
+  （与 `/events` 一起，默认 `127.0.0.1:8210`）。body
+  `{agent_id, kind, unread, seq?, from?}` ⇒ 回包 `{"delivered": bool}` ——
+  **BUS 的真实答案**（到底有没有人挂着流）。帧里**仍然只有元数据**
+  （`seq` / `from` / `unread`），**永远没有正文**。
+* **两道闸**：① **只接受回环来源**（`request.client.host ∈ {127.0.0.1, ::1}`；
+  反向代理不转发本路径 ⇒ 公网不可达）② **共享密钥头** `X-Internal-Token`，
+  值从 env `KEEPSAKE_INTERNAL_TOKEN` 读。
+* 🔴 **未配置该 env ⇒ 端点一律 503**（fail-closed）：提醒**不投递**，控制台
+  **如实**这么说，不谎报已送达。
+* **控制台侧**：端点地址 = 配置项 `nudge.publish_endpoint`（env 覆盖
+  `KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`），缺省
+  `http://127.0.0.1:8210/internal/publish`；共享密钥读**同一个**
+  `KEEPSAKE_INTERNAL_TOKEN` env。
+* **如实回报**：`delivered=false` + `reason=no_stream`（没人挂着流）或
+  `reason=publish_endpoint_unavailable`（端点没起来 / 503 / 没配密钥）⇒
+  页面显示 **⚠ 端点不可用** —— 提醒**没送到**；寄生层（对话轮提醒）与
+  `unread_dm` 水位仍在。
+
+**部署**：两个进程要配**同一个**密钥，否则 MCP 侧一直 503，每次提醒都报
+「端点不可用」。给两个 unit 各加一行（之后 `systemctl daemon-reload` + 重启）：
+
+```ini
+# /etc/systemd/system/keepsake-mcp-http.service
+# /etc/systemd/system/keepsake-console.service
+Environment=KEEPSAKE_INTERNAL_TOKEN=<一串足够长的随机串>
+```
 
 ### provider 侧挂流消费者（补齐最后一米）
 

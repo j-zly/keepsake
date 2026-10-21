@@ -11,6 +11,12 @@
   推一帧 `dm-nudge` 事件（SSE 快车道）。只推**元数据**（未读数 + 最近发件人），
   **没有正文**；没挂着流就如实回报 `delivered=false`（提醒**不补发**）。
 
+🔴 **nudge 是跨进程投递**（2026-10 ks_nudge_xproc）：SSE 流挂在 **MCP 进程**
+（8210）的内存总线上，而控制台是**另一个进程**（8200）⇒ 控制台自己那台总线
+永远没有订阅者。所以投递动作**不做在本进程**，而是 POST 到 MCP 进程的内部
+端点 `POST /internal/publish`（回环 + 共享密钥两道闸），由**挂着流的那台
+进程**去推。端点不可达 ⇒ 如实回报 `publish_endpoint_unavailable`，不谎报。
+
 🔴 **只读治理面**：这些端点都不回显任何凭据字段（明文 / 哈希都不出现）。
 消息正文按原样返回 —— 那是治理面要看的东西，不是秘密。
 
@@ -28,13 +34,15 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+import httpx
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
-from keepsake.govern.events import publish_nudge
+from keepsake.govern.events import (EVENT_DM_NUDGE, INTERNAL_TOKEN_HEADER,
+                                    internal_token)
 from keepsake.govern.messaging import LIMIT_MAX, Messaging
 
-from .. import audit
+from .. import audit, config
 from ..deps import get_storage, require_session
 from .agents import _backup, _need_agent, _registry
 from .ops import _need_flag, _reject, write_guard
@@ -49,6 +57,13 @@ DEFAULT_SIZE = 50
 
 #: 一次 nudge 最多点名几个代理（1~50，去重后计）。
 NUDGE_MAX_AGENTS = 50
+
+#: 投递端点的请求超时（秒）—— 端点不可达时要**快**地如实回报不可用，
+#: 不能让控制台页面干等（本地回环，正常是毫秒级）。
+NUDGE_PUBLISH_TIMEOUT_S = 3.0
+
+#: 「投递端点不可用」的 reason（前端文案映射里有一条人话）。
+REASON_PUBLISH_UNAVAILABLE = "publish_endpoint_unavailable"
 
 
 class AgentDmBody(BaseModel):
@@ -86,6 +101,41 @@ def _dedupe_agents(raw: List[str]) -> List[str]:
         seen.add(aid)
         out.append(aid)
     return out
+
+
+def _publish_client() -> httpx.Client:
+    """内部投递用的 HTTP 客户端（**测试替换这一处**即可 mock 传输层）。"""
+    return httpx.Client(timeout=NUDGE_PUBLISH_TIMEOUT_S)
+
+
+def _publish_via_internal(endpoint: str, token: str,
+                          payload: Dict[str, Any]) -> Dict[str, Any]:
+    """把一帧提醒投递到 MCP 进程的内部端点（跨进程那一跳）。
+
+    返回 `{"delivered": bool, "reason": str}`：
+
+    * 端点回 `delivered=true` ⇒ **送达**（对方当前挂着流，帧推出去了）；
+    * 端点回 `delivered=false` ⇒ 没挂着流（`reason=no_stream`）；
+    * 端点**不可达 / 503 / 401 / 任何非 200** ⇒
+      `reason=publish_endpoint_unavailable` —— **如实**说没送到，不谎报。
+    """
+    try:
+        with _publish_client() as client:
+            resp = client.post(endpoint, json=payload,
+                               headers={INTERNAL_TOKEN_HEADER: token})
+    except Exception as e:      # noqa: BLE001 —— 连不上也是「不可用」，不许 500
+        logger.warning("keepsake: nudge 投递端点不可达（%s: %s）",
+                       type(e).__name__, e)
+        return {"delivered": False, "reason": REASON_PUBLISH_UNAVAILABLE}
+    if resp.status_code != 200:
+        logger.warning("keepsake: nudge 投递端点回 %s（不可用）", resp.status_code)
+        return {"delivered": False, "reason": REASON_PUBLISH_UNAVAILABLE}
+    try:
+        body = resp.json()
+    except Exception:           # noqa: BLE001 —— 回包不是 JSON ⇒ 当不可用
+        return {"delivered": False, "reason": REASON_PUBLISH_UNAVAILABLE}
+    delivered = bool((body or {}).get("delivered"))
+    return {"delivered": delivered, "reason": "" if delivered else "no_stream"}
 
 
 def _item(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,10 +216,17 @@ def nudge_messages(body: NudgeBody,
 
     * `delivered=true` ＝ 该代理当前**挂着 SSE 流**，帧已经推出去；
     * `delivered=false` ＝ 没挂着流（`reason=no_stream`）／该代理关了推送
-      （`reason=push_disabled`）／代理不存在（`reason=unknown_agent`）。
+      （`reason=push_disabled`）／代理不存在（`reason=unknown_agent`）／
+      **投递端点不可用**（`reason=publish_endpoint_unavailable`）。
       🔴 **提醒不补发**：没连着就没有快车道，寄生层（对话轮提醒）与
       `unread_dm` 水位仍在 —— 这里**如实**说没送到，不谎报送达。
     * 帧里**只有元数据**（未读数 + 最近发件人），**没有正文**。
+
+    🔴 **跨进程投递**（2026-10 ks_nudge_xproc）：帧推给**挂着流的 MCP 进程**
+    （不是本进程 —— 本进程那台总线没有订阅者）。投递走内部端点
+    `POST /internal/publish`（回环来源 + 共享密钥两道闸；未配共享密钥 ⇒
+    端点 503 ⇒ 这里如实回报不可用）。端点地址 = 配置项 `nudge.publish_endpoint`
+    （缺省 `http://127.0.0.1:8210/internal/publish`）。
 
     🔴 本端点**不改任何数据**（只是推一帧事件）⇒ 没有「改前快照」可备份，
     只留一行审计（控制台写操作纪律的另一半）。
@@ -184,7 +241,10 @@ def nudge_messages(body: NudgeBody,
                 action, ",".join(ids[:NUDGE_MAX_AGENTS]))
     registry = _registry(storage)
     box = Messaging(storage)
+    endpoint = config.nudge_publish_endpoint()
+    token = internal_token()
     results: List[Dict[str, Any]] = []
+    endpoint_down = False
     for aid in ids:
         if not registry.get(aid):
             results.append({"agent_id": aid, "delivered": False,
@@ -196,11 +256,24 @@ def nudge_messages(body: NudgeBody,
             results.append({"agent_id": aid, "delivered": False,
                             "reason": "push_disabled", "unread": unread})
             continue
-        delivered = publish_nudge(aid, unread=unread,
-                                  from_id=str(snap.get("last_from") or ""),
-                                  seq=int(snap.get("max_seq") or 0)) > 0
-        results.append({"agent_id": aid, "delivered": bool(delivered),
-                        "reason": "" if delivered else "no_stream", "unread": unread})
+        if endpoint_down:
+            # 端点已经不可用 ⇒ 后面的代理**同样投不出去**（一个端点，一份生死）：
+            # 不再逐个去撞（50 个代理 × 超时会把页面拖死），如实报「不可用」。
+            results.append({"agent_id": aid, "delivered": False,
+                            "reason": REASON_PUBLISH_UNAVAILABLE, "unread": unread})
+            continue
+        # 跨进程那一跳：帧由**挂着流的 MCP 进程**推（见模块 docstring）
+        outcome = _publish_via_internal(endpoint, token, {
+            "agent_id": aid,
+            "kind": EVENT_DM_NUDGE,
+            "unread": unread,
+            "seq": int(snap.get("max_seq") or 0),
+            "from": str(snap.get("last_from") or ""),
+        })
+        if outcome["reason"] == REASON_PUBLISH_UNAVAILABLE:
+            endpoint_down = True
+        results.append({"agent_id": aid, "delivered": bool(outcome["delivered"]),
+                        "reason": str(outcome["reason"]), "unread": unread})
     ok_count = sum(1 for r in results if r["delivered"])
     audit.record(action, ",".join(ids), ok=True,
                  reason=f"delivered={ok_count}/{len(results)}")

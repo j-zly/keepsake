@@ -82,6 +82,16 @@ KB_TABLE_DOCUMENTS = "documents"
 KB_TABLE_CHUNKS = "chunks"
 
 # --------------------------------------------------------------------------
+# nudge 跨进程投递（2026-10 ks_nudge_xproc）
+# --------------------------------------------------------------------------
+
+#: nudge 投递端点（配置项 `nudge.publish_endpoint`）—— env 覆盖用。
+NUDGE_PUBLISH_ENDPOINT_ENV = "KEEPSAKE_NUDGE_PUBLISH_ENDPOINT"
+
+#: 缺省投递端点：MCP 的 http 传输默认端口 8210（与 SSE 端点同一个进程）。
+DEFAULT_NUDGE_PUBLISH_ENDPOINT = "http://127.0.0.1:8210/internal/publish"
+
+# --------------------------------------------------------------------------
 # 静态资源 / 分页
 # --------------------------------------------------------------------------
 
@@ -171,6 +181,31 @@ def cron_jobs_path() -> str:
 def static_dir() -> Path:
     """前端构建产物目录。"""
     return Path(_env(STATIC_DIR_ENV) or DEFAULT_STATIC_DIR)
+
+
+def nudge_publish_endpoint() -> str:
+    """nudge 的**跨进程投递端点**（控制台 → MCP 的内部端点）。
+
+    取值优先级：env `KEEPSAKE_NUDGE_PUBLISH_ENDPOINT` → `config.json` 的
+    `nudge.publish_endpoint` → 缺省 `http://127.0.0.1:8210/internal/publish`。
+
+    🔴 端点**不可达**时控制台如实回报 `publish_endpoint_unavailable`，
+    不谎报已送达（见 `api/routers/messages.py`）。
+    """
+    env = _env(NUDGE_PUBLISH_ENDPOINT_ENV)
+    if env:
+        return env
+    try:
+        from keepsake.adapters.hermes.provider import _load_json_config
+
+        node = (_load_json_config() or {}).get("nudge")
+        if isinstance(node, dict):
+            value = str(node.get("publish_endpoint") or "").strip()
+            if value:
+                return value
+    except Exception:       # noqa: BLE001 —— 配置读不到就回落缺省，不该打死端点
+        pass
+    return DEFAULT_NUDGE_PUBLISH_ENDPOINT
 
 
 def core_char_budget() -> int:

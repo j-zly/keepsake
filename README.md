@@ -397,6 +397,7 @@ Then reference it in config.json:
 | `push_consumer.notify_url` | — | `""` | Channel webhook the unread-DM notification is POSTed to (e.g. a Feishu group bot). **Empty = the notify outlet is off** ⇒ zero outbound calls |
 | `push_consumer.notify_min_interval_s` | — | `120` | Rate-limit window (s) for the notify outlet: the **same** unread count is announced at most once per window; a rising count is announced immediately |
 | `push_consumer.notify_format` | — | `generic` | Payload shape of the notify outlet: `generic` (`{"text": …}`) or `feishu` (`{"msg_type": "text", "content": {"text": …}}`) |
+| `nudge.publish_endpoint` | — | `http://127.0.0.1:8210/internal/publish` | Where the console **posts** a nudge frame (cross-process delivery — the stream lives in the MCP process). Env override: `KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`. See [Nudge delivery across processes](#nudge-delivery-across-processes) |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -805,10 +806,11 @@ into logs and agent memory.
 * **Revocation takes effect within one heartbeat (≤25s)**: every heartbeat
   re-checks the stream's admission — a revoked credential or a disabled
   `push_enabled` ends the open stream within 25s;
-* **The bus is in-process** (`dict[agent_id → list[asyncio.Queue]]`) ⇒ when the
-  console and the MCP server run as separate processes, a console *nudge*
-  cannot reach the stream held by the MCP process (the reply honestly says
-  `delivered=false`; the reminder layer still runs).
+* **The bus is in-process** (`dict[agent_id → list[asyncio.Queue]]`) ⇒ the
+  console and the MCP server run as separate processes ⇒ a console *nudge* is
+  delivered through the **internal endpoint** below (the frame is pushed by
+  the process that actually holds the stream; the console never pushes
+  locally).
   `ponytail:` cross-process means swapping this layer for Redis pub/sub.
 
 ### Manual and batch nudges
@@ -825,6 +827,51 @@ Console → *Message Center → by recipient*:
 Backing endpoints: `POST /api/v1/messages/nudge` (body
 `{agents: ["id1", ...]}`, 1–50, de-duplicated) and
 `POST /api/v1/agents/{agent_id}/push` (the switch).
+
+### Nudge delivery across processes
+
+The SSE stream lives on the **MCP http process** (8210); the console is a
+**different process** (8200) whose own in-memory bus has **no subscribers at
+all**. A console *nudge* used to be published on the console's own bus ⇒ it
+was **always** `delivered=false` (honest, but a dead feature).
+
+The missing half-metre is now in place — the console **POSTs** the frame to
+the process that actually holds the stream:
+
+```
+console (8200) ──POST /internal/publish──▶ mcp-http (8210) ──▶ BUS ──▶ SSE stream
+```
+
+* **Endpoint**: `POST /internal/publish` on the **MCP http transport, same
+  process and port** as `/events` (`127.0.0.1:8210` by default). Body
+  `{agent_id, kind, unread, seq?, from?}` ⇒ reply `{"delivered": bool}` — the
+  **real** answer of the bus (is anybody listening?). The frame still carries
+  **metadata only** (`seq` / `from` / `unread`), never a body.
+* **Two gates**: ① **loopback only** (`request.client.host ∈ {127.0.0.1, ::1}`;
+  the reverse proxy does not forward this path ⇒ not reachable from the
+  internet) ② **shared-secret header** `X-Internal-Token`, the value coming
+  from the env `KEEPSAKE_INTERNAL_TOKEN`.
+* 🔴 **Not configured ⇒ the endpoint answers 503** (fail-closed): the nudge is
+  simply not delivered, and the console says exactly that.
+* **Console side**: endpoint address = config item `nudge.publish_endpoint`
+  (env override `KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`), default
+  `http://127.0.0.1:8210/internal/publish`; the shared secret comes from the
+  same `KEEPSAKE_INTERNAL_TOKEN` env.
+* **Honest replies**: `delivered=false` with `reason=no_stream` (nobody is
+  listening) or `reason=publish_endpoint_unavailable` (endpoint down / 503 /
+  secret missing) ⇒ the page shows **⚠ endpoint unavailable** — the reminder
+  was **not** delivered; the parasitic layer (per-conversation reminder) and
+  the `unread_dm` watermark still work.
+
+**Deployment**: both processes need the *same* secret, otherwise the MCP side
+keeps answering 503 and every nudge reports "endpoint unavailable". Add one
+line to each unit (then `systemctl daemon-reload` + restart both):
+
+```ini
+# /etc/systemd/system/keepsake-mcp-http.service
+# /etc/systemd/system/keepsake-console.service
+Environment=KEEPSAKE_INTERNAL_TOKEN=<one long random string>
+```
 
 ### Provider-side consumer (the last metre)
 

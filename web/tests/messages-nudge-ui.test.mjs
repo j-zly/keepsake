@@ -51,6 +51,13 @@ test('送达与否由后端如实回报（不许前端乐观）', () => {
   assert.doesNotMatch(VIEW, /delivered:\s*true/, '前端不许自己写死 delivered')
 })
 
+test('投递端点不可用：如实说不送达（不笼统说离线）', () => {
+  assert.match(VIEW, /result\.reason === 'publish_endpoint_unavailable'/, '新 reason 有映射')
+  assert.match(VIEW, /return '⚠ 端点不可用'/, '端点不可用有独立文案')
+  assert.match(VIEW, /KEEPSAKE_INTERNAL_TOKEN/, '悬浮说明点出运维口径（共享密钥）')
+  assert.match(VIEW, /return '⚠ 离线'/, '真的离线仍是离线（两种情况不混为一谈）')
+})
+
 test('勾选口径与另两页一致（复用 SelectionBar）', () => {
   assert.match(VIEW, /import SelectionBar from '\.\.\/components\/SelectionBar\.vue'/, '复用现成的 SelectionBar')
   assert.match(VIEW, /:count="selCount"/, '已选数接 SelectionBar')

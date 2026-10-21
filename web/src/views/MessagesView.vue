@@ -335,6 +335,7 @@ function clearSel() {
  * * `✓ 已送达` —— 对方挂着流，帧推出去了；
  * * `⚠ 未开推送` —— 那个代理关了「私信实时推送」（治理页的开关）；
  * * `⚠ 代理不存在` —— 注册表里没这一行；
+ * * `⚠ 端点不可用` —— 跨进程投递端点没起来 / 没配共享密钥（**不谎报**）；
  * * `⚠ 离线` —— 没挂着流，提醒**不补发**。
  */
 function nudgeChip(result) {
@@ -342,6 +343,7 @@ function nudgeChip(result) {
   if (result.delivered) return '✓ 已送达'
   if (result.reason === 'push_disabled') return '⚠ 未开推送'
   if (result.reason === 'unknown_agent') return '⚠ 代理不存在'
+  if (result.reason === 'publish_endpoint_unavailable') return '⚠ 端点不可用'
   return '⚠ 离线'
 }
 
@@ -351,6 +353,9 @@ function nudgeReasonText(result) {
   if (result.delivered) return `已送达（对方当前未读 ${result.unread ?? 0} 条）`
   if (result.reason === 'push_disabled') return '该代理未开启私信实时推送（到治理页开启后再试）'
   if (result.reason === 'unknown_agent') return '注册表里没有这个代理'
+  if (result.reason === 'publish_endpoint_unavailable') {
+    return '内部投递端点不可用 —— mcp-http 没起来，或没配共享密钥 KEEPSAKE_INTERNAL_TOKEN（提醒未送达）'
+  }
   return '对方当前没挂着事件流 —— 提醒不补发（寄生层仍在）'
 }
 

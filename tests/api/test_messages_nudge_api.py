@@ -4,6 +4,8 @@
 
 * nudge：**有流** ⇒ `delivered=true` 且真的收到一帧 `dm-nudge`；
 * nudge：**无流** ⇒ `delivered=false` + `reason=no_stream`（**不谎报送达**）；
+* nudge：**投递端点不可达** ⇒ `delivered=false` + `reason=publish_endpoint_unavailable`
+  （见 `tests/api/test_nudge_cross_process.py`）；
 * nudge：代理关了推送 ⇒ `delivered=false` + `reason=push_disabled`；
 * nudge：代理不存在 ⇒ `delivered=false` + `reason=unknown_agent`；
 * nudge：**空 agents 列表** ⇒ 400；超过 50 个 ⇒ 400；重复 id ⇒ 去重；
@@ -28,12 +30,36 @@ from fastapi.testclient import TestClient
 
 from keepsake.api.app import create_app
 from keepsake.api.deps import get_storage
+from keepsake.api.routers import messages as messages_mod
 from keepsake.govern.events import BUS
 from keepsake.govern.messaging import Messaging
 from keepsake.govern.registry import Registry
+from keepsake.mcp_server import internal as internal_mod
 
 TOKEN = "test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+#: 跨进程投递的共享密钥（控制台与 MCP 两个进程读**同一个** env）。
+INTERNAL_TOKEN = "internal-token-not-a-real-secret"
+
+#: 收到的内部投递请求（断言「控制台真的按契约发了」）。
+SENT: List[httpx.Request] = []
+
+
+def _internal_handler(request: httpx.Request) -> httpx.Response:
+    """模拟 MCP 侧的内部端点 —— **调用真的核心逻辑**（闸门与推帧都是真的）。
+
+    只把**传输层**换成 mock（httpx.MockTransport），端点判定与 BUS 推帧
+    走的都是生产代码那一份。
+    """
+    SENT.append(request)
+    try:
+        body = json.loads(request.content)
+    except ValueError:
+        body = internal_mod.INVALID_JSON
+    status, payload = internal_mod.publish_core(
+        "127.0.0.1", request.headers.get("x-internal-token", ""), body)
+    return httpx.Response(status, json=payload)
 
 
 @pytest.fixture()
@@ -47,6 +73,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("KEEPSAKE_CONSOLE_TOKEN_FILE", str(tmp_path / "不存在.token"))
     monkeypatch.setenv("KEEPSAKE_CONSOLE_ADMIN_FILE", str(tmp_path / "不存在-admin.json"))
     monkeypatch.setenv("KEEPSAKE_CONSOLE_SESSION_FILE", str(tmp_path / "不存在-sess.json"))
+    monkeypatch.setenv("KEEPSAKE_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    SENT.clear()
+    # 投递走**内部端点**（跨进程那一跳）⇒ 这里只 mock 传输层
+    monkeypatch.setattr(
+        messages_mod, "_publish_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(_internal_handler)))
     storage = SqliteStorage(path=str(tmp_path / "nudge.db"))
     assert storage.ensure_index() is True
     app = create_app()
@@ -92,6 +124,15 @@ async def test_nudge_有流_送达且收到dm_nudge帧(env):
     data = json.loads(item.split("data: ", 1)[1].split("\n", 1)[0])
     assert data["unread"] == 0
     assert set(data) == {"seq", "from", "unread"}       # 🔴 只有元数据，没有正文
+    # 跨进程那一跳的**请求契约**：端点 / 共享密钥头 / body 形状
+    assert len(SENT) == 1
+    req = SENT[0]
+    assert req.url.path == "/internal/publish"
+    assert req.headers["X-Internal-Token"] == INTERNAL_TOKEN
+    sent = json.loads(req.content)
+    assert sent["agent_id"] == "worker-1"
+    assert sent["kind"] == "dm-nudge"
+    assert sent["unread"] == 0
 
 
 def test_nudge_无流_如实说不送达(env):

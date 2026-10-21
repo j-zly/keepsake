@@ -14,10 +14,12 @@
 1. **只元数据**：帧里绝不带正文。正文永远走信箱本体（`message_inbox` 拿）——
    推正文等于把私信复制进日志、代理缓存与代理进程内存里。
 2. **进程内**：`dict[agent_id → list[Subscription]]`。🔴 控制台进程与 MCP 进程
-   **分开跑**时，控制台的 nudge 推不到 MCP 侧挂着的那条流（回包**如实**说
-   `delivered=false`，不谎报已送达；寄生层仍在）。
-   `ponytail:` 真要跨进程，把这一层换成 Redis pub/sub 即可 —— 订阅端还是
-   `asyncio.Queue`，换的只是「谁把帧送进来」。
+   **分开跑**时，控制台的 nudge 推不到 MCP 侧挂着的那条流 —— 所以补了
+   **跨进程投递**（2026-10 ks_nudge_xproc）：控制台 POST 内部端点
+   `POST /internal/publish`（MCP 进程侧，见 `mcp_server/internal.py`），
+   由**那台进程里的总线**推帧，回包带 `delivered`（BUS 真实有无订阅者）。
+   `ponytail:` 真要更通用的跨进程（不止 nudge），把这一层换成 Redis pub/sub
+   即可 —— 订阅端还是 `asyncio.Queue`，换的只是「谁把帧送进来」。
 3. **静默丢弃**：没有挂着的连接 = 这一帧直接丢（不重试、不轰炸）。
    补偿在下一层（重连追帧 + `unread_dm` 水位），不在这一层做。
 """
@@ -27,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from typing import Any, Dict, List
 
@@ -36,6 +39,7 @@ __all__ = [
     "BUS", "EventBus", "Subscription",
     "EVENT_DM", "EVENT_DM_NUDGE", "STOP",
     "MAX_STREAMS_PER_AGENT", "QUEUE_MAXSIZE",
+    "ENV_INTERNAL_TOKEN", "INTERNAL_TOKEN_HEADER", "internal_token",
     "frame", "publish_dm", "publish_nudge",
 ]
 
@@ -52,6 +56,25 @@ QUEUE_MAXSIZE = 64
 
 #: 停止哨兵（塞进队列 ⇒ 那条流自己收尾）
 STOP = object()
+
+# --------------------------------------------------------------------------
+# 跨进程投递的**共享契约**（2026-10 ks_nudge_xproc）
+# --------------------------------------------------------------------------
+
+#: 共享密钥的环境变量名 —— 控制台进程与 MCP 进程读**同一个**。
+#: 🔴 **未配置 ⇒ 内部端点一律 503**（fail-closed）：宁可不投递，也不裸奔。
+ENV_INTERNAL_TOKEN = "KEEPSAKE_INTERNAL_TOKEN"
+
+#: 共享密钥的请求头名（内部端点只认这一个头）
+INTERNAL_TOKEN_HEADER = "X-Internal-Token"
+
+
+def internal_token() -> str:
+    """共享密钥本体（**只从环境变量读**；空串 = 未配置 = 端点禁用）。
+
+    🔴 真值**永不**进代码 / 配置 / 日志 —— 只在这两个进程的环境里。
+    """
+    return (os.environ.get(ENV_INTERNAL_TOKEN) or "").strip()
 
 
 def frame(event: str, data: Dict[str, Any]) -> str:

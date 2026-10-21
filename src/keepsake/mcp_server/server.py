@@ -53,6 +53,7 @@ from mcp.server.fastmcp import FastMCP
 from ..govern.registry import CREDENTIAL_HINT_LEN, is_connection_error
 from .events import register_events_route
 from .factory import DEFAULT_AGENT_ID, default_provider
+from .internal import register_internal_route
 from .resources import register_resources
 from .tools import ToolError, register_tools
 
@@ -515,6 +516,10 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
     # 私信实时推送的 SSE 端点（`GET /events`）—— 与 streamable-http **同进程同端口**。
     # 建流要过三道闸（凭据反查 → approved → push_enabled=1），见 `events.py`。
     register_events_route(server, gate)
+    # 内部投递端点（`POST /internal/publish`）—— 控制台进程经它把 nudge 帧
+    # 送进**本进程**的总线（跨进程投递，2026-10 ks_nudge_xproc）。
+    # 两道闸：回环来源 + 共享密钥头；未配共享密钥 ⇒ 一律 503。
+    register_internal_route(server)
     # 闸门句柄挂在 server 上（探针 / 运维脚本看「现在放不放行」用；工具调用本身
     # 走 `gate.check`，不经过这个属性 —— 改它不会放松任何一道闸）。
     server.agent_gate = gate
