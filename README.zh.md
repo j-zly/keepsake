@@ -184,7 +184,10 @@ pip install git+https://github.com/j-zly/keepsake.git
   // "push_consumer": {
   //   "enabled": true,
   //   "base_url": "http://127.0.0.1:8210",              // SSE 服务端根地址；/events 由消费者自己拼
-  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"      // 或 "credential_file": "/path/to/secret"
+  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",     // 或 "credential_file": "/path/to/secret"
+  //   "notify_url": "https://example.invalid/hooks/xxx",// 通知出口（渠道 webhook）；空 = 零外呼
+  //   "notify_min_interval_s": 120,                     // 同水位限频窗口（秒）
+  //   "notify_format": "generic"                        // generic | feishu
   // },
   
   // 自动维护配置
@@ -375,6 +378,9 @@ yeah
 | `push_consumer.enabled` | — | `false` | provider 侧是否挂 SSE 流（私信推送消费者）。关 = 零线程零连接。**进程启动时读** ⇒ 改它要重启网关 |
 | `push_consumer.base_url` | — | `""` | SSE 服务端根地址（消费者自己拼 `/events`） |
 | `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | 建流凭据的**环境变量名**（**凭据真值不落 config.json**）。另有 `push_consumer.credential_file` 指 secrets 文件 |
+| `push_consumer.notify_url` | — | `""` | 通知出口的渠道 webhook 地址（例：飞书群机器人）。**空 = 功能关** ⇒ 零外呼 |
+| `push_consumer.notify_min_interval_s` | — | `120` | 通知出口的限频窗口（秒）：**同一未读数**在窗口内只喊一次；水位升高立刻再喊 |
+| `push_consumer.notify_format` | — | `generic` | 通知载荷形状：`generic`（`{"text": …}`）或 `feishu`（`{"msg_type": "text", "content": {"text": …}}`） |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -709,7 +715,10 @@ provider 挂一条 SSE 流听着，于是新私信**立刻**被看见，不必�
 "push_consumer": {
   "enabled": true,
   "base_url": "http://127.0.0.1:8210",
-  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"
+  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
+  "notify_url": "https://example.invalid/hooks/xxxx",
+  "notify_min_interval_s": 120,
+  "notify_format": "generic"
 }
 ```
 
@@ -735,6 +744,20 @@ provider.on_push_event(lambda summary: print(summary["unread"]))
 
 回调在**消费者线程**里被调用 ⇒ 要短、要自己吞异常（实现已经兜了一层：
 回调抛异常只记 warning，不影响其余回调与主路径）。
+
+#### 通知出口（空闲期把人叫醒）
+
+上面那套只置水位 —— 提醒还得等用户开口；代理**空闲**时提醒就一直浮不出来。
+所以收到 `dm` / `dm-nudge` 帧时，**另外**往你配的渠道 webhook POST 一次
+（`push_consumer.notify_url`，例：飞书群机器人）：
+
+* 🔴 **只含元数据** —— 载荷只有未读条数与发件人
+  （`📩 你有 2 条未读私信（来自: worker-1）`），**永远没有正文**
+  （正文仍在信箱里，用 `message_inbox` 取）；
+* ⚠️ **同水位限频** —— 同一未读数在 `notify_min_interval_s`（缺省 120s）窗口内
+  只喊一次；**水位升高立刻再喊**，不让人干等窗口；
+* `notify_url` 为空 ⇒ **零外呼**（行为与上线前逐字相同）；POST 失败只记 warning
+  —— 绝不重试轰炸、绝不碰水位与主路径。
 
 健壮性：连不上 / 断流 ⇒ **指数退避**重连（5s 起、翻倍、封顶 5min）；消费者整体
 **fail-open**：起不来也不影响 provider（`initialize()` 绝不因它失败），线程是

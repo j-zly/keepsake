@@ -191,7 +191,9 @@ _DM_HINT_CACHE: Dict[str, Any] = {"ts": 0.0, "key": None}
 #   ① 让未读私信提醒的**水位缓存失效** —— 下一轮 prefetch 必重新查库并提醒，
 #      不必等那个 60s 去重窗口（否则「刚到的信」最多晚一分钟才被看见）；
 #   ② `logger.info` 记**一行**事件摘要（无正文）；
-#   ③ 通知宿主可选注册的回调 `on_push_event(fn)`（摘要 dict，无正文）。
+#   ③ 通知宿主可选注册的回调 `on_push_event(fn)`（摘要 dict，无正文）；
+#   ④（可选）**通知出口**：旁路 POST 渠道 webhook，把人叫醒 ——
+#      见下方「私信通知出口」一节（`notify_url` 为空 ⇒ 不做这件事）。
 #
 # 三条纪律：
 #   * **fail-open**：消费者的任何异常都不许碰主路径 —— provider 初始化
@@ -212,6 +214,48 @@ _PUSH_RECONNECT_MAX_S = 300.0
 _PUSH_LOCK = threading.Lock()
 _PUSH_CONSUMER: Optional["_PushConsumer"] = None
 _PUSH_CALLBACKS: List[Callable[[Dict[str, Any]], None]] = []
+
+
+# ---------------------------------------------------------------------------
+# 私信通知出口（2026-10 ks_notify_outlet）—— 空闲期把人叫醒
+#
+# 推送帧到达后只置水位 ⇒ 用户不冒泡，提醒就浮不出来（**空闲期盲区**）。
+# 消费者收到 dm / dm-nudge 帧时**旁路** POST 一个可配置的渠道 webhook
+#（例：飞书群机器人）—— 🔴 **只含元数据**（未读条数 / 发件人），**永不含正文**。
+#
+# 三条纪律：
+#   * **fail-open**：通知失败只记 warning —— 绝不重试轰炸、绝不碰水位/主路径；
+#   * **限频**：同水位（未读条数不变）在窗口内只喊一次；水位一变立刻再喊；
+#   * **可关**：`notify_url` 为空 ⇒ 零外呼（行为与上线前逐字相同）。
+# ---------------------------------------------------------------------------
+
+#: 通知限频窗口的缺省值（秒）：同水位在窗口内只喊一次。
+_NOTIFY_DEFAULT_MIN_INTERVAL_S = 120.0
+
+#: 进程级通知水位 `{"ts": 单调时刻, "count": 上次通知时的未读条数}`。
+#: 与 `_DM_HINT_CACHE` 同款进程级模式（一条流 ⇒ 一份水位）。
+_NOTIFY_CACHE: Dict[str, Any] = {"ts": 0.0, "count": None}
+
+
+def _notify_payload(text: str, fmt: str) -> Dict[str, Any]:
+    """通知载荷 —— **渠道适配写死在这一处**（加新渠道只改这个函数）。
+
+    * `generic`（缺省）：`{"text": ...}` —— 通用 webhook；
+    * `feishu`：飞书群机器人吃 `{"msg_type": "text", "content": {"text": ...}}`。
+    """
+    if str(fmt or "").strip().lower() == "feishu":
+        return {"msg_type": "text", "content": {"text": text}}
+    return {"text": text}
+
+
+def _notify(url: str, payload: Dict[str, Any], timeout: float = 5.0) -> None:
+    """POST 通知载荷到渠道 webhook（`httpx.post(url, json=..., timeout=...)`）。
+
+    🔴 **不吞异常**：调用方据此判断「这一帧算不算已通知」—— 吞掉异常会把
+    失败的通知记成已送达。异常一律由调用方记 warning（fail-open）。
+    """
+    import httpx                   # 延迟 import：没装 httpx 也不影响记忆功能
+    httpx.post(url, json=payload, timeout=timeout)
 
 
 def _as_int(value: Any) -> int:
@@ -242,14 +286,16 @@ def _push_credential(settings: dict) -> str:
     return ""
 
 
-def _dispatch_push_event(event: str, raw: str) -> None:
+def _dispatch_push_event(event: str, raw: str) -> Optional[Dict[str, Any]]:
     """处理一帧推送（进程级）：失效水位 → 记一行摘要 → 通知宿主回调。
 
     🔴 **帧里只有元数据**（seq / from / unread）：私信正文永远走信箱本体。
     这里连日志都只记这几个字段 —— 正文进日志 = 私信进了日志。
+
+    返回**摘要 dict**（非 dm 帧 ⇒ `None`）：通知出口据此旁路发 webhook。
     """
     if event not in ("dm", "dm-nudge"):
-        return
+        return None
     try:
         data = json.loads(raw) if raw else {}
     except (TypeError, ValueError):
@@ -275,19 +321,32 @@ def _dispatch_push_event(event: str, raw: str) -> None:
         except Exception as e:      # noqa: BLE001 —— 宿主的回调不许反噬宿主
             logger.warning("keepsake: 推送回调异常（已吞掉）: %s: %s",
                            type(e).__name__, e)
+    return summary
 
 
 class _PushConsumer:
     """挂着 SSE 流的守护线程（provider 侧消费者）。
 
-    线程体只做三件事：连上去 → 读帧 → 收帧交给 `_dispatch_push_event`。
+    线程体只做三件事：连上去 → 读帧 → 收帧交给 `_dispatch_push_event`
+    （收完帧再旁路发一次通知，`notify_url` 为空就不发）。
     任何异常都在 `_loop` 里被吃掉并退避重连（**fail-open**：推送层坏了不许
     影响记忆读写）。线程 `daemon=True` —— 随进程亡，不留孤儿。
     """
 
-    def __init__(self, base_url: str, credential: str) -> None:
+    def __init__(self, base_url: str, credential: str, *,
+                 notify_url: str = "",
+                 notify_format: str = "generic",
+                 notify_min_interval_s: float = _NOTIFY_DEFAULT_MIN_INTERVAL_S) -> None:
         self._url = base_url.rstrip("/") + "/events"
         self._credential = credential
+        # 通知出口（可选）：notify_url 为空 ⇒ 零外呼（功能关，现状逐字回归）
+        self._notify_url = str(notify_url or "").strip()
+        self._notify_format = str(notify_format or "generic").strip().lower() or "generic"
+        try:
+            self._notify_interval = max(0.0, float(notify_min_interval_s))
+        except (TypeError, ValueError):
+            # 脏配置不该连累整条流 ⇒ 回落缺省窗口（通知降级，不是不发）
+            self._notify_interval = _NOTIFY_DEFAULT_MIN_INTERVAL_S
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -303,6 +362,37 @@ class _PushConsumer:
 
     def stop(self) -> None:
         self._stop.set()
+
+    # ---- 通知出口 ----
+
+    def _notify_unread(self, summary: Dict[str, Any]) -> None:
+        """未读私信 ⇒ POST 渠道 webhook（**只有元数据**）。fail-open。
+
+        限频口径：**同水位**（未读条数不变）在 `notify_min_interval_s` 窗口内
+        只喊一次；水位一变（升高）立刻再喊 —— 不让人干等窗口。
+
+        🔴 载荷**永不含正文**：只带未读条数与发件人（正文永远走信箱本体）。
+        🔴 失败只记 warning：既不重试轰炸，也不影响水位/主路径。
+        """
+        if not self._notify_url:
+            return                                  # 缺省关 ⇒ 零外呼
+        count = _as_int(summary.get("unread"))
+        sender = str(summary.get("from") or "")
+        import time as _time
+        now = _time.monotonic()                    # 单调钟：不受系统时间跳变影响
+        cached = _NOTIFY_CACHE
+        if count == cached.get("count") and \
+                now - float(cached.get("ts") or 0.0) < self._notify_interval:
+            return                                  # 同水位 + 窗口内 ⇒ 不重复喊
+        text = (f"📩 你有 {count} 条未读私信（来自: {sender}）" if sender
+                else f"📩 你有 {count} 条未读私信")
+        try:
+            _notify(self._notify_url, _notify_payload(text, self._notify_format))
+        except Exception as e:      # noqa: BLE001 —— 通知层永远 fail-open
+            logger.warning("keepsake: 私信通知发送失败（已吞掉，不影响水位/主路径）: %s: %s",
+                           type(e).__name__, e)
+            return                                  # 失败不记水位 ⇒ 下一帧可再试
+        _NOTIFY_CACHE.update({"ts": now, "count": count})
 
     # ---- 线程体 ----
 
@@ -343,7 +433,10 @@ class _PushConsumer:
                     if not line:
                         # 空行 = 一帧结束（SSE 的帧分隔）
                         if event_name:
-                            _dispatch_push_event(event_name, "\n".join(data_lines))
+                            summary = _dispatch_push_event(event_name, "\n".join(data_lines))
+                            # 通知出口：**在置水位之后**旁路发（失败也不碰水位）
+                            if summary is not None:
+                                self._notify_unread(summary)
                         event_name, data_lines = "", []
                         continue
                     if line.startswith(":"):
@@ -694,6 +787,13 @@ class KeepsakeProvider(MemoryProvider):
                 "enabled": False,
                 "base_url": "",          # SSE 服务端根地址（消费者自己拼 /events）
                 "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
+                # 通知出口（空闲期把人叫醒）：notify_url 为空 = 功能关（零外呼）。
+                # 🔴 同水位限频（缺省 120s）：未读数不变则窗口内不重复喊，
+                #    水位升高立刻再喊。notify_format 决定载荷形状
+                #    （generic / feishu）—— 渠道适配写死在 adapter 一处。
+                "notify_url": "",
+                "notify_min_interval_s": 120,
+                "notify_format": "generic",
             },
         }
 
@@ -1261,7 +1361,10 @@ class KeepsakeProvider(MemoryProvider):
         配置节 `push_consumer`：
           * `enabled`（缺省 **false**）—— 关着就是**零线程零连接**；
           * `base_url` —— SSE 服务端根地址（消费者自己拼 `/events`）；
-          * `credential_env` / `credential_file` —— 凭据来源（**不落真值**）。
+          * `credential_env` / `credential_file` —— 凭据来源（**不落真值**）；
+          * `notify_url` —— 渠道 webhook 地址（**空 = 通知功能关，零外呼**）；
+          * `notify_min_interval_s` —— 同水位限频窗口（缺省 120s）；
+          * `notify_format` —— 载荷格式（`generic` / `feishu`，缺省 generic）。
 
         🔴 进程级**一条流**：多个 provider 实例（Hermes 多 session）各挂一条
         只会互相踢（服务端每代理最多 2 条并发流，新的踢旧的）。
@@ -1278,11 +1381,26 @@ class KeepsakeProvider(MemoryProvider):
             if not base_url or not credential:
                 logger.warning("keepsake: 推送消费者已开启，但 base_url / 凭据缺失（不挂流）")
                 return
+            notify_url = str(settings.get("notify_url") or "").strip()
+            notify_format = (str(settings.get("notify_format") or "generic")
+                             .strip().lower() or "generic")
+            try:
+                notify_interval = float(settings.get(
+                    "notify_min_interval_s", _NOTIFY_DEFAULT_MIN_INTERVAL_S))
+            except (TypeError, ValueError):
+                notify_interval = _NOTIFY_DEFAULT_MIN_INTERVAL_S
+            if notify_interval < 0:
+                notify_interval = 0.0
             with _PUSH_LOCK:
                 if _PUSH_CONSUMER is not None and _PUSH_CONSUMER.alive():
                     logger.info("keepsake: 推送消费者已在运行（复用现有流）")
                     return
-                consumer = _PushConsumer(base_url, credential)
+                consumer = _PushConsumer(
+                    base_url, credential,
+                    notify_url=notify_url,
+                    notify_format=notify_format,
+                    notify_min_interval_s=notify_interval,
+                )
                 consumer.start()
                 _PUSH_CONSUMER = consumer
             logger.info("keepsake: 推送消费者已启动（%s/events）", base_url)
@@ -2182,6 +2300,10 @@ class KeepsakeProvider(MemoryProvider):
         `push_consumer=True` 表示**能**接推送（实现了可选契约
         `PushEventConsumer`）—— 是否真的挂流由 `push_consumer.enabled` 决定
         （缺省关 ⇒ 行为与上线前逐字相同）。
+
+        `notify_outlet=True` 表示**能**把未读私信提醒打到渠道 webhook
+        （只含元数据，无正文）—— 是否真的发由 `push_consumer.notify_url`
+        决定（缺省空 ⇒ 零外呼）。
         """
         return Capabilities(core_tier=True, knn=True, dry_run_merge=True,
-                            push_consumer=True, version="v1")
+                            push_consumer=True, notify_outlet=True, version="v1")

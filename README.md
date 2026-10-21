@@ -192,7 +192,10 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   // "push_consumer": {
   //   "enabled": true,
   //   "base_url": "http://127.0.0.1:8210",              // SSE server root; /events is appended
-  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"      // or "credential_file": "/path/to/secret"
+  //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",     // or "credential_file": "/path/to/secret"
+  //   "notify_url": "https://example.invalid/hooks/xxx",// notify outlet (channel webhook); empty = zero outbound
+  //   "notify_min_interval_s": 120,                     // same-watermark rate-limit window (s)
+  //   "notify_format": "generic"                        // generic | feishu
   // },
 
   // Auto maintenance
@@ -391,6 +394,9 @@ Then reference it in config.json:
 | `push_consumer.enabled` | — | `false` | Whether the provider hangs an SSE stream (the private-message push consumer). Off = zero threads, zero connections. Read at process start ⇒ **restart the gateway to apply** |
 | `push_consumer.base_url` | — | `""` | SSE server root address (the consumer appends `/events` itself) |
 | `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | **Env var name** holding the stream credential (the credential value never lives in `config.json`). `push_consumer.credential_file` points at a secrets file instead |
+| `push_consumer.notify_url` | — | `""` | Channel webhook the unread-DM notification is POSTed to (e.g. a Feishu group bot). **Empty = the notify outlet is off** ⇒ zero outbound calls |
+| `push_consumer.notify_min_interval_s` | — | `120` | Rate-limit window (s) for the notify outlet: the **same** unread count is announced at most once per window; a rising count is announced immediately |
+| `push_consumer.notify_format` | — | `generic` | Payload shape of the notify outlet: `generic` (`{"text": …}`) or `feishu` (`{"msg_type": "text", "content": {"text": …}}`) |
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -833,7 +839,10 @@ connections**, behaviour byte-identical to before.
 "push_consumer": {
   "enabled": true,
   "base_url": "http://127.0.0.1:8210",
-  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL"
+  "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
+  "notify_url": "https://example.invalid/hooks/xxxx",
+  "notify_min_interval_s": 120,
+  "notify_format": "generic"
 }
 ```
 
@@ -863,6 +872,24 @@ provider.on_push_event(lambda summary: print(summary["unread"]))
 The callback runs **on the consumer thread** ⇒ keep it short and swallow your
 own exceptions (the implementation already catches them: a raising callback
 only logs a warning).
+
+#### Notify outlet (waking the user up while the agent sits idle)
+
+The frame handling above only invalidates the watermark — the reminder still
+needs the user to speak up. While the agent sits **idle**, that reminder never
+surfaces. So a received `dm` / `dm-nudge` frame is *additionally* POSTed to a
+channel webhook you configure (`push_consumer.notify_url`, e.g. a Feishu group
+bot):
+
+* 🔴 **metadata only** — the payload carries the unread count and the sender
+  (`📩 你有 2 条未读私信（来自: worker-1）`), **never the message body**
+  (the body stays in the mailbox, fetched with `message_inbox`);
+* ⚠️ **rate-limited by watermark** — the same unread count is announced at most
+  once per `notify_min_interval_s` (120s by default); a **rising** count is
+  announced immediately, so the user is never kept waiting for the window;
+* `notify_url` empty ⇒ **zero outbound calls** (behaviour byte-identical to
+  before); a failed POST only logs a warning — never retried, never touching
+  the watermark or the main path.
 
 Robustness: a failed connect or a dropped stream ⇒ **exponential backoff**
 (5s, doubling, capped at 5min) and reconnect. The consumer is **fail-open**:

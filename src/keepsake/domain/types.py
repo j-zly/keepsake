@@ -102,6 +102,17 @@ class Capabilities:
     True = 宿主可以注册 `on_push_event(fn)` 拿事件摘要；
     False = 只剩寄生层的对话轮提醒（既有行为，逐字不变）。"""
 
+    notify_outlet: bool = False
+    """是否带**通知出口**（2026-10 ks_notify_outlet）：收到未读私信帧时，
+    旁路 POST 一个可配置的渠道 webhook（例：飞书群机器人），把人叫醒。
+
+    🔴 载荷**只含元数据**（未读条数 / 发件人）—— **永不含正文**；
+    🔴 同水位按 `notify_min_interval_s` 限频（缺省 120s），水位升高立刻再喊；
+    🔴 通道侧失败只记 warning（fail-open），绝不重试轰炸、绝不碰水位。
+
+    True = **能**发（是否真的发由 `push_consumer.notify_url` 决定，空 ⇒ 零外呼）；
+    False = 没有任何外呼出口。"""
+
     version: str = "v1"
     """契约版本号。"""
 

@@ -7,6 +7,10 @@
 3. `enabled=false` ⇒ **零线程零连接**（回归：没开的用户一个字节都不多跑）；
 4. 消费者 / 回调抛异常 ⇒ provider 其余功能**照常**（fail-open 钉桩）。
 
+外加**通知出口**（2026-10 ks_notify_outlet）五条判据，见文末 ⑥ 节：
+dm 帧 ⇒ 通知 POST（只含元数据）/ 同水位限频 / `notify_url` 空零外呼 /
+通知失败不影响水位与主路径 / feishu 载荷结构。
+
 全程 hermetic：模拟 SSE 服务端是 **stdlib http.server**（127.0.0.1 随机端口），
 不连真服务端、不连 Redis / PG / 生产库；凭据是**假串**（不落任何真值）。
 
@@ -49,6 +53,7 @@ def _clean_push_state():
     prov_mod._stop_push_consumer()                      # noqa: SLF001
     prov_mod._PUSH_CALLBACKS.clear()                    # noqa: SLF001
     prov_mod._DM_HINT_CACHE.update({"ts": 0.0, "key": None})   # noqa: SLF001
+    prov_mod._NOTIFY_CACHE.update({"ts": 0.0, "count": None})  # noqa: SLF001
     yield
     prov_mod._stop_push_consumer()                      # noqa: SLF001
     prov_mod._PUSH_CALLBACKS.clear()                    # noqa: SLF001
@@ -134,6 +139,17 @@ class _MockSse:
 
 def _dm_frame(seq: int = 7, from_id: str = "worker-1", unread: int = 2) -> str:
     return frame(EVENT_DM, {"seq": seq, "from": from_id, "unread": unread})
+
+
+def _dm_frame_with_body(seq: int = 7, from_id: str = "worker-1",
+                         unread: int = 2) -> str:
+    """一帧**额外带 body 字段**的 dm —— 用来证明通知出口不会把正文带出去。
+
+    线上帧本来就不带正文（`publish_dm` 只放 seq/from/unread）；这一帧是**故意
+    多带一个 body** 的探针：出口只认元数据 ⇒ 正文既不进载荷也不进日志。
+    """
+    return frame(EVENT_DM, {"seq": seq, "from": from_id, "unread": unread,
+                            "body": "机密正文不该出现在通知里"})
 
 
 # --------------------------------------------------------------------------
@@ -347,3 +363,148 @@ def test_通用契约层不import_hermes():
             elif isinstance(node, ast.Import):
                 mod = node.names[0].name
             assert "hermes" not in (mod or ""), f"{path.name} 引用了 {mod}"
+
+
+# --------------------------------------------------------------------------
+# ⑥ 通知出口（2026-10 ks_notify_outlet）—— 空闲期把人叫醒
+#
+# 五条判据（对应任务书）：
+#   ① dm 帧 ⇒ mock 收到 notify POST，载荷含条数、**无正文**；
+#   ② 同水位限频窗口内第二帧不重复喊，水位升高立刻再喊；
+#   ③ `notify_url` 空 ⇒ **零外呼**（回归）；
+#   ④ notify POST 抛异常 ⇒ 水位照常置、消费者不死；
+#   ⑤ feishu 格式载荷结构断言。
+#
+# 全程 hermetic：`httpx.post` 被 monkeypatch 拦下 ⇒ **不连真渠道**；
+# 通知 URL 用假地址（`.invalid` 保留域，永不可解析）。
+# --------------------------------------------------------------------------
+
+#: 假通知 URL（**不是**真值 —— 任务书红线：URL 真值不得进提交物）。
+FAKE_NOTIFY_URL = "http://notify.invalid/hook"
+
+
+@pytest.fixture()
+def notify_calls(monkeypatch):
+    """拦下通知出口的 HTTP POST —— 记录载荷，不连真渠道。"""
+    import httpx
+
+    calls: List[Dict[str, Any]] = []
+
+    def _fake_post(url, json=None, timeout=None, **_kw):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return None
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    return calls
+
+
+def test_dm帧触发通知且载荷只含元数据(cred_env, notify_calls):
+    """🔴 ① dm 帧 ⇒ 恰好一次 notify POST；载荷只有条数/发件人，**没有正文**。"""
+    with _MockSse([[_dm_frame_with_body()]]) as srv:
+        p = _provider()
+        got: List[Dict[str, Any]] = []
+        p.on_push_event(got.append)
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+            "notify_url": FAKE_NOTIFY_URL,
+        }})
+        assert _wait_until(lambda: bool(notify_calls)), "消费者没发出通知"
+
+    assert len(notify_calls) == 1, notify_calls
+    call = notify_calls[0]
+    assert call["url"] == FAKE_NOTIFY_URL
+    assert call["timeout"] == 5
+    # 载荷**逐字**断言：只含条数与发件人，多一个字都不行
+    assert call["json"] == {"text": "📩 你有 2 条未读私信（来自: worker-1）"}, call["json"]
+    # 🔴 红线：载荷里**绝不能有私信正文**（帧里带的 body 也不许被带出去）
+    assert "机密正文" not in json.dumps(call["json"], ensure_ascii=False)
+
+
+def test_同水位限频且水位升高立刻再喊(cred_env, notify_calls):
+    """🔴 ② 同水位（unread 不变）窗口内不重复喊；unread 升高立刻再喊。"""
+    with _MockSse([[_dm_frame(seq=7, unread=2),
+                    _dm_frame(seq=8, unread=2),      # 同水位 ⇒ 窗口内不喊
+                    _dm_frame(seq=9, unread=3)]]) as srv:   # 升高 ⇒ 立刻喊
+        p = _provider()
+        got: List[Dict[str, Any]] = []
+        p.on_push_event(got.append)
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+            "notify_url": FAKE_NOTIFY_URL,
+            "notify_min_interval_s": 120,
+        }})
+        assert _wait_until(lambda: len(got) == 3 and len(notify_calls) >= 2)
+        time.sleep(0.3)                    # 给「本该被限频掉的那一帧」留机会
+
+    assert len(notify_calls) == 2, notify_calls
+    texts = [c["json"]["text"] for c in notify_calls]
+    assert "2 条" in texts[0] and "3 条" in texts[1], texts
+
+
+def test_notify_url为空时零外呼(cred_env, notify_calls):
+    """🔴 ③ `notify_url` 空 ⇒ **零外呼**（回归：现状逐字不变）。"""
+    with _MockSse([[_dm_frame()]]) as srv:
+        p = _provider()
+        got: List[Dict[str, Any]] = []
+        p.on_push_event(got.append)
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+        }})
+        assert _wait_until(lambda: bool(got)), "帧都没收到（回归坏了）"
+        time.sleep(0.2)
+    assert notify_calls == [], notify_calls
+
+
+def test_通知失败不影响水位与消费者(cred_env, monkeypatch, st, caplog):
+    """🔴 ④ notify POST 抛异常 ⇒ 水位照常置、消费者不死、主路径照常。"""
+    import httpx
+
+    def _boom(url, json=None, timeout=None, **_kw):
+        raise RuntimeError("渠道挂了")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+    with _MockSse([[_dm_frame(seq=7, unread=2),
+                    _dm_frame(seq=8, unread=3)]]) as srv:
+        p = _provider(st)
+        got: List[Dict[str, Any]] = []
+        p.on_push_event(got.append)
+        with caplog.at_level(logging.WARNING, logger="keepsake"):
+            p._init_push_consumer({"push_consumer": {
+                "enabled": True, "base_url": srv.base_url,
+                "credential_env": "TEST_PUSH_CREDENTIAL",
+                "notify_url": FAKE_NOTIFY_URL,
+            }})
+            assert _wait_until(lambda: len(got) == 2), "通知失败不该连累消费者"
+
+    # 水位照常置（失效）⇒ 下一轮 prefetch 必重新查库并提醒
+    assert prov_mod._DM_HINT_CACHE["key"] is None      # noqa: SLF001
+    # 失败只记 warning，不抛
+    assert any("私信通知发送失败" in rec.getMessage() for rec in caplog.records), \
+        [rec.getMessage() for rec in caplog.records]
+    # provider 其余功能照常
+    assert "相关记忆" in p.prefetch(QUERY)
+
+
+def test_feishu格式载荷结构(cred_env, notify_calls):
+    """🔴 ⑤ `notify_format=feishu` ⇒ 载荷是飞书群机器人的形状。"""
+    with _MockSse([[_dm_frame()]]) as srv:
+        p = _provider()
+        got: List[Dict[str, Any]] = []
+        p.on_push_event(got.append)
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+            "notify_url": FAKE_NOTIFY_URL,
+            "notify_format": "feishu",
+        }})
+        assert _wait_until(lambda: bool(notify_calls))
+
+    payload = notify_calls[0]["json"]
+    assert payload["msg_type"] == "text"
+    assert payload["content"]["text"].startswith("📩")
+    assert "2" in payload["content"]["text"]
+    # 载荷里仍然没有正文
+    assert "机密正文" not in json.dumps(payload, ensure_ascii=False)
