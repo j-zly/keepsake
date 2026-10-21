@@ -19,6 +19,7 @@ import os
 from typing import Any, Dict, List
 
 from ..adapters.hermes.provider import KeepsakeProvider, _load_json_config
+from ..govern.visibility import visible_core_fragments
 
 __all__ = ["KeepsakeMCPProvider", "default_provider", "DEFAULT_AGENT_ID", "SCAN_PAGE"]
 
@@ -40,15 +41,23 @@ class KeepsakeMCPProvider(KeepsakeProvider):
 
     # ---- 可选扩展（MemoryProvider 契约之外）----
 
-    def list_core(self) -> List[Dict[str, Any]]:
+    def list_core(self, caller_agent_id: str = "",
+                  caller_role: str = "") -> List[Dict[str, Any]]:
         """常驻层全量条目。走 `storage.list_by_tag("core")` —— 与控制台
         `GET /api/v1/core` 同一个原语，所以两边条数永远一致。
 
         刻意**不走** `KeepsakeProvider._core_fragments()`：那个带 60s 进程级缓存
         且超预算就返回空，MCP 是显式取数接口，缓存与预算兜底都会让调用方
         拿到「与库里不一致」的结果。
+
+        🔴 **可见性同口径**（2026-10 ks_share_memory）：非 primary 只拿得到
+        primary 的 core + 已共享代理的 core（判据在 `govern.visibility`）。
         """
-        return list(self._require_storage().list_by_tag("core"))
+        frags = list(self._require_storage().list_by_tag("core"))
+        scope = self._visibility_scope(caller_agent_id, caller_role)
+        if scope.is_primary or self._registry is None:
+            return frags
+        return visible_core_fragments(frags, self._registry, scope.caller_id)
 
     def count_fragments(self) -> int:
         """当前记忆条目总数（`memory_forget` 的 confirm 凭据）。

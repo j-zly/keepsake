@@ -23,6 +23,10 @@
 * `revoke` = **停权限留记录**（`status=revoked`，读写全拒）；
 * `revoke_credential` = **只废那把钥匙**（行留在册、状态与角色一个都不动）；
 * `delete` = **整行抹掉**（删前备份一份，可人工复原；**primary 拒删** 400）。
+
+🔴 **记忆共享开关**（`share`，2026-10 ks_share_memory）：`POST .../share` 只改
+**读可见性**（这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据 ——
+与私信开关（`dm`）同一档，不是治理动作。
 """
 
 from __future__ import annotations
@@ -113,6 +117,18 @@ class AgentDeleteBody(BaseModel):
     """
 
     confirm: Any = ""
+
+
+class AgentShareBody(BaseModel):
+    """`POST /api/v1/agents/{agent_id}/share` 的请求体：记忆共享开关 + 显式确认。
+
+    🔴 `enabled` 是**读可见性偏好**（共不共享记忆），不是治理动作 ——
+    它不碰 `status` / `role` / 已发的凭据（与私信开关 `dm` 同一档）。
+    `confirm` 要 `true`（与本文件其余写端点同一道闸）。
+    """
+
+    enabled: bool = Field(..., description="true = 共享记忆给其他已批准代理；false = 不共享")
+    confirm: Any = False
 
 
 def _valid_agent_id(agent_id: str) -> bool:
@@ -396,6 +412,30 @@ def set_agent_exclude(agent_id: str, body: AgentActionBody,
     return {"ok": True, "agent_id": agent_id,
             "exclude_from_primary": bool(body.exclude), "changed": changed,
             "backup": backup}
+
+
+@router.post("/api/v1/agents/{agent_id}/share",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_share(agent_id: str, body: AgentShareBody,
+                    storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """开关「这个代理的记忆**共享不共享**给别的已批准代理」（`share_memory`）。
+
+    🔴 **只影响读可见性**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
+    一个都不动（那是别的语义）。
+    🔴 **不是治理动作**：`status` / `role` / 已发的凭据 / 记忆归属一个都不碰
+    （`Registry.set_share_memory` 同纪律）—— 与私信开关（`dm`）同一档。
+    🔴 未知代理 ⇒ 404；没带 `confirm` ⇒ 400 且**不改**。
+    """
+    action = "agents.share"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改共享开关')
+    backup = _backup("share", row)
+    changed = registry.set_share_memory(agent_id, bool(body.enabled))
+    audit.record(action, agent_id, ok=True,
+                 reason=f"share_memory={bool(body.enabled)} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": agent_id, "share_memory": bool(body.enabled),
+            "changed": bool(changed), "backup": backup}
 
 
 @router.post("/api/v1/agents",

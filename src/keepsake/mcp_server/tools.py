@@ -1,4 +1,4 @@
-"""MCP 工具面 —— 8 个记忆 tool + 3 个信箱 tool + 5 个治理 tool 的实现。
+"""MCP 工具面 —— 8 个记忆 tool + 3 个信箱 tool + 6 个治理 tool 的实现。
 
 **取数只经 `MemoryProvider` 协议**：数据出口只有
 `provider.search/get/add/remove/merge/forget/capabilities/system_prompt_block`。
@@ -88,8 +88,11 @@ def _introspect(provider: Any) -> StorageIntrospection:
     return provider
 
 
-def _list_core(provider: Any) -> List[Dict[str, Any]]:
-    return list(_introspect(provider).list_core())
+def _list_core(provider: Any, caller_agent_id: str = "",
+               caller_role: str = "") -> List[Dict[str, Any]]:
+    """列 core 层条目（带调用方可见性 —— provider 支持才传身份参数）。"""
+    lister = _introspect(provider).list_core
+    return list(lister(**_caller_kwargs(lister, caller_agent_id, caller_role)))
 
 
 def _count_fragments(provider: Any) -> int:
@@ -111,6 +114,22 @@ def _hit_key(hit: Dict[str, Any]) -> str:
     return str(hit.get("key") or hit.get("_key") or "")
 
 
+def _caller_kwargs(fn: Any, caller_agent_id: str, caller_role: str) -> Dict[str, Any]:
+    """调用方身份参数（2026-10 ks_share_memory）—— **provider 支持才带**。
+
+    `MemoryProvider` 契约里没有 `caller_agent_id` / `caller_role` 这两个形参
+    （它们是 keepsake 自己的可见性扩展），所以先看签名再决定带不带：
+    别的记忆系统 provider 没这两个参数 ⇒ 照常调，不猜、不 try/except 吞异常。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):       # 签名取不到（内置/C 扩展）⇒ 不带
+        return {}
+    if "caller_agent_id" not in params:
+        return {}
+    return {"caller_agent_id": caller_agent_id or "", "caller_role": caller_role or ""}
+
+
 # --------------------------------------------------------------------------
 # 8 个 tool 的实现（纯函数，provider 显式传参 —— 不靠闭包，方便单测直接调）
 # --------------------------------------------------------------------------
@@ -128,12 +147,18 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
     }
 
 
-def memory_search(provider: Any, query: str, limit: int = 10) -> Dict[str, Any]:
-    """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。"""
+def memory_search(provider: Any, query: str, limit: int = 10,
+                 caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+    """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。
+
+    `caller_agent_id` / `caller_role`（2026-10 ks_share_memory）：调用方身份
+    （凭据反查得出）。非 primary 只看得见自己 + 已共享代理的记忆。
+    """
     if not query or not query.strip():
         raise ToolError("query 不能为空")
     limit = max(1, min(int(limit), 100))
-    hits = provider.search(query.strip(), limit=limit)
+    hits = provider.search(query.strip(), limit=limit,
+                           **_caller_kwargs(provider.search, caller_agent_id, caller_role))
     return {
         "query": query.strip(),
         "count": len(hits),
@@ -149,9 +174,14 @@ def memory_search(provider: Any, query: str, limit: int = 10) -> Dict[str, Any]:
     }
 
 
-def memory_get(provider: Any, key: str) -> Dict[str, Any]:
-    """按 key 取单条全文。key 不存在 ⇒ 抛 ToolError（不是「空 ok」）。"""
-    frag = provider.get(key)
+def memory_get(provider: Any, key: str, caller_agent_id: str = "",
+               caller_role: str = "") -> Dict[str, Any]:
+    """按 key 取单条全文。key 不存在 ⇒ 抛 ToolError（不是「空 ok」）。
+
+    🔴 **未共享代理的条目按「不存在」回**（2026-10 ks_share_memory）：
+    存在性本身也不许泄露。
+    """
+    frag = provider.get(key, **_caller_kwargs(provider.get, caller_agent_id, caller_role))
     if not frag:
         raise ToolError(f"记忆条目不存在：{key}")
     return {
@@ -162,10 +192,14 @@ def memory_get(provider: Any, key: str) -> Dict[str, Any]:
     }
 
 
-def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS) -> Dict[str, Any]:
-    """常驻层（core tag）条数 + 每条预览 —— 与 P1 控制台 `GET /api/v1/core` 同源。"""
+def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
+                     caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+    """常驻层（core tag）条数 + 每条预览 —— 与 P1 控制台 `GET /api/v1/core` 同源。
+
+    🔴 非 primary 只拿得到 primary 的 core + 已共享代理的 core（同口径）。
+    """
     preview_chars = max(1, min(int(preview_chars), 2000))
-    rows = _list_core(provider)
+    rows = _list_core(provider, caller_agent_id, caller_role)
     return {
         "count": len(rows),
         "chars": sum(len(str(r.get("content", "") or "")) for r in rows),
@@ -268,9 +302,10 @@ def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "") -> Dic
 # 🔴 **凭据明文只出现在 `agent_approve` 的返回值**（与界面同语义）：不进审计、不进日志。
 # --------------------------------------------------------------------------
 
-#: 5 个治理工具的名字（写口 4 个在 `server.GATE_WRITE_TOOLS` 里也登记过一次）
+#: 6 个治理工具的名字（写口 5 个在 `server.GATE_WRITE_TOOLS` 里也登记过一次）
 GOVERN_TOOLS = (
     "agent_list", "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
+    "agent_set_share",
 )
 
 #: 非 primary 调用方的**唯一**拒绝文案。带上 role 与 status 两个字段 ——
@@ -424,6 +459,26 @@ def agent_set_exclude(registry: Any, agent_id: str, exclude: bool = False) -> Di
             "changed": changed, "backup": backup}
 
 
+def agent_set_share(registry: Any, agent_id: str, enabled: bool = False) -> Dict[str, Any]:
+    """开关「这个代理的记忆**共享不共享**给别的已批准代理」（`share_memory`）。
+
+    🔴 只影响**读可见性**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
+    一个都不动（那是别的语义）。
+    🔴 不是治理动作：`status` / `role` / 已发的凭据一个都不碰
+    （与 `Registry.set_share_memory` 同纪律）。
+    """
+    action = "agents.share"
+    aid = (agent_id or "").strip()
+    row = _govern_row(registry, aid, action)
+    audit.precheck()
+    backup = _backup("share", row)
+    changed = registry.set_share_memory(aid, bool(enabled))
+    _audit(action, aid, ok=True,
+           reason=f"share_memory={bool(enabled)} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": aid, "share_memory": bool(enabled),
+            "changed": changed, "backup": backup}
+
+
 # --------------------------------------------------------------------------
 # 代理互聊信箱（message_*）：**所有已批准代理**可用，与治理面无关
 #
@@ -519,14 +574,14 @@ def message_recent(box: Any, caller: str, peer: str, limit: int = 20) -> List[Di
 
 def register_tools(server: Any, provider: Any, gate: Any = None, *,
                    govern: bool = False) -> Any:
-    """把 8 个记忆 tool + 3 个信箱 tool（+ `govern=True` 时再挂 5 个治理 tool）挂到 `server` 上。
+    """把 8 个记忆 tool + 3 个信箱 tool（+ `govern=True` 时再挂 6 个治理 tool）挂到 `server` 上。
 
     `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
     先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
     闸门负责按 read/write 打活动计数，所以它必须挂在 tool 入口，
     而不是塞进各工具函数体里（漏一处就是一个绕过闸门的入口）。
 
-    治理那 5 个走 `gate.identify` + `role == primary`（见 `_govern_identity`）：
+    治理那 6 个走 `gate.identify` + `role == primary`（见 `_govern_identity`）：
     自造 provider 没有注册表（`gate is None`）时它们照常注册，只是每个都明确报
     「治理工具需要代理注册表」—— 不静默消失，免得调用方以为治理面不存在。
 
@@ -538,9 +593,15 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     #: 没有注册表时留 None —— 工具照常注册，但每次调用明确报「需要代理注册表」。
     box = Messaging(registry.storage) if registry is not None else None
 
-    def _authorize(tool_name: str) -> None:
-        if gate is not None:
-            gate.check(tool_name)
+    def _authorize(tool_name: str) -> Dict[str, Any]:
+        """过身份闸门，并**把身份结论带回来**（可见性过滤要用，2026-10 ks_share_memory）。
+
+        🔴 身份只认闸门那条链（凭据反查）—— 调用方自报身份正是这套治理要拔掉的
+        东西，所以这里的 caller 一律来自 `gate.check` 的结论。
+        """
+        if gate is None:
+            return {}
+        return dict(gate.check(tool_name) or {})
 
     @server.tool(
         name="memory_capabilities",
@@ -555,24 +616,30 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）。",
     )
     def _search(query: str, limit: int = 10) -> Dict[str, Any]:
-        _authorize("memory_search")
-        return memory_search(provider, query, limit)
+        ident = _authorize("memory_search")
+        return memory_search(provider, query, limit,
+                             caller_agent_id=str(ident.get("agent_id") or ""),
+                             caller_role=str(ident.get("role") or ""))
 
     @server.tool(
         name="memory_get",
         description="按 key 取一条记忆的全文；key 不存在则报错。",
     )
     def _get(key: str) -> Dict[str, Any]:
-        _authorize("memory_get")
-        return memory_get(provider, key)
+        ident = _authorize("memory_get")
+        return memory_get(provider, key,
+                          caller_agent_id=str(ident.get("agent_id") or ""),
+                          caller_role=str(ident.get("role") or ""))
 
     @server.tool(
         name="memory_core_list",
         description="列出常驻层（core）记忆：条数 + 每条预览。",
     )
     def _core_list(preview_chars: int = CORE_PREVIEW_CHARS) -> Dict[str, Any]:
-        _authorize("memory_core_list")
-        return memory_core_list(provider, preview_chars)
+        ident = _authorize("memory_core_list")
+        return memory_core_list(provider, preview_chars,
+                                caller_agent_id=str(ident.get("agent_id") or ""),
+                                caller_role=str(ident.get("role") or ""))
 
     @server.tool(
         name="memory_add",
@@ -677,5 +744,14 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         def _agent_set_exclude(agent_id: str, exclude: bool = False) -> Dict[str, Any]:
             _govern_identity(gate, registry, "agent_set_exclude")
             return agent_set_exclude(registry, agent_id, exclude)
+
+        @server.tool(
+            name="agent_set_share",
+            description="开关「该代理的记忆共享不共享给别的已批准代理」。"
+                        "enabled=true 表示共享（只影响读可见性）。仅主代理可用。",
+        )
+        def _agent_set_share(agent_id: str, enabled: bool = False) -> Dict[str, Any]:
+            _govern_identity(gate, registry, "agent_set_share")
+            return agent_set_share(registry, agent_id, enabled)
 
     return server

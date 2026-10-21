@@ -35,6 +35,8 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/set_id",
     "/api/v1/agents/{agent_id}/revoke_credential",
     "/api/v1/agents/{agent_id}/delete",
+    # 记忆共享开关（ks_share_memory）：只改读可见性，不是治理动作
+    "/api/v1/agents/{agent_id}/share",
 )
 
 #: 非 POST 的写端点（DELETE 与 POST 别名是同一条路，只是方法不同）。
@@ -107,7 +109,7 @@ def test_列表形状与pending计数(env):
     # 🆕 多了 dm_enabled（私信开关）：控制台的「私信开关」读的就是这个字段
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
-                         "credential_hint", "meta", "dm_enabled"}
+                         "credential_hint", "meta", "dm_enabled", "share_memory"}
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文
     assert "credential_hash" not in json.dumps(body)
@@ -558,11 +560,12 @@ def test_写前备份落盘(env, tmp_path):
 
 # ---------------------------------------------------------------- 写面枚举
 
-def test_写面枚举_九条agents写端点都在(env):
+def test_写面枚举_十条agents写端点都在(env):
     """与 tests/api/test_api_readonly.py 的白名单互为反面：少挂一条依赖就红。
 
     （代理治理原有四条 approve / revoke / role / exclude，登记与改名两条，
-    改 id 一条 —— 换主键 + 记忆归属级联，停凭据与整行删除两条。）
+    改 id 一条 —— 换主键 + 记忆归属级联，停凭据与整行删除两条，
+    记忆共享开关一条 —— 只改读可见性。）
     """
     app = create_app()
     paths = {getattr(r, "path", "") for r in app.routes}

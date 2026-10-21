@@ -78,7 +78,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
@@ -1530,6 +1530,7 @@ class PgStorage(StorageBase):
         tag_filter: str,
         agent_id: str,
         is_primary: Optional[bool],
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> tuple:
         """检索 WHERE 片段（标签 + agent 隔离），语义逐条对齐 Redis 侧。
 
@@ -1557,7 +1558,10 @@ class PgStorage(StorageBase):
         #  与 Redis/SQLite 同口径；写侧的降级闸在 provider.add()）
         if not effective_is_primary:
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
-                          if effective_agent_id else []) + ["shared", "core"]
+                          if effective_agent_id else [])
+            # 共享集（2026-10 ks_share_memory）：这些代理的记忆对本次调用方可见
+            agent_tags += [self._clean_tag(f"agent:{a}") for a in (visible_agents or []) if a]
+            agent_tags += ["shared", "core"]
             sql, args = tag_match_sql("tags", agent_tags, "%s", pos_fn="strpos")
             clauses.append(sql)
             params.extend(args)
@@ -1679,9 +1683,11 @@ class PgStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索（对外入口：内部薄候选 + 一次取回正文，形状逐字不变）。"""
-        results = self._hydrate_thin(self._bm25_thin(query, tag_filter, agent_id, is_primary))
+        results = self._hydrate_thin(self._bm25_thin(query, tag_filter, agent_id, is_primary,
+                                                     visible_agents))
         self._fire_hits(results)        # 侧写打点：命中 keys，后台 + fail-open
         return results
 
@@ -1691,6 +1697,7 @@ class PgStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索（jieba 分词 → tsquery 召回 → **Python 侧真 BM25 打分**）。
 
@@ -1737,7 +1744,8 @@ class PgStorage(StorageBase):
         # `to_tsvector('simple', ...)` 会把词元**小写化**，所以 tf / df 两处
         # 都拿小写词元比对（不清就查不到 tf，BM25 会整批算成 0）。
         lexemes = [t.lower() for t in terms]
-        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
+        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary,
+                                                     visible_agents)
 
         # 2. 召回 + 取打分素材。一条 SQL 同时拿：
         #    doclen = 该文档全部词元数（= 入库 jieba 分词后的词数，与分词口径一致）
@@ -1920,9 +1928,11 @@ class PgStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """KNN 向量搜索（对外入口：内部薄候选 + 一次取回正文）。"""
-        return self._hydrate_thin(self._knn_thin(query, tag_filter, agent_id, is_primary))
+        return self._hydrate_thin(self._knn_thin(query, tag_filter, agent_id, is_primary,
+                                                  visible_agents))
 
     def _knn_thin(
         self,
@@ -1930,6 +1940,7 @@ class PgStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """KNN 向量搜索（HNSW + 余弦距离），经共用的时间衰减重排后返回。
 
@@ -1955,7 +1966,8 @@ class PgStorage(StorageBase):
                            "returning no results (explicit, not a backend outage)")
             return []
 
-        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
+        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary,
+                                                     visible_agents)
         lit = self._vector_literal(vec)
         # 🔴 **内层子查询不带任何过滤**，「活记忆」过滤放在外层 WHERE：
         #   带过滤时规划器把过滤后的行数估成 rows=1218/3655，HNSW 索引路径的
@@ -2016,6 +2028,7 @@ class PgStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """统一检索入口（与 RedisStorage.search 同构）。
 
@@ -2045,13 +2058,13 @@ class PgStorage(StorageBase):
 
         if not self._has_embedder():
             bm25_results = self._bm25_thin(query, tag_filter, effective_agent_id,
-                                            effective_is_primary)
+                                            effective_is_primary, visible_agents)
             final = self._hydrate_thin(self._apply_v2_filters(bm25_results))
             self._fire_hits(final)     # 侧写打点：命中 keys，后台 + fail-open
             return final
 
         knn_results, bm25_results = self._search_parallel(
-            query, tag_filter, effective_agent_id, effective_is_primary)
+            query, tag_filter, effective_agent_id, effective_is_primary, visible_agents)
         if knn_results:
             fused = self._rrf_fuse(bm25_results, knn_results)
             final = self._hydrate_thin(self._apply_v2_filters(self._tiebreak(fused)))
@@ -2066,6 +2079,7 @@ class PgStorage(StorageBase):
         tag_filter: str,
         agent_id: str,
         is_primary: Optional[bool],
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> tuple:
         """BM25 与 KNN 两路并行跑，返回 `(knn_results, bm25_results)`。
 
@@ -2081,8 +2095,10 @@ class PgStorage(StorageBase):
 
         # KNN 先投：它要先做查询向量的 embedder HTTP 调用（最慢的一段），
         # 先投进去让 BM25 的 SQL 与它重叠，而不是排在它后面等。
-        f_knn = pool.submit(self._knn_thin, query, tag_filter, agent_id, is_primary)
-        f_bm25 = pool.submit(self._bm25_thin, query, tag_filter, agent_id, is_primary)
+        f_knn = pool.submit(self._knn_thin, query, tag_filter, agent_id, is_primary,
+                            visible_agents)
+        f_bm25 = pool.submit(self._bm25_thin, query, tag_filter, agent_id, is_primary,
+                             visible_agents)
         # 取 BM25 的结果先（它通常更短），但两路都已 in-flight，取哪个不影响并行度
         bm25_results = f_bm25.result()
         knn_results = f_knn.result()

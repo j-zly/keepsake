@@ -173,6 +173,10 @@ export const api = {
   // 🔴 失败时**不要**自己改 UI —— 页面负责回滚（回滚逻辑在 AgentsView 里）。
   setAgentDm: (agentId, enabled) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/dm`, { enabled, confirm: true }).then((r) => r.data),
+  // 记忆共享开关（share_memory）：同样 confirm 恒为 true；只改**读可见性**
+  // （这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据。
+  setAgentShare: (agentId, enabled) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/share`, { enabled, confirm: true }).then((r) => r.data),
 
   // ---- 知识库 CRUD（控制台批2 后端）：同样纯透传，域隔离与护栏都在后端 ----
   // 新增/改必须显式带 confirm（与其它写操作同一口径）；条目只进手动域。

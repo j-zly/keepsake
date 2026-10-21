@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import redis
 from redis.commands.search.query import Query
@@ -1870,6 +1870,7 @@ class RedisStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索，经时间衰减重排序后返回。
 
@@ -1992,10 +1993,14 @@ class RedisStorage(StorageBase):
                 shared_filter = f"@tags:{{shared}}"
                 core_filter = "@tags:{core}"
                 # 三者之一即可
-                filter_clause = f"({agent_filter} || {shared_filter} || {core_filter}) AND "
+                vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
+                filter_clause = ("(" + " || ".join([agent_filter, shared_filter, core_filter]
+                                                   + vis) + ") AND ")
             elif not effective_is_primary and not effective_agent_id:
-                # 没有 agent_id：shared 或 core
-                filter_clause = "(@tags:{shared} || @tags:{core}) AND "
+                # 没有 agent_id：shared 或 core（+ 共享集，语义与上面同款）
+                vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
+                filter_clause = ("(" + " || ".join(["@tags:{shared}", "@tags:{core}"] + vis)
+                                 + ") AND ")
             query_expr = f"{filter_clause}{body_expr}"
 
             q = (
@@ -2138,6 +2143,7 @@ class RedisStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """KNN 向量搜索，经时间衰减重排序后返回。"""
         if not self._has_embedder():
@@ -2167,13 +2173,19 @@ class RedisStorage(StorageBase):
 
             if not effective_is_primary and effective_agent_id:
                 # 只能搜索 agent 指定的碎片或者 shared 标签的碎片
-                agent_filter = f"@tags:{{agent:{effective_agent_id}}}"
-                shared_filter = f"@tags:{{shared}}"
-                # 两者之一即可
-                query_expr = f"({agent_filter} || {shared_filter}) AND {query_expr}"
+                # （🔴 这一路**不含 core** —— 与 BM25 路的历史差异保持原样，
+                #  本单只**加**共享集，不顺手改既有口径）
+                agent_filter = f"@tags:{{agent:{_tag_safe(effective_agent_id)}}}"
+                shared_filter = "@tags:{shared}"
+                # 两者之一即可（+ 共享集：这些代理的记忆对本次调用方可见）
+                vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
+                query_expr = ("(" + " || ".join([agent_filter, shared_filter] + vis)
+                              + f") AND {query_expr}")
             elif not effective_is_primary and not effective_agent_id:
-                # 如果没有 agent_id，只搜索 shared 标签
-                query_expr = f"@tags:{{shared}} AND {query_expr}"
+                # 如果没有 agent_id，只搜索 shared 标签（+ 共享集）
+                vis = [f"@tags:{{agent:{_tag_safe(a)}}}" for a in (visible_agents or []) if a]
+                query_expr = ("(" + " || ".join(["@tags:{shared}"] + vis)
+                              + f") AND {query_expr}")
 
             q = (
                 Query(query_expr)
@@ -2273,6 +2285,7 @@ class RedisStorage(StorageBase):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """统一检索入口。
 
@@ -2295,10 +2308,12 @@ class RedisStorage(StorageBase):
         # RRF 融合检索（v1.3）: BM25 + KNN 两路排名融合（Reciprocal Rank Fusion）
         # 不比较原始分数（量纲不同），只按排名位置加权：score = Σ 1/(k + rank)
         # 两路都排名高的记忆排最前（交叉验证）；单路时退化为该路自身顺序
-        bm25_results = self.search_bm25(query, tag_filter, effective_agent_id, effective_is_primary)
+        bm25_results = self.search_bm25(query, tag_filter, effective_agent_id,
+                                        effective_is_primary, visible_agents)
 
         if self._has_embedder():
-            knn_results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
+            knn_results = self.search_knn(query, tag_filter, effective_agent_id,
+                                          effective_is_primary, visible_agents)
             if knn_results:
                 fused = self._rrf_fuse(bm25_results, knn_results)
                 final = self._apply_v2_filters(fused)

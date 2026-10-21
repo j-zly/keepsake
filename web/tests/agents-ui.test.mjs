@@ -311,12 +311,14 @@ test('自动刷新：10s 静默重拉，卸载必须清定时器', () => {
 })
 
 test('刷新失败保留旧数据不清屏', () => {
+  // 窗口 800：load() 里多了一行「共享开关的乐观值也丢掉」（ks_share_memory），
+  // 断言看的是**失败路径那一段**，窗口跟着长一点，判据本身没变。
   const body = VIEW.slice(VIEW.indexOf('async function load'))
-  assert.match(body.slice(0, 700), /const list = await api\.listAgents\(\{/, '列表按 q/page 透传')
-  assert.match(body.slice(0, 700), /data\.value = list/, '成功才整份替换')
-  assert.doesNotMatch(body.slice(0, 700), /agents\.value = \[\]/, '失败路径不许把列表清空')
-  assert.match(body.slice(0, 700), /error\.value = `读取代理列表失败/, '失败要有可见提示')
-  assert.match(body.slice(0, 700), /if \(lastErr !== error\.value\) showError/, '连着失败只报一次，不刷屏')
+  assert.match(body.slice(0, 800), /const list = await api\.listAgents\(\{/, '列表按 q/page 透传')
+  assert.match(body.slice(0, 800), /data\.value = list/, '成功才整份替换')
+  assert.doesNotMatch(body.slice(0, 800), /agents\.value = \[\]/, '失败路径不许把列表清空')
+  assert.match(body.slice(0, 800), /error\.value = `读取代理列表失败/, '失败要有可见提示')
+  assert.match(body.slice(0, 800), /if \(lastErr !== error\.value\) showError/, '连着失败只报一次，不刷屏')
 })
 
 test('空态说的是「为什么空 + 接下来点哪里」', () => {

@@ -13,13 +13,27 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .tools import ToolError
+from .tools import ToolError, _caller_kwargs
 
 __all__ = ["register_resources"]
 
 
-def register_resources(server: Any, provider: Any) -> Any:
-    """把两个 resource 挂到 `server` 上。"""
+def register_resources(server: Any, provider: Any, gate: Any = None) -> Any:
+    """把两个 resource 挂到 `server` 上。
+
+    `gate` 非 None 时按**调用方身份**收窄可见范围（2026-10 ks_share_memory）：
+    非 primary 只拿得到 primary 的 core + 已共享代理的 core（与检索同口径）。
+    身份判定走闸门那条链（凭据反查），**不抛、不记账** —— resource 不是工具，
+    没有「未批准即拒绝」那道闸（闸门只挂在 tool 入口）。
+    """
+
+    def _caller() -> Dict[str, Any]:
+        if gate is None:
+            return {}
+        try:
+            return dict(gate.identify("memory_core") or {})
+        except Exception:      # noqa: BLE001 —— 判不出身份就按「本进程自己」处理
+            return {}
 
     @server.resource(
         "memory://core",
@@ -28,7 +42,11 @@ def register_resources(server: Any, provider: Any) -> Any:
         mime_type="text/plain",
     )
     def core() -> str:
-        return provider.system_prompt_block()
+        ident = _caller()
+        kwargs = _caller_kwargs(provider.system_prompt_block,
+                               str(ident.get("agent_id") or ""),
+                               str(ident.get("role") or ""))
+        return provider.system_prompt_block(**kwargs)
 
     @server.resource(
         "memory://fragment/{key}",
@@ -37,7 +55,10 @@ def register_resources(server: Any, provider: Any) -> Any:
         mime_type="application/json",
     )
     def fragment(key: str) -> str:
-        frag = provider.get(key)
+        ident = _caller()
+        kwargs = _caller_kwargs(provider.get, str(ident.get("agent_id") or ""),
+                               str(ident.get("role") or ""))
+        frag = provider.get(key, **kwargs)
         if not frag:
             raise ToolError(f"记忆条目不存在：{key}")
         return json.dumps(

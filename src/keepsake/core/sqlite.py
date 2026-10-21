@@ -98,7 +98,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
@@ -1683,6 +1683,7 @@ class SqliteStorage(StorageBase):
         tag_filter: str,
         agent_id: str,
         is_primary: Optional[bool],
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> Tuple[str, List[Any]]:
         """检索 WHERE 片段（标签 + agent 隔离 + 活记忆），语义逐条对齐 PG/Redis。
 
@@ -1696,6 +1697,9 @@ class SqliteStorage(StorageBase):
         多标签是 OR 并集（拼法用「重复 N 次再 OR 连起来」：**单标签时不能写成
         `(instr(...) > 0 OR )`** —— 那是语法错，整条检索抛 `near ")": syntax
         error`，p2.1 实测过）。
+
+        `visible_agents`（2026-10 ks_share_memory）：**额外**可见的归属代理
+        （共享集）。缺省 / 空 ⇒ 可见标签与开关上线前逐字相同。
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -1705,7 +1709,10 @@ class SqliteStorage(StorageBase):
         if not effective_is_primary:
             # 多代理治理：子代理对常驻层只读 ⇒ 检索侧放开 core（PG/Redis 同口径）
             agent_tags = ([self._clean_tag(f"agent:{effective_agent_id}")]
-                          if effective_agent_id else []) + ["shared", "core"]
+                          if effective_agent_id else [])
+            # 共享集：这些代理的记忆对本次调用方可见（标签口径与检索过滤同款）
+            agent_tags += [self._clean_tag(f"agent:{a}") for a in (visible_agents or []) if a]
+            agent_tags += ["shared", "core"]
             sql, args = tag_match_sql("tags", agent_tags, "?")
             clauses.append(sql)
             params.extend(args)
@@ -1832,7 +1839,8 @@ class SqliteStorage(StorageBase):
         return tiebreak_by_key(fragments, score_key=score_key)
 
     def search(self, query: str, tag_filter: str = "", agent_id: str = "",
-               is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
+               is_primary: Optional[bool] = None,
+               visible_agents: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
         """统一检索入口（与 `RedisStorage.search` / `PgStorage.search` 同构）。
 
           1. BM25 全文（jieba + FTS5 + 内建 bm25）
@@ -1843,15 +1851,17 @@ class SqliteStorage(StorageBase):
         （与 PG「无 embedder 就只走 BM25」同构），**不是静默返回空**；
         需要向量结果的调用方请直接调 `search_knn`，那里抛的是明确的
         `NotImplementedError`。
+
+        `visible_agents`：共享集（额外可见的归属代理），语义见 `base.StorageBase`。
         """
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
         bm25_results = self.search_bm25(query, tag_filter, effective_agent_id,
-                                        effective_is_primary)
+                                        effective_is_primary, visible_agents)
         try:
             knn_results = self.search_knn(query, tag_filter, effective_agent_id,
-                                          effective_is_primary)
+                                          effective_is_primary, visible_agents)
         except NotImplementedError as e:
             logger.warning(
                 "storage_sqlite: search() 向量路不可用，降级为 BM25 单路（不是静默空结果）：%s", e)
@@ -1907,7 +1917,8 @@ class SqliteStorage(StorageBase):
         return n_docs_f, avgdl, dfs
 
     def search_bm25(self, query: str, tag_filter: str = "", agent_id: str = "",
-                    is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
+                    is_primary: Optional[bool] = None,
+                    visible_agents: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
         """BM25 全文搜索（jieba 切词 → FTS5 MATCH 召回 → **PG 的同一个 BM25 公式**
         在 Python 侧打分 → 共用 `rerank_with_decay` 重排 → 取 `final_limit` 条）。
 
@@ -1940,7 +1951,8 @@ class SqliteStorage(StorageBase):
                            "returning no results (explicit)", query[:50])
             return []
 
-        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary)
+        where_sql, params = self._search_filter_sql(tag_filter, agent_id, is_primary,
+                                                     visible_agents)
         expr = _fts_match_expr(terms)
         try:
             with self._lock:
@@ -2089,7 +2101,8 @@ class SqliteStorage(StorageBase):
     # ------------------------------------------------------------------
 
     def search_knn(self, query: str, tag_filter: str = "", agent_id: str = "",
-                   is_primary: Optional[bool] = None) -> List[Dict[str, Any]]:
+                   is_primary: Optional[bool] = None,
+                   visible_agents: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
         """向量检索 —— 需要 `sqlite-vec` 扩展（第 3 批可选懒加载），本批未实现。
 
         🔴 **绝不静默返回空列表**：向量路不可用时唯一正确的形态是抛错，

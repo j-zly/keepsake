@@ -267,6 +267,25 @@
                   @change="toggleDm(a, $event)"
                 />
               </span>
+
+              <!--
+                记忆共享开关（share_memory）：打开之后，这个代理名下的记忆进入
+                **别的已批准代理**的检索可见范围（关着就只有它自己 + 主脑看得见）。
+                🔴 与私信开关**同一档**：只改**读可见性**，不是治理动作
+                （不碰状态 / 角色 / 凭据 / 记忆归属）—— 所以同样放在 primary
+                的分流链**外面**（主代理也可以共享自己的记忆，合法）。
+                失败回滚：乐观值丢掉即回到服务器口径，并报红条。
+              -->
+              <span class="dm-toggle">
+                <span class="dm-label">共享记忆</span>
+                <el-switch
+                  :model-value="shareOn(a)"
+                  size="small"
+                  :loading="shareBusy === a.agent_id"
+                  :title="shareOn(a) ? '已共享：别的代理能检索到它的记忆' : '未共享：只有它自己和主脑看得见'"
+                  @change="toggleShare(a, $event)"
+                />
+              </span>
             </template>
           </ItemCard>
         </div>
@@ -436,6 +455,10 @@ const busy = ref(false)
 const dmState = ref({})
 /** 正在提交的那一行（同一时刻只允许一个，避免连点连发）。 */
 const dmBusy = ref('')
+/** 记忆共享开关的乐观值（agent_id → 开/关）：与私信开关同款（乐观 + 失败回滚）。 */
+const shareState = ref({})
+/** 正在提交共享开关的那一行。 */
+const shareBusy = ref('')
 
 // 搜索 + 服务端分页（口径照抄 CoreView：回车查、清空回全量、seq 防串）
 const q = ref('')
@@ -492,6 +515,7 @@ async function load(silent = false) {
     lastErr = ''
     // 服务器口径为准：没有正在提交的行时，乐观值一律丢掉（页面回到真实状态）
     if (!dmBusy.value) dmState.value = {}
+    if (!shareBusy.value) shareState.value = {}
   } catch (e) {
     if (isStale(seq, reqSeq)) return
     // 保留旧数据不清屏：一次抖动不该把正在审的列表抽走
@@ -554,6 +578,43 @@ function dmOn(a) {
   const s = dmState.value
   if (a.agent_id in s) return s[a.agent_id]
   return a.dm_enabled !== false
+}
+
+// ---------------------------------------------------------------------------
+// 记忆共享开关（share_memory）：只改读可见性，不是治理动作
+// ---------------------------------------------------------------------------
+
+/** 当前共享状态：乐观值优先；没有乐观值就看服务器给的（缺字段按**关** —— 老数据兼容）。 */
+function shareOn(a) {
+  const s = shareState.value
+  if (a.agent_id in s) return s[a.agent_id]
+  return a.share_memory === true
+}
+
+/**
+ * 切换记忆共享开关：乐观更新 → 打端点 → 失败回滚（丢掉乐观值）+ 红条。
+ *
+ * 🔴 失败**必须**回滚：不回滚的话，界面显示「已共享」而服务端根本没改 ——
+ * 那正是这套治理要拔掉的「以为改成了」。
+ */
+async function toggleShare(a, val) {
+  const id = a.agent_id
+  shareState.value = { ...shareState.value, [id]: !!val }
+  shareBusy.value = id
+  try {
+    await api.setAgentShare(id, !!val)
+    showToast(`${id}：记忆已${val ? '共享' : '收回'}`)
+    // 状态以服务器为准（本地改了很快就和注册表对不上）
+    await load(true)
+  } catch (e) {
+    const next = { ...shareState.value }
+    delete next[id]
+    shareState.value = next
+    error.value = `记忆共享开关切换失败：${e.message}`
+    showError(error.value)
+  } finally {
+    shareBusy.value = ''
+  }
 }
 
 /**

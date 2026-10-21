@@ -333,6 +333,10 @@ class AgentItem(BaseModel):
     #: 私信开关（`dm_enabled`）：false = 这个代理**不收**私信（别人投不进来）。
     #: 默认**开**（老行缺列也算开 —— 新增字段不许改存量语义）。
     dm_enabled: bool = Field(True, description="是否接收私信（默认开）")
+    #: 记忆共享开关（`share_memory`）：true = 这个代理的记忆进**别的**已批准代理
+    #: 的检索可见范围。默认**关**（老行缺列也算关 —— 共享是放宽权限的开关，
+    #: 缺省必须最严）。
+    share_memory: bool = Field(False, description="是否共享记忆给其他已批准代理（默认关）")
 
 
 class AgentList(BaseModel):

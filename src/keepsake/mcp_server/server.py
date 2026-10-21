@@ -86,8 +86,8 @@ MESSAGING_HINT = (
 #: 治理面只在 `build_server(govern=True)` 时存在 —— 那时才把它写进 instructions，
 #: 免得模型按一段并不存在的工具说明去调（govern=False 时那段话是假的）。
 GOVERN_HINT = (
-    "治理面 agent_list/agent_approve/agent_revoke/agent_set_role/agent_set_exclude "
-    "只对注册表里的 primary 代理开放，与控制台同一套操作。"
+    "治理面 agent_list/agent_approve/agent_revoke/agent_set_role/agent_set_exclude/"
+    "agent_set_share 只对注册表里的 primary 代理开放，与控制台同一套操作。"
 )
 
 
@@ -105,6 +105,7 @@ GOVERN_HINT = (
 GATE_WRITE_TOOLS = frozenset({
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
     "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
+    "agent_set_share",
     "message_send", "message_inbox", "message_recent",
 })
 
@@ -473,13 +474,13 @@ def _sync_view(fn: Any, *, str_uri: bool = False) -> Any:
 
 
 def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any:
-    """构造挂好 8 个记忆 tool（+ 2 个 resource，可选再加 5 个治理 tool）的 MCP 服务。
+    """构造挂好 8 个记忆 tool（+ 2 个 resource，可选再加 6 个治理 tool）的 MCP 服务。
 
     `provider` 省略时用 keepsake 默认装配（`factory.default_provider()`，
     按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连接）。
     传入自己的 `MemoryProvider` 实现即可让任意宿主复用同一套工具面。
 
-    🔴 `govern=True` 才挂 `agent_*` 五个治理工具（列代理/批准/吊销/改角色/exclude，
+    🔴 `govern=True` 才挂 `agent_*` 六个治理工具（列代理/批准/吊销/改角色/exclude/共享，
     **只对注册表里 role=primary 的调用方放行**，见 `tools._govern_identity`）。
     默认关闭是**兼容性**决定：那 5 个工具是本文件对外承诺过的 8 工具契约之外的新面，
     对「把工具面枚举出来喂给模型的宿主」是可见的破坏性变更 —— 宿主若要治理面，
@@ -505,7 +506,7 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
                      + (GOVERN_HINT if govern else ""))
     gate = AgentGate.for_provider(provider, server)
     register_tools(server, provider, gate=gate, govern=govern)
-    register_resources(server, provider)
+    register_resources(server, provider, gate=gate)
     # 闸门句柄挂在 server 上（探针 / 运维脚本看「现在放不放行」用；工具调用本身
     # 走 `gate.check`，不经过这个属性 —— 改它不会放松任何一道闸）。
     server.agent_gate = gate

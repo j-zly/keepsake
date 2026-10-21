@@ -107,7 +107,7 @@ REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
-    "meta", "dm_enabled",
+    "meta", "dm_enabled", "share_memory",
 )
 
 #: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -119,6 +119,18 @@ DM_DISABLED_VALUES: Tuple[str, ...] = ("0", "false", "False", "no", "off")
 #: `dm_enabled` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
 DM_COLUMN = "dm_enabled"
 DM_COLUMN_DECL = "text NOT NULL DEFAULT '1'"
+
+#: `share_memory` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: 🔴 与 `dm_enabled` **相反**：缺省是**关**（'0'）——「记忆共享」是**放宽**权限的
+#: 开关，缺省必须是最严的那一档（老行没有这一列 ⇒ 一律当关，语义不变）。
+SHARE_ENABLED_ON = "1"
+SHARE_DISABLED_ON = "0"
+#: 认作「开」的值（其余一切（含空 / 缺列）都当关）。
+SHARE_ENABLED_VALUES: Tuple[str, ...] = ("1", "true", "yes", "on")
+
+#: `share_memory` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
+SHARE_COLUMN = "share_memory"
+SHARE_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 
 #: 计数与布尔列（SQL 里是 integer，Redis hash 里存字符串 —— 规范化时统一成 int/bool）
 _INT_FIELDS = ("reads", "writes")
@@ -144,7 +156,11 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     meta                 text NOT NULL DEFAULT '{}',
     -- 2026-10 ks_agent_messaging：是否接收别的代理的私信（代理互聊信箱）。
     -- 默认 '1'（开）—— 老库补列时也落 '1'，存量行的语义不变。
-    dm_enabled           text NOT NULL DEFAULT '1'
+    dm_enabled           text NOT NULL DEFAULT '1',
+    -- 2026-10 ks_share_memory：是否把这个代理的记忆共享给**别的**已批准代理。
+    -- 默认 '0'（关）—— 这是**放宽**权限的开关，缺省必须是最严的那一档；
+    -- 老库补列时也落 '0'，存量行的语义不变（谁也没被共享出去）。
+    share_memory         text NOT NULL DEFAULT '0'
 )
 """
 
@@ -241,6 +257,10 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     # 老行没有这一列时语义不变）；显式的关掉值原样留着。
     dm = str(row.get("dm_enabled") or "").strip()
     row["dm_enabled"] = dm if dm else DM_ENABLED_ON
+    # share_memory：缺列 / 空值 ⇒ 默认**关**（与 DDL 的 DEFAULT '0' 同口径，
+    # 「新增字段不许改存量语义」：老行一个都没被共享出去）。
+    share = str(row.get("share_memory") or "").strip()
+    row["share_memory"] = share if share else SHARE_DISABLED_ON
     # 脏数据不许悄悄当权威：角色/状态只认枚举内的值
     if row["role"] not in ROLES:
         row["role"] = ROLE_SUB
@@ -257,6 +277,17 @@ def _dm_is_on(row: Optional[Dict[str, Any]]) -> bool:
     「代理存不存在」是**另一道闸**（由发送侧先判），不是这一列的事。
     """
     return str((row or {}).get("dm_enabled") or DM_ENABLED_ON).strip() not in DM_DISABLED_VALUES
+
+
+def _share_is_on(row: Optional[Dict[str, Any]]) -> bool:
+    """`share_memory` 这一列的**唯一判读口**（默认**关**）。
+
+    🔴 与 `_dm_is_on` 相反：那边缺省**开**（老行语义不变），这边缺省**关** ——
+    「记忆共享」是**放宽**可见性的开关，缺省必须是最严的那一档。
+    查无此代理（空行）也当关 —— 「代理存不存在」是**另一道闸**。
+    """
+    value = str((row or {}).get("share_memory") or "").strip().lower()
+    return value in SHARE_ENABLED_VALUES
 
 
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,6 +311,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         # 私信开关（投递偏好）：控制台要能看见当前状态 —— 判读口径与
         # `Registry.dm_enabled` 同一个（`_dm_is_on`），两处不许各写一份。
         "dm_enabled": _dm_is_on(row),
+        # 记忆共享开关：true = 这个代理的记忆进**别的**已批准代理的检索可见范围。
+        # 判读口径与 `Registry.share_memory` 同一个（`_share_is_on`）。
+        "share_memory": _share_is_on(row),
     }
 
 
@@ -374,7 +408,7 @@ class _SqlBackend(_SqlBase):
 
     # -- ks_agent 专用 --------------------------------------------------
     def ensure_schema(self) -> bool:
-        """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` 列。
+        """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` / `share_memory` 列。
 
         🔴 补列走「先查后补」（`_SqlBase.has_column`）：列已在 ⇒ **一条 DDL 都不发**
         （PG 的 `ADD COLUMN IF NOT EXISTS` 列已存在也要拿 ACCESS EXCLUSIVE，
@@ -382,13 +416,15 @@ class _SqlBackend(_SqlBase):
         """
         if not super().ensure_schema():
             return False
-        try:
-            if not self.has_column(DM_COLUMN):
-                self.add_column(DM_COLUMN, DM_COLUMN_DECL)
-        except Exception as e:      # noqa: BLE001 —— 返回 False，不抛（调用方决定降级）
-            logger.warning("keepsake: 注册表补列 %s 失败（%s: %s）",
-                           DM_COLUMN, type(e).__name__, e)
-            return False
+        for column, decl in ((DM_COLUMN, DM_COLUMN_DECL),
+                             (SHARE_COLUMN, SHARE_COLUMN_DECL)):
+            try:
+                if not self.has_column(column):
+                    self.add_column(column, decl)
+            except Exception as e:      # noqa: BLE001 —— 返回 False，不抛（调用方决定降级）
+                logger.warning("keepsake: 注册表补列 %s 失败（%s: %s）",
+                               column, type(e).__name__, e)
+                return False
         return True
 
     def load(self, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -676,6 +712,7 @@ class Registry:
             "exclude_from_primary": False,
             "meta": {},
             "dm_enabled": DM_ENABLED_ON,
+            "share_memory": SHARE_DISABLED_ON,
         })
         return self.get(aid) or {}
 
@@ -790,6 +827,35 @@ class Registry:
         if str(row.get("dm_enabled") or DM_ENABLED_ON).strip() == want:
             return False
         self._be.update(aid, {"dm_enabled": want})
+        return True
+
+    # ---- 记忆共享开关（读可见性）-------------------------------------
+    def share_memory(self, agent_id: str) -> bool:
+        """这个代理的记忆**是否共享**给别的已批准代理。默认**关**。
+
+        🔴 查不到代理 / 老行没有这一列 ⇒ 一律 False：
+        「新增字段必须兼容旧数据」—— 存量行的语义不许因为加了一列而变
+        （谁也没被共享出去过）。这是**放宽**权限的开关，缺省必须最严。
+        """
+        row = self._be.load((agent_id or "").strip())
+        if not row:
+            return False
+        return _share_is_on(row)
+
+    def set_share_memory(self, agent_id: str, flag: bool) -> bool:
+        """开关「这个代理的记忆是否共享给别的已批准代理」。返回**值是否真的变了**。
+
+        🔴 行不存在 ⇒ False（调用方 404）；`status` / `role` / 凭据**一个都不碰**
+        —— 共不共享记忆是**读可见性偏好**，不是治理动作（与 `set_dm_enabled` 同纪律）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        want = SHARE_ENABLED_ON if flag else SHARE_DISABLED_ON
+        if str(row.get("share_memory") or SHARE_DISABLED_ON).strip() == want:
+            return False
+        self._be.update(aid, {"share_memory": want})
         return True
 
     def rename(self, agent_id: str, name: str) -> bool:

@@ -80,6 +80,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/revoke_credential",
     "/api/v1/agents/{agent_id}",
     "/api/v1/agents/{agent_id}/delete",
+    # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
+    "/api/v1/agents/{agent_id}/share",
 } | AUTH_POST_PATHS
 
 

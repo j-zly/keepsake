@@ -26,7 +26,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("keepsake.storage_base")
 
@@ -161,8 +161,14 @@ class StorageBase(ABC):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """统一检索入口（BM25 + KNN 融合 + v2 后置过滤）。"""
+        """统一检索入口（BM25 + KNN 融合 + v2 后置过滤）。
+
+        `visible_agents`：**额外**可见的归属代理 id 集合（2026-10 ks_share_memory）。
+        非 primary 时，可见标签 = `agent:<自己>` + `agent:<集合里每个>` +
+        `shared` + `core`；集合为空 ⇒ 与开关上线前逐字相同。
+        """
 
     @abstractmethod
     def search_bm25(
@@ -171,6 +177,7 @@ class StorageBase(ABC):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """BM25 全文搜索。"""
 
@@ -181,6 +188,7 @@ class StorageBase(ABC):
         tag_filter: str = "",
         agent_id: str = "",
         is_primary: Optional[bool] = None,
+        visible_agents: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """KNN 向量搜索。"""
 

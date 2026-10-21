@@ -24,7 +24,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -44,6 +44,12 @@ from ...core.ops.forgetter import Forgetter
 # `govern` 只依赖标准库，这里 import 它不会与 `core/*` 成环。
 from ...govern.registry import AGENT_TAG_PREFIX, Registry
 from ...govern.registry import ROLE_PRIMARY as REGISTRY_ROLE_PRIMARY
+# 记忆共享开关的可见性过滤器（2026-10 ks_share_memory）：**唯一**那份口径。
+from ...govern.visibility import (
+    fragment_owner,
+    visible_agent_ids,
+    visible_core_fragments,
+)
 # v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
 from ...core.pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
 # 通用契约的 Capabilities（依赖方向只准 hermes → generic）
@@ -356,6 +362,23 @@ def _build_query_expansion_llm_fn(cfg: dict):
             return None
 
     return _call
+
+
+class _ReadScope(NamedTuple):
+    """一次读取的**可见范围**（`provider._visibility_scope` 算出来的唯一形状）。
+
+    * `caller_id` —— 调用方的 agent_id（空 = 本进程自己）。
+    * `is_primary` —— 调用方是不是 primary（primary ⇒ 永远全量可见）。
+    * `visible` —— **看得见的归属代理**集合；`None` = 不过滤（全量）。
+      非 primary 时 = {自己} ∪ {已批准且打开「共享记忆」的代理}。
+    * `explicit` —— 调用方是不是**别人**（MCP 远端凭据反查出来的身份）：
+      是 ⇒ 存储层的 `agent_id` / `is_primary` 要按它传，不能沿用存储自己的。
+    """
+
+    caller_id: str = ""
+    is_primary: bool = False
+    visible: Optional[Tuple[str, ...]] = None
+    explicit: bool = False
 
 
 class KeepsakeProvider(MemoryProvider):
@@ -820,7 +843,8 @@ class KeepsakeProvider(MemoryProvider):
             except OSError as e:
                 logger.warning("keepsake: failed to write jobs.json: %s", e)
 
-    def system_prompt_block(self) -> str:
+    def system_prompt_block(self, caller_agent_id: str = "",
+                            caller_role: str = "") -> str:
         parts = [
             "你有Keepsake记忆系统（keepsake），连接在 Redis + RediSearch 上。",
             "当执行 memory(action='add') 操作时，系统会自动存储完整内容并支持后续检索。",
@@ -830,7 +854,7 @@ class KeepsakeProvider(MemoryProvider):
             "负反馈用 keepsake_feedback(key, positive=False) 标记没用。",
             "热门话题用 keepsake_topics() 查询。",
         ]
-        block = self._core_block()
+        block = self._core_block(caller_agent_id, caller_role)
         if block:
             parts.append("")
             parts.append(block)
@@ -851,38 +875,48 @@ class KeepsakeProvider(MemoryProvider):
     # 在这里抛出去等于整轮对话失败 —— 记忆是增强项，不该有能力让对话瘫掉。
     # ------------------------------------------------------------------
 
-    def _core_fragments(self) -> List[Dict[str, Any]]:
+    def _core_fragments(self, caller_agent_id: str = "",
+                        caller_role: str = "") -> List[Dict[str, Any]]:
         """取核心层碎片，带 60s 进程内缓存；任何异常/超时都退化成空列表 + warning。
 
         缓存是进程级而非实例级：core 层在一次对话里只应查一次库，而 Hermes
         可能为多 session 构造 provider 实例。
+
+        🔴 **缓存里存的是原始行，可见性过滤在缓存之后做**（2026-10 ks_share_memory）：
+        否则「先给子代理看一遍、再给主脑看一遍」的进程级缓存会把上一个调用方的
+        可见范围漏给下一个（主脑于是看不到自己该看的那部分）。
         """
         import time as _time
 
         now = _time.time()
         cached = _CORE_CACHE.get("frags")
         if cached is not None and now - _CORE_CACHE["ts"] < _CORE_CACHE_TTL:
-            return cached
-        try:
-            start = _time.time()
-            frags = list(self._storage.list_by_tag(_CORE_TAG))
-            elapsed = _time.time() - start
-        except Exception as e:
-            logger.warning("keepsake: core 层读取失败（fail-open，只注入静态文案）: %s", e)
-            return []
-        if elapsed > _CORE_READ_BUDGET_S:
-            logger.warning("keepsake: core 层读取耗时 %.1fs 超预算 %.1fs（fail-open，本轮不注入）",
-                           elapsed, _CORE_READ_BUDGET_S)
-            return []
-        _CORE_CACHE["ts"] = now
-        _CORE_CACHE["frags"] = frags
-        return frags
+            frags = list(cached)
+        else:
+            try:
+                start = _time.time()
+                frags = list(self._storage.list_by_tag(_CORE_TAG))
+                elapsed = _time.time() - start
+            except Exception as e:
+                logger.warning("keepsake: core 层读取失败（fail-open，只注入静态文案）: %s", e)
+                return []
+            if elapsed > _CORE_READ_BUDGET_S:
+                logger.warning("keepsake: core 层读取耗时 %.1fs 超预算 %.1fs（fail-open，本轮不注入）",
+                               elapsed, _CORE_READ_BUDGET_S)
+                return []
+            _CORE_CACHE["ts"] = now
+            _CORE_CACHE["frags"] = frags
+        # 同口径可见性：非 primary 只留 primary 的 + 已共享代理的 core
+        scope = self._visibility_scope(caller_agent_id, caller_role)
+        if scope.is_primary or self._registry is None:
+            return frags
+        return visible_core_fragments(frags, self._registry, scope.caller_id)
 
-    def _core_block(self) -> str:
+    def _core_block(self, caller_agent_id: str = "", caller_role: str = "") -> str:
         """渲染 `<keepsake-core>…</keepsake-core>` 块；无内容时返回空串（不留空行）。"""
         if not self._storage:
             return ""
-        frags = self._core_fragments()
+        frags = self._core_fragments(caller_agent_id, caller_role)
         if not frags:
             return ""
         lines = [f"- {f.get('content', '')}" for f in frags]
@@ -921,9 +955,13 @@ class KeepsakeProvider(MemoryProvider):
             logger.debug("keepsake: workflow lock probe failed, proceeding: %s", e)
 
         start = _time.time()
+        # 可见范围与 `search()` 同一份口径（2026-10 ks_share_memory）：
+        # 本进程是 primary 时不过滤（现状逐字不变），是子代理时按共享集收窄。
+        scope = self._visibility_scope()
         fragments = self._storage.search(
             query.strip(),
             tag_filter=self._tag_filter,
+            **self._scope_kwargs(scope),
         )
         elapsed = _time.time() - start
         # 活动计数：🔴 主脑每轮注入走的是 prefetch 而不是 self.search()
@@ -1405,24 +1443,97 @@ class KeepsakeProvider(MemoryProvider):
         return [h for h in hits
                 if not any(_has_tag(h.get("tags", ""), t) for t in tags)]
 
-    def search(self, query: str, *, limit: int = 10) -> List[Dict[str, Any]]:
+    def search(self, query: str, *, limit: int = 10,
+               caller_agent_id: str = "", caller_role: str = "") -> List[Dict[str, Any]]:
         """按查询检索，返回最多 `limit` 条命中。
 
         🔴 显式抛错：后端不可达 / 查询非法都让异常往外走，**绝不返回 []** ——
         空列表在契约里只有一个含义「确实没有匹配」。
+
+        `caller_agent_id` / `caller_role`（2026-10 ks_share_memory）：**MCP 远端
+        调用方**的身份（凭据反查得出）。缺省 = 本进程自己（主脑直连存储），
+        此时可见范围与开关上线前逐字一致。
         """
         storage = self._require_storage()
+        scope = self._visibility_scope(caller_agent_id, caller_role)
         hits = self._filter_excluded(
-            list(storage.search(query.strip(), tag_filter=self._tag_filter)))
+            list(storage.search(query.strip(), tag_filter=self._tag_filter,
+                                 **self._scope_kwargs(scope))))
         self._touch("read")      # 活动计数：主脑每轮都在检索，这条路径必须记
         return hits[:limit]
 
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """按 key 取单条碎片；**确实不存在**返回 None，后端故障抛错。"""
+    def get(self, key: str, *, caller_agent_id: str = "",
+            caller_role: str = "") -> Optional[Dict[str, Any]]:
+        """按 key 取单条碎片；**确实不存在**返回 None，后端故障抛错。
+
+        🔴 **归属校验**（2026-10 ks_share_memory）：非 primary 取到「未共享代理」
+        的条目 ⇒ 返回 **not-found 语义**（None）—— 存在性本身也不许泄露。
+        无归属的条目（老数据 / 共享层）人人可见。
+        """
         storage = self._require_storage()
         row = storage.get_fragment(key)
         self._touch("read")
+        if not row:
+            return None
+        scope = self._visibility_scope(caller_agent_id, caller_role)
+        if scope.visible is not None:
+            owner = fragment_owner(row.get("tags", ""))
+            if owner and owner not in scope.visible:
+                return None
         return row
+
+    # ---- 可见性（2026-10 ks_share_memory）------------------------------
+
+    def _visibility_scope(self, caller_agent_id: str = "",
+                          caller_role: str = "") -> _ReadScope:
+        """这次读取**看得见什么** —— 唯一口径入口（判据全在 `govern.visibility`）。
+
+        * `caller_agent_id` 空 ⇒ **本进程自己**（provider 路径：主脑直连存储）。
+          角色沿用既有来源（config 的 `is_primary`）—— 读路径的 primary 判定
+          **逐字不变**（primary 全量可见是硬回归线）。
+        * `caller_agent_id` 非空 ⇒ **MCP 远端调用方**（身份由闸门按凭据反查），
+          角色以闸门给的为准（谁是 primary 由注册表说了算）。
+        * 注册表不可用 ⇒ 读路径照旧（不过滤）：治理面挂掉不该让记忆读不出来
+          （写闸那边是 fail-closed，方向相反：写要保守，读要照旧）。
+        """
+        registry = self._registry
+        if caller_agent_id:
+            aid = str(caller_agent_id).strip()
+            role = str(caller_role or "").strip()
+            if not role and registry is not None:
+                # 注册表读面残缺（替身 / 半成品）⇒ 判不出角色就按 sub（收窄）
+                role_of = getattr(registry, "role_of", None)
+                role = str(role_of(aid) or "") if callable(role_of) else ""
+            is_primary = role == REGISTRY_ROLE_PRIMARY
+            explicit = True
+        else:
+            aid = self._agent_id
+            is_primary = bool(self._is_primary)
+            explicit = False
+        if registry is None:
+            return _ReadScope(aid, is_primary, None, explicit)
+        ids = visible_agent_ids(aid, registry, is_primary=is_primary)
+        return _ReadScope(aid, is_primary,
+                          tuple(sorted(ids)) if ids is not None else None, explicit)
+
+    @staticmethod
+    def _scope_kwargs(scope: _ReadScope) -> Dict[str, Any]:
+        """把可见范围翻译成存储层的调用参数。
+
+        🔴 **只在真需要时才带新参数**：`visible_agents` 为空就不传 ——
+        既有替身（测试里的假存储）没有这个形参，传了会 TypeError；
+        语义上也正好是「集合为空 ⇒ 与开关上线前逐字相同」。
+        """
+        kwargs: Dict[str, Any] = {}
+        if scope.explicit:
+            # 调用方是**别人**（MCP 远端凭据）：身份与角色按它传，不能沿用存储自己的
+            kwargs["agent_id"] = scope.caller_id
+            kwargs["is_primary"] = scope.is_primary
+        if scope.visible:
+            extra = [a for a in scope.visible if a != scope.caller_id]
+            if extra:
+                kwargs["visible_agents"] = extra
+        return kwargs
 
     # ---- 写层（fail-closed）----
 
