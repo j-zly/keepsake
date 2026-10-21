@@ -254,6 +254,28 @@ def test_write_gate_人工显式直写放行():
     assert _has_tag(st2.store_calls[0]["tags"], CORE_CANDIDATE_TAG), st2.store_calls[0]
 
 
+def test_write_gate_显式直写只对primary凭据生效():
+    """🔴 2026-10 ks_share_tighten：显式直写**只对 primary 生效**（凭据说了算）。
+
+    远端调用方（MCP）的身份由**凭据反查**得出 —— 一个外部代理带着 core 标签
+    进来，显式直写**不生效**：照常降级成候选，且**不带提名日戳**（班车不会
+    自动审它 ⇒ 它进不了常驻层）。
+    """
+    st = _FakeStorage()
+    _provider(st, is_primary=True).add("外部代理想直写", tags="core",
+                                        core_direct=True, caller_role="sub")
+    tags = st.store_calls[0]["tags"]
+    assert _has_tag(tags, CORE_CANDIDATE_TAG), tags
+    assert not _has_tag(tags, "core"), tags
+    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+
+    # 判不出角色（空串）⇒ 按 sub（fail-closed）
+    st2 = _FakeStorage()
+    _provider(st2, is_primary=True).add("角色未知的调用方", tags="core",
+                                        core_direct=True, caller_role="")
+    assert _has_tag(st2.store_calls[0]["tags"], CORE_CANDIDATE_TAG), st2.store_calls[0]
+
+
 def test_write_gate_primary_非core标签原样():
     """非 core 标签两边都原样（写闸只认完整标签 `core`）。"""
     st2 = _FakeStorage()

@@ -22,7 +22,8 @@ def register_resources(server: Any, provider: Any, gate: Any = None) -> Any:
     """把两个 resource 挂到 `server` 上。
 
     `gate` 非 None 时按**调用方身份**收窄可见范围（2026-10 ks_share_memory）：
-    非 primary 只拿得到 primary 的 core + 已共享代理的 core（与检索同口径）。
+    非 primary 只拿得到自己的 core + 已共享代理的 core（与检索同口径；primary 的
+    core 要 primary 自己开共享才外露 —— 对称规则）。
     身份判定走闸门那条链（凭据反查），**不抛、不记账** —— resource 不是工具，
     没有「未批准即拒绝」那道闸（闸门只挂在 tool 入口）。
     """

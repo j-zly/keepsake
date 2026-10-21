@@ -268,23 +268,35 @@ def test_归属标签按逗号边界取(env):
     assert fragment_owner("") == ""
 
 
-def test_core按同口径过滤_非primary只留primary与已共享的(env):
+def test_core按同口径过滤_非primary只留自己的与已共享的(env):
+    """🔴 对称规则（2026-10 ks_share_tighten）：core 层**不给 primary 开后门**。
+
+    旧口径「非 primary 看得见 primary 的 core」作废 —— primary 的 core 要外露，
+    **得它自己把 `share_memory` 打开**（缺省关 ⇒ 不外露）。普通条目本来就是这个
+    口径，core 层曾经例外，现在对齐。
+    """
     reg, path, _ = env
     reg.set_share_memory("agent-a", True)
     frags = [
         {"key": "k1", "content": "c", "tags": "core,agent:primary"},
         {"key": "k2", "content": "c", "tags": "core,agent:agent-a"},
         {"key": "k3", "content": "c", "tags": "core,agent:agent-c"},
-        {"key": "k4", "content": "c", "tags": "core"},          # 老数据：没有归属
+        {"key": "k4", "content": "c", "tags": "core,agent:agent-b"},   # 自己的
+        {"key": "k5", "content": "c", "tags": "core"},          # 老数据：没有归属
     ]
+    # 自己的 + 已共享的（agent-a）+ 没有归属的老数据 ⇒ 可见
     keys = [f["key"] for f in visible_core_fragments(frags, reg, "agent-b")]
-    assert keys == ["k1", "k2", "k4"], keys
+    assert keys == ["k2", "k4", "k5"], keys
+    # primary 自己开共享 ⇒ 它的 core 才外露
+    assert reg.set_share_memory("primary", True) is True
+    keys = [f["key"] for f in visible_core_fragments(frags, reg, "agent-b")]
+    assert keys == ["k1", "k2", "k4", "k5"], keys
     # primary 全量可见（现状逐字不变）
-    assert len(visible_core_fragments(frags, reg, "primary")) == 4
+    assert len(visible_core_fragments(frags, reg, "primary")) == 5
 
 
 def test_core资源在provider侧同口径(env):
-    """provider 的 core 层（非 primary 调用方）只给 primary 的 + 已共享代理的 core。"""
+    """provider 的 core 层（非 primary 调用方）只给**自己的** + 已共享代理的 core。"""
     reg, path, _ = env
     reg.set_share_memory("agent-a", True)
     p, st = _provider(path, reg, agent_id="agent-b", is_primary=False)
@@ -296,13 +308,20 @@ def test_core资源在provider侧同口径(env):
         writer = SqliteStorage(path=path)
         try:
             writer.store(text="primary 的常驻", tags="core,agent:primary")
+            writer.store(text="A 的常驻", tags="core,agent:agent-a")
             writer.store(text="C 的常驻", tags="core,agent:agent-c")
         finally:
             writer.close()
         frags = p._core_fragments(caller_agent_id="agent-b", caller_role="sub")
         got = sorted(str(f.get("content")) for f in frags)
-        # primary 的 core 可见；C 的 core 不可见；**没有归属的老数据**继续可见
-        assert got == sorted(["primary 的常驻", f"{QUERY} 丁"]), got
+        # 已共享的 A 可见；primary 的 core **不可见**（它没开共享）；C 的不可见；
+        # **没有归属的老数据**继续可见
+        assert got == sorted(["A 的常驻", f"{QUERY} 丁"]), got
+        # primary 把自己的 core 开共享 ⇒ 外露（开关即时生效）
+        reg.set_share_memory("primary", True)
+        frags = p._core_fragments(caller_agent_id="agent-b", caller_role="sub")
+        got = sorted(str(f.get("content")) for f in frags)
+        assert got == sorted(["A 的常驻", "primary 的常驻", f"{QUERY} 丁"]), got
     finally:
         st.close()
 

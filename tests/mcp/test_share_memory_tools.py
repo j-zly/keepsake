@@ -192,3 +192,36 @@ def test_直取共享代理的条目取得到(gov, tmp_path):
     _as_caller(gov, "worker-sub")
     out = call(gov, "memory_get", key=keys["乙"])
     assert out["key"] == keys["乙"]
+
+
+# ---------------------------------------------------------------------------
+# ④ 写 core：人工显式直写**只对 primary 凭据生效**（2026-10 ks_share_tighten）
+# ---------------------------------------------------------------------------
+
+def _stored_tags(gov, key: str) -> List[str]:
+    """落库后的标签（`memory_add` 返回的是**请求里**的 tags —— 拿它验闸门等于没验）。"""
+    row = gov.agent_gate.registry.storage.get_fragment(key) or {}
+    return [t.strip() for t in str(row.get("tags") or "").split(",") if t.strip()]
+
+
+def test_子代理写core落候选不进常驻(gov, tmp_path):
+    """🔴 外部代理带 `core` 标签进来 ⇒ 不许直写常驻层。
+
+    落 `core_candidate` 且**不带提名日戳**（与既有降级路径同款）—— 提名日戳是
+    「进 7 天观察期」的凭据，带上它就等于给这条候选开了自动审核的后门。
+    """
+    _seed(gov, tmp_path)
+    _as_caller(gov, "worker-sub")
+    key = call(gov, "memory_add", text="子代理要记住的事", tags="core")["key"]
+    tags = _stored_tags(gov, key)
+    assert "core_candidate" in tags, tags
+    assert "core" not in tags, tags
+    assert not any(t.startswith("tier:auto-hot:") for t in tags), tags
+
+
+def test_primary写core仍直写(gov):
+    """primary 凭据 ⇒「人在对话里明确要求记这一条」照旧：直写常驻层。"""
+    key = call(gov, "memory_add", text="主脑要记住的事", tags="core")["key"]
+    tags = _stored_tags(gov, key)
+    assert "core" in tags, tags
+    assert "core_candidate" not in tags, tags

@@ -8,6 +8,12 @@
 * **关（默认）**：只有它自己 + 主脑（primary）看得见；
 * **primary 调用方**：永远全量可见（行为与开关上线前逐字一致）。
 
+🔴 **对称规则**（2026-10 ks_share_tighten 收紧）：**谁都不许白拿别人的** ——
+普通条目与 core（常驻层）用的是**同一把尺子**：非 primary 看得见的归属 =
+`{自己} ∪ {share_memory=1 的代理}`。primary 自己的记忆（含 core）要外露，
+**得由 primary 那行自己把 `share_memory` 打开**（缺省关 ⇒ 不外露）。
+旧口径「非 primary 看得见 primary 的 core」**作废**（core 层曾给 primary 开后门）。
+
 🔴 **只影响「读可见性」**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
 一个都不动（那是别的语义）。
 
@@ -37,7 +43,6 @@ from .registry import (
 __all__ = [
     "visible_agent_ids",
     "shared_agent_ids",
-    "primary_agent_id",
     "fragment_owner",
     "visible_core_fragments",
 ]
@@ -68,20 +73,6 @@ def shared_agent_ids(registry: Any) -> List[str]:
             continue
         out.append(str(row.get("agent_id") or ""))
     return sorted(a for a in out if a)
-
-
-def primary_agent_id(registry: Any) -> str:
-    """全库 primary 的 agent_id（查不到 ⇒ 空串）。
-
-    注册表保证 primary 全库唯一，所以取第一个即可。
-    """
-    lister = getattr(registry, "list_agents", None)
-    if registry is None or not callable(lister):
-        return ""
-    for row in lister():
-        if str(row.get("role") or "") == ROLE_PRIMARY:
-            return str(row.get("agent_id") or "")
-    return ""
 
 
 def visible_agent_ids(
@@ -142,14 +133,19 @@ def visible_core_fragments(
     registry: Any,
     caller_agent_id: str = "",
 ) -> List[Dict[str, Any]]:
-    """core（常驻层）按**同一口径**过滤：非 primary 只留 primary 的 + 已共享代理的。
+    """core（常驻层）按**同一口径**过滤：非 primary 只留**自己的** + 已共享代理的。
+
+    🔴 **对称规则**（2026-10 ks_share_tighten 收紧）：core 层**不再给 primary
+    开后门** —— 旧口径「非 primary 看得见 primary 的 core」作废。primary 自己的
+    core 要不要外露，**由 primary 那行的 `share_memory` 开关决定**（缺省关 ⇒
+    不外露）。primary **自己**看自己的 core 不受影响（它全量可见）。
 
     🔴 与检索侧同口径，但**多了「无归属」这一档**：老库里没有 `agent:` 标签的
-    core 条目（写它的时候存储还没注入归属标签）**继续可见** —— 它们本来就是
-    primary 写的（core 只有 primary 写得动），把「现状不变」这条硬回归线守住。
+    core 条目（写它的时候存储还没注入归属标签）**继续可见** —— 把「现状不变」
+    这条硬回归线守住。
 
-    有归属的条目按归属判：归属是 primary、或归属在共享集里 ⇒ 可见；
-    别的代理自己写的 core（将来才可能出现）⇒ 不可见。
+    有归属的条目按归属判：归属是自己、或归属在共享集里 ⇒ 可见；
+    别的代理的 core（含 primary 的，除非它开了共享）⇒ 不可见。
     """
     rows = list(fragments or [])
     if registry is None:
@@ -160,9 +156,8 @@ def visible_core_fragments(
     if role == ROLE_PRIMARY:
         return rows                      # primary 全量可见（现状逐字不变）
     allowed = set(shared_agent_ids(registry))
-    primary_id = primary_agent_id(registry)
-    if primary_id:
-        allowed.add(primary_id)
+    if caller:
+        allowed.add(caller)             # 自己的 core 自己看得见
     out: List[Dict[str, Any]] = []
     for row in rows:
         owner = fragment_owner(row.get("tags", ""))

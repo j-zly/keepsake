@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
-from typing import Any, Dict, List, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -196,7 +196,8 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
                      caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
     """常驻层（core tag）条数 + 每条预览 —— 与 P1 控制台 `GET /api/v1/core` 同源。
 
-    🔴 非 primary 只拿得到 primary 的 core + 已共享代理的 core（同口径）。
+    🔴 非 primary 只拿得到自己的 core + 已共享代理的 core（同口径；primary 的
+    core 要 primary 自己开共享才外露 —— 对称规则）。
     """
     preview_chars = max(1, min(int(preview_chars), 2000))
     rows = _list_core(provider, caller_agent_id, caller_role)
@@ -214,36 +215,52 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
     }
 
 
-def memory_add(provider: Any, text: str, tags: str = "") -> Dict[str, Any]:
+def memory_add(provider: Any, text: str, tags: str = "",
+               caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
     """写入一条记忆并返回它的 key。写层 fail-closed：失败抛错，不谎报成功。
 
-    🔴 **本工具的写入是「显式人工写入」**（人/助手在对话里明确要求记这一条），
-    所以 provider 支持 `core_direct` 时一律带上 —— 常驻层（`core` 标签）只认
-    两条入口：人工显式直写、审核通过。自动管线与通用协议路径不带这个标志，
-    写 core 一律落候选（2026-10 常驻层入口改革）。
+    🔴 **「人工显式直写 core」只对 primary 凭据生效**（2026-10 ks_share_tighten
+    收紧）：`core_direct` 是「人在对话里明确要求记这一条」的等价动作 —— 但**只有
+    凭据反查出来是 primary 的调用方**才算「人」在批。外部代理带 `core` 标签进来
+    ⇒ 不带 `core_direct` ⇒ 走既有降级（落 `core_candidate`，**无提名日戳** ⇒
+    班车不会自动审它）。
+
+    判不出身份（没有闸门 / 没有凭据）⇒ **不带** `core_direct`（fail-closed：
+    判不出就别当 primary）。
     """
     if not text or not text.strip():
         raise ToolError("text 不能为空")
-    key = _add_memory(provider, text.strip(), tags or "")
+    known = bool((caller_agent_id or "").strip())
+    role = str(caller_role or "").strip()
+    is_primary = known and role == ROLE_PRIMARY
+    key = _add_memory(provider, text.strip(), tags or "",
+                      core_direct=is_primary,
+                      caller_role=(role if known else None))
     if not key:
         raise ToolError("写入失败：provider 未返回 key（fail-closed）")
     return {"key": key, "tags": tags or ""}
 
 
-def _add_memory(provider: Any, text: str, tags: str) -> str:
-    """调 `provider.add`；provider 支持 `core_direct` 就带上（可选扩展）。
+def _add_memory(provider: Any, text: str, tags: str, *,
+                core_direct: bool = False,
+                caller_role: Optional[str] = None) -> str:
+    """调 `provider.add`；provider 支持 `core_direct` / `caller_role` 就带上（可选扩展）。
 
     `core_direct` **不在通用契约里**（契约不该为某一个宿主的「显式直写」开洞），
-    所以这里先看签名再决定带不带：别的记忆系统没有这个参数 ⇒ 照常调，
-    不猜、不用 try/except 吞异常（那会把 provider 自己的写失败吞成「没写进去」）。
+    `caller_role` 同理（那是 keepsake 自己的治理扩展）—— 所以这里先看签名再决定
+    带不带：别的记忆系统没有这两个参数 ⇒ 照常调，不猜、不用 try/except 吞异常
+    （那会把 provider 自己的写失败吞成「没写进去」）。
     """
     try:
         params = inspect.signature(provider.add).parameters
     except (TypeError, ValueError):       # 签名取不到（内置/C 扩展）⇒ 按不支持处理
         params = {}
+    kwargs: Dict[str, Any] = {}
     if "core_direct" in params:
-        return provider.add(text, tags=tags, core_direct=True)
-    return provider.add(text, tags=tags)
+        kwargs["core_direct"] = core_direct
+    if "caller_role" in params:
+        kwargs["caller_role"] = caller_role
+    return provider.add(text, tags=tags, **kwargs)
 
 
 def memory_remove(provider: Any, key: str, confirm: bool = False) -> Dict[str, Any]:
@@ -646,8 +663,10 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         description="写入一条记忆，返回它的 key。",
     )
     def _add(text: str, tags: str = "") -> Dict[str, Any]:
-        _authorize("memory_add")
-        return memory_add(provider, text, tags)
+        ident = _authorize("memory_add")
+        return memory_add(provider, text, tags,
+                          caller_agent_id=str(ident.get("agent_id") or ""),
+                          caller_role=str(ident.get("role") or ""))
 
     @server.tool(
         name="memory_remove",

@@ -906,7 +906,8 @@ class KeepsakeProvider(MemoryProvider):
                 return []
             _CORE_CACHE["ts"] = now
             _CORE_CACHE["frags"] = frags
-        # 同口径可见性：非 primary 只留 primary 的 + 已共享代理的 core
+        # 同口径可见性：非 primary 只留**自己的** + 已共享代理的 core
+        # （primary 的 core 也要 primary 自己开共享才外露 —— 对称规则）
         scope = self._visibility_scope(caller_agent_id, caller_role)
         if scope.is_primary or self._registry is None:
             return frags
@@ -1623,13 +1624,24 @@ class KeepsakeProvider(MemoryProvider):
         except Exception as e:      # noqa: BLE001 —— 计数是遥测，不是账本
             logger.debug("keepsake: 活动计数失败（忽略）: %s: %s", type(e).__name__, e)
 
-    def _apply_write_gate(self, tags: str, *, core_direct: bool = False
+    def _apply_write_gate(self, tags: str, *, core_direct: bool = False,
+                          caller_role: Optional[str] = None
                           ) -> Tuple[str, bool]:
         """写闸：写 `core` 一律**不直通**常驻层（多代理治理第二条 + 2026-10 常驻层入口改革）。
 
         🔴 2026-10 ks_agent_registry：判定源已从 config 自报的 `_is_primary`
         切到 **registry 的角色**（`self._registry_is_primary()`，5s 缓存；
         注册表不可达时 fail-closed 按 sub —— 见那处的三条纪律）。
+
+        🔴 **谁在写**（2026-10 ks_share_tighten 收紧）：`caller_role` 是 **MCP 远端
+        调用方的角色**（凭据反查得出）。它是**权威**的 —— 远端调用方的身份不能
+        由「托管这个进程的进程」替它回答（否则一个外部代理拿着 core 标签就能
+        借主脑的进程身份绕审核进常驻）：
+
+        * `None` ⇒ 本进程自己（Hermes 同进程直连）⇒ 按 `_registry_is_primary()` 判
+          （既有行为逐字不变）；
+        * `"primary"` ⇒ 调用方是 primary；
+        * 其它（含空串）⇒ 非 primary（**判不出角色就当 sub**，fail-closed）。
 
         三条分支（标签判据是**逗号边界的完整标签相等**，复用 `_has_tag`，
         `core_x` / `xcore` 不算命中；其余标签原样保留、顺序不变）：
@@ -1640,8 +1652,9 @@ class KeepsakeProvider(MemoryProvider):
           （2026-10 常驻层入口改革：常驻层从此只有「审核页人工批准」与
           「候选满观察期自动通过」两个入口）；
         * **人工显式直写**（`core_direct=True`，MCP `memory_add` 显式 core）
-          ⇒ primary 原样放行 —— 那是「人在批」的等价动作（控制台 promote /
-          CoreView 新增同理，都不走这里）。
+          ⇒ **只对 primary 生效**：primary 原样放行 —— 那是「人在批」的等价动作
+          （控制台 promote / CoreView 新增同理，都不走这里）；非 primary 带这个
+          标志**不生效**（照常降级成候选 —— 显式直写不能绕过治理）。
 
         返回 `(改写后的 tags, 是否提名)`：第二个值为 True 时，这条是**新提名的
         候选**（⇒ 写闸负责补召回基数，见 `core.tiering.backfill_nominate_hits`）。
@@ -1650,7 +1663,10 @@ class KeepsakeProvider(MemoryProvider):
             return tags, False
         from ...core import tiering as tiering_mod
 
-        if self._registry_is_primary():
+        role = None if caller_role is None else str(caller_role).strip()
+        is_primary = (role == REGISTRY_ROLE_PRIMARY if role is not None
+                      else self._registry_is_primary())
+        if is_primary:
             if core_direct:
                 return tags, False          # 人工显式直写：原样放行
             new_tags = tiering_mod.candidate_tags(tags, datetime.now(timezone.utc))
@@ -1671,6 +1687,7 @@ class KeepsakeProvider(MemoryProvider):
         tags: str = "",
         meta: Optional[Dict[str, Any]] = None,
         core_direct: bool = False,
+        caller_role: Optional[str] = None,
     ) -> str:
         """写入一条记忆，返回它的 key；写入失败返回空串（falsy）。
 
@@ -1678,14 +1695,19 @@ class KeepsakeProvider(MemoryProvider):
         它是契约里预留的扩展位，不认识的键直接忽略，不报错。
 
         🔴 `core_direct=True` = **人工显式直写**（MCP `memory_add` 显式写 core）：
-        这是「人在批」的等价动作，primary 写 `core` 时仍直通常驻层。
-        自动管线与通用协议路径**不传**这个标志 ⇒ 写 core 一律落候选
+        这是「人在批」的等价动作，**只对 primary 生效**（primary 写 `core` 时仍
+        直通常驻层）。自动管线与通用协议路径**不传**这个标志 ⇒ 写 core 一律落候选
         （2026-10 常驻层入口改革，判据见 `_apply_write_gate`）。
+
+        🔴 `caller_role` = **谁在写**（2026-10 ks_share_tighten 收紧）：MCP 远端
+        调用方的角色（凭据反查得出）。`None` ⇒ 本进程自己（按本进程的身份判，
+        既有行为逐字不变）；给了值就以它为准（判不出角色 ⇒ 按 sub，fail-closed）。
         """
         meta = meta or {}
         try:
             storage = self._require_storage()
-            gated_tags, nominated = self._apply_write_gate(tags, core_direct=core_direct)
+            gated_tags, nominated = self._apply_write_gate(
+                tags, core_direct=core_direct, caller_role=caller_role)
             key = self._fragment_key_for(text)
             # 同内容已存在 ⇒ 存储层会**版本化**（新条走 `key:epoch` 独立 key，
             # 旧条归档）。那种情况下本函数返回的 key 指向的是归档旧条 ⇒

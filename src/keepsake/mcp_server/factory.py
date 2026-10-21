@@ -51,7 +51,8 @@ class KeepsakeMCPProvider(KeepsakeProvider):
         拿到「与库里不一致」的结果。
 
         🔴 **可见性同口径**（2026-10 ks_share_memory）：非 primary 只拿得到
-        primary 的 core + 已共享代理的 core（判据在 `govern.visibility`）。
+        自己的 core + 已共享代理的 core（判据在 `govern.visibility`；primary 的
+        core 也要 primary 自己开共享才外露 —— 对称规则）。
         """
         frags = list(self._require_storage().list_by_tag("core"))
         scope = self._visibility_scope(caller_agent_id, caller_role)

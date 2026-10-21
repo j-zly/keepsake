@@ -72,6 +72,8 @@
    * primary 写 core ⇒ 也落 `core_candidate` + 提名日戳（**不再直通**）；
    * 人工显式直写（控制台 promote / CoreView / MCP `memory_add` 显式 core）
      ⇒ 仍是直写 —— 那是「人在批」的等价动作。
+     🔴 2026-10 ks_share_tighten：**只对 primary 生效**（MCP 侧按凭据反查的
+     角色判）—— 外部代理带 core 标签进来不许绕审核进常驻。
 2. **提名即带基数**（`tiering.nominate_backfill_hits`，默认 3000，0 = 关闭）：
    成为候选的**瞬间**给该 key 补写这么多条**命中事件**（批量 INSERT，
    分块，不逐条）。为什么是「打点」而不是「打个标」：规则二判的是
