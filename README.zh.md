@@ -187,7 +187,9 @@ pip install git+https://github.com/j-zly/keepsake.git
   //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",     // 或 "credential_file": "/path/to/secret"
   //   "notify_url": "https://example.invalid/hooks/xxx",// 通知出口（渠道 webhook）；空 = 零外呼
   //   "notify_min_interval_s": 120,                     // 同水位限频窗口（秒）
-  //   "notify_format": "generic"                        // generic | feishu
+  //   "notify_format": "generic",                       // generic | feishu
+  //   "wake_url": "http://127.0.0.1:8210/hooks/dm-wake",// 唤醒出口（宿主 webhook）；空 = 零外呼
+  //   "wake_secret_env": "KEEPSAKE_WAKE_SECRET"         // 或 "wake_secret_file": "/path/to/secret"
   // },
   
   // 自动维护配置
@@ -233,6 +235,7 @@ pip install git+https://github.com/j-zly/keepsake.git
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
 | `OPENAI_API_KEY` | `embedder.api_key` | 嵌入 API 密钥 |
 | `KEEPSAKE_PUSH_CREDENTIAL` | `push_consumer.credential_env` | 私信推送消费者的建流凭据（**默认环境变量名 —— 名字本身可配**） |
+| `KEEPSAKE_WAKE_SECRET` | `push_consumer.wake_secret_env` | 唤醒出口 webhook 的订阅密钥（`X-Hub-Signature-256` 的 HMAC 签名密钥；**默认环境变量名 —— 名字本身可配**） |
 
 > **其余配置项一律只走 `config.json`，没有对应环境变量。** 特别是 `bm25_limit`、`decay_half_days`、`hot_topic_decay_half_days`、`embed_cache_ttl`、`storage.backend`、`embed_dim`、`consolidate_min_group`、`consolidate_min_overlap`、`consolidate_max_age_hours`、`forget_max_age_days`、`forget_dry_run`、`emotion_intensity_factor` 都只从配置文件读。默认值见下方[配置参考](#配置参考)表。
 
@@ -381,7 +384,10 @@ yeah
 | `push_consumer.notify_url` | — | `""` | 通知出口的渠道 webhook 地址（例：飞书群机器人）。**空 = 功能关** ⇒ 零外呼 |
 | `push_consumer.notify_min_interval_s` | — | `120` | 通知出口的限频窗口（秒）：**同一未读数**在窗口内只喊一次；水位升高立刻再喊 |
 | `push_consumer.notify_format` | — | `generic` | 通知载荷形状：`generic`（`{"text": …}`）或 `feishu`（`{"msg_type": "text", "content": {"text": …}}`） |
+
 | `nudge.publish_endpoint` | — | `http://127.0.0.1:8210/internal/publish` | 控制台把提醒帧 **POST** 到哪儿（跨进程投递 —— 流挂在 MCP 进程里）。env 覆盖：`KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`。见「nudge 跨进程投递」节 |
+| `push_consumer.wake_url` | — | `""` | 唤醒出口的宿主 webhook 地址（Hermes 网关的 webhook 订阅）⇒ 宿主起一轮代理会话自己去读信。**空 = 功能关** ⇒ 零外呼 |
+| `push_consumer.wake_secret_env` | `KEEPSAKE_WAKE_SECRET` | `KEEPSAKE_WAKE_SECRET` | 订阅密钥的**环境变量名**（`X-Hub-Signature-256` 的 HMAC-SHA256 密钥；**密钥真值不落 config.json**）。另有 `push_consumer.wake_secret_file` 指 secrets 文件 |
 
 > `sentiment_*`、`feedback_*`、`hot_topic_*` 等排序权重参数目前仅支持 JSON 配置文件设置，暂不支持环境变量。设 `1.0` 即关闭该维度的加权效果。
 
@@ -759,7 +765,9 @@ provider 挂一条 SSE 流听着，于是新私信**立刻**被看见，不必�
   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
   "notify_url": "https://example.invalid/hooks/xxxx",
   "notify_min_interval_s": 120,
-  "notify_format": "generic"
+  "notify_format": "generic",
+  "wake_url": "http://127.0.0.1:8210/hooks/dm-wake",
+  "wake_secret_env": "KEEPSAKE_WAKE_SECRET"
 }
 ```
 
@@ -799,6 +807,25 @@ provider.on_push_event(lambda summary: print(summary["unread"]))
   只喊一次；**水位升高立刻再喊**，不让人干等窗口；
 * `notify_url` 为空 ⇒ **零外呼**（行为与上线前逐字相同）；POST 失败只记 warning
   —— 绝不重试轰炸、绝不碰水位与主路径。
+
+#### 唤醒出口（代理自己去读信）
+
+通知出口叫醒的是**人**；唤醒出口叫醒的是**宿主会话**。收到 `dm` / `dm-nudge` 帧时
+**另外**往宿主配的 webhook 订阅 POST 一次（`push_consumer.wake_url` —— Hermes 网关，
+本机 `127.0.0.1`）⇒ 网关直接起一轮代理会话去 `message_inbox` 读信处理 ——
+「私信不需要人转告，代理自己读和处理」。🔴 **通知不经过 LLM，唤醒才经过** ——
+两条旁路并存、各司其职、默认可各自独立开关。
+
+* 🔴 **只含元数据** —— 载荷是**平铺**的三键（`from` / `unread` / `seq`，订阅的
+  prompt 模板按 `{from}`/`{unread}`/`{seq}` 取值），**永远没有正文**；
+* 🔴 **带签名** —— `X-Hub-Signature-256: sha256=<hex>` = HMAC-SHA256(原始请求体字节,
+  订阅密钥)；密钥从 `wake_secret_env` / `wake_secret_file` 读（**密钥真值不落
+  config.json**；读不到密钥 ⇒ 不唤醒）；
+* ⚠️ **边沿触发** —— 只有**新**消息 seq 才唤醒宿主；重连补报的**追帧摘要**
+  （同一份状态的重报）**不再唤醒** ⇒ 断开/重连风暴不会把宿主反复叫醒；
+  `dm-nudge` 帧则**每帧必唤醒**（催办语义就是「现在就去看」）；
+* `wake_url` 为空 ⇒ **零外呼**；POST 失败只记 warning —— 绝不重试轰炸、绝不碰
+  水位/通知/主路径。
 
 健壮性：连不上 / 断流 ⇒ **指数退避**重连（5s 起、翻倍、封顶 5min）；消费者整体
 **fail-open**：起不来也不影响 provider（`initialize()` 绝不因它失败），线程是

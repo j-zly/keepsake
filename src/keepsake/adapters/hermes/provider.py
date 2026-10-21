@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -258,6 +259,71 @@ def _notify(url: str, payload: Dict[str, Any], timeout: float = 5.0) -> None:
     httpx.post(url, json=payload, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# 唤醒出口（2026-10 ks_wake_outlet）—— 叫醒**宿主会话**，代理自己读信
+#
+# 通知出口叫醒的是**人**；唤醒出口叫醒的是**宿主**（Hermes 网关的 webhook
+# 订阅，本机 127.0.0.1）：收到私信帧 ⇒ POST 一次 ⇒ 宿主直接起一轮代理会话去
+# `message_inbox` 读信处理 —— 「私信不需要人转告，代理自己读和处理」。
+#
+# 🔴 **通知不经过 LLM，唤醒才经过** —— 两条旁路并存、各司其职、各自可关
+# （`notify_url` 空 ⇒ 无人叫醒；`wake_url` 空 ⇒ 无会话被叫醒）。
+#
+# 三条纪律：
+#   * **fail-open**：唤醒失败只记 warning —— 绝不重试轰炸、绝不碰水位/通知/主路径；
+#   * **边沿触发（限频语义）**：只对**新**消息 seq 唤醒；重连补报的**追帧摘要**
+#     （seq 没前进 = 同一份状态的重报）不再唤醒 ⇒ 断开/重连风暴不反复叫醒宿主；
+#   * **可关**：`wake_url` 为空 ⇒ 零外呼（行为与上线前逐字相同）。
+# ---------------------------------------------------------------------------
+
+#: 进程级「已唤醒到的消息 seq」水位（**边沿触发**的边沿在哪）。
+#: 与 `_NOTIFY_CACHE` 同款进程级模式（一条流 ⇒ 一份水位）。
+_WAKE_LAST_SEQ = -1
+
+
+def _wake_payload(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """唤醒载荷 —— **三个平铺键**（订阅的 prompt 模板按 `{from}`/`{unread}`/`{seq}` 取值）。
+
+    🔴 **别再套一层**：模板取的是平铺字段，套一层就取不到了。
+    🔴 只含元数据（**永不含正文**）—— 正文永远走信箱本体 `message_inbox`。
+    """
+    return {
+        "from": str(summary.get("from") or ""),
+        "unread": _as_int(summary.get("unread")),
+        "seq": _as_int(summary.get("seq")),
+    }
+
+
+def _wake_signature(secret: str, body: bytes) -> str:
+    """Hermes webhook 订阅签名：`sha256=<hex>` = HMAC-SHA256(raw body bytes, secret)。
+
+    签的是**实际发出的原始字节** —— 所以 body 必须自己序列化（不许 httpx
+    再编一遍 —— 那编出来的字节和签的字节对不上）。
+    """
+    digest = hmac.new(str(secret or "").encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def _wake(url: str, secret: str, payload: Dict[str, Any], timeout: float = 5.0) -> None:
+    """POST 唤醒载荷到宿主 webhook（Hermes 网关的 webhook 订阅）。
+
+    头：`X-Hub-Signature-256: sha256=<hex>`（订阅密钥的 HMAC-SHA256 签名）。
+
+    🔴 **不吞异常**：非 2xx 一律抛给调用方记 warning（**失败不重试**）。
+    🔴 **不碰正文**：载荷只有 from / unread / seq 三个元数据键。
+    """
+    import httpx                   # 延迟 import：没装 httpx 也不影响记忆功能
+    body = json.dumps(payload, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Hub-Signature-256"] = _wake_signature(secret, body)
+    resp = httpx.post(url, content=body, headers=headers, timeout=timeout)
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if not 200 <= status < 300:
+        raise RuntimeError(f"唤醒被拒（HTTP {status}）")
+
+
 def _as_int(value: Any) -> int:
     """值 → int（**非法值回落 0**，不许因为一个脏字段把整帧丢掉）。"""
     try:
@@ -266,24 +332,34 @@ def _as_int(value: Any) -> int:
         return 0
 
 
+def _read_secret(settings: dict, env_key: str, file_key: str,
+                 default_env: str, label: str) -> str:
+    """读一个密钥 —— **只从环境变量 / secrets 文件读**，config.json 不落真值。
+
+    顺序：`env_key` 指名的环境变量 → `file_key` 指的文件内容。
+    两处都没有 ⇒ 空串（调用方据此**不挂流 / 不发请求**，而不是拿空凭据去连）。
+    """
+    env_name = str(settings.get(env_key) or "").strip() or default_env
+    value = (os.environ.get(env_name) or "").strip()
+    if value:
+        return value
+    path = str(settings.get(file_key) or "").strip()
+    if path:
+        try:
+            return Path(path).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.warning("keepsake: %s文件读取失败（%s）", label, type(e).__name__)
+    return ""
+
+
 def _push_credential(settings: dict) -> str:
     """取推送凭据 —— **只从环境变量 / secrets 文件读**，config.json 不落真值。
 
     顺序：`credential_env` 指名的环境变量 → `credential_file` 指的文件内容。
     两处都没有 ⇒ 空串（调用方据此**不挂流**，而不是拿空凭据去连）。
     """
-    env_name = str(settings.get("credential_env") or "").strip() \
-        or "KEEPSAKE_PUSH_CREDENTIAL"
-    token = (os.environ.get(env_name) or "").strip()
-    if token:
-        return token
-    path = str(settings.get("credential_file") or "").strip()
-    if path:
-        try:
-            return Path(path).expanduser().read_text(encoding="utf-8").strip()
-        except OSError as e:
-            logger.warning("keepsake: 推送凭据文件读取失败（%s）", type(e).__name__)
-    return ""
+    return _read_secret(settings, "credential_env", "credential_file",
+                         "KEEPSAKE_PUSH_CREDENTIAL", "推送凭据")
 
 
 def _dispatch_push_event(event: str, raw: str) -> Optional[Dict[str, Any]]:
@@ -328,7 +404,7 @@ class _PushConsumer:
     """挂着 SSE 流的守护线程（provider 侧消费者）。
 
     线程体只做三件事：连上去 → 读帧 → 收帧交给 `_dispatch_push_event`
-    （收完帧再旁路发一次通知，`notify_url` 为空就不发）。
+    （收完帧再旁路发一次通知与一次唤醒，`notify_url` / `wake_url` 为空就不发）。
     任何异常都在 `_loop` 里被吃掉并退避重连（**fail-open**：推送层坏了不许
     影响记忆读写）。线程 `daemon=True` —— 随进程亡，不留孤儿。
     """
@@ -336,7 +412,9 @@ class _PushConsumer:
     def __init__(self, base_url: str, credential: str, *,
                  notify_url: str = "",
                  notify_format: str = "generic",
-                 notify_min_interval_s: float = _NOTIFY_DEFAULT_MIN_INTERVAL_S) -> None:
+                 notify_min_interval_s: float = _NOTIFY_DEFAULT_MIN_INTERVAL_S,
+                 wake_url: str = "",
+                 wake_secret: str = "") -> None:
         self._url = base_url.rstrip("/") + "/events"
         self._credential = credential
         # 通知出口（可选）：notify_url 为空 ⇒ 零外呼（功能关，现状逐字回归）
@@ -347,6 +425,9 @@ class _PushConsumer:
         except (TypeError, ValueError):
             # 脏配置不该连累整条流 ⇒ 回落缺省窗口（通知降级，不是不发）
             self._notify_interval = _NOTIFY_DEFAULT_MIN_INTERVAL_S
+        # 唤醒出口（可选）：wake_url 为空 ⇒ 零外呼（功能关，现状逐字回归）
+        self._wake_url = str(wake_url or "").strip()
+        self._wake_secret = str(wake_secret or "").strip()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -394,6 +475,41 @@ class _PushConsumer:
             return                                  # 失败不记水位 ⇒ 下一帧可再试
         _NOTIFY_CACHE.update({"ts": now, "count": count})
 
+    # ---- 唤醒出口 ----
+
+    def _wake_unread(self, summary: Dict[str, Any]) -> None:
+        """私信帧 ⇒ POST 宿主唤醒 webhook（唤起宿主一轮会话去读信处理）。fail-open。
+
+        🔴 **通知不经过 LLM，唤醒才经过** —— 通知叫醒的是人，唤醒叫醒的是
+        宿主会话；两条旁路并存、各自可关（`wake_url` 空 ⇒ 零外呼）。
+        🔴 **载荷只含元数据**（from / unread / seq），**永不含正文**。
+        🔴 **边沿触发（限频语义）**：只有**新**消息 seq 才唤醒；重连补报的
+        **追帧摘要**（seq 没前进 = 同一份状态的重报）**不再唤醒** ——
+        断开/重连风暴不会把宿主反复叫醒（那才是风暴）；而断线期间真来的
+        新信（seq 前进了）照常唤醒（那是新事件，不是补报）。
+        🔴 **失败只记 warning**：不重试、不碰水位/通知/主路径。
+        """
+        global _WAKE_LAST_SEQ
+        if not self._wake_url:
+            return                                  # 缺省关 ⇒ 零外呼
+        event = str(summary.get("event") or "")
+        seq = _as_int(summary.get("seq"))
+        if event == "dm":
+            if seq <= _WAKE_LAST_SEQ:
+                return                              # 补报（重连追帧）/ 旧帧 ⇒ 不重复叫醒
+            # 先记水位再发：失败也**不重试**（同一帧不重复打宿主）
+            _WAKE_LAST_SEQ = seq
+        # dm-nudge：催办语义就是「现在就去看」⇒ 每帧必唤醒（不参与 seq 去重）
+        payload = _wake_payload(summary)
+        try:
+            _wake(self._wake_url, self._wake_secret, payload)
+        except Exception as e:      # noqa: BLE001 —— 唤醒层永远 fail-open
+            logger.warning("keepsake: 唤醒宿主失败（已吞掉，不重试，不影响水位/通知/主路径）: %s: %s",
+                           type(e).__name__, e)
+            return
+        logger.info("keepsake: 已唤醒宿主（seq=%d, from=%s）",
+                    seq, payload["from"] or "-")
+
     # ---- 线程体 ----
 
     def _loop(self) -> None:
@@ -434,9 +550,11 @@ class _PushConsumer:
                         # 空行 = 一帧结束（SSE 的帧分隔）
                         if event_name:
                             summary = _dispatch_push_event(event_name, "\n".join(data_lines))
-                            # 通知出口：**在置水位之后**旁路发（失败也不碰水位）
+                            # 通知出口 / 唤醒出口：**在置水位之后**旁路发
+                            #（失败也不碰水位；两条旁路各司其职、各自可关）
                             if summary is not None:
                                 self._notify_unread(summary)
+                                self._wake_unread(summary)
                         event_name, data_lines = "", []
                         continue
                     if line.startswith(":"):
@@ -1364,7 +1482,10 @@ class KeepsakeProvider(MemoryProvider):
           * `credential_env` / `credential_file` —— 凭据来源（**不落真值**）；
           * `notify_url` —— 渠道 webhook 地址（**空 = 通知功能关，零外呼**）；
           * `notify_min_interval_s` —— 同水位限频窗口（缺省 120s）；
-          * `notify_format` —— 载荷格式（`generic` / `feishu`，缺省 generic）。
+          * `notify_format` —— 载荷格式（`generic` / `feishu`，缺省 generic）；
+          * `wake_url` —— 宿主唤醒 webhook 地址（**空 = 唤醒功能关，零外呼**）；
+          * `wake_secret_env` / `wake_secret_file` —— 订阅密钥来源
+            （**不落真值**；读不到 ⇒ 不唤醒）。
 
         🔴 进程级**一条流**：多个 provider 实例（Hermes 多 session）各挂一条
         只会互相踢（服务端每代理最多 2 条并发流，新的踢旧的）。
@@ -1391,6 +1512,14 @@ class KeepsakeProvider(MemoryProvider):
                 notify_interval = _NOTIFY_DEFAULT_MIN_INTERVAL_S
             if notify_interval < 0:
                 notify_interval = 0.0
+            # 唤醒出口（可选）：wake_url 为空 ⇒ 零外呼；密钥读不到 ⇒ 也不唤醒
+            #（没有签名 = 订阅鉴权过不去，发了也是白发）
+            wake_url = str(settings.get("wake_url") or "").strip()
+            wake_secret = _read_secret(settings, "wake_secret_env", "wake_secret_file",
+                                       "KEEPSAKE_WAKE_SECRET", "唤醒订阅密钥")
+            if wake_url and not wake_secret:
+                logger.warning("keepsake: 已配置 wake_url，但读不到订阅密钥（不唤醒）")
+                wake_url = ""
             with _PUSH_LOCK:
                 if _PUSH_CONSUMER is not None and _PUSH_CONSUMER.alive():
                     logger.info("keepsake: 推送消费者已在运行（复用现有流）")
@@ -1400,6 +1529,8 @@ class KeepsakeProvider(MemoryProvider):
                     notify_url=notify_url,
                     notify_format=notify_format,
                     notify_min_interval_s=notify_interval,
+                    wake_url=wake_url,
+                    wake_secret=wake_secret,
                 )
                 consumer.start()
                 _PUSH_CONSUMER = consumer

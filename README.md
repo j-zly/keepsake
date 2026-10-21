@@ -195,7 +195,9 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   //   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",     // or "credential_file": "/path/to/secret"
   //   "notify_url": "https://example.invalid/hooks/xxx",// notify outlet (channel webhook); empty = zero outbound
   //   "notify_min_interval_s": 120,                     // same-watermark rate-limit window (s)
-  //   "notify_format": "generic"                        // generic | feishu
+  //   "notify_format": "generic",                       // generic | feishu
+  //   "wake_url": "http://127.0.0.1:8210/hooks/dm-wake",// wake outlet (host webhook); empty = zero outbound
+  //   "wake_secret_env": "KEEPSAKE_WAKE_SECRET"         // or "wake_secret_file": "/path/to/secret"
   // },
 
   // Auto maintenance
@@ -245,6 +247,7 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
 | `OPENAI_API_KEY` | `embedder.api_key` | Embedding API key |
 | `KEEPSAKE_PUSH_CREDENTIAL` | `push_consumer.credential_env` | Credential for the private-message push consumer (**the default env name — the name itself is configurable**) |
+| `KEEPSAKE_WAKE_SECRET` | `push_consumer.wake_secret_env` | Subscription secret for the **wake outlet** webhook (the HMAC-SHA256 signing key; **the default env name — the name itself is configurable**) |
 
 > **Every other config item is `config.json`-only — there is no environment variable for it.** In particular `bm25_limit`, `decay_half_days`, `hot_topic_decay_half_days`, `embed_cache_ttl`, `storage.backend`, `embed_dim`, `consolidate_min_group`, `consolidate_min_overlap`, `consolidate_max_age_hours`, `forget_max_age_days`, `forget_dry_run` and `emotion_intensity_factor` are read from the config file only. See the [Configuration Reference](#configuration-reference) table below for defaults.
 
@@ -398,6 +401,9 @@ Then reference it in config.json:
 | `push_consumer.notify_min_interval_s` | — | `120` | Rate-limit window (s) for the notify outlet: the **same** unread count is announced at most once per window; a rising count is announced immediately |
 | `push_consumer.notify_format` | — | `generic` | Payload shape of the notify outlet: `generic` (`{"text": …}`) or `feishu` (`{"msg_type": "text", "content": {"text": …}}`) |
 | `nudge.publish_endpoint` | — | `http://127.0.0.1:8210/internal/publish` | Where the console **posts** a nudge frame (cross-process delivery — the stream lives in the MCP process). Env override: `KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`. See [Nudge delivery across processes](#nudge-delivery-across-processes) |
+| `push_consumer.wake_url` | — | `""` | Host webhook the **wake outlet** POSTs to (Hermes gateway webhook subscription) ⇒ the host starts an agent turn that reads the inbox itself. **Empty = the wake outlet is off** ⇒ zero outbound calls |
+| `push_consumer.wake_secret_env` | `KEEPSAKE_WAKE_SECRET` | `KEEPSAKE_WAKE_SECRET` | **Env var name** holding the subscription secret (the `X-Hub-Signature-256` HMAC-SHA256 key; the value never lives in `config.json`). `push_consumer.wake_secret_file` points at a secrets file instead |
+
 
 > `sentiment_*`, `feedback_*`, `hot_topic_*` and other ranking weight parameters currently only support configuration through JSON config file, not environment variables. Set to `1.0` to disable the effect of that dimension.
 
@@ -889,7 +895,9 @@ connections**, behaviour byte-identical to before.
   "credential_env": "KEEPSAKE_PUSH_CREDENTIAL",
   "notify_url": "https://example.invalid/hooks/xxxx",
   "notify_min_interval_s": 120,
-  "notify_format": "generic"
+  "notify_format": "generic",
+  "wake_url": "http://127.0.0.1:8210/hooks/dm-wake",
+  "wake_secret_env": "KEEPSAKE_WAKE_SECRET"
 }
 ```
 
@@ -937,6 +945,31 @@ bot):
 * `notify_url` empty ⇒ **zero outbound calls** (behaviour byte-identical to
   before); a failed POST only logs a warning — never retried, never touching
   the watermark or the main path.
+
+#### Wake outlet (the agent reads the inbox itself)
+
+The notify outlet wakes the **user**; the wake outlet wakes the **host
+session**. A received `dm` / `dm-nudge` frame is *additionally* POSTed to the
+host's webhook subscription (`push_consumer.wake_url` — the Hermes gateway,
+local `127.0.0.1`) ⇒ the gateway starts one agent turn that reads
+`message_inbox` and handles the message — no human relay. 🔴 **The
+notification does not go through the LLM; the wake does** — the two bypasses
+coexist, each with its own job, each independently switchable.
+
+* 🔴 **metadata only** — the payload is flat and carries exactly three keys
+  (`from` / `unread` / `seq`), because the subscription's prompt template reads
+  `{from}` / `{unread}` / `{seq}`; **never the message body**;
+* 🔴 **signed** — `X-Hub-Signature-256: sha256=<hex>` =
+  HMAC-SHA256(raw body bytes, subscription secret). The secret comes from
+  `wake_secret_env` / `wake_secret_file` (**the value never lives in
+  `config.json`**; no secret ⇒ no wake);
+* ⚠️ **edge-triggered** — only a **new** message `seq` wakes the host; the
+  reconnect catch-up summary (the same state reported again) does **not** wake
+  it again ⇒ a disconnect/reconnect storm never wakes the host over and over.
+  A `dm-nudge` frame wakes on every frame (a nudge means "go look now");
+* `wake_url` empty ⇒ **zero outbound calls**; a failed POST only logs a
+  warning — never retried, never touching the watermark, the notification or
+  the main path.
 
 Robustness: a failed connect or a dropped stream ⇒ **exponential backoff**
 (5s, doubling, capped at 5min) and reconnect. The consumer is **fail-open**:
