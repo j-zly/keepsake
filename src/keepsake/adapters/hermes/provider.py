@@ -1006,11 +1006,16 @@ class KeepsakeProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
+        # 未读私信提醒：独立于检索（一次 SELECT COUNT，成本可忽略）⇒ 放在
+        # 「省钱闸」之前算。寒暄/短消息轮跳过检索，但提醒不能跟着一起跳过
+        # （否则短消息轮永远收不到未读私信提醒）。
+        hint = self._dm_hint_line()
+
         if not self._should_search(query):
-            return ""
+            return hint
 
         if not query or not self._storage:
-            return ""
+            return hint
 
         import time as _time
 
@@ -1043,8 +1048,9 @@ class KeepsakeProvider(MemoryProvider):
         fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
         fragments = self._filter_excluded(fragments)
 
-        # 未读私信提醒（寄生在本轮检索上）：>0 才有一行，=0 什么都不加。
-        hint = self._dm_hint_line()
+        # 未读私信提醒：>0 才有一行，=0 什么都不加。
+        # （hint 在本方法开头已算好，这里**复用**变量，别再算第二遍 ——
+        #   `_dm_hint_line` 内部有 60s 水位去重，算两遍会把提醒自己吃掉。）
         if not fragments:
             return hint
 

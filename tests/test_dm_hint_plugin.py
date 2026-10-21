@@ -148,6 +148,47 @@ def test_窗口外同一水位会再提醒(st, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# ③' trivial 轮（寒暄/短消息）也要能收到提醒
+# --------------------------------------------------------------------------
+
+def test_trivial查询也要提醒(st):
+    """🔴 寒暄/短消息轮跳过检索，但未读私信提醒**不能**跟着跳过。
+
+    提醒是独立的 `SELECT COUNT`（成本可忽略），不该跟昂贵的语义检索捆死：
+    检索闸在前 ⇒ 短消息轮收不到提醒（2026-10 ks_dm_trivial_fix）。
+    """
+    box = Messaging(st)
+    assert box.ensure_schema() is True
+    p = _provider(st)
+    box.send("agent-a", "agent-b", "在吗")
+
+    out = p.prefetch("好")                 # 「好」长度 < skip_min_length ⇒ 不检索
+    assert out, "trivial 轮有未读私信时不能返回空串"
+    assert "📩" in out, out
+    assert "你有 1 条未读私信" in out, out
+
+
+def test_trivial查询无未读返回空串(st):
+    """🔴 回归：trivial 轮 + 没有未读 ⇒ 空串（寒暄轮零打扰）。"""
+    box = Messaging(st)
+    assert box.ensure_schema() is True
+    p = _provider(st)
+
+    assert p.prefetch("好") == "", "trivial 轮没有未读就不该有任何注入"
+
+
+def test_正常查询提醒只出现一次(st):
+    """🔴 一次轮询内 📩 只出现一次（防 hint 被算两遍）。"""
+    box = Messaging(st)
+    assert box.ensure_schema() is True
+    p = _provider(st)
+    box.send("agent-a", "agent-b", "在吗")
+
+    out = p.prefetch(QUERY)
+    assert out.count("📩") == 1, out
+
+
+# --------------------------------------------------------------------------
 # ④ 存储层口径（服务端与插件**共用**的那一份）
 # --------------------------------------------------------------------------
 
