@@ -35,6 +35,7 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
 from __future__ import annotations
 
 import inspect
+import logging
 import uuid
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -48,6 +49,8 @@ from ..govern.registry import (
     STATUS_APPROVED,
     STATUS_REVOKED,
 )
+
+logger = logging.getLogger("keepsake.mcp_server.tools")
 
 __all__ = ["ToolError", "StorageIntrospection", "register_tools",
            "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS",
@@ -131,6 +134,35 @@ def _caller_kwargs(fn: Any, caller_agent_id: str, caller_role: str) -> Dict[str,
 
 
 # --------------------------------------------------------------------------
+# 未读私信提醒（2026-10 ks_dm_hint）：**寄生在检索响应里**（零定时器方案）
+#
+# 私信是拉取式的 —— 接收方无感知。定案：每轮必然发生的检索调用顺路带回未读数，
+# 宿主把这一行渲染成提醒。计数口径与插件侧**同一份**（`Messaging.unread_summary`），
+# 两处各写一条 SQL 必然漂（漂了就是「面板说 3 条、注入说 1 条」）。
+# --------------------------------------------------------------------------
+
+#: provider 侧自带的信箱句柄属性名（宿主 provider 懒创建的那一份）。
+#: 本模块**不 import 任何宿主**（见模块 docstring），所以只按属性名取。
+_PROVIDER_BOX_ATTR = "_keepsake_messaging"
+
+
+def _unread_dm(box: Any, agent_id: str) -> int:
+    """调用方的未读私信条数 —— **fail-open**（读不到 ⇒ 0）。
+
+    🔴 提醒是**附加值**：信箱表读失败（PG 抖动 / schema 未就绪）时，
+    检索结果必须**照常返回** —— 一个计数查询不该有能力让检索瘫掉。
+    """
+    if box is None or not (agent_id or "").strip():
+        return 0
+    try:
+        return max(0, int(box.unread_count(agent_id)))
+    except Exception as e:      # noqa: BLE001 —— 读不到就不提醒，不影响检索本体
+        logger.warning("keepsake MCP: 未读私信计数失败（不影响检索本体）: %s: %s",
+                       type(e).__name__, e)
+        return 0
+
+
+# --------------------------------------------------------------------------
 # 8 个 tool 的实现（纯函数，provider 显式传参 —— 不靠闭包，方便单测直接调）
 # --------------------------------------------------------------------------
 
@@ -148,20 +180,30 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
 
 
 def memory_search(provider: Any, query: str, limit: int = 10,
-                 caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+                 caller_agent_id: str = "", caller_role: str = "",
+                 box: Any = None) -> Dict[str, Any]:
     """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。
 
     `caller_agent_id` / `caller_role`（2026-10 ks_share_memory）：调用方身份
     （凭据反查得出）。非 primary 只看得见自己 + 已共享代理的记忆。
+
+    🔴 `unread_dm`（2026-10 ks_dm_hint）：**顺路带回的未读私信数** ——
+    私信是拉取式的，接收方无感知；把提醒寄生在每轮必然发生的检索上，
+    零定时器、零额外请求。计数走既有连接池（`box` 与注册表同一个 storage），
+    读失败 ⇒ 0（fail-open，**绝不影响检索本体返回**）。
     """
     if not query or not query.strip():
         raise ToolError("query 不能为空")
     limit = max(1, min(int(limit), 100))
     hits = provider.search(query.strip(), limit=limit,
                            **_caller_kwargs(provider.search, caller_agent_id, caller_role))
+    if box is None:
+        # 没显式给信箱句柄 ⇒ 问 provider 要它自己那份（宿主 provider 懒创建）。
+        box = getattr(provider, _PROVIDER_BOX_ATTR, None)
     return {
         "query": query.strip(),
         "count": len(hits),
+        "unread_dm": _unread_dm(box, caller_agent_id),
         "results": [
             {
                 "key": _hit_key(h),
@@ -607,8 +649,12 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     """
     registry = getattr(gate, "registry", None)
     #: 信箱句柄（与注册表**同一个 storage** ⇒ 不另开连接、不另拼 DSN）。
+    #: 优先用 provider 自己那份（`KeepsakeProvider` 在 initialize 时就建好了，
+    #: schema 也已就绪 ⇒ 检索热路径上只剩一条 count 查询，没有 DDL）。
     #: 没有注册表时留 None —— 工具照常注册，但每次调用明确报「需要代理注册表」。
-    box = Messaging(registry.storage) if registry is not None else None
+    box = getattr(provider, _PROVIDER_BOX_ATTR, None)
+    if box is None and registry is not None:
+        box = Messaging(registry.storage)
 
     def _authorize(tool_name: str) -> Dict[str, Any]:
         """过身份闸门，并**把身份结论带回来**（可见性过滤要用，2026-10 ks_share_memory）。
@@ -630,13 +676,15 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_search",
-        description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）。",
+        description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）；"
+                    "unread_dm = 本代理的未读私信条数（0 = 没有）。",
     )
     def _search(query: str, limit: int = 10) -> Dict[str, Any]:
         ident = _authorize("memory_search")
         return memory_search(provider, query, limit,
                              caller_agent_id=str(ident.get("agent_id") or ""),
-                             caller_role=str(ident.get("role") or ""))
+                             caller_role=str(ident.get("role") or ""),
+                             box=box)
 
     @server.tool(
         name="memory_get",

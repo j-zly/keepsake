@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -75,6 +76,10 @@ CONTENT_MAX = 4000
 #: 收件箱 / 历史各自的默认条数与硬上限（防一次拉爆上下文）。
 DEFAULT_LIMIT = 20
 LIMIT_MAX = 200
+
+#: 建表失败后的**重试冷却**（秒）—— 见 `Messaging.ensure_schema`：
+#: 未读计数寄生在检索热路径上，DDL 失败时不能每轮都重试建表。
+SCHEMA_RETRY_COOLDOWN_S = 60.0
 
 #: 🔴 `ks_message` 的 DDL **唯一定义处**（本模块）。PG 与 SQLite 各一份 ——
 #: 两边**方言不同**（`BIGSERIAL` / `timestamptz` vs `INTEGER PRIMARY KEY` /
@@ -269,12 +274,23 @@ class _MsgSqlBackend(_SqlBase):
                  f"(from_id = {ph} AND to_id = {ph})")
         return self._select(where, (a, b, b, a), limit)
 
-    def unread_count(self, agent_id: str) -> int:
-        rows = self.read(
-            f"SELECT COUNT(*) FROM {TABLE} WHERE to_id = {self.ph} AND read_at IS NULL",
-            (agent_id,),
-        )
-        return int(rows[0][0]) if rows and rows[0] else 0
+    def unread_summary(self, agent_id: str, sender_limit: int = 0) -> Dict[str, Any]:
+        """未读私信的**计数 + 发件人**（**不取正文** —— 提醒行只要这两样）。
+
+        `sender_limit=0` ⇒ 只计数（一条 count 查询；检索顺路带未读数用的就是这一种）。
+        """
+        where = f"to_id = {self.ph} AND read_at IS NULL"
+        rows = self.read(f"SELECT COUNT(*) FROM {TABLE} WHERE {where}", (agent_id,))
+        count = int(rows[0][0]) if rows and rows[0] else 0
+        senders: List[str] = []
+        if count > 0 and sender_limit > 0:
+            srows = self.read(
+                f"SELECT from_id FROM {TABLE} WHERE {where} "
+                f"GROUP BY from_id ORDER BY MIN(seq), from_id LIMIT {int(sender_limit)}",
+                (agent_id,),
+            )
+            senders = [str(r[0]) for r in srows if r and r[0]]
+        return {"count": count, "senders": senders}
 
     # -- 治理面只读列表 -------------------------------------------------
     def list_messages(self, agent: str, thread: str, q: str,
@@ -417,8 +433,23 @@ class _RedisBackend:
         picked.sort(key=lambda r: r["seq"])
         return self._fill_read_at(picked[-limit:])
 
-    def unread_count(self, agent_id: str) -> int:
-        return int(self._client().llen(self.inbox_key(agent_id)) or 0)
+    def unread_summary(self, agent_id: str, sender_limit: int = 0) -> Dict[str, Any]:
+        client = self._client()
+        count = int(client.llen(self.inbox_key(agent_id)) or 0)
+        senders: List[str] = []
+        if count > 0 and sender_limit > 0:
+            seen = set()
+            for blob in client.lrange(self.inbox_key(agent_id), 0, -1):
+                try:
+                    fid = str(json.loads(_text(blob)).get("from_id") or "")
+                except (TypeError, ValueError):
+                    continue
+                if fid and fid not in seen:
+                    seen.add(fid)
+                    senders.append(fid)
+                    if len(senders) >= sender_limit:
+                        break
+        return {"count": count, "senders": senders}
 
     # -- 治理面只读列表 -------------------------------------------------
     def list_messages(self, agent: str, thread: str, q: str,
@@ -470,21 +501,33 @@ class Messaging:
                          else _RedisBackend(storage))
         self._ensured = False
         self._ensure_lock = threading.Lock()
+        #: 建表失败后的**重试冷却**截止时刻（单调钟）。见 `ensure_schema`。
+        self._fail_until = 0.0
 
     # ---- 生命周期 ----------------------------------------------------
     def ensure_schema(self) -> bool:
-        """确保 `ks_message` 在（幂等；**成功 True / 失败 False**）。"""
+        """确保 `ks_message` 在（幂等；**成功 True / 失败 False**）。
+
+        🔴 **失败后有冷却**（60s 内不重试 DDL）：2026-10 ks_dm_hint 之后
+        信箱的未读计数被**寄生在检索热路径**上（每轮都走）—— 建表 DDL 失败
+        时若每次都重试，等于每轮发一遍 DDL（PG 上建索引会拿锁、挡写）。
+        冷却期内的调用直接回 False（=「schema 未就绪」），不碰库。
+        """
         with self._ensure_lock:
             if self._ensured:
                 return True
+            if time.monotonic() < self._fail_until:
+                return False
             try:
                 ok = bool(self._be.ensure_schema())
             except Exception as e:      # noqa: BLE001 —— 返回 False，不抛
                 logger.warning("keepsake: 信箱 ensure_schema 失败（%s: %s）",
                                type(e).__name__, e)
-                return False
+                ok = False
             if ok:
                 self._ensured = True
+            else:
+                self._fail_until = time.monotonic() + SCHEMA_RETRY_COOLDOWN_S
             return ok
 
     def _ready(self) -> None:
@@ -530,13 +573,22 @@ class Messaging:
         self._ready()
         return list(self._be.recent_between(left, right, _clamp_limit(limit)))
 
-    def unread_count(self, agent_id: str) -> int:
-        """还有几条没读（收件箱里未读的消息条数）。"""
+    def unread_summary(self, agent_id: str, sender_limit: int = 0) -> Dict[str, Any]:
+        """未读私信的**计数 + 发件人**（不取正文）—— 提醒行的**唯一口径**。
+
+        🔴 **服务端（检索顺路带未读数）与插件（注入 📩 提醒行）走的是同一份**：
+        两处各写一条 SQL 必然漂（漂了就是「面板说 3 条、注入说 1 条」）。
+        `sender_limit=0` ⇒ 只计数（一条 count 查询）。
+        """
         aid = (agent_id or "").strip()
         if not aid:
-            return 0
+            return {"count": 0, "senders": []}
         self._ready()
-        return int(self._be.unread_count(aid))
+        return self._be.unread_summary(aid, max(0, int(sender_limit)))
+
+    def unread_count(self, agent_id: str) -> int:
+        """还有几条没读（收件箱里未读的消息条数）。"""
+        return int(self.unread_summary(agent_id).get("count") or 0)
 
     # ---- 治理面只读列表（控制台「消息中心」用）------------------------
     def list_messages(self, agent: str = "", thread: str = "", q: str = "",
@@ -562,5 +614,5 @@ class Messaging:
 __all__ = [
     "Messaging", "MESSAGE_FIELDS", "CONTENT_MAX", "DEFAULT_LIMIT", "LIMIT_MAX",
     "TABLE", "INDEX", "REDIS_KEY_GLOBAL", "REDIS_KEY_INBOX",
-    "KS_MESSAGE_DDL_PG", "KS_MESSAGE_DDL_SQLITE",
+    "KS_MESSAGE_DDL_PG", "KS_MESSAGE_DDL_SQLITE", "SCHEMA_RETRY_COOLDOWN_S",
 ]

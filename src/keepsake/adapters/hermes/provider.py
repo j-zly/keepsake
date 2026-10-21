@@ -44,6 +44,8 @@ from ...core.ops.forgetter import Forgetter
 # `govern` 只依赖标准库，这里 import 它不会与 `core/*` 成环。
 from ...govern.registry import AGENT_TAG_PREFIX, Registry
 from ...govern.registry import ROLE_PRIMARY as REGISTRY_ROLE_PRIMARY
+# 代理互聊信箱（2026-10 ks_dm_hint）：未读私信提醒的**唯一口径**（同一个 storage）。
+from ...govern.messaging import Messaging
 # 记忆共享开关的可见性过滤器（2026-10 ks_share_memory）：**唯一**那份口径。
 from ...govern.visibility import (
     fragment_owner,
@@ -158,6 +160,24 @@ _CORE_CACHE: Dict[str, Any] = {"ts": 0.0, "frags": None}
 #: 指纹取 (mtime_ns, size) —— 照抄 `consolidator.resolve_llm_channel_cached` 的
 #: 缓存手法（改了 config.json 下一轮注入就热生效，不必重启进程）。
 _CORE_BUDGET_CACHE: Dict[str, Any] = {}
+
+# ---------------------------------------------------------------------------
+# 未读私信提醒（2026-10 ks_dm_hint）—— **寄生在检索上**（零定时器方案）
+#
+# 私信是拉取式的：接收方不主动拉就永远不知道有信。已否决 cron 哨兵
+# （定时任务太多不好管理），定案 = 每轮必然发生的检索顺路带回未读数，
+# 注入块末尾渲染成一行 📩 提醒。
+# ---------------------------------------------------------------------------
+
+#: 提醒的**去重窗口**（秒）：同一水位在窗口内只提醒一次；水位一变立刻再提醒。
+_DM_HINT_TTL = 60.0
+
+#: 提醒行里最多列几个发件人（再多是噪音 —— 正文等 inbox 拉）。
+_DM_SENDER_LIMIT = 3
+
+#: 进程级缓存 `{"ts": 时刻, "key": 水位}`（照抄 `_CORE_CACHE` 那套模式，不造新机制）。
+#: 水位 = (未读条数, 发件人集合) —— 条数相同但换人发，也是新消息，照样该提醒。
+_DM_HINT_CACHE: Dict[str, Any] = {"ts": 0.0, "key": None}
 
 
 def config_path() -> Path:
@@ -409,6 +429,9 @@ class KeepsakeProvider(MemoryProvider):
     #: 代理注册表（`keepsake.govern.registry.Registry`）：身份 / 角色 / 上下文的唯一真相源。
     #: **类属性兜底 None** = 没装配注册表（裸实例 / 单测），此时写闸回落到 config 自报。
     _registry: Optional[Any] = None
+    #: 信箱句柄（`govern.messaging.Messaging`）：**未读私信提醒**用（2026-10 ks_dm_hint）。
+    #: 与注册表**同一个 storage** ⇒ 不另开连接、不另拼 DSN。
+    _keepsake_messaging: Optional[Any] = None
     #: 本进程自己的 agent_id（注册表登记与角色查询用）
     _agent_id: str = ""
     #: 角色查询的进程内缓存 `{"ts": 单调时刻, "is_primary": bool}`
@@ -936,6 +959,51 @@ class KeepsakeProvider(MemoryProvider):
                            budget, len(kept))
         return "\n".join(["<keepsake-core>", *lines, "</keepsake-core>"])
 
+    # ------------------------------------------------------------------
+    # 未读私信提醒（2026-10 ks_dm_hint）—— 寄生在本轮检索上
+    #
+    # 私信是**拉取式**的：接收方不主动拉就永远不知道有信。已否决 cron 哨兵
+    # （定时任务太多不好管理）⇒ 定案：把提醒寄生在每轮必然发生的检索上，
+    # 零新组件、零定时器、零额外请求。
+    # ------------------------------------------------------------------
+
+    def _dm_hint_line(self) -> str:
+        """未读私信提醒行（📩 …）—— **没有未读就返回空串**（静默是默认态）。
+
+        三条纪律：
+
+        * **fail-open**：信箱读失败（PG 抖动 / schema 未就绪）⇒ 不提醒，
+          绝不把异常抛进对话关键路径（与本文件其余注入路径同款）；
+        * **不塞正文**：只取条数与发件人，正文等 `message_inbox` 拉（省 token）；
+        * **防刷屏**：同一水位在 60s 窗口内只提醒一次；水位一变立刻再提醒。
+        """
+        box = self._keepsake_messaging
+        agent_id = (self._agent_id or "").strip()
+        if box is None or not agent_id:
+            return ""
+        import time as _time
+
+        now = _time.monotonic()          # 单调钟：去重窗口不受系统时间跳变影响
+        try:
+            summary = box.unread_summary(agent_id, sender_limit=_DM_SENDER_LIMIT)
+        except Exception as e:      # noqa: BLE001 —— 提醒读不到就不提醒
+            logger.warning("keepsake: 未读私信计数失败（fail-open，不提醒）: %s: %s",
+                           type(e).__name__, e)
+            return ""
+        count = int(summary.get("count") or 0)
+        senders = [str(s) for s in (summary.get("senders") or [])]
+        if count <= 0:
+            # 水位归零 ⇒ 缓存也归零（否则「读完又收到同样条数」会被当成没变化而漏提醒）
+            _DM_HINT_CACHE.update({"ts": now, "key": None})
+            return ""
+        key = (count, tuple(senders))
+        cached = _DM_HINT_CACHE
+        if cached.get("key") == key and now - float(cached.get("ts") or 0.0) < _DM_HINT_TTL:
+            return ""              # 同一水位、窗口内 ⇒ 不重复刷屏
+        _DM_HINT_CACHE.update({"ts": now, "key": key})
+        src = ("（来自: " + "、".join(senders) + "）") if senders else ""
+        return f"📩 你有 {count} 条未读私信{src}。请调用 message_inbox 处理。"
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """根据用户消息检索相关碎片，注入到上下文。"""
         if not self._should_search(query):
@@ -975,8 +1043,10 @@ class KeepsakeProvider(MemoryProvider):
         fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
         fragments = self._filter_excluded(fragments)
 
+        # 未读私信提醒（寄生在本轮检索上）：>0 才有一行，=0 什么都不加。
+        hint = self._dm_hint_line()
         if not fragments:
-            return ""
+            return hint
 
         lines = ["<keepsake>"]
         lines.append(f"# 相关记忆 (检索耗时 {elapsed:.1f}s)")
@@ -1004,6 +1074,8 @@ class KeepsakeProvider(MemoryProvider):
             lines.append("")
 
         lines.append("</keepsake>")
+        if hint:
+            lines.append(hint)
         return "\n".join(lines)
 
     def sync_turn(
@@ -1549,12 +1621,24 @@ class KeepsakeProvider(MemoryProvider):
         注册表不可用时 `self._registry` 留 None，写闸据此 fail-closed 按 sub
         （见 `_registry_is_primary`）—— 记忆写入降级，人还能用。
         """
+        # 本进程自己的身份（注册表登记 / 未读私信提醒都要用）。
+        # 🔴 放在最前面：注册表不可用时身份仍然成立（提醒是附加值，不该被注册表带崩）。
+        self._agent_id = str(cfg.get("agent_id") or self._agent_id or "")
+        # 信箱句柄（未读私信提醒用，2026-10 ks_dm_hint）：与注册表**同一个
+        # storage** ⇒ 不另开连接、不另拼 DSN。装配失败也不拦对话（提醒是附加值）。
+        try:
+            self._keepsake_messaging = Messaging(self._storage)
+            # 🔴 建表 DDL 放在**启动**这一步（不放在检索热路径上）：
+            # 检索每轮都跑，DDL 不该混在里面（PG 上建索引会拿锁）。
+            if not self._keepsake_messaging.ensure_schema():
+                logger.warning("keepsake: 信箱 schema 未就绪（未读私信提醒可能不可用）")
+        except Exception as e:      # noqa: BLE001 —— 提醒读不到就不提醒
+            logger.warning("keepsake: 信箱句柄装配失败（未读提醒不可用）: %s", e)
         try:
             registry = Registry(self._storage)
             if not registry.ensure_schema():
                 logger.warning("keepsake: 注册表 schema 未就绪，写闸将按 sub 处理（fail-closed）")
                 return
-            self._agent_id = str(cfg.get("agent_id") or self._agent_id or "")
             # 本机文件通道：批准自己；`is_primary` 为真且库里还没有主脑时才上位。
             # 🔴 这一行的 `is_primary` 只是**首次引导**的种子，之后角色一律由注册表
             #    说了算（控制台改一次即生效，写闸 5s 内收敛）。
