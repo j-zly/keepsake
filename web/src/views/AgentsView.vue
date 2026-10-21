@@ -15,9 +15,10 @@
   换主的唯一路径是给别的行点「设为主代理」—— 那次会自动把旧主降级。
   后端同口径 409，绕开 UI 打 API 也一样被挡。
 
-  ⚠️ 唯一的例外是「重新生成凭据」：换发就是**再 approve 一次**（approve 本就是
-  换发语义 —— 旧的那条立即作废），主代理行同样给。主脑走本机 bootstrap，
-  不吃这把凭据，泄露时它也得能自己换一把。
+  ⚠️ 唯一的例外是「重新生成凭据」：换发 = **approve + 显式 reissue**（后端对已
+  批准的行再 approve 一律 409 —— 重复批准不再静默把旧凭据顶掉，线上代理瞬间全断
+  而操作者毫无感知），主代理行同样给。主脑走本机 bootstrap，不吃这把凭据，
+  泄露时它也得能自己换一把。
 
   ponytail: 后端 GET /api/v1/agents 不按 status 过滤（零后端改动约束），所以本页的
   分页与计数是**全状态口径** —— pending 行占着页位却不渲染（它去审核页）。
@@ -236,7 +237,8 @@
               <button class="act-btn" :disabled="busy" @click="openEdit(a)">编辑</button>
 
               <!--
-                重新生成凭据：**换发**（再 approve 一次 —— 旧的那条立即作废，新的一条顶上来）。
+                重新生成凭据：**换发**（approve + 显式 reissue=true —— 旧的那条立即作废，
+                新的一条顶上来；不带 reissue 的重复批准会被后端 409 挡掉）。
                 放在 primary / 非 primary 的分流链**外面** —— 换发对主代理无副作用
                 （主脑走本机 bootstrap，不吃这把凭据），泄露场景下主代理同样得能换。
                 门只开在「已批准」行上：待审的去审核页，已吊销的走「重新批准」。
@@ -1009,7 +1011,7 @@ const dlgConsequences = computed(() => {
   }
   if (dlgKind.value === 'rotate') {
     return [
-      '旧凭据立即作废：使用该凭据的客户端最迟 60 秒内被拒（哈希一换即失配）。',
+      '旧凭据立即作废（旧的那条当场失效，不等它过期）：使用该凭据的客户端最迟 60 秒内被拒（哈希一换即失配）。',
       '代理状态与记忆归属不变 —— 还是已批准、角色照旧、它写过的记忆照旧归它。',
       '新凭据明文只在这个响应里出现一次，关掉弹框就再也拿不到了 —— 请当场转交。',
     ]
@@ -1069,10 +1071,16 @@ async function doAction(typed) {
   dlgOpen.value = false
   busy.value = true
   try {
-    if (kind === 'approve' || kind === 'rotate') {
-      // 换发与批准是**同一个端点**（approve 本就是换发语义：旧的立即作废）
+    if (kind === 'approve') {
+      // 批准：**不带 reissue** —— 后端对已批准的行会 409（重复批准不许静默换发）。
+      // 本页这个钮只开在 pending / revoked 行上（approved 的行去「重新生成凭据」）。
       const r = await api.approveAgent(row.agent_id)
       // 明文只在这一刻落到内存态（关框即抹）；没回明文就没有成功可言（红条已报）
+      if (showCred(r)) showToast(dlgDoneText.value)
+    } else if (kind === 'rotate') {
+      // 换发：同一条端点，但**必须显式 reissue=true**（旧的那条随即失效）。
+      // 手输那道闸（agent_id 前 8 位）就在确认框里，不许弱化。
+      const r = await api.reissueAgent(row.agent_id)
       if (showCred(r)) showToast(dlgDoneText.value)
     } else if (kind === 'revoke') {
       await api.revokeAgent(row.agent_id, typed)

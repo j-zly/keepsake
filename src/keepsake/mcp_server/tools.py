@@ -44,6 +44,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 from ..api import audit
 from ..govern.messaging import CONTENT_MAX as MESSAGE_CONTENT_MAX, Messaging
 from ..govern.registry import (
+    ALREADY_APPROVED_NOTE,
+    AlreadyApprovedError,
     ROLE_PRIMARY,
     ROLES,
     STATUS_APPROVED,
@@ -417,7 +419,7 @@ REVOKE_CONFIRM_LEN = 8
 #: 批准响应里的回显提示（与界面同义，只是把「界面」换成「转交给用户」）
 CREDENTIAL_ONCE_NOTE = (
     "凭据只此一次返回，库里只存 sha256 —— 请立即转交并通知用户在界面外妥善保存；"
-    "丢失请重新调用 agent_approve 换一条（旧凭据随即失效）。"
+    "丢失请用 agent_approve 传 reissue=true 换一条（旧凭据随即失效）。"
 )
 
 #: 置 primary 时必须让人看见的后果（旧主被降级）
@@ -480,14 +482,26 @@ def agent_list(registry: Any) -> Dict[str, Any]:
     return {"count": len(items), "pending_count": registry.pending_count(), "items": items}
 
 
-def agent_approve(registry: Any, agent_id: str) -> Dict[str, Any]:
-    """批准并签发**一次性凭据**（明文只在这个返回值里出现一次，库里只落 sha256）。"""
+def agent_approve(registry: Any, agent_id: str, reissue: bool = False) -> Dict[str, Any]:
+    """批准并签发**一次性凭据**（明文只在这个返回值里出现一次，库里只落 sha256）。
+
+    🔴 **已批准的行再 approve ⇒ 拒**（除非显式 `reissue=True`）：治理工具对
+    已批准代理「再批准一次」是误伤线上代理的第三条路（另两条：审核页双击 /
+    UI 状态未刷新重复点）—— 静默换发会把旧凭据当场顶掉，代理瞬间连不上。
+    判定走 `Registry.approve` 那个**后端原语**（与控制台同一份），这里只负责
+    把它翻译成 MCP 口径：拒 + 一行 `ok=false` 的审计（`reason=already_approved`）。
+    要换发：显式传 `reissue=true`（旧的那条随即失效）。
+    """
     action = "agents.approve"
     aid = (agent_id or "").strip()
     row = _govern_row(registry, aid, action)
     audit.precheck()                       # 审计落不下账 ⇒ 这次治理变更不许做
     backup = _backup("approve", row)
-    credential = registry.approve(aid)
+    try:
+        credential = registry.approve(aid, reissue=bool(reissue))
+    except AlreadyApprovedError:
+        _audit(action, aid, ok=False, reason="already_approved")
+        raise ToolError(f"{ALREADY_APPROVED_NOTE}（agent_approve 请传 reissue=true）")
     if not credential:      # 竞态：行在读与写之间消失 ⇒ 报错，不谎报「已批准」
         _audit(action, aid, ok=False, reason="agent_race")
         raise ToolError("代理在批准过程中消失，请重试")
@@ -819,11 +833,13 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
         @server.tool(
             name="agent_approve",
-            description="批准一个 pending 代理并签发一次性 ksk_ 凭据（明文只此一次返回）。仅主代理可用。",
+            description="批准一个 pending 代理并签发一次性 ksk_ 凭据（明文只此一次返回）。"
+                        "已批准的代理再批会拒（不换发）；要换发请显式 reissue=true（旧凭据随即失效）。"
+                        "仅主代理可用。",
         )
-        def _agent_approve(agent_id: str) -> Dict[str, Any]:
+        def _agent_approve(agent_id: str, reissue: bool = False) -> Dict[str, Any]:
             _govern_identity(gate, registry, "agent_approve")
-            return agent_approve(registry, agent_id)
+            return agent_approve(registry, agent_id, reissue=reissue)
 
         @server.tool(
             name="agent_revoke",

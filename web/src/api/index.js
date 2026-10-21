@@ -156,9 +156,15 @@ export const api = {
   // role 要**手输完整 agent_id**（改的是全库唯一 primary 这件事，不是单个开关）。
   // 🔴 approve 的响应里带**一次性凭据明文**：只许由页面当场展示转交，
   // 不许落任何持久面（不进 URL、不进浏览器存储）。
+  // 🔴 `approveAgent` = 批准（pending / revoked 行）：**不带 reissue** ⇒ 后端对
+  // 已批准的代理一律 409（不换发、不动凭据）—— 重复批准不再静默把线上代理的旧
+  // 凭据顶掉。`reissueAgent` = **换发**（同一条端点 + 显式 reissue=true）：
+  // 只给「重新生成凭据」那条路用，旧的那条随即失效。
   listAgents: (params) => http.get('/api/v1/agents', { params }).then((r) => r.data),
   approveAgent: (agentId) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/approve`, { confirm: true }).then((r) => r.data),
+  reissueAgent: (agentId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/approve`, { confirm: true, reissue: true }).then((r) => r.data),
   revokeAgent: (agentId, confirm) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/revoke`, { confirm }).then((r) => r.data),
   setAgentRole: (agentId, role, confirm) =>

@@ -712,6 +712,32 @@ def _sql_value(field: str, value: Any) -> Any:
 
 
 # --------------------------------------------------------------------------
+# approve 的单点判定：已批准的行再 approve ⇒ 拒（要换发必须显式 reissue）
+# --------------------------------------------------------------------------
+
+#: 已批准行再 approve（且**没显式 reissue**）时的统一回显（API 与 MCP 共用这一句）。
+ALREADY_APPROVED_NOTE = (
+    "该代理已批准——要换发凭据请走「重新生成凭据」（需显式 reissue）"
+)
+
+
+class AlreadyApprovedError(Exception):
+    """已 `approved` 的行再 approve、且**没显式 reissue** ⇒ 拒（一个字节都不改）。
+
+    🔴 这是 approve 原语的**默认安全档**：重复批准（审核页双击 / MCP 治理工具对
+    已批准代理再批准 / UI 状态未刷新重复点）不再静默签发新凭据把旧的顶掉 ——
+    凭据一旦顶掉，线上代理瞬间全断，而操作者毫无感知。
+
+    要换发（补发凭据、泄露止血）必须显式 `reissue=True` —— 与界面「重新生成凭据」
+    钮同一条路径（那条路还额外过一道手输确认闸）。
+    """
+
+    def __init__(self, agent_id: str) -> None:
+        super().__init__(ALREADY_APPROVED_NOTE)
+        self.agent_id = agent_id
+
+
+# --------------------------------------------------------------------------
 # 注册表本体
 # --------------------------------------------------------------------------
 
@@ -797,15 +823,25 @@ class Registry:
         return self.get(aid) or {}
 
     # ---- 批准 / 吊销 / 角色 / 上下文开关 -------------------------------
-    def approve(self, agent_id: str) -> Optional[str]:
+    def approve(self, agent_id: str, reissue: bool = False) -> Optional[str]:
         """批准并**生成一条一次性凭据**，返回明文；代理不存在返回 None。
 
         明文**只在这里出现一次**（返回值 = 控制台的响应体），库里只落 sha256。
-        重新 approve 会换一条新凭据（旧的随即失效）—— 补发凭据走的就是这条。
+
+        🔴 **默认安全档**（`reissue=False`）：行已是 `approved` ⇒ 抛
+        `AlreadyApprovedError`，**凭据哈希 / 状态一个都不动**。重复批准是最容易
+        误伤线上代理的操作（审核页双击、治理工具对已批准代理再批准、UI 状态未
+        刷新重复点）—— 静默换发会让旧凭据当场作废，而操作者毫无感知。
+        要换发（补发凭据 / 泄露止血）必须显式 `reissue=True`：与界面「重新生成
+        凭据」钮同一条路径（那边还额外过一道手输确认闸），旧凭据随即失效。
+        `pending` / `revoked` 的行照旧直接批准签发（重新批准 = 换一条新凭据）。
         """
         aid = (agent_id or "").strip()
-        if not self._be.load(aid):
+        row = self._be.load(aid)
+        if not row:
             return None
+        if not reissue and row.get("status") == STATUS_APPROVED:
+            raise AlreadyApprovedError(aid)
         credential = new_credential()
         self._be.update(aid, {
             "status": STATUS_APPROVED,

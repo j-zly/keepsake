@@ -360,10 +360,15 @@ class AgentActionBody(BaseModel):
     `confirm` 的口径按端点不同：approve 与 exclude 要 `true`，revoke 要手输
     agent_id 前 8 位 —— 同一个字段承载三道闸，具体判据在各自端点里。
     `exclude` 只对 exclude 端点有意义（其余端点忽略它）。
+
+    🔴 `reissue` 也只对 approve 端点有意义：**已 approved 的行再 approve 默认
+    409**（不换发、不动凭据），只有显式 `reissue: true` 才换发那条新凭据
+    （旧的随即失效）。默认关 = 重复批准不会静默把线上代理的旧凭据顶掉。
     """
 
     confirm: Any = False
     exclude: bool = False
+    reissue: bool = False
 
 
 class AgentRoleBody(BaseModel):

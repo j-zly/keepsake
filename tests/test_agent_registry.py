@@ -34,6 +34,7 @@ from keepsake.govern.registry import (
     STATUS_APPROVED,
     STATUS_PENDING,
     STATUS_REVOKED,
+    AlreadyApprovedError,
     Registry,
     hash_credential,
 )
@@ -133,11 +134,44 @@ def test_吊销后凭据立即作废(lite):
 
 
 def test_补发凭据换一条旧的即失效(lite):
+    """换发（补发凭据）必须**显式** `reissue=True` —— 默认档是「已批准 ⇒ 拒」。"""
     reg = lite
     reg.register("worker-1")
     first = reg.approve("worker-1")
-    second = reg.approve("worker-1")
+    second = reg.approve("worker-1", reissue=True)
     assert first != second
+    assert reg.verify("worker-1", first)["ok"] is False
+    assert reg.verify("worker-1", second)["ok"] is True
+
+
+def test_已批准再approve默认拒_凭据与状态都不动(lite):
+    """🔴 approve 原语的**默认安全档**：重复批准不再静默换发。
+
+    已 approved 的行再 approve（不带 reissue）⇒ 抛 `AlreadyApprovedError`，
+    凭据哈希 / 状态 / 角色一个都不动 —— 静默换发会让线上代理瞬间全断，
+    而操作者毫无感知（重复批准的三个误伤路径：双击、治理工具再批一次、UI 状态未刷新）。
+    """
+    reg = lite
+    reg.register("worker-1")
+    first = reg.approve("worker-1")
+    before = reg._be.load("worker-1")            # noqa: SLF001 —— 直读后端对照哈希
+    with pytest.raises(AlreadyApprovedError):
+        reg.approve("worker-1")
+    after = reg._be.load("worker-1")             # noqa: SLF001
+    assert after["credential_hash"] == before["credential_hash"]
+    assert after["status"] == STATUS_APPROVED
+    assert reg.verify("worker-1", first)["ok"] is True
+    assert reg.verify_any(first)["agent_id"] == "worker-1"
+
+
+def test_revoked行approve不归reissue闸管(lite):
+    """回归：revoked 行重新批准照旧直接签发（它不是「已批准」）。"""
+    reg = lite
+    reg.register("worker-1")
+    first = reg.approve("worker-1")
+    reg.revoke("worker-1")
+    second = reg.approve("worker-1")            # 不带 reissue 也放行
+    assert second != first
     assert reg.verify("worker-1", first)["ok"] is False
     assert reg.verify("worker-1", second)["ok"] is True
 
@@ -590,7 +624,9 @@ def test_pg_库里没有明文凭据(pg_registry):
     """🔴 凭据纪律：真库里也只有 sha256。"""
     reg = pg_registry
     reg.register("pg-registry-worker")
-    credential = reg.approve("pg-registry-worker")
+    # 🔴 上一条用例已批准过这一行（模块级夹具，PG 里同一批 id 复用）⇒
+    #    换发要**显式** reissue=True（默认档是「已批准 ⇒ 拒」，不是这里要测的东西）。
+    credential = reg.approve("pg-registry-worker", reissue=True)
     row = reg._be.load("pg-registry-worker")     # noqa: SLF001 —— 直读后端验纪律
     assert row["credential_hash"] == hash_credential(credential)
     assert credential not in json.dumps(row, ensure_ascii=False)

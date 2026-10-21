@@ -147,15 +147,90 @@ def test_approve返回一次性凭据(env):
 
 
 def test_approve两次换凭据旧的即失效(env):
+    """🔴 换发必须**显式** `reissue: true`（默认档是「已批准 ⇒ 409，不换发」）。"""
     client, reg = env
     _seed(reg, "worker-1")
     first = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
                         json={"confirm": True}).json()["credential"]
     second = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
-                         json={"confirm": True}).json()["credential"]
+                         json={"confirm": True, "reissue": True}).json()["credential"]
     assert first != second
     assert reg.verify("worker-1", first)["ok"] is False
     assert reg.verify("worker-1", second)["ok"] is True
+
+
+# ---------------------------------------------------------------- 重复批准（静默换发）
+
+def test_已批准再approve不带reissue_409且凭据哈希不变(env):
+    """🔴 **重复批准不许静默换发**（审核页双击 / 治理工具再批一次 / UI 状态未刷新）。
+
+    已 approved 的行再 approve ⇒ 409 `already_approved`，**凭据哈希一个字节都不动**
+    —— 静默换发会让线上代理瞬间全断，而操作者毫无感知。
+    """
+    client, reg = env
+    _seed(reg, "worker-1")
+    first = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                        json={"confirm": True}).json()["credential"]
+    before = reg._be.load("worker-1")["credential_hash"]        # noqa: SLF001 —— 直读后端对照哈希
+    r = client.post("/api/v1/agents/worker-1/approve", headers=AUTH, json={"confirm": True})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "already_approved"
+    assert "重新生成凭据" in detail["message"] and "reissue" in detail["message"]
+    # 一个字节都没动：旧凭据照旧能用，状态照旧是已批准
+    assert reg._be.load("worker-1")["credential_hash"] == before   # noqa: SLF001
+    assert reg.verify("worker-1", first)["ok"] is True
+    assert reg.verify_any(first)["ok"] is True
+    assert reg.get("worker-1")["status"] == "approved"
+
+
+def test_已批准带reissue_换发成功旧凭据立即失效(env):
+    """显式 `reissue: true` ⇒ 换发：旧的当场作废（连反查都认不出），新的可用。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    first = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                        json={"confirm": True}).json()["credential"]
+    r = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                    json={"confirm": True, "reissue": True})
+    assert r.status_code == 200
+    second = r.json()["credential"]
+    assert second != first
+    assert reg.verify("worker-1", first)["ok"] is False      # 旧的那条立即作废
+    assert reg.verify_any(first)["ok"] is False              # 反查也认不出它了
+    assert reg.verify("worker-1", second)["ok"] is True
+    assert reg.verify_any(second)["agent_id"] == "worker-1"
+
+
+def test_pending与revoked行approve回归不变(env):
+    """回归：pending 直接批准签发；revoked 重新批准 = 换一条新凭据（都不是「已批准」）。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    first = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                        json={"confirm": True})
+    assert first.status_code == 200 and first.json()["status"] == "approved"
+    first_cred = first.json()["credential"]
+    # revoked 行：重新批准照旧直接签发（不带 reissue 也放行 —— 它不是「已批准」）
+    reg.revoke("worker-1")
+    again = client.post("/api/v1/agents/worker-1/approve", headers=AUTH,
+                        json={"confirm": True})
+    assert again.status_code == 200
+    assert again.json()["credential"] != first_cred
+    assert reg.verify("worker-1", first_cred)["ok"] is False
+    assert reg.verify("worker-1", again.json()["credential"])["ok"] is True
+    assert reg.get("worker-1")["status"] == "approved"
+
+
+def test_重复批准被拒_审计留痕(env, tmp_path):
+    """🔴 被拒的写也要留痕：action=agents.approve / ok=false / reason=already_approved。"""
+    client, reg = env
+    _seed(reg, "worker-1")
+    client.post("/api/v1/agents/worker-1/approve", headers=AUTH, json={"confirm": True})
+    r = client.post("/api/v1/agents/worker-1/approve", headers=AUTH, json={"confirm": True})
+    assert r.status_code == 409
+    lines = _audit_lines(tmp_path)
+    rejected = [l for l in lines if l["action"] == "agents.approve" and not l["ok"]]
+    assert rejected, "被拒的批准必须留一行痕"
+    assert rejected[-1]["reason"] == "already_approved"
 
 
 def test_approve不带confirm_400且不改状态(env):
@@ -353,7 +428,7 @@ def test_登记并立即批准_一次性凭据且二次调用换发(env):
                         json={"agent_id": "worker-2", "confirm": True, "approve_now": True})
     assert again.status_code == 409 and again.json()["detail"]["error"] == "agent_exists"
     reissued = client.post("/api/v1/agents/worker-2/approve", headers=AUTH,
-                            json={"confirm": True}).json()["credential"]
+                            json={"confirm": True, "reissue": True}).json()["credential"]
     assert reissued != body["credential"]
     assert reg.verify("worker-2", body["credential"])["ok"] is False
     assert reg.verify("worker-2", reissued)["ok"] is True

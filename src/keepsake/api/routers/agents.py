@@ -11,6 +11,13 @@
   revoke_credential 要 `confirm=true`，delete 要手输**整个** agent_id（最高一档）；
 * **一次审计**：被拒绝的写也记一行 `ok=false`（`_reject`）。
 
+🔴 **approve 默认是安全档**（2026-10-21 用户拍板修）：**已 approved 的行再 approve
+⇒ 409 `already_approved`，一个字节都不改**（凭据哈希原样留着）。换发（补发凭据、
+泄露止血）必须请求体**显式带** `reissue: true` —— 判定在 `Registry.approve` 那个
+原语里（`mcp_server/tools.py` 的治理工具走同一份，不自拼逻辑）。
+为什么：以前重复 approve（审核页双击 / 治理工具再批一次 / UI 状态未刷新重复点）
+会**静默换发**一条新凭据把旧的顶掉 —— 线上代理瞬间全断，操作者却毫无感知。
+
 🔴 **凭据纪律**：明文只在 `approve` 的响应体里出现**一次**，之后库里只有 sha256。
 审计 / 备份 / 错误消息里都不许出现明文 —— 本文件没有一处把它写进 `audit.record`
 的 `reason`（那里只写「issued」这类与凭据无关的字样）。
@@ -47,6 +54,8 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from keepsake.govern.registry import (
+    ALREADY_APPROVED_NOTE,
+    AlreadyApprovedError,
     ROLE_PRIMARY,
     ROLES,
     STATUS_APPROVED,
@@ -73,7 +82,7 @@ REVOKE_HINT_LEN = 8
 #: 批准响应里回显的一次性提示（前端据此弹「只此一次，请立即保存」）
 CREDENTIAL_ONCE_NOTE = (
     "凭据只此一次返回，库里只存 sha256 —— 关掉弹框就再也拿不到了；"
-    "丢失请重新调用 approve 换一条（旧凭据随即失效）。"
+    "丢失请走「重新生成凭据」换一条（显式 reissue，旧凭据随即失效）。"
 )
 
 #: 置 primary 时的回显说明：必须让操作者看见「旧主将降为 sub」这个后果。
@@ -330,15 +339,27 @@ def approve_agent(agent_id: str, body: AgentActionBody,
                   storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """批准并签发**一次性凭据**（`ksk_` + 32 hex）。
 
-    明文只在这个响应里出现一次；重新调用会换一条新凭据（旧的那条随即失效）。
-    🔴 审计只记「issued」，**绝不记明文**。
+    明文只在这个响应里出现一次。
+
+    🔴 **已批准的行再 approve ⇒ 409**（`already_approved`），**一个字节都不改**：
+    重复批准（审核页双击 / 治理工具对已批准代理再批准 / UI 状态未刷新重复点）
+    以前会静默换发一条新凭据把旧的顶掉 —— 线上代理瞬间全断，操作者却毫无感知。
+    要换发必须请求体**显式带** `reissue: true`（与界面「重新生成凭据」钮同一条
+    路径：那边还额外过一道手输确认闸），旧的那条随即失效。
+    `pending` / `revoked` 的行照旧直接批准签发。
+    🔴 审计只记「issued」，**绝不记明文**；被拒的那次照样留一行 `ok=false`。
     """
     action = "agents.approve"
     registry = _registry(storage)
     _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才批准')
     row = _need_agent(registry, agent_id, action)
     backup = _backup("approve", row)
-    credential = registry.approve(agent_id)
+    try:
+        credential = registry.approve(agent_id, reissue=bool(body.reissue))
+    except AlreadyApprovedError:
+        # 🔴 判定在 `Registry.approve` 那个原语里（API 与 MCP 共用同一份），
+        #    这里只负责把它翻译成 HTTP 口径：409 + 人话 + 一行 ok=false 的审计。
+        _reject(409, "already_approved", ALREADY_APPROVED_NOTE, action, agent_id)
     if not credential:      # 竞态：行在读与写之间消失 ⇒ 409，不谎报「已批准」
         _reject(409, "agent_race", "代理在批准过程中消失，请重试", action, agent_id)
     audit.record(action, agent_id, ok=True, reason="credential issued (one-time)")
@@ -611,7 +632,12 @@ def register_agent(body: AgentRegisterBody,
                 "name": name, "backup": backup}
     # 紧接着批准：与 approve 端点同一条路径（`Registry.approve` 内部换凭据 +
     # 只落 sha256），明文只在这里出现一次。
-    credential = registry.approve(agent_id)
+    # 刚登记出来的行必是 `pending` ⇒ 不受「已批准要显式 reissue」那道闸管
+    # （真撞上并发批准 ⇒ 抛 AlreadyApprovedError ⇒ 409，不谎报「已批准」）。
+    try:
+        credential = registry.approve(agent_id)
+    except AlreadyApprovedError:
+        _reject(409, "already_approved", ALREADY_APPROVED_NOTE, action, agent_id)
     if not credential:      # 竞态：行在登记与批准之间消失 ⇒ 409，不谎报「已批准」
         _reject(409, "agent_race", "代理在批准过程中消失，请重试", action, agent_id)
     audit.record("agents.approve", agent_id, ok=True, reason="credential issued (one-time)")
