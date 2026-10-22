@@ -102,7 +102,9 @@ export const api = {
   kbTags: () => http.get('/api/v1/kb/tags').then((r) => r.data),
   kbDocumentChunks: (docId, params) =>
     http.get(`/api/v1/kb/documents/${encodeURIComponent(docId)}/chunks`, { params }).then((r) => r.data),
-  stats: () => http.get('/api/v1/stats').then((r) => r.data),
+  // 总览：?days=N 追加一段 daily（近 N 天每日新增）—— 看板折线图用它。
+  // 🔴 缺省不传 days ⇒ 后端**不查**那一段（老调用方的开销一字不变）。
+  stats: (params) => http.get('/api/v1/stats', { params }).then((r) => r.data),
   crons: (params) => http.get('/api/v1/crons', { params }).then((r) => r.data),
 
   // ---- 写操作（后端会写前自动备份 + 审计，这里只是把 confirm 显式带上）----
@@ -218,6 +220,27 @@ export const api = {
     http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/delete`, { confirm }).then((r) => r.data),
   // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
   kbImportDocuments: (payload) => http.post('/api/v1/kb/import', payload).then((r) => r.data),
+
+  // ---- 待办（2026-10 ks_todo 一等公民）--------------------------------
+  // 列表：服务端分页 + 按 owner / status 筛（scope 快捷档 open/done/all）。
+  // 🔴 计数**全部由后端给**（前端不自己数 —— 数字写死就等于库一变数字就错）。
+  listTodos: (params) => http.get('/api/v1/todos', { params }).then((r) => r.data),
+  // 看板那枚「待办」小节：{open, done, obsolete, total, overdue}
+  todoSummary: () => http.get('/api/v1/todos/summary').then((r) => r.data),
+  // 「建议废弃」提名清单（维护页用）：**只提名，不改状态**。
+  todoObsoleteSuggestions: (params) =>
+    http.get('/api/v1/todos/obsolete-suggestions', { params }).then((r) => r.data),
+  // 新增：confirm 恒为 true（后端要显式二次确认）；owner 必须是已批准的代理。
+  createTodo: (payload) =>
+    http.post('/api/v1/todos', { confirm: true, ...payload }).then((r) => r.data),
+  // 改状态：status = open / done / obsolete（后端带 CHECK 校验，非法值 400）。
+  setTodoStatus: (id, status) =>
+    http.post(`/api/v1/todos/${encodeURIComponent(id)}/status`,
+      { status, confirm: true }).then((r) => r.data),
+  // 真删：confirm 传**待办标题全文**（手输防手滑，后端比对）。
+  deleteTodo: (id, confirm) =>
+    http.request({ method: 'delete', url: `/api/v1/todos/${encodeURIComponent(id)}`,
+      data: { confirm } }).then((r) => r.data),
 
   // ---- 知识库审核队列（批2）：子代理提交的知识文档先审后用 ----
   // 待审面板（pending + rejected 一起给，pending_count 是全量 pending 数）：

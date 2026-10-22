@@ -626,6 +626,30 @@ python3 scripts/kb_ingest.py           # 实跑
 
 四个工具走**既有 ingest 管线**（切块 / 幂等 / 审核 status 链一个字没改）：子代理提交落控制台待审队列（`pending`，批准时才切块），主代理的直进 `effective`。控制台知识库页给每篇文档加「来源代理」chip，并可按代理筛（`?agents=a,b`，服务端过滤、切页之前）。`agent_id` 是新增列，老库迁移 SQL：`ALTER TABLE documents ADD COLUMN IF NOT EXISTS agent_id text NULL;`（未迁移前全库按无主读 —— 可见性与迁移前逐字相同，而 `kb_store` 会带迁移提示拒写）。
 
+## 待办（todo）—— 一等公民（2026-10）
+
+待办此前一直用 `kind:pending` 记忆条目凑合：盘点 12 条里 9 条烂账（做完没销、过期没人知）。待办要有**状态机**与专页，于是有了 `ks_todo` 表。
+
+| 口径 | 行为 |
+|------|------|
+| **状态三态** | `open`（开放）/ `done`（已完成）/ `obsolete`（已废弃）——「干完了」与「这条作废了」是两件事，DDL 里有 CHECK 兜底。 |
+| **归属两列** | `owner`（谁该干）+ `creator`（谁记的）。可见性 = **owner = 自己 ∪ creator = 自己**（协作台账：被指派者必见自己的活），primary 全量。 |
+| **到期口径单点** | `due_state`（`none` / `soon` / `overdue`）由后端算（基准日 = UTC 今天）：3 天内到期 = 橙、过了今天 = 红。**前端只翻译它，不自己算日期**。 |
+| **三后端一份语义** | PG / SQLite 是行表（DDL 由 `govern/todo.py` 唯一定义两套方言），Redis 是 `keepsake:todo:<id>` hash + 全量 id LIST。 |
+
+代理侧三个工具（工具面 15 → 18，全部走凭据闸）：`todo_add(title, detail?, owner?, due?)`（owner 缺省 = 调用方；可指他人，但那个代理**必须在册且已批准**）、`todo_list(scope?)`（`open` 默认 / `done` / `all`）、`todo_done(id, status?)`（`done` / `obsolete` / `open`；只有 owner / creator / primary 能改）。
+
+控制台「待办」页（侧栏在「审核」之前）：状态分组卡片、owner chip、到期橙/红、SelectionBar 批量标完成、新增表单（owner 下拉 = 注册表代理）、真删要**手输标题**。看板多一节待办小节（开放 N / 逾期 M，点进去就是待办页）；维护页列「建议废弃」提名（**只提名，不改状态** —— 到期过 7 天还开着的待办由人决定要不要作废）。
+
+老条目迁移（脚本默认 **dry-run**，`--write` 才真写）：
+
+```bash
+python3 scripts/migrate_pending_to_todo.py            # dry-run
+python3 scripts/migrate_pending_to_todo.py --write    # 真迁
+```
+
+映射：标题 = 正文前 60 字、正文 = **原文**（一条不丢）、归属 = 条目上的 `agent:<id>`（在册且已批准时）否则主代理、状态一律 `open`；原条目打 `migrated-to-todo` 标**不删**（删了就查不回来「当初为什么记这条」）。幂等判据 = 那个标签，重复跑第二遍 `migrated=0`。
+
 ## 通用记忆接口与 MCP
 
 `keepsake.adapters.generic.protocol.MemoryProvider` 是一个 `runtime_checkable` 的 `typing.Protocol`，描述「一个记忆系统对宿主暴露什么」。该模块不 import 任何宿主的东西 —— 描述的是形状，与调用方是谁无关；依赖方向严格是 `adapters.hermes → adapters.generic`。

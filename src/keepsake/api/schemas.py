@@ -268,11 +268,25 @@ class SectionError(BaseModel):
     error: str
 
 
+class DailyCount(BaseModel):
+    """一天的条目增量（`GET /api/v1/stats?days=7` 的一段）。
+
+    `date` 是 `YYYY-MM-DD`（UTC）；**没有新增的那天也占一格（count=0）** ——
+    折线图上「那天没写入」是一条真实的 0，不该从横轴上消失。
+    """
+
+    date: str = Field(..., description="YYYY-MM-DD（UTC）")
+    count: int = Field(..., description="这一天新增的记忆条目数")
+
+
 class Overview(BaseModel):
     core: CoreStats
     retrieval: Dict[str, Any] = Field(
         ..., description="{count, truncated}：存储层无 count 原语，按 keyset 扫描有上限地统计")
     kb: Dict[str, Any] = Field(..., description="同 KbSummary；不可用时为 {available:false,error:...}")
+    daily: List[DailyCount] = Field(
+        default_factory=list,
+        description="近 N 天每日新增（?days=N 时给；缺省 = 空列表 = 不查这一段）")
 
 
 # --------------------------------------------------------------------------

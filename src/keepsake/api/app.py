@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from keepsake.kb.service import KbError
 
 from . import config
-from .routers import agents, auth, core, crons, fragments, hits, kb, messages, ops, stats
+from .routers import (agents, auth, core, crons, fragments, hits, kb, messages, ops, stats, todos)
 
 logger = logging.getLogger("keepsake.api")
 
@@ -70,6 +70,9 @@ def create_app() -> FastAPI:
     # 消息中心（代理互聊信箱的治理面）：读面一条 GET + 私信开关一条写端点，
     # 写端点与 agents 同款纪律（require_session + write_guard + 备份 + 审计）。
     app.include_router(messages.router)
+    # 待办（2026-10 ks_todo 一等公民）：读面三条 GET + 写面三条
+    # （新增 / 改状态 / 真删），写端点与 agents 同款纪律。
+    app.include_router(todos.router)
 
     # ---- 全局异常：任一数据源异常 ⇒ 500 + 结构化 detail，绝不吞成空结果 ----
     @app.exception_handler(Exception)

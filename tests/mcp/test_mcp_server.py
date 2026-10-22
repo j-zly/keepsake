@@ -30,12 +30,15 @@ from keepsake.mcp_server.tools import ToolError
 #: 2026-10 ks_kb_agents：**新增 4 个知识库工具**（`kb_store` / `kb_search` /
 #: `kb_get` / `kb_remove`）—— 知识库对代理开放，归属 / 可见性 / 删除与记忆
 #: 同一把尺子（`govern.visibility`）。
+#: 2026-10 ks_todo：**新增 3 个待办工具**（`todo_add` / `todo_list` / `todo_done`）
+#: —— 待办是一等公民（工具面 15 → 18）。
 #: 记忆工具那 8 个的契约**逐字不动**（仍逐个在集合里，见下面的 `<=` 断言）。
 EXPECTED_TOOLS = {
     "memory_capabilities", "memory_search", "memory_get", "memory_core_list",
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
     "message_send", "message_inbox", "message_recent",
     "kb_store", "kb_search", "kb_get", "kb_remove",
+    "todo_add", "todo_list", "todo_done",
 }
 
 

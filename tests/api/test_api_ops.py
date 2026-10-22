@@ -43,6 +43,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: ks_share_memory 起再加 1 条记忆共享开关端点（share_memory —— 只改读可见性，
 #: 不是治理动作），ks_agent_budget 起再加 1 条 per-agent 注入预算端点
 #: （core_budget_chars —— 只改一个阈值，不是治理动作）。
+#: ks_todo 起再加 3 条待办端点（新增 / 改状态 / 真删）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -96,6 +97,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/push",
     # 消息中心手动 / 批量触发提醒一条（ks_dm_sse）：推一帧事件，不改数据
     "/api/v1/messages/nudge",
+    # 待办三条（ks_todo 一等公民）：新增 / 改状态 / 真删
+    "/api/v1/todos",
+    "/api/v1/todos/{todo_id}/status",
+    "/api/v1/todos/{todo_id}",
 } | AUTH_POST_PATHS
 
 
@@ -507,8 +512,8 @@ def test_写面白名单全量断点_37条业务加4条认证():
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 41
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 37
+    assert len(ALLOWED_POST_PATHS) == 44
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 40
 
 
 def test_P1只读路由未被写面影响(client):

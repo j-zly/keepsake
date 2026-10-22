@@ -99,6 +99,18 @@ MESSAGING_HINT = (
     "只有在「需要对方即时响应」时才投信箱；只是要自己以后能检索到的内容，写 memory_add。"
 )
 
+#: 待办工具面的用法说明（**什么时候用待办，而不是 memory_add**）。
+#:
+#: 🔴 待办与记忆是**两件事**：记忆是「能检索回来的事实」，待办是「谁欠谁一件事」。
+#:   写进 `kind:pending` 条目的老做法没有状态机（做完没销、过期没人知）——
+#:   有截止日、有归属、要销账的事，一律走 todo_*。
+TODO_HINT = (
+    "待办：todo_add 记一条（owner 缺省是你自己，可以指给别人但那个代理必须已批准，"
+    "due 填 ISO 日期），todo_list 看待办（scope=open/done/all；你只看得到与自己有关的），"
+    "todo_done 销账（status=done 完成 / obsolete 作废 / open 重新打开）。"
+    "有归属、有截止日、要销账的事写待办；只是要以后能检索到的内容，写 memory_add。"
+)
+
 #: 治理面只在 `build_server(govern=True)` 时存在 —— 那时才把它写进 instructions，
 #: 免得模型按一段并不存在的工具说明去调（govern=False 时那段话是假的）。
 GOVERN_HINT = (
@@ -119,12 +131,14 @@ GOVERN_HINT = (
 #: `agent_*` 治理写口自然算写 —— 批准/吊销/改角色/改上下文开关都动注册表。
 #: `message_*` 三个信箱工具**也算写**：收信即消费（标已读）是状态变更，不是纯读。
 #: 🆕 `kb_store` / `kb_remove` 也算写（知识库文档的增删）。
+#: 🆕 `todo_add` / `todo_done` 也算写（待办的增 / 状态变更；`todo_list` 是纯读）。
 GATE_WRITE_TOOLS = frozenset({
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
     "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
     "agent_set_share",
     "message_send", "message_inbox", "message_recent",
     "kb_store", "kb_remove",
+    "todo_add", "todo_done",
 })
 
 #: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
@@ -522,7 +536,7 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
         provider = default_provider()
     server = FastMCP(name=SERVER_NAME,
                      instructions=INSTRUCTIONS + MESSAGING_HINT + KB_HINT
-                     + (GOVERN_HINT if govern else ""))
+                     + TODO_HINT + (GOVERN_HINT if govern else ""))
     gate = AgentGate.for_provider(provider, server)
     register_tools(server, provider, gate=gate, govern=govern)
     register_resources(server, provider, gate=gate)

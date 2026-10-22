@@ -13,22 +13,51 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from ..deps import get_storage, require_session
 from ..config import RETRIEVAL_SCAN_CAP, core_char_budget
-from ..schemas import CoreAgentUsage, Overview
+from ..schemas import CoreAgentUsage, DailyCount, Overview
 from . import kb as kb_router
 from .core import CORE_TAG, core_stats
 
 router = APIRouter(tags=["stats"])
 
 
+#: `?days=` 的上限（再长就不是「近几天」而是「全量历史」了 —— 那该走导出）。
+DAILY_MAX_DAYS = 90
+
+
+def _daily(storage: Any, days: int) -> List[DailyCount]:
+    """近 N 天的每日新增（**补齐没写入的那天**：折线图上它是 0，不是空白）。
+
+    🔴 补齐只在这一处做（PG 侧那条 `GROUP BY` 只给有数据的天）——
+    横轴的「连续 N 天」是图表口径，存储层不该管。
+    """
+    if days <= 0:
+        return []
+    counts = {str(r.get("date") or ""): int(r.get("count") or 0)
+              for r in (storage.daily_counts(days) or [])}
+    today = datetime.now(timezone.utc).date()
+    out: List[DailyCount] = []
+    for back in range(days - 1, -1, -1):
+        day = (today - timedelta(days=back)).isoformat()
+        out.append(DailyCount(date=day, count=counts.get(day, 0)))
+    return out
+
+
 @router.get("/api/v1/stats", response_model=Overview, dependencies=[Depends(require_session)])
-def overview(storage: Any = Depends(get_storage)) -> Overview:
-    """两域总览。core/retrieval 失败 ⇒ 500；kb 失败 ⇒ 该段显式标 unavailable。"""
+def overview(days: int = Query(0, ge=0, le=DAILY_MAX_DAYS,
+                                description="近 N 天的每日新增（0 = 不查这一段）"),
+             storage: Any = Depends(get_storage)) -> Overview:
+    """两域总览。core/retrieval 失败 ⇒ 500；kb 失败 ⇒ 该段显式标 unavailable。
+
+    `?days=N` 追加一段 `daily`（近 N 天每日新增条目数）—— 看板折线图用它。
+    缺省 `days=0` ⇒ **不查这一段**（老调用方的开销一字不变）。
+    """
     core = core_stats(storage)
     _, keys = storage.scan_fragment_keys("", RETRIEVAL_SCAN_CAP)
     retrieval = {"count": len(keys), "truncated": len(keys) >= RETRIEVAL_SCAN_CAP}
@@ -36,6 +65,7 @@ def overview(storage: Any = Depends(get_storage)) -> Overview:
         core=core,
         retrieval=retrieval,
         kb=kb_router.probe(),
+        daily=_daily(storage, days),
     )
 
 

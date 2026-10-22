@@ -71,8 +71,13 @@ test('看板代理卡：读写标「累计」，不伪造「今日」', () => {
 test('看板常驻层：按代理分列（各自生效预算 = core_budget_chars ?? 全局）', () => {
   assert.match(STATS, /按代理分列/, '看板要有按代理分列这一节')
   assert.match(STATS, /agentUsageRows\(perAgent\.value, agentNames\.value\)/)
-  assert.match(STATS, /row\.budget/, '每张分列卡要显示它自己生效的预算')
-  assert.match(STATS, /row\.chars/, '每张分列卡要显示字符数')
+  // 🔴 2026-10 看板图表化：分列从「一堆文字卡」改成**横向条形图**（代理一多
+  // 文字卡堆不动）。每根柱子要显示它自己生效的预算 —— tooltip 里给全。
+  assert.match(STATS, /<AgentUsageBars[\s\S]{0,240}:rows="coreAgentCards"/,
+    '分列要用 AgentUsageBars 画')
+  const KIT = read('utils/chart-kit.js')
+  assert.match(KIT, /row\.budget/, '每根柱子要显示它自己生效的预算')
+  assert.match(KIT, /row\.chars/, '每根柱子要显示字符数')
 })
 
 // ---------------------------------------------------------------- ② 常驻层两态

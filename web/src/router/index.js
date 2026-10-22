@@ -14,6 +14,7 @@ import ReviewView from '../views/ReviewView.vue'
 import SetupView from '../views/SetupView.vue'
 import StatsView from '../views/StatsView.vue'
 import TokenView from '../views/TokenView.vue'
+import TodosView from '../views/TodosView.vue'
 
 const routes = [
   // setup / login 是 P3 的正常入口；token 页保留给「用静态 token 的老脚本/临时排查」
@@ -36,6 +37,9 @@ const routes = [
   // 代理审核独立成页（原来挤在 AgentsView 里）：待审队列要逐条判，
   // 与已批准代理的日常维护（登记/改名/设角色）分开摆
   { path: '/agents-review', name: 'agents-review', component: AgentsReviewView, meta: { title: '代理审核' } },
+  // 待办（2026-10 ks_todo 一等公民）：独立成页 —— 待办有状态机与到期日，
+  // 挤在别页里既看不清也翻不动；侧栏位置在「审核」之前（业务页在前、审核收尾）。
+  { path: '/todos', name: 'todos', component: TodosView, meta: { title: '待办' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]
 

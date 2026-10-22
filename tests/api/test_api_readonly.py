@@ -90,6 +90,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/push",
     # 消息中心手动 / 批量触发提醒一条（ks_dm_sse）：推一帧事件，不改数据
     "/api/v1/messages/nudge",
+    # 待办三条（ks_todo 一等公民）：新增 / 改状态 / 真删
+    "/api/v1/todos",
+    "/api/v1/todos/{todo_id}/status",
+    "/api/v1/todos/{todo_id}",
 } | AUTH_POST_PATHS
 
 

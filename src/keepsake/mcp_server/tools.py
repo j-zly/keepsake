@@ -65,6 +65,19 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from ..api import audit
 from ..govern.messaging import CONTENT_MAX as MESSAGE_CONTENT_MAX, Messaging
+# 待办（2026-10 ks_todo）：存储层 + 口径单点（到期判定、可见性都在那边）。
+from ..govern.todo import (
+    DEFAULT_LIMIT as TODO_DEFAULT_LIMIT,
+    SCOPE_ALL,
+    SCOPE_DONE,
+    SCOPE_OPEN,
+    SCOPES,
+    STATUS_DONE,
+    STATUS_OBSOLETE,
+    STATUS_OPEN,
+    TodoError,
+    TodoStore,
+)
 from ..govern.registry import (
     ALREADY_APPROVED_NOTE,
     AlreadyApprovedError,
@@ -88,7 +101,8 @@ logger = logging.getLogger("keepsake.mcp_server.tools")
 
 __all__ = ["ToolError", "StorageIntrospection", "register_tools",
            "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS",
-           "GOVERN_TOOLS", "GOVERN_DENIED", "MESSAGE_TOOLS", "KB_TOOLS"]
+           "GOVERN_TOOLS", "GOVERN_DENIED", "MESSAGE_TOOLS", "KB_TOOLS",
+           "TODO_TOOLS"]
 
 #: `memory_search` 结果里单条正文的截断长度（全文走 `memory_get` / resource）
 SEARCH_PREVIEW_CHARS = 300
@@ -197,6 +211,9 @@ def _caller_kwargs(fn: Any, caller_agent_id: str, caller_role: str) -> Dict[str,
 #: provider 侧自带的信箱句柄属性名（宿主 provider 懒创建的那一份）。
 #: 本模块**不 import 任何宿主**（见模块 docstring），所以只按属性名取。
 _PROVIDER_BOX_ATTR = "_keepsake_messaging"
+
+#: provider 上挂待办存储的属性名（没挂就按注册表的 storage 现造一份）。
+_PROVIDER_TODO_ATTR = "_keepsake_todo"
 
 
 def _unread_dm(box: Any, agent_id: str) -> int:
@@ -793,6 +810,136 @@ def message_recent(box: Any, caller: str, peer: str, limit: int = 20) -> List[Di
 
 
 # --------------------------------------------------------------------------
+# 待办工具面（todo_add / todo_list / todo_done）：所有**已批准**代理可用
+#
+# 🔴 三条纪律（与治理面同一把尺子，见 `govern/todo.py`）：
+#   1) **归属两列**：`owner`（谁该干这件事）+ `creator`（谁记下的这件事）——
+#      非 primary 看得见的是 **owner = 自己 ∪ creator = 自己**（协作台账：
+#      被指派者必见自己的活），primary 全量；
+#   2) **owner 必须在册且已批准**（不存在 / 未批准 / 已吊销 ⇒ 拒投，不静默挂空）；
+#   3) **改状态只有 owner / creator / primary 能改**（待办不是共享记忆）。
+#
+# 🔴 三个工具**都走 `_authorize`**（凭据闸）：未批准 / 凭据无效 ⇒ 全部拒绝。
+# --------------------------------------------------------------------------
+
+#: 待办三工具的名字（`todo_add` / `todo_done` 在 `server.GATE_WRITE_TOOLS` 里登记为写口）。
+TODO_TOOLS = ("todo_add", "todo_list", "todo_done")
+
+
+def _todo_store(provider: Any, registry: Any) -> Any:
+    """取待办存储句柄：provider 上挂了就用，没挂就按注册表的 storage 现造一份。
+
+    与信箱同款（`Messaging(registry.storage)`）—— **不另开连接、不另配 DSN**。
+    """
+    store = getattr(provider, _PROVIDER_TODO_ATTR, None)
+    if store is None and registry is not None:
+        store = TodoStore(registry.storage)
+    return store
+
+
+def _todo_owner_check(registry: Any, owner: str) -> str:
+    """owner 资格闸：不在册 / 未批准 / 已吊销 ⇒ 拒（不静默挂一个空 owner）。"""
+    target = (owner or "").strip()
+    if not target:
+        raise ToolError("owner 不能为空")
+    if registry is None:
+        raise ToolError("待办需要代理注册表（当前 provider 未装配 ks_agent）")
+    row = registry.get(target)
+    if not row or row.get("status") != STATUS_APPROVED:
+        raise ToolError(
+            f"待办归属代理未批准：{target}（不存在 / 未批准 / 已吊销）")
+    return target
+
+
+def todo_add(store: Any, registry: Any, caller: str, title: str,
+             detail: str = "", owner: str = "", due: str = "") -> Dict[str, Any]:
+    """记一条待办，返回 `{ok, id, owner, creator, status}`。
+
+    * `owner` 缺省 = **调用方自己**（凭据反查出来的那个）；
+    * `owner` 可以指他人 ⇒ 但**必须在册且已批准**（否则拒）；
+    * `creator` 一律是**调用方**（工具签名里没有 creator —— 不给自报留口子）。
+    """
+    if store is None:
+        raise ToolError("待办存储未装配（当前 provider 没有 ks_todo）")
+    who = (caller or "").strip()
+    target = (owner or "").strip() or who
+    if not target:
+        raise ToolError("owner 不能为空")
+    _todo_owner_check(registry, target)
+    try:
+        todo_id = store.add(title, detail, target, who, due)
+    except TodoError as e:
+        raise ToolError(e.message) from e
+    return {"ok": True, "id": todo_id, "owner": target, "creator": who,
+            "status": STATUS_OPEN}
+
+
+def todo_list(store: Any, registry: Any, caller: str, caller_role: str,
+              scope: str = SCOPE_OPEN, limit: int = TODO_DEFAULT_LIMIT
+              ) -> List[Dict[str, Any]]:
+    """看待办（默认只看**开放**的）：`scope` = open / done / all。
+
+    🔴 非 primary 只见**与自己有关的**（owner = 自己 ∪ creator = 自己）；
+    primary 全量 —— 判据在 `govern.todo.can_access`，不在这儿重写一遍。
+    """
+    if store is None:
+        raise ToolError("待办存储未装配（当前 provider 没有 ks_todo）")
+    sc = (scope or "").strip() or SCOPE_OPEN
+    if sc not in SCOPES:
+        raise ToolError(f"scope 只能是 {'/'.join(SCOPES)}，收到：{sc}")
+    primary = _is_primary_caller(caller, caller_role)
+    rows, _total = store.list_rows(
+        status="", scope=sc, page=1, size=limit,
+        visible_to="" if primary else str(caller or "").strip())
+    out: List[Dict[str, Any]] = []
+    for row in rows[:max(1, int(limit or TODO_DEFAULT_LIMIT))]:
+        out.append({
+            "id": row.get("id"),
+            "title": row.get("title", ""),
+            "detail": row.get("detail", ""),
+            "owner": row.get("owner", ""),
+            "creator": row.get("creator", ""),
+            "status": row.get("status", STATUS_OPEN),
+            "due": row.get("due", ""),
+            "due_state": row.get("due_state", "none"),
+            "created": row.get("created", ""),
+            "done_at": row.get("done_at", ""),
+        })
+    return out
+
+
+def todo_set_status(store: Any, registry: Any, caller: str, caller_role: str,
+                    todo_id: int, status: str = STATUS_DONE) -> Dict[str, Any]:
+    """改一条待办的状态（`done` / `obsolete` / `open`）。
+
+    🔴 **只有 owner / creator / primary 能改**（`govern.todo.can_access`）——
+    别人的待办既看不见也改不了（看不见 ⇒ 自然改不了）。
+    """
+    if store is None:
+        raise ToolError("待办存储未装配（当前 provider 没有 ks_todo）")
+    from ..govern.todo import can_access
+
+    try:
+        tid = int(todo_id)
+    except (TypeError, ValueError):
+        raise ToolError(f"id 必须是整数，收到：{todo_id}") from None
+    row = store.get(tid)
+    if not row:
+        raise ToolError(f"待办不存在：{tid}")
+    primary = _is_primary_caller(caller, caller_role)
+    if not can_access(row, str(caller or ""), primary):
+        raise ToolError("这条待办与你无关 —— 只有归属人、记录人或主代理能改")
+    st = (status or "").strip() or STATUS_DONE
+    try:
+        changed = store.set_status(tid, st)
+    except TodoError as e:
+        raise ToolError(e.message) from e
+    if not changed:
+        raise ToolError(f"待办状态没改成（{tid} 可能刚被别人改掉），请重试")
+    return {"ok": True, "id": tid, "status": st}
+
+
+# --------------------------------------------------------------------------
 # 知识库工具面（kb_store / kb_search / kb_get / kb_remove）
 #
 # 🔴 **归属 / 可见性 / 删除口径与记忆同一把尺子**（`govern.visibility`）：
@@ -932,8 +1079,8 @@ def kb_remove(id: str, confirm: bool = False, *, caller_agent_id: str = "",
 
 def register_tools(server: Any, provider: Any, gate: Any = None, *,
                    govern: bool = False) -> Any:
-    """把 8 个记忆 tool + 3 个信箱 tool + 4 个知识库 tool（+ `govern=True` 时再挂
-    6 个治理 tool）挂到 `server` 上。
+    """把 8 个记忆 tool + 3 个信箱 tool + 4 个知识库 tool + 3 个待办 tool
+    （+ `govern=True` 时再挂 6 个治理 tool）挂到 `server` 上。
 
     `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
     先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
@@ -959,6 +1106,9 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     box = getattr(provider, _PROVIDER_BOX_ATTR, None)
     if box is None and registry is not None:
         box = Messaging(registry.storage)
+
+    # 待办存储（与信箱同款：provider 上挂了就用，没挂就按注册表的 storage 现造）
+    todos = _todo_store(provider, registry)
 
     def _authorize(tool_name: str) -> Dict[str, Any]:
         """过身份闸门，并**把身份结论带回来**（可见性过滤要用，2026-10 ks_share_memory）。
@@ -1133,6 +1283,43 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     def _message_recent(peer: str, limit: int = 20) -> List[Dict[str, Any]]:
         caller, mbox = _message_ctx(gate, box, "message_recent")
         return message_recent(mbox, caller, peer, limit=limit)
+
+    # ---- 待办：所有**已批准**代理可用（与治理面无关）--------------------
+    # 身份判定走 `gate.check`（与记忆工具同一条身份链）：owner / creator 一律
+    # 由**凭据反查**得来，工具签名里没有这两个字段 —— 不给调用侧自报留口子。
+    @server.tool(
+        name="todo_add",
+        description="记一条待办。owner 缺省 = 你自己（可以指给别人，但那个代理"
+                    "必须在册且已批准）。due 是 ISO 日期（YYYY-MM-DD，可空）。"
+                    "返回 {id, owner, status}。",
+    )
+    def _todo_add(title: str, detail: str = "", owner: str = "",
+                  due: str = "") -> Dict[str, Any]:
+        ident = _authorize("todo_add")
+        return todo_add(todos, registry, str(ident.get("agent_id") or ""),
+                        title, detail, owner, due)
+
+    @server.tool(
+        name="todo_list",
+        description="看待办。scope = open（默认）/ done / all。你只看得到"
+                    "与你有关的（owner 或 creator 是你）；主代理看得到全部。"
+                    "每条带 due_state（none/soon/overdue，到期口径由后端算）。",
+    )
+    def _todo_list(scope: str = SCOPE_OPEN,
+                   limit: int = TODO_DEFAULT_LIMIT) -> List[Dict[str, Any]]:
+        ident = _authorize("todo_list")
+        return todo_list(todos, registry, str(ident.get("agent_id") or ""),
+                         str(ident.get("role") or ""), scope, limit)
+
+    @server.tool(
+        name="todo_done",
+        description="把一条待办标成已完成（status=done）；也可传 status=obsolete "
+                    "标废弃、status=open 重新打开。只有归属人、记录人或主代理能改。",
+    )
+    def _todo_done(id: int, status: str = STATUS_DONE) -> Dict[str, Any]:
+        ident = _authorize("todo_done")
+        return todo_set_status(todos, registry, str(ident.get("agent_id") or ""),
+                               str(ident.get("role") or ""), id, status)
 
     # ---- 治理面：仅 primary，且只在本单显式开了 govern 时才存在 ----------
     # 二次判定在每个治理工具**函数体第一行**（`_govern_identity`）而不是靠

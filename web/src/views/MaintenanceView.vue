@@ -70,6 +70,33 @@
       </p>
     </div>
 
+    <!-- 待办「建议废弃」（2026-10 ks_todo 班车）：到期日过了 7 天还开着的待办，
+         这里**只提名**（不改状态）—— 「这条到底还有没有人管」只有人知道，
+         自动标废弃等于替人做决定。要销账去「待办」页做。 -->
+    <h3 class="section-title">建议废弃的待办（到期过 7 天仍未销）</h3>
+    <div v-if="obsoleteError" class="banner banner--danger">{{ obsoleteError }}</div>
+    <div v-if="!obsoleteTodos.length" class="panel">
+      <div class="empty">
+        <p><b>没有建议废弃的待办</b>没有过了 7 天还没销的开放待办。</p>
+      </div>
+    </div>
+    <div v-else class="panel pad agent-split">
+      <div v-for="row in obsoleteTodos" :key="row.id" class="agent-line">
+        <span class="cell-key">
+          <span class="k">{{ row.title }}</span>
+        </span>
+        <span v-if="row.owner" class="tag tag--owner" :title="`归属代理：${row.owner}`">
+          {{ row.owner }}
+        </span>
+        <span class="chip chip--danger">已过期 {{ row.overdue_days }} 天</span>
+        <span class="num agent-num">到期 {{ row.due }}</span>
+      </div>
+      <p class="src">
+        共 {{ obsoleteTodos.length }} 条；<b>这里只提名，不改状态</b> ——
+        确认没人管了，去「待办」页标废弃或删除。
+      </p>
+    </div>
+
     <div class="banner">
       dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
     </div>
@@ -193,6 +220,11 @@ const demotes = ref([])        // 退居提名条目
 const demoteCount = ref(0)     // 退居提名总条数（这一页只显示前 20 条）
 const demoteError = ref('')
 
+/* 待办「建议废弃」（2026-10 ks_todo）：只提名，不改状态 —— 这一页是只读面，
+   改状态去「待办」页（那边有状态机与确认闸）。 */
+const obsoleteTodos = ref([])
+const obsoleteError = ref('')
+
 /** agent_id → 显示名（注册表备注名）。 */
 const agentNames = computed(() =>
     Object.fromEntries(agentRows.value.map((a) => [a.agent_id, a.name || a.agent_id])),
@@ -289,6 +321,18 @@ async function loadDemotes() {
     }
 }
 
+/** 待办「建议废弃」清单（只提名）。 */
+async function loadObsoleteTodos() {
+    try {
+        const res = await api.todoObsoleteSuggestions()
+        obsoleteTodos.value = res?.items || []
+        obsoleteError.value = ''
+    } catch (e) {
+        obsoleteTodos.value = []
+        obsoleteError.value = `读取建议废弃清单失败：${e.message}`
+    }
+}
+
 /**
  * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
  * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
@@ -348,6 +392,7 @@ onMounted(() => {
   loadTiering()
   loadAgentDimension()
   loadDemotes()
+  loadObsoleteTodos()
 })
 
 // ---------------------------------------------------------------------------

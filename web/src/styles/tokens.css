@@ -39,6 +39,15 @@
   --ok: #22c55e;
   --danger: #dc2626;
   --danger-soft: #fdeeee;
+  /* ---- 临期告警色（2026-10 ks_todo）：「快到期了」与「已过期」要能一眼分开 ——
+   * 过期用 --danger（红），临期用 --warn（橙）。红橙挨着才看得出差别，
+   * 拿同一个红表示两种状态 = 用户分不清「还剩两天」和「欠了十天」。 */
+  --warn: #b45309;
+  --warn-soft: #fef3c7;
+  /* ---- 图表网格线（2026-10 ks_todo 看板图表化）：canvas 上没有半透明 ——
+   * ECharts 的线条只吃实色，所以描边档（半透明白）不能直接用，
+   * 单独给一档**不透明**的网格线色（浅色下与 --border 同值）。 */
+  --chart-grid: #ececee;
 
   /* ---- 圆角阶梯：容器 20 > 卡片 16 > 内嵌 12 > 控件 10 > chip 6（小按钮 8）---- */
   --r-panel: 20px;
@@ -97,6 +106,11 @@
   --ok: #22c55e;
   --danger: #f05252;
   --danger-soft: #2a1618;
+  /* 临期告警色（暗底提亮，与 --danger 拉开距离：暗底上两块红橙挨着更难分） */
+  --warn: #f59e0b;
+  --warn-soft: #33240a;
+  /* 图表网格线（暗底：不透明的一档，浅于底色但压得住） */
+  --chart-grid: #242a33;
 
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.5);
@@ -662,6 +676,12 @@ html.dark {
 .chip--danger {
   background: var(--danger-soft);
   color: var(--danger);
+}
+/* 临期 chip（2026-10 ks_todo）：3 天内到期 = 橙，已过期 = 红（.chip--danger）。
+   两态必须一眼分开 —— 同一个红表示「还剩两天」和「欠了十天」是分不清的。 */
+.chip--warn {
+  background: var(--warn-soft);
+  color: var(--warn);
 }
 /* 操作行：贴卡片底部，左文字链接 + 右按钮 */
 .card-foot {

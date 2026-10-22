@@ -76,7 +76,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -3247,6 +3247,26 @@ class PgStorage(StorageBase):
         if len(keys) < limit:
             return "", keys
         return keys[-1], keys
+
+    def daily_counts(self, days: int = 7) -> List[Dict[str, Any]]:
+        """近 N 天的每日新增（PG 侧**一条 SQL**：`GROUP BY` 日期）。
+
+        🔴 `created` 是 ISO 文本 ⇒ `substr(created, 1, 10)` 就是日期；
+        与 `StorageBase.daily_counts`（中性扫描）**同一口径**，只是少一次往返。
+        `created` 为空的老行不计入（判不出日期就不编一个）。
+        """
+        n = max(1, int(days))
+        since = (datetime.now(timezone.utc).date() - timedelta(days=n - 1)).isoformat()
+        with self._ro() as cur:
+            cur.execute(
+                "SELECT substr(created, 1, 10) AS d, COUNT(*) FROM ks_fragment "
+                "WHERE created <> '' AND substr(created, 1, 10) >= %s "
+                "GROUP BY d ORDER BY d",
+                (since,),
+            )
+            rows = cur.fetchall()
+        return [{"date": str(r[0]), "count": int(r[1] or 0)}
+                for r in rows if r and r[0]]
 
     def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:
         """批量 upsert。复用 `upsert_fragment`（它已负责重算 content_tsv/embedding）。

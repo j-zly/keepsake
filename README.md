@@ -729,6 +729,30 @@ The knowledge base used to be console-only; it is now open to **every agent** ov
 
 The four tools reuse the existing ingest pipeline unchanged (chunking / idempotency / the review status chain): a sub-agent's submission lands in the console's review queue (`pending`, not chunked until approved), a primary agent's lands directly as `effective`. The console's knowledge base page shows a **source-agent chip** per document and filters by agent (`?agents=a,b`, server-side, before pagination). `agent_id` is a new column — the migration for an existing database is `ALTER TABLE documents ADD COLUMN IF NOT EXISTS agent_id text NULL;` (until it is applied every document reads as unowned, and `kb_store` refuses to write with a human-readable error).
 
+## Todo (first-class citizen, 2026-10)
+
+Todo used to be faked with `kind:pending` memory entries — 9 of 12 were stale bookkeeping (done but never closed, overdue but nobody knew). A todo needs a **state machine** and its own page, hence the `ks_todo` table.
+
+| Rule | Behaviour |
+|------|-----------|
+| **Three states** | `open` / `done` / `obsolete` — "finished" and "this one is void" are different things; the DDL carries a CHECK constraint. |
+| **Two ownership columns** | `owner` (who owes it) + `creator` (who wrote it down). Visible = **owner = me ∪ creator = me** (collaborative ledger: the assignee always sees their own work); primary sees everything. |
+| **One due-date oracle** | `due_state` (`none` / `soon` / `overdue`) is computed **server-side** (base day = UTC today): due within 3 days = amber, past today = red. The frontend only translates it — it never computes dates itself. |
+| **One semantics across three backends** | PG / SQLite are row tables (both DDL dialects live in `govern/todo.py` alone), Redis is a `keepsake:todo:<id>` hash plus an id LIST. |
+
+Three agent-side tools (tool surface 15 → 18, all behind the credential gate): `todo_add(title, detail?, owner?, due?)` (owner defaults to the caller; you may assign it to someone else, but that agent must be registered **and approved**), `todo_list(scope?)` (`open` by default / `done` / `all`), `todo_done(id, status?)` (`done` / `obsolete` / `open`; only the owner, the creator, or the primary agent may change it).
+
+Console page "待办" (sidebar, right before "审核"): cards grouped by state, owner chips, amber/red due badges, SelectionBar batch-close, a create form (owner dropdown = registered agents), and a real delete that requires **typing the title**. The dashboard gains a todo section (open N / overdue M, click through to the page); the maintenance page lists "suggest obsolete" nominations (**naming only, never changing state** — whether anyone still owns an overdue todo is a human decision).
+
+Migrating the old entries (the script is **dry-run by default**; `--write` actually writes):
+
+```bash
+python3 scripts/migrate_pending_to_todo.py            # dry-run
+python3 scripts/migrate_pending_to_todo.py --write    # real run
+```
+
+Mapping: title = first 60 chars of the body, detail = the **original text** (nothing is lost), owner = the entry's `agent:<id>` tag (when registered and approved) else the primary agent, status always `open`; the original entry is tagged `migrated-to-todo` and **kept** (deleting it would erase "why did we note this"). Idempotency key = that tag, so a second run reports `migrated=0`.
+
 ## Generic Memory Interface & MCP
 
 `keepsake.adapters.generic.protocol.MemoryProvider` is a runtime-checkable `typing.Protocol` describing what a memory system exposes to its host. The module imports nothing host-specific — it describes the shape, not the caller — and the dependency direction is strictly `adapters.hermes → adapters.generic`.

@@ -98,7 +98,9 @@ test('正文超 160 字截断，点开看全文；已读/未读走 chip 徽标',
 // ---------------------------------------------------------------------------
 
 test('侧栏「消息中心」在代理登记之后、代理审核之前；路由有 /messages', () => {
-  assert.match(APP, /\{ path: '\/agents', label: '代理登记', icon: ICON\.users \},\s*\n\s*\/\/[^\n]*\n\s*\{ path: '\/messages', label: '消息中心', icon: ICON\.mail \},\s*\n\s*\{ path: '\/agents-review', label: '代理审核'/,
+  // 🔴 只管**先后**（消息中心在代理登记之后、代理审核之前）：中间允许插入别的
+  // 入口（2026-10 待办就插在这两页之间）。
+  assert.match(APP, /\{ path: '\/agents', label: '代理登记', icon: ICON\.users \},[\s\S]*?\{ path: '\/messages', label: '消息中心', icon: ICON\.mail \},[\s\S]*?\{ path: '\/agents-review', label: '代理审核'/,
     '侧栏顺序：代理登记 → 消息中心 → 代理审核')
   assert.match(ROUTER, /\{ path: '\/messages', name: 'messages', component: MessagesView/, '路由挂了 MessagesView')
   assert.match(ROUTER, /import MessagesView from '\.\.\/views\/MessagesView\.vue'/, '路由引了 MessagesView')

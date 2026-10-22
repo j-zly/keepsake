@@ -25,7 +25,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("keepsake.storage_base")
@@ -255,6 +255,40 @@ class StorageBase(ABC):
         Redis 若无该 keyspace 就返回空，PG 侧 ks_fragment 里没有这些 key 也返回空。
         """
         ...
+
+    def daily_counts(self, days: int = 7) -> List[Dict[str, Any]]:
+        """近 N 天的**每日新增条目数**（`[{date, count}]`，按日期升序）。
+
+        🔴 **默认实现走中性原语**（`scan_fragment_keys` + `get_fragments_batch`）——
+        与合并/遗忘同一条读路径，后端语义天然等价。PG 侧覆写成一条
+        `GROUP BY 日期` 的 SQL（`core/pg.py::daily_counts`）：同样的口径，
+        少一次往返。
+
+        `date` 是 `created` 的前 10 位（ISO 文本 ⇒ 取日期）；`created` 为空的
+        老行**不计入**（判不出日期就不编一个）。
+
+        🔴 **刻意不是 `@abstractmethod`**：加进抽象方法清单就要同步改
+        `tests/test_storage_interface.py` 里那份写死的清单（那是本单范围外的
+        文件），而漏实现的后端会**构造期就炸**、波及既有测试。默认值能跑，
+        后端想更快就覆写它。
+        """
+        n = max(1, int(days))
+        since = (datetime.now(timezone.utc).date() - timedelta(days=n - 1)).isoformat()
+        cursor = ""
+        keys: List[str] = []
+        while True:
+            cursor, batch = self.scan_fragment_keys(cursor=cursor, limit=500)
+            keys.extend(batch)
+            if not cursor or not batch:
+                break
+        counts: Dict[str, int] = {}
+        for doc in self.get_fragments_batch(keys).values():
+            created = str(doc.get("created") or "")
+            if len(created) < 10 or created[:10] < since:
+                continue
+            day = created[:10]
+            counts[day] = counts.get(day, 0) + 1
+        return [{"date": day, "count": counts[day]} for day in sorted(counts)]
 
     @abstractmethod
     def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:

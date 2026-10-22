@@ -2,7 +2,10 @@
  * 控制台视觉规范的自检（纯静态扫描，node --test 直接跑）：
  * 盯三件「改了看不出来、但会慢慢烂掉」的事 ——
  *   1) 圆角五档（20/16/12/10/6）必须还在 tokens.css 里；
- *   2) 颜色不许散落到组件里（全 src 扫 #hex / rgba()，排除 tokens.css）；
+ *   2) 颜色不许散落到组件里（全 src 扫 #hex / rgba()，排除 tokens.css
+ *      与 utils/chart-theme.js —— 后者是**任务书指定的唯一图表色值出处**：
+ *      ECharts 画在 canvas 上读不到 CSS 变量，必须有一份十六进制副本，
+ *      那就集中放在这一个文件里，别处引用。见 tests/chart-ui.test.mjs）；
  *   3) 术语：界面里不再出现「碎片」。
  * 注意 (2) 会把 el-table 的 #default 插槽也算成颜色 —— 列表已全部改成卡片网格，
  * 哪天谁又插回一张表格，这里先红。
@@ -16,12 +19,21 @@ import { fileURLToPath } from 'node:url'
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const TOKENS = join(SRC, 'styles/tokens.css')
 
-/** 递归列出 src 下所有 .vue / .js（tokens.css 单独排除） */
+/**
+ * 递归列出 src 下所有 .vue / .js。
+ *
+ * 两处豁免：
+ *   * `tokens.css` —— 令牌表本身（色值的家）；
+ *   * `utils/chart-theme.js` —— **唯一**的图表色值出处（canvas 读不到 CSS 变量，
+ *     必须有一份十六进制副本；散在图表配置里的色值才是违规，见 chart-ui.test.mjs）。
+ */
+const CHART_THEME = join(SRC, 'utils', 'chart-theme.js')
+
 function walk(dir, out = []) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name)
     if (statSync(p).isDirectory()) walk(p, out)
-    else if (/\.(vue|js)$/.test(name) && p !== TOKENS) out.push(p)
+    else if (/\.(vue|js)$/.test(name) && p !== TOKENS && p !== CHART_THEME) out.push(p)
   }
   return out
 }
@@ -35,7 +47,7 @@ test('tokens.css：圆角五档齐全（容器20 > 卡片16 > 内嵌12 > 控件1
   }
 })
 
-test('颜色不散落：src 里除 tokens.css 外没有硬编码色值', () => {
+test('颜色不散落：src 里除 tokens.css 与 chart-theme.js 外没有硬编码色值', () => {
   const bad = []
   for (const f of FILES) {
     for (const [i, line] of readFileSync(f, 'utf8').split('\n').entries()) {

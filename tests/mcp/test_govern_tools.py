@@ -26,7 +26,8 @@ import anyio
 import pytest
 
 from keepsake.mcp_server.server import build_server
-from keepsake.mcp_server.tools import GOVERN_TOOLS, KB_TOOLS, MESSAGE_TOOLS, ToolError
+from keepsake.mcp_server.tools import (GOVERN_TOOLS, KB_TOOLS, MESSAGE_TOOLS,
+                                        TODO_TOOLS, ToolError)
 
 MEMORY_TOOLS = {
     "memory_capabilities", "memory_search", "memory_get", "memory_core_list",
@@ -107,11 +108,14 @@ def test_治理面默认不挂_既有八工具契约不动(tmp_path, monkeypatch
     治理那 5 个**仍然不挂**（本单没有放宽治理面的默认可见性）。
     🔴 2026-10 ks_kb_agents：**知识库那 4 个同样与治理面无关**（所有已批准代理
     都能用，归属 / 可见性 / 删除与记忆同一把尺子）⇒ 默认装配下也在工具面里。
+    🔴 2026-10 ks_todo：**待办那 3 个同样与治理面无关**（所有已批准代理都能用）⇒
+    默认装配下也在工具面里（工具面 15 → 18）。
     """
     server = _build(tmp_path, monkeypatch, govern=False)
     try:
         names = {t.name for t in server.list_tools()}
-        assert names == MEMORY_TOOLS | set(MESSAGE_TOOLS) | set(KB_TOOLS)
+        assert names == (MEMORY_TOOLS | set(MESSAGE_TOOLS) | set(KB_TOOLS)
+                         | set(TODO_TOOLS))
         assert not (set(GOVERN_TOOLS) & names)
     finally:
         server.agent_gate.stop()

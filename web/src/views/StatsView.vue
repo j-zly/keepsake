@@ -46,33 +46,64 @@
       />
     </div>
 
-    <!-- 常驻层按代理分列：每个代理用**各自**生效的注入预算
-         （core_budget_chars ?? 全局），不再共用一个全局数。
+    <!-- 常驻层按代理分列：**横向条形图**（每代理占用 vs 各自预算）。
+         🔴 代理一多，文字卡堆不动（每张卡一行、十几张就滚过去了）⇒ 改成图：
+         一眼看出「谁快满了」，悬停看字符数与百分比。
          口径写在下面的说明行里 —— 「谁的预算」不许让人猜。 -->
     <h3 class="section-title">常驻层 · 按代理分列</h3>
-    <div class="stat-grid">
-      <StatCard
-        v-for="row in coreAgentCards"
-        :key="row.agent_id"
-        :label="row.label"
-        :value="`${row.percent}%`"
-        :percent="row.percent"
-        :tone="row.tone"
-        :hint="`${row.count} 条 · ${row.chars}/${row.budget} 字符`"
-      />
-      <StatCard
-        v-if="!coreAgentCards.length"
-        label="按代理分列"
-        value="-"
-        hint="没有可分列的代理数据"
-      />
+    <div class="panel pad">
+      <AgentUsageBars v-if="coreAgentCards.length" :rows="coreAgentCards" :height="barsHeight" />
+      <div v-else class="empty">
+        <b>没有可分列的代理数据</b>
+        <span>每个代理按自己生效的注入预算分列（core_budget_chars ?? 全局）。</span>
+      </div>
     </div>
     <p class="src">
       分列口径：条目 <code>agent:&lt;id&gt;</code> 归属（与可见性同一把尺子）；
       预算 = 该代理自己的注入预算，没单设就用全局 {{ globalBudget }} 字符<template v-if="unattributedCount">；
       另有 {{ unattributedCount }} 条无归属常驻（{{ unattributedChars }} 字符）不计入分列</template>。
+      占用 ≥90% 走告警色，≥100% 走危险色（与卡片口径同一把尺子）。
     </p>
     <div v-if="perAgentError" class="banner banner--danger">{{ perAgentError }}</div>
+
+    <!-- 水位与趋势：环形仪表两块（总预算水位 / 待办完成率）+ 近 7 天增量折线。
+         🔴 数字**全部来自后端**（前端不自己算比例）：预算水位 = tiering 给的 ratio，
+         完成率 = 待办计数给的 done/obsolete/total（口径写在卡片 hint 里）。 -->
+    <h3 class="section-title">水位与趋势</h3>
+    <div class="chart-grid">
+      <div class="panel pad">
+        <div class="chart-title">水位</div>
+        <RingGauge :metrics="gaugeMetrics" :height="gaugeHeight" />
+        <p class="src">{{ gaugeHint }}</p>
+      </div>
+      <div class="panel pad">
+        <div class="chart-title">近 7 天记忆增量</div>
+        <SparkLine :points="dailyPoints" :height="sparkHeight" />
+        <p class="src">{{ dailyHint }}</p>
+      </div>
+    </div>
+
+    <!-- 待办小节：开放 N / 逾期 M，点进去就是待办页。 -->
+    <h3 class="section-title">待办</h3>
+    <div class="stat-grid">
+      <button type="button" class="todo-jump" @click="gotoTodos" aria-label="进入待办页">
+        <StatCard label="开放" :value="todoSummary.open" unit="条" hint="还没销掉的待办" />
+      </button>
+      <button type="button" class="todo-jump" @click="gotoTodos" aria-label="进入待办页">
+        <StatCard
+          label="逾期"
+          :value="todoSummary.overdue"
+          unit="条"
+          :tone="todoSummary.overdue ? 'danger' : 'ok'"
+          hint="到期日已过，还没销"
+        />
+      </button>
+      <button type="button" class="todo-jump" @click="gotoTodos" aria-label="进入待办页">
+        <StatCard label="已完成" :value="todoSummary.done" unit="条" hint="status = done" />
+      </button>
+    </div>
+    <p class="src">待办独立成页（状态机 + 到期日 + 归属）：点任意一张卡进「待办」。</p>
+    <div v-if="todoError" class="banner banner--danger">{{ todoError }}</div>
 
     <!-- 代理小节：在册 / 已批准 / 在线 + 每个代理的累计读写。
          「在线」的口径写在卡上（注册表 last_seen_at 5 分钟内），
@@ -246,16 +277,21 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import AgentUsageBars from '../components/AgentUsageBars.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
+import RingGauge from '../components/RingGauge.vue'
+import SparkLine from '../components/SparkLine.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, isOnline, loadAgentRows, ONLINE_HINT } from '../utils/agents'
+import { chartPalette, usageColor } from '../utils/chart-theme.js'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { completionPercent } from '../utils/todo'
 
 const data = ref(null)
 const crons = ref([])
@@ -266,6 +302,22 @@ const error = ref('')
 const cronError = ref('')
 const tiering = ref(null)
 const tieringError = ref('')
+
+// 待办小节（2026-10 ks_todo）：计数**全部由后端给**（前端不自己数）。
+const todoSummary = ref({ open: 0, done: 0, obsolete: 0, total: 0, overdue: 0 })
+const todoError = ref('')
+
+/* ---------------------------------------------------------------- 图表
+ * 三个图共用 `utils/chart-theme.js` 的色板与 `utils/chart-kit.js` 的 option 形状。
+ * 🔴 图高按**视口宽度**给（窄屏图矮一点，横向不滚动 —— 容器宽 100%，
+ *    ECharts 自己 resize；不许出现横向滚动条，那是最常见的看板事故）。 */
+const chartWidth = ref(typeof window === 'undefined' ? 1200 : window.innerWidth)
+function onViewportResize() {
+  chartWidth.value = window.innerWidth
+}
+const barsHeight = computed(() => (chartWidth.value < 900 ? 220 : 300))
+const gaugeHeight = computed(() => (chartWidth.value < 900 ? 200 : 240))
+const sparkHeight = computed(() => (chartWidth.value < 900 ? 180 : 220))
 
 // 待审条目计数（侧栏同一份数据，独立 fetch 让这页不至于因 review 端点挂了而红）
 // — 顶部「待审核 N 条」卡专用。三个数全库口径，与 GET /api/v1/review/counts 一致。
@@ -427,16 +479,92 @@ function schedLabel(raw) {
   return bits.join(' · ') || '未知'
 }
 
+/* ---------------------------------------------------------------- 图表数据
+ * 近 7 天每日新增（`?days=7` 那段 `daily`）—— 后端补齐了没写入的那天（= 0，
+ * 不是空白），前端只画。 */
+const dailyPoints = computed(() => (data.value?.daily || []).map((d) => ({
+  date: d.date, count: Number(d.count || 0),
+})))
+
+const dailyHint = computed(() => {
+  const sum = dailyPoints.value.reduce((acc, p) => acc + p.count, 0)
+  return `近 7 天新增 ${sum} 条（每天一格，没写入的那天是 0）`
+})
+
+/** 总预算水位（%）—— tiering 给的 ratio（与「常驻预算水位」卡同一份数）。 */
+const budgetPercent = computed(() => {
+  const r = tiering.value?.budget?.ratio
+  return typeof r === 'number' ? r : null
+})
+
+/** 待办完成率（%）—— 已销掉（done + obsolete）占全部（口径写在 hint 里）。 */
+const todoPercent = computed(() => completionPercent(todoSummary.value))
+
+/** 两块环形仪表：总预算水位 + 待办完成率（颜色取自 chart-theme 的色板）。 */
+const gaugeMetrics = computed(() => {
+  const p = chartPalette()
+  const metrics = []
+  if (budgetPercent.value !== null) {
+    metrics.push({
+      label: '总预算水位',
+      percent: budgetPercent.value,
+      color: usageColor(budgetPercent.value, p),
+    })
+  }
+  metrics.push({
+    label: '待办完成率',
+    percent: todoPercent.value,
+    color: usageColor(todoPercent.value, p),
+  })
+  return metrics
+})
+
+const gaugeHint = computed(() => {
+  const bits = []
+  if (budgetPercent.value !== null) {
+    bits.push(`总预算水位 ${budgetPercent.value}%`)
+  } else {
+    bits.push('总预算水位未读到')
+  }
+  bits.push(`待办完成率 ${todoPercent.value}%（已销掉的 done + obsolete ÷ 全部）`)
+  return bits.join(' · ')
+})
+
+async function fetchTodoSummary() {
+  // 单独 fetch：待办端点挂了不许把整张看板拖红（只掉这一小节）
+  try {
+    const s = await api.todoSummary()
+    todoSummary.value = {
+      open: Number(s?.open || 0),
+      done: Number(s?.done || 0),
+      obsolete: Number(s?.obsolete || 0),
+      total: Number(s?.total || 0),
+      overdue: Number(s?.overdue || 0),
+    }
+    todoError.value = ''
+  } catch (e) {
+    todoSummary.value = { open: 0, done: 0, obsolete: 0, total: 0, overdue: 0 }
+    todoError.value = `读取待办计数失败：${e.message}`
+  }
+}
+
+/** 进待办页（待办小节的卡点哪儿都跳同一个地方）。 */
+function gotoTodos() {
+  router.push('/todos')
+}
+
 async function load() {
   loading.value = true
   try {
-    data.value = await api.stats()
+    // ?days=7：顺带取近 7 天每日新增（折线图那段）
+    data.value = await api.stats({ days: 7 })
     error.value = ''
   } catch (e) {
     error.value = `读取总览失败：${e.message}`
   }
   // 代理维度两段各自独立取数：任一挂了只掉自己那一段，不把整张看板拖红
-  await Promise.all([loadReview(), fetchAgentRows(), fetchCorePerAgent()])
+  await Promise.all([loadReview(), fetchAgentRows(), fetchCorePerAgent(),
+    fetchTodoSummary()])
   try {
     const c = await api.crons()
     crons.value = c.jobs
@@ -530,10 +658,40 @@ async function doEdit() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  // 图高跟着视口宽度走（窄屏图矮一点）：只改高度，**不许**改宽度 ——
+  // 容器宽 100% + ECharts 自 resize，横向滚动条是最常见的看板事故。
+  window.addEventListener('resize', onViewportResize)
+  load()
+})
+onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 </script>
 
 <style scoped>
+/* 图表两栏：窄屏自动落成一列（不许横向滚动 —— 看板最常见的事故） */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+}
+.chart-title {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+/* 待办小节的卡：整张卡可点（进待办页）—— 按钮壳不带默认边框/底色 */
+.todo-jump {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+.todo-jump:hover .stat {
+  border-color: var(--accent);
+}
 /* ---------------------------------------------------------------- 任务卡内布局
  * 这一节的全部修复都落在 StatsView 的卡内类上：ItemCard 与 tokens.css 是
  * 常驻层 / 记忆条目 / 知识库几页共用的，动它们会把别的视图一起带歪。 */

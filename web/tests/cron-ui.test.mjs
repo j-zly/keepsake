@@ -107,8 +107,11 @@ test('调度器行走 toLocal，模板里不出现裸 ISO', () => {
 test('schedLabel 真跑一遍：结构化两段各归各位，Next run 不再漏进界面', async () => {
   const { toLocal } = await import(`${ROOT}src/utils/format.js`)
   // 从 SFC 里原样抠出这段逻辑再执行 —— 纯静态断言盯不住「摘错了一段」的活
-  const src = STATS.slice(STATS.indexOf('function schedLabel'),
-    STATS.indexOf('async function load')).trim()
+  // 🔴 只抠**这一个函数**（按行首 `}` 收尾）：看板后来在 schedLabel 与 load
+  // 之间插了别的代码，按区间抠会把那些一起抠进来执行（computed 未定义 ⇒ 假红）。
+  const matched = STATS.match(/function schedLabel\(raw\) \{[\s\S]*?\n\}/)
+  assert.ok(matched, '没在 StatsView 里找到 schedLabel')
+  const src = matched[0].trim()
   // eslint-disable-next-line no-new-func
   const schedLabel = new Function('toLocal', `${src}\nreturn schedLabel`)(toLocal)
 
