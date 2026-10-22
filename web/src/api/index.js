@@ -84,6 +84,9 @@ export const api = {
       .then((r) => r.data),
   coreList: (params) => http.get('/api/v1/core', { params }).then((r) => r.data),
   coreStats: () => http.get('/api/v1/core/stats').then((r) => r.data),
+  // 常驻层**按代理**分列：{agent_id: {count, chars, budget_effective}}。
+  // 看板分列 / 常驻层页 / 维护页占比行共用这一份口径（别处不重算一遍）。
+  corePerAgent: () => http.get('/api/v1/stats/core-per-agent').then((r) => r.data),
   fragments: (params) => http.get('/api/v1/fragments', { params }).then((r) => r.data),
   fragment: (key) => http.get(`/api/v1/fragments/${encodeURIComponent(key)}`).then((r) => r.data),
   kbSummary: () => http.get('/api/v1/kb/summary').then((r) => r.data),

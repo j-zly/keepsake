@@ -36,21 +36,68 @@
     </div>
 
     <div class="stat-grid">
-      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" />
+      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" :hint="attributedHint" />
       <StatCard label="常驻层字符" :value="data?.core?.chars ?? '-'" unit="字符" />
-      <StatCard
-        label="预算占用"
-        :value="data?.core ? `${data.core.percent}%` : '-'"
-        :percent="data?.core?.percent ?? null"
-        :tone="budgetTone"
-        :hint="`预算 ${data?.core?.budget ?? '-'} 字符`"
-      />
       <StatCard
         label="记忆条目"
         :value="data?.retrieval?.count ?? '-'"
         unit="条"
         :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : 'keyset 扫描'"
       />
+    </div>
+
+    <!-- 常驻层按代理分列：每个代理用**各自**生效的注入预算
+         （core_budget_chars ?? 全局），不再共用一个全局数。
+         口径写在下面的说明行里 —— 「谁的预算」不许让人猜。 -->
+    <h3 class="section-title">常驻层 · 按代理分列</h3>
+    <div class="stat-grid">
+      <StatCard
+        v-for="row in coreAgentCards"
+        :key="row.agent_id"
+        :label="row.label"
+        :value="`${row.percent}%`"
+        :percent="row.percent"
+        :tone="row.tone"
+        :hint="`${row.count} 条 · ${row.chars}/${row.budget} 字符`"
+      />
+      <StatCard
+        v-if="!coreAgentCards.length"
+        label="按代理分列"
+        value="-"
+        hint="没有可分列的代理数据"
+      />
+    </div>
+    <p class="src">
+      分列口径：条目 <code>agent:&lt;id&gt;</code> 归属（与可见性同一把尺子）；
+      预算 = 该代理自己的注入预算，没单设就用全局 {{ globalBudget }} 字符<template v-if="unattributedCount">；
+      另有 {{ unattributedCount }} 条无归属常驻（{{ unattributedChars }} 字符）不计入分列</template>。
+    </p>
+    <div v-if="perAgentError" class="banner banner--danger">{{ perAgentError }}</div>
+
+    <!-- 代理小节：在册 / 已批准 / 在线 + 每个代理的累计读写。
+         「在线」的口径写在卡上（注册表 last_seen_at 5 分钟内），
+         「读写」是**累计**计数（注册表只有累计列，没有按日打点）——
+         不为了「今日」另造打点。 -->
+    <h3 class="section-title">代理</h3>
+    <div class="stat-grid">
+      <StatCard label="在册代理" :value="agentRows.length" unit="个" hint="注册表里的全部代理" />
+      <StatCard label="已批准" :value="approvedCount" unit="个" hint="status = approved" />
+      <StatCard label="在线" :value="onlineCount" unit="个" :hint="ONLINE_HINT" />
+    </div>
+    <div v-if="agentError" class="banner banner--danger">{{ agentError }}</div>
+    <div v-if="agentRows.length" class="panel pad agent-list">
+      <div v-for="a in agentRows" :key="a.agent_id" class="agent-line">
+        <span class="agent-name">{{ a.name || a.agent_id }}</span>
+        <span class="agent-id mono">{{ a.agent_id }}</span>
+        <span class="chip" :class="a.status === 'approved' ? 'chip--accent' : ''">{{ statusText(a.status) }}</span>
+        <span class="chip">{{ a.online ? '在线' : '离线' }}</span>
+        <span class="num agent-num">累计读 {{ a.reads }} · 累计写 {{ a.writes }}</span>
+        <span class="num agent-num">最近活动 {{ toLocal(a.last_seen_at) }}</span>
+      </div>
+      <p class="src">
+        读写是注册表的累计计数（注册表没有按日打点 ⇒ 不给「今日」增量）；
+        「在线」= 最近活动落在 5 分钟内。
+      </p>
     </div>
 
     <h3 class="section-title">分级班车</h3>
@@ -205,6 +252,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { agentUsageRows, isOnline, loadAgentRows, ONLINE_HINT } from '../utils/agents'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -280,13 +328,68 @@ const tieringHint = computed(() => {
 
 const tieringLastRun = computed(() => (tiering.value?.last_run ? toLocal(tiering.value.last_run) : '—'))
 
-const budgetTone = computed(() => {
-  const p = data.value?.core?.percent
-  if (p === undefined || p === null) return ''
-  if (p >= 100) return 'danger'
-  if (p >= 80) return 'accent'
-  return 'ok'
-})
+/* ---------------------------------------------------------------- 代理维度
+ * 多代理时代，看板要看得见「谁在跑、谁占了常驻层、谁的预算快满了」。
+ * 数据从两个只读端点来（各自独立 fetch，挂了就挂自己那一段，不拖红整页）：
+ *   * `GET /api/v1/agents` —— 注册表（在册 / 已批准 / 最近活动 / 累计读写）；
+ *   * `GET /api/v1/stats/core-per-agent` —— 常驻层按代理分列（条数 / 字符 / 各自预算）。 */
+const agentRows = ref([])          // 注册表每行 + online 判定
+const perAgent = ref({})           // 常驻层按代理分列
+const agentError = ref('')         // 注册表读失败
+const perAgentError = ref('')      // 分列读失败（与上面**分开**：一段挂了不许擦掉另一段的报错）
+
+/** agent_id → 注册表备注名（分列卡上的标签用名字，鼠标悬停能看 id）。 */
+const agentNames = computed(() =>
+    Object.fromEntries(agentRows.value.map((a) => [a.agent_id, a.name || a.agent_id])),
+)
+
+const approvedCount = computed(() => agentRows.value.filter((a) => a.status === 'approved').length)
+const onlineCount = computed(() => agentRows.value.filter((a) => a.online).length)
+
+/** 常驻层分列卡（每代理一张：占用率 + 条数 + 字符/预算）。 */
+const coreAgentCards = computed(() => agentUsageRows(perAgent.value, agentNames.value))
+
+/** 已归属到某个代理的条数 / 字符（分列之外的差额 = 无归属的那些）。 */
+const attributed = computed(() => coreAgentCards.value.reduce(
+    (acc, r) => ({ count: acc.count + r.count, chars: acc.chars + r.chars }),
+    { count: 0, chars: 0 },
+))
+
+const unattributedCount = computed(() => Math.max(0, (data.value?.core?.count ?? 0) - attributed.value.count))
+const unattributedChars = computed(() => Math.max(0, (data.value?.core?.chars ?? 0) - attributed.value.chars))
+/** 全局注入预算（没给代理单设预算时它生效）。 */
+const globalBudget = computed(() => data.value?.core?.budget ?? '-')
+const attributedHint = computed(() =>
+    unattributedCount.value
+      ? `其中 ${attributed.value.count} 条有代理归属，${unattributedCount.value} 条无归属`
+      : '全部有代理归属',
+)
+
+/** 注册表状态的显示词（枚举外的值显示原样，不编一个）。 */
+function statusText(status) {
+    return { approved: '已批准', pending: '待审', revoked: '已吊销' }[status] || status || '未知'
+}
+
+async function fetchAgentRows() {
+  try {
+    const rows = await loadAgentRows(api.listAgents)
+    agentRows.value = rows.map((r) => ({ ...r, online: isOnline(r) }))
+    agentError.value = ''
+  } catch (e) {
+    agentRows.value = []
+    agentError.value = `读取代理注册表失败：${e.message}`
+  }
+}
+
+async function fetchCorePerAgent() {
+  try {
+    perAgent.value = await api.corePerAgent()
+    perAgentError.value = ''
+  } catch (e) {
+    perAgent.value = {}
+    perAgentError.value = `读取常驻层代理分列失败：${e.message}`
+  }
+}
 
 /**
  * kb 段不可用时后端给的是 {available:false, error:...} —— 显示成可见的报错，不是 0。
@@ -332,8 +435,8 @@ async function load() {
   } catch (e) {
     error.value = `读取总览失败：${e.message}`
   }
-  // 待审数并行拿，timeout 与看板 stat 分离
-  await loadReview()
+  // 代理维度两段各自独立取数：任一挂了只掉自己那一段，不把整张看板拖红
+  await Promise.all([loadReview(), fetchAgentRows(), fetchCorePerAgent()])
   try {
     const c = await api.crons()
     crons.value = c.jobs
@@ -505,6 +608,40 @@ onMounted(load)
   margin-top: 12px;
   color: var(--text-faint);
   font-size: 12px;
+}
+
+/* 代理小节的每行：一个代理 + 状态/在线 chip + 累计读写 + 最近活动。
+   一行一个代理，横着排；窄屏允许折行（不裁字）。零新色：chip 走全局
+   .chip / .chip--accent，行内数字走 .num。 */
+.agent-list {
+  margin-bottom: 20px;
+}
+.agent-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+}
+.agent-line + .agent-line {
+  border-top: 1px solid var(--border-2);
+}
+.agent-name {
+  font-weight: 600;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-num {
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+/* agent_id：备注名之外的第二身份（同名代理靠它区分），弱化显示。 */
+.agent-id {
+  color: var(--text-faint);
+  font-size: 12.5px;
 }
 /* 待审核卡：自成一类（不是普通 StatCard —— 整卡可点击跳转 + 三色分项 pill）。
    零新色：danger / on-accent / ok / chip 全部走既有 token。 */

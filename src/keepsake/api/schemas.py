@@ -47,6 +47,19 @@ class CoreStats(BaseModel):
     percent: float = Field(..., description="chars / budget * 100，保留两位")
 
 
+class CoreAgentUsage(BaseModel):
+    """**按代理**的常驻层占用（`GET /api/v1/stats/core-per-agent` 的一格）。
+
+    归属判据 = 条目 tags 里的 `agent:<id>`（`govern.visibility.fragment_owner`
+    同一把尺子）；预算 = 该代理自己的 `core_budget_chars`，没有 ⇒ 全局。
+    """
+
+    count: int = Field(..., description="该代理名下的常驻条目数")
+    chars: int = Field(..., description="这些条目的正文字符合计（与 core.chars 同一口径）")
+    budget_effective: int = Field(
+        ..., description="该代理生效的注入预算：自己的 core_budget_chars ?? 全局")
+
+
 # --------------------------------------------------------------------------
 # 记忆条目（检索层）
 # --------------------------------------------------------------------------

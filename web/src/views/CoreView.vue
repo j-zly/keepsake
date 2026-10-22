@@ -8,21 +8,38 @@
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
     <div class="stat-grid">
-      <StatCard label="条数" :value="stats?.count ?? '-'" unit="条" />
-      <StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" />
+      <StatCard label="条数" :value="stats?.count ?? '-'" unit="条" :hint="statsScopeHint" />
+      <StatCard label="正文字符" :value="stats?.chars ?? '-'" unit="字符" :hint="statsScopeHint" />
       <StatCard label="全局默认注入预算" :value="stats?.budget ?? '-'" unit="字符" hint="没单独设预算的代理都用它" />
       <!-- 包一层：StatCard 的 hint 是纯字符串 prop，放不下可点的「设置」入口，
            而 StatCard.vue 不在本次改动范围内。卡撑满格高，入口贴在卡下沿。 -->
       <div class="budget-cell">
         <StatCard
-          label="预算占用"
-          :value="stats ? `${stats.percent}%` : '-'"
-          :percent="stats ? stats.percent : null"
-          :tone="budgetTone"
-          :hint="stats && stats.percent >= 100 ? '已超预算，注入时会截断' : ''"
+          :label="budgetCard.label"
+          :value="budgetCard.value"
+          :percent="budgetCard.percent"
+          :tone="budgetCard.tone"
+          :hint="budgetCard.hint"
         />
         <button class="soft-btn" @click="openBudget">设置全局默认注入预算…</button>
       </div>
+    </div>
+
+    <!-- 本视图口径的预算占用：没筛（或筛了多个）代理 ⇒ 分列摘要；
+         正好筛中一个代理 ⇒ 那一个的占用条单独放大（复用 StatCard 那根条）。 -->
+    <div v-if="!oneAgentRow" class="panel pad agent-split">
+      <div class="filter-title">按代理分列（本视图口径）</div>
+      <p class="filter-desc">
+        每行一个代理：条数 · 字符 / 它自己生效的预算（没单设就用全局
+        {{ stats?.budget ?? '-' }} 字符）。选中代理后这里只留选中的那些。
+      </p>
+      <div v-for="row in shownAgentRows" :key="row.agent_id" class="agent-line">
+        <span class="agent-name" :title="row.agent_id">{{ row.label }}</span>
+        <span class="num agent-num">{{ row.count }} 条 · {{ row.chars }}/{{ row.budget }} 字符</span>
+        <span class="stat-bar"><i :style="{ width: barWidth(row.percent) + '%' }" :class="row.tone"></i></span>
+        <span class="num agent-num">{{ row.percent }}%</span>
+      </div>
+      <p v-if="!shownAgentRows.length" class="src">没有可分列的代理数据</p>
     </div>
 
     <div class="filter-panel">
@@ -320,7 +337,7 @@ import PagerBar from '../components/PagerBar.vue'
 import SelectionBar from '../components/SelectionBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
-import { filterByOwners, loadAgentOptions, ownerLabel, ownerOf } from '../utils/agents'
+import { agentUsageRows, filterByOwners, loadAgentOptions, ownerLabel, ownerOf } from '../utils/agents'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
 import { downloadFile, downloadTemplate, exportKeys } from '../utils/export'
@@ -534,6 +551,64 @@ const budgetTone = computed(() => {
   return 'ok'
 })
 
+/* ---------------------------------------------------------------- 代理维度
+ * 多代理时代：**每个代理的常驻层预算是自己的**（core_budget_chars ?? 全局），
+ * 顶部那根条要按「本视图口径」说话 ——
+ *   * 没筛代理（或筛了多个）⇒ 下方分列摘要（每个代理一行）；
+ *   * 正好筛中一个代理      ⇒ 那个代理的占用条单独放大成一张卡。 */
+const perAgent = ref({})           // GET /api/v1/stats/core-per-agent
+/** 全部分列行（标签用注册表备注名）。 */
+const coreAgentRows = computed(() => agentUsageRows(perAgent.value, agentNames.value))
+/** 正好选中一个代理时的那一行（没有 ⇒ null）。 */
+const oneAgentRow = computed(() =>
+    agents.value.length === 1
+      ? coreAgentRows.value.find((r) => r.agent_id === agents.value[0]) || null
+      : null,
+)
+/** 分列摘要要显示哪些行：没筛 ⇒ 全部；筛了 ⇒ 只留选中的。 */
+const shownAgentRows = computed(() =>
+    agents.value.length
+      ? coreAgentRows.value.filter((r) => agents.value.includes(r.agent_id))
+      : coreAgentRows.value,
+)
+/** 顶部那张预算卡：选中单个代理 ⇒ 那个代理的占用；否则 ⇒ 全量占用。 */
+const budgetCard = computed(() => {
+  const one = oneAgentRow.value
+  if (one) {
+    return {
+      label: `${one.label} 的预算占用`,
+      value: `${one.percent}%`,
+      percent: one.percent,
+      tone: one.tone,
+      hint: `${one.count} 条 · ${one.chars}/${one.budget} 字符（该代理自己的预算）`,
+    }
+  }
+  const s = stats.value
+  return {
+    label: '预算占用',
+    value: s ? `${s.percent}%` : '-',
+    percent: s ? s.percent : null,
+    tone: budgetTone.value,
+    hint: s
+      ? (s.percent >= 100 ? '已超预算，注入时会截断' : `全量常驻 ${s.chars}/${s.budget} 字符`)
+      : '',
+  }
+})
+
+/**
+ * 「条数 / 正文字符」两张卡的口径提示：筛了代理时它们**仍是全库数**
+ * （后端 `/core/stats` 恒为全量 —— 拿搜索结果当预算会把「以为没超预算」写进脑子）。
+ * 说清楚，别让人把两个数当成筛选后的。
+ */
+const statsScopeHint = computed(() =>
+    agents.value.length ? '全库口径（不随代理筛选变）' : '',
+)
+
+/** 进度条永远画 0~100：超预算的那部分由 tone=danger 表达，不让条溢出。 */
+function barWidth(percent) {
+  return Math.min(100, Math.max(0, Number(percent) || 0))
+}
+
 /** tags 是逗号分隔的一串，拆成一个个 chip 展示 */
 function splitTags(s) {
   return (s || '')
@@ -566,6 +641,13 @@ async function load() {
     items.value = filterByOwners(list.items, agents.value)
     count.value = list.count
     stats.value = st
+    // 按代理分列（各自生效的预算）：**独立取数** —— 它挂了只掉分列摘要，
+    // 不许把常驻层列表一起拖成报错（那一页的主功能是列表）。
+    try {
+      perAgent.value = (await api.corePerAgent()) || {}
+    } catch {
+      perAgent.value = {}
+    }
   } catch (e) {
     if (isStale(seq, reqSeq)) return
     error.value = `读取常驻层失败：${e.message}`
@@ -807,6 +889,39 @@ onMounted(() => {
 }
 .budget-cell :deep(.stat) {
   flex: 1;
+}
+/* 按代理分列摘要：一行一个代理（名字 · 条数/字符 · 占用条 · 百分比）。
+   占用条复用全局 .stat-bar（token 里的那根条），零新色。 */
+.agent-split {
+  margin-bottom: 20px;
+}
+.agent-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+}
+.agent-line + .agent-line {
+  border-top: 1px solid var(--border-2);
+}
+.agent-name {
+  font-weight: 600;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-num {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.agent-line .stat-bar {
+  flex: 1 1 120px;
+  min-width: 80px;
+  max-width: 320px;
 }
 /* 字段名旁的「下载模板」：和正文标题同一行，不另起一行抢视线 */
 .fld {

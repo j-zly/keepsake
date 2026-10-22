@@ -71,14 +71,130 @@ export function agentOwnerLabel(agentId, names) {
  * @returns {Promise<{id: string, name: string}[]>}
  */
 export async function loadAgentOptions(listAgents) {
+  return (await loadAgentRows(listAgents)).map((a) => ({ id: a.agent_id, name: a.name || '' }))
+}
+
+/**
+ * 拉**全部**代理的**完整行**（注册表字段全给：`status` / `last_seen_at` /
+ * `reads` / `writes` …）。看板的「代理」小节要的就是这些，不是只要 id+名字。
+ *
+ * 与 `loadAgentOptions` 同一份翻页逻辑（一个分页循环写两遍必然漂）。
+ * @returns {Promise<object[]>}
+ */
+export async function loadAgentRows(listAgents) {
   const out = []
   const pageSize = 100
   for (let page = 1; ; page += 1) {
     const res = await listAgents({ page, page_size: pageSize })
     const items = res?.items || []
-    out.push(...items.map((a) => ({ id: a.agent_id, name: a.name || '' })))
+    out.push(...items)
     const total = res?.count ?? 0
     if (items.length < pageSize || out.length >= total) break
+  }
+  return out
+}
+
+/**
+ * 「在线」的判据：**注册表 `last_seen_at` 落在最近 5 分钟内**。
+ *
+ * 🔴 口径写在代码里也得写在页面上（看板那张卡的 hint 里明写），否则「在线」
+ *   是个没人知道怎么算的词。`last_seen_at` 是注册表的活动时间戳（读写都算，
+ *   60s 限频），不是「SSE 连着」—— 注册表没有单独的 SSE 活动列，别假装有。
+ */
+export const ONLINE_WINDOW_MS = 5 * 60 * 1000
+
+/** 在线口径的**人话**（页面上照这句显示，别自己另编一套）。 */
+export const ONLINE_HINT = '口径：注册表 last_seen_at 在最近 5 分钟内（最近活动）'
+
+/**
+ * 某个代理现在算不算「在线」（`last_seen_at` 解析不出来 ⇒ 离线，不瞎猜）。
+ * @param {object} row  注册表一行
+ * @param {number} now  当前时刻（毫秒）；默认取本机时间
+ */
+export function isOnline(row, now = Date.now()) {
+  const t = Date.parse(row?.last_seen_at || '')
+  if (!Number.isFinite(t)) return false
+  return now - t <= ONLINE_WINDOW_MS
+}
+
+/**
+ * 注入预算占用的配色档：≥100% danger / ≥80% accent / 其余 ok
+ * （与看板、常驻层页的全局占用条同一套阈值 —— 差一处就会出现两个页面
+ * 同一份数据一个红一个绿）。
+ */
+export function usageTone(percent) {
+  const p = Number(percent)
+  if (!Number.isFinite(p)) return 'ok'
+  if (p >= 100) return 'danger'
+  if (p >= 80) return 'accent'
+  return 'ok'
+}
+
+/**
+ * `GET /api/v1/stats/core-per-agent` 的返回 → 页面好用的行。
+ *
+ * 输入 `{agent_id: {count, chars, budget_effective}}`，输出每行
+ * `{agent_id, label, count, chars, budget, percent, tone}`：
+ * `label` 用注册表备注名（没有就裸 id），`percent` = chars / budget（两位小数，
+ * 与后端同一精度）。
+ *
+ * @param {object} perAgent  后端分列返回
+ * @param {object} names     agent_id → 显示名
+ */
+export function agentUsageRows(perAgent, names = {}) {
+  return Object.entries(perAgent || {}).map(([agent_id, u]) => {
+    const budget = Number(u?.budget_effective || 0)
+    const chars = Number(u?.chars || 0)
+    const percent = budget > 0 ? Math.round((chars * 10000) / budget) / 100 : 0
+    return {
+      agent_id,
+      label: (names && names[agent_id]) || agent_id,
+      count: Number(u?.count || 0),
+      chars,
+      budget,
+      percent,
+      tone: usageTone(percent),
+    }
+  })
+}
+
+/**
+ * 分列摘要按「当前筛选的代理」收窄（**空筛选 = 全部分列**，与列表同口径）。
+ *
+ * 常驻层页顶部那条预算条要跟这一屏看到的东西对齐：无筛选时给全库分列，
+ * 选了代理就只留那个代理的占用（不选 = 现状不变 = 全量）。
+ *
+ * @param {object[]} rows      agentUsageRows 的行
+ * @param {string[]} agentIds  选中的 agent_id（空 = 全选）
+ */
+export function usageRowsForFilter(rows, agentIds) {
+  const want = new Set((agentIds || []).filter(Boolean))
+  if (!want.size) return rows || []
+  return (rows || []).filter((r) => want.has(r.agent_id))
+}
+
+/**
+ * 某代理的字符占**总量**（水位）的百分比 —— 与 `usageTone` 的「占自己预算」
+ * 是两个口径，别混：这里分母是全库常驻字符数。
+ *
+ * @param {number} chars 该代理的常驻字符数
+ * @param {number} total 全库常驻字符数（水位总量）
+ */
+export function sharePercent(chars, total) {
+  const c = Number(chars) || 0
+  const t = Number(total) || 0
+  return t > 0 ? Math.round((c * 10000) / t) / 100 : 0
+}
+
+/**
+ * 注册表行 → `agent_id → 显示名` 的映射（看板 / 常驻层 / 维护页共用一份）。
+ *
+ * @param {object[]} rows 注册表行（loadAgentRows 的返回）
+ */
+export function agentNameMap(rows) {
+  const out = {}
+  for (const r of rows || []) {
+    if (r?.agent_id) out[r.agent_id] = r.name || r.agent_id
   }
   return out
 }

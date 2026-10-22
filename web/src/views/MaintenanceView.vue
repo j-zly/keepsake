@@ -17,6 +17,59 @@
       />
     </div>
 
+    <!-- 常驻层水位：总量 + 每代理字符占比（多代理时代，水位是被几个代理分着占的） -->
+    <h3 class="section-title">常驻层水位 · 按代理</h3>
+    <div class="stat-grid">
+      <StatCard
+        label="常驻水位"
+        :value="waterValue"
+        :percent="waterPercent"
+        :tone="waterTone"
+        :hint="waterHint"
+      />
+      <StatCard
+        label="按代理分列"
+        :value="agentShareCount"
+        unit="个"
+        hint="每个代理一份独立注入预算；占比的分母是水位总量"
+      />
+    </div>
+    <div class="panel pad agent-split">
+      <div v-for="row in agentShares" :key="row.agent_id" class="agent-line">
+        <span class="agent-name" :title="row.agent_id">{{ row.label }}</span>
+        <span class="num agent-num">{{ row.chars }} 字符 · 占 {{ row.percent }}%</span>
+      </div>
+      <p v-if="!agentShares.length" class="src">没有可分列的代理数据</p>
+    </div>
+
+    <!-- 退居提名（班车建议退出常驻层）：归属代理一眼可见 ——
+         主脑名下的条目不挂 chip（默认就是它的），别的代理的挂上，
+         免得「班车要把谁踢出去」看半天看不出来。批准/驳回在审核页做（这里只读）。 -->
+    <h3 class="section-title">退居提名（班车建议退出常驻层）</h3>
+    <div v-if="demoteError" class="banner banner--danger">{{ demoteError }}</div>
+    <div v-if="!demotes.length" class="panel">
+      <div class="empty">
+        <p><b>没有退居提名</b>常驻层水位没到告警线，或建议都已经审完了。</p>
+      </div>
+    </div>
+    <div v-else class="panel pad agent-split">
+      <div v-for="row in demotes" :key="row.key" class="agent-line">
+        <span class="cell-key">
+          <span class="k" :title="row.key">{{ row.key }}</span>
+        </span>
+        <span
+          v-if="ownerChip(row)"
+          class="tag tag--owner"
+          :title="`归属代理：${ownerOf(row.tags)}`"
+        >{{ ownerChip(row) }}</span>
+        <span class="num agent-num">{{ toLocal(row.updated_at) }}</span>
+      </div>
+      <p class="src">
+        共 {{ demoteCount }} 条<template v-if="demoteCount > demotes.length">（这里只列前 {{ demotes.length }} 条）</template>；
+        批准 / 驳回在「记忆审核」页的「退居建议」里做（这里只读）。
+      </p>
+    </div>
+
     <div class="banner">
       dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
     </div>
@@ -100,7 +153,9 @@ import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
+import { agentUsageRows, loadAgentRows, ownerLabel, ownerOf, sharePercent } from '../utils/agents'
 import { showError, showToast } from '../utils/dialog'
+import { toLocal } from '../utils/format'
 
 // 计数口径与看板同一接口（/api/v1/stats）：实跑时用户手输的就是这里显示的两个数
 const data = ref(null)
@@ -122,6 +177,116 @@ async function load() {
   } catch (e) {
     error.value = `读取计数失败：${e.message}`
   }
+}
+
+/* ---------------------------------------------------------------- 代理维度
+ * 多代理时代，常驻层的水位是**几个代理分着占**的 —— 只报一个总数看不出
+ * 「谁把预算吃掉了」。下面两段各读一个只读端点，挂了只掉自己那一段。 */
+
+/** 班车提名的退居建议标（后端 `keepsake/core/tiering.py` 的 DEMOTE_CANDIDATE_TAG；
+ *  审核页 ReviewView 里同一个标 —— 两处各写一个字面量，改的时候一起改）。 */
+const DEMOTE_CANDIDATE_TAG = 'tier:demote-candidate'
+
+const perAgent = ref({})       // GET /api/v1/stats/core-per-agent
+const agentRows = ref([])      // 注册表（要显示名 + 谁是 primary）
+const demotes = ref([])        // 退居提名条目
+const demoteCount = ref(0)     // 退居提名总条数（这一页只显示前 20 条）
+const demoteError = ref('')
+
+/** agent_id → 显示名（注册表备注名）。 */
+const agentNames = computed(() =>
+    Object.fromEntries(agentRows.value.map((a) => [a.agent_id, a.name || a.agent_id])),
+)
+/** 现役主代理（role=primary）：它名下的条目默认就是「主脑的」，不挂归属 chip。 */
+const primaryAgentId = computed(() => {
+    const p = agentRows.value.find((a) => a.role === 'primary')
+    return p ? p.agent_id : ''
+})
+
+/** 常驻水位总量：优先班车状态端点的 budget（与看板同一口径），退到 stats 的 core。 */
+const water = computed(() => {
+    const b = tStatus.value?.budget
+    if (b && typeof b.used === 'number') return b
+    const chars = data.value?.core?.chars
+    if (typeof chars === 'number') {
+        return { used: chars, total: data.value?.core?.budget || 0, ratio: data.value?.core?.percent || 0 }
+    }
+    return null
+})
+const waterValue = computed(() => (water.value ? `${water.value.ratio}%` : '-'))
+const waterPercent = computed(() => (water.value ? water.value.ratio : null))
+const waterTone = computed(() => {
+    const r = water.value?.ratio
+    if (typeof r !== 'number') return ''
+    if (r >= 100) return 'danger'
+    if (r >= 90) return 'accent'
+    return 'ok'
+})
+const waterHint = computed(() =>
+    (water.value ? `已占 ${water.value.used} / ${water.value.total} 字符` : '读取失败'))
+
+/**
+ * 每代理字符占比（占**当前常驻水位总量**，不是占它自己的预算 ——
+ * 这一页说的是「水位被谁分着占」）。
+ * 无归属的条目（老库没打 `agent:` 标签的）算一行「无归属」，占比补齐到 100%。
+ */
+const agentShares = computed(() => {
+    const total = Number(water.value?.used || 0)
+    const rows = agentUsageRows(perAgent.value, agentNames.value).map((r) => ({
+        ...r,
+        percent: sharePercent(r.chars, total),
+    }))
+    const sum = rows.reduce((n, r) => n + r.chars, 0)
+    const rest = Math.max(0, total - sum)
+    if (rest > 0) {
+        rows.push({
+            agent_id: '',
+            label: '无归属',
+            chars: rest,
+            percent: sharePercent(rest, total),
+        })
+    }
+    return rows
+})
+
+/** 分列里的代理数（不含「无归属」那一行）。 */
+const agentShareCount = computed(() =>
+    agentShares.value.filter((r) => r.agent_id).length,
+)
+
+/** 退居提名条目的归属 chip：不是主脑的才挂（挂了就看得见「班车要踢谁」）。 */
+function ownerChip(row) {
+    const id = ownerOf(row?.tags)
+    if (!id || id === primaryAgentId.value) return ''
+    return ownerLabel(row.tags, agentNames.value)
+}
+
+/** 读注册表（显示名 + 谁是 primary）与按代理分列。 */
+async function loadAgentDimension() {
+    try {
+        agentRows.value = await loadAgentRows(api.listAgents)
+    } catch (e) {
+        agentRows.value = []
+    }
+    try {
+        perAgent.value = (await api.corePerAgent()) || {}
+    } catch (e) {
+        perAgent.value = {}
+    }
+}
+
+/** 退居提名列表（只读；批准/驳回在审核页）。 */
+async function loadDemotes() {
+    try {
+        const res = await api.fragments({ tag: DEMOTE_CANDIDATE_TAG, page: 1, page_size: 20 })
+        demotes.value = res?.items || []
+        demoteCount.value = Number(res?.count || demotes.value.length)
+        demoteError.value = ''
+    } catch (e) {
+        demotes.value = []
+        demoteCount.value = 0
+        demoteError.value = `读取退居提名失败：${e.message}`
+    }
 }
 
 /**
@@ -181,6 +346,8 @@ async function runOps(kind, dryRun, confirm) {
 onMounted(() => {
   load()
   loadTiering()
+  loadAgentDimension()
+  loadDemotes()
 })
 
 // ---------------------------------------------------------------------------
@@ -272,5 +439,33 @@ async function saveTiering() {
   margin-top: 10px;
   color: var(--text-faint);
   font-size: 12px;
+}
+/* 按代理分列 / 退居提名：一行一条。零新色 —— 归属 chip 走全局 .tag--owner，
+   数字走 .num，行分隔线走 --border-2。 */
+.agent-split {
+  margin-bottom: 20px;
+}
+.agent-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+}
+.agent-line + .agent-line {
+  border-top: 1px solid var(--border-2);
+}
+.agent-name {
+  font-weight: 600;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-num {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
 }
 </style>
