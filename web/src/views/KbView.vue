@@ -121,8 +121,30 @@
         <el-select v-model="sourceType" class="sel" title="来源" @change="onSource">
           <el-option label="全部来源" value="" />
           <el-option label="手动（可改删）" value="manual" />
+          <el-option label="代理 agent（代理写入）" value="agent" />
           <el-option label="技能 skill（灌入器）" value="skill" />
           <el-option label="技能手册 skill_hk（灌入器）" value="skill_hk" />
+        </el-select>
+        <!-- 来源代理筛选：与记忆页的「按代理筛选」同款模式（多选下拉 + 服务端过滤）。
+             🔴 **必须作为参数透传给后端**（agents=）：分页列表只在前端切当前页 =
+             「看着筛了、其实漏了」（总数与翻页都会骗人）。选项来自 /api/v1/agents。 -->
+        <el-select
+          v-model="agents"
+          class="sel sel--agents"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          placeholder="按来源代理筛选（不选＝全部）"
+          clearable
+          title="只看选中代理名下的知识库文档（可多选）"
+          @change="onAgents"
+        >
+          <el-option
+            v-for="a in agentOptions"
+            :key="a.id"
+            :label="a.name ? `${a.id}（${a.name}）` : a.id"
+            :value="a.id"
+          />
         </el-select>
         <el-button type="primary" :loading="loading" @click="search">搜索</el-button>
       </div>
@@ -170,9 +192,13 @@
             <span class="tag" :class="`tag--${typeOf(doc)}`">
               {{ typeLabel(doc) }}<template v-if="typeOf(doc) === 'link'"> ↗</template>
             </span>
+            <!-- 来源代理 chip：一眼看出这篇是谁存的（无主走灰色 chip，与记忆卡片同款） -->
+            <span class="tag" :class="doc.agent_id ? 'tag--owner' : ''" :title="ownerTitle(doc)">
+              {{ ownerText(doc) }}
+            </span>
             <!-- 自由标签：复用现有 .tag 配方（零新色）。字段缺席（老库未迁移）= 没打标 -->
             <span v-for="t in tagsOf(doc)" :key="t" class="tag" :title="`标签：${t}`">{{ t }}</span>
-            <span v-if="!isManual(doc)" class="tag">只读 · 灌入器维护</span>
+            <span v-if="!isManual(doc)" class="tag">{{ readonlyBadge(doc) }}</span>
           </template>
 
           <template #lead>查看切片 →</template>
@@ -191,7 +217,7 @@
             <path d="M4.5 4h4.6a2 2 0 0 1 2 2v13a1.8 1.8 0 0 0-1.8-1.8H4.5Z" stroke-linejoin="round" />
             <path d="M19.5 4h-4.6a2 2 0 0 0-2 2v13a1.8 1.8 0 0 0 1.8 1.8h4.8Z" stroke-linejoin="round" />
           </svg>
-          <p v-if="!sourceType && !contentType && !activeTag"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
+          <p v-if="!sourceType && !contentType && !activeTag && !agents.length"><b>知识库里还没有文档</b>往 documents 表灌入文档后，这里会自动列出标题、更新时间和切片数。</p>
           <p v-else><b>该筛选下还没有文档</b>当前只列 {{ filterLabel }} 的文档，换个筛选或选「全部」再看看。</p>
         </div>
       </div>
@@ -499,6 +525,7 @@ import { showError, showToast } from '../utils/dialog'
 import { downloadTemplate } from '../utils/export'
 import { toLocal } from '../utils/format'
 import { hasAnyHit, isStale, mergeCounts } from '../utils/kb'
+import { agentOwnerLabel, loadAgentOptions } from '../utils/agents'
 
 // 每页条数跟着各自 PagerBar 的下拉走 —— 两路各自独立：文档列表 / 切片命中 / 文档内切片
 const pageSize = ref(20)
@@ -524,6 +551,14 @@ const typeCounts = ref({})
  *  activeTag = 当前选中的那一个（再点一次取消）。与 q / source_type / content_type 取 AND。 */
 const tagRows = ref([])
 const activeTag = ref('')
+/** 来源代理筛选：选中的 agent_id 列表（空 = 全部 = 现状不变）。
+ *  ⚠️ **服务端过滤**：分页列表只在前端切当前页 =「看着筛了、其实漏了」——
+ *  所以筛选值必须作为 `agents` 参数透传给后端（与记忆页的 agent_filter 同款模式）。 */
+const agents = ref([])
+/** 下拉选项：来自 /api/v1/agents（注册表；代理数量是个位数 ⇒ 一次拉完）。 */
+const agentOptions = ref([])
+/** agent_id → 显示名（注册表备注名）；拿不到显示名就显示裸 id。 */
+const agentNames = computed(() => Object.fromEntries(agentOptions.value.map((a) => [a.id, a.name])))
 
 /** 类型 Tab（顺序即展示顺序）。count 取不到就不渲染那个数 */
 const TYPE_TABS = [
@@ -584,7 +619,8 @@ const filterLabel = computed(() => {
   const t = contentType.value ? `content_type=${contentType.value}` : ''
   const s = sourceType.value ? `source_type=${sourceType.value}` : ''
   const g = activeTag.value ? `tag=${activeTag.value}` : ''
-  return [t, s, g].filter(Boolean).join(' · ')
+  const a = agents.value.length ? `agents=${agents.value.join(',')}` : ''
+  return [t, s, g, a].filter(Boolean).join(' · ')
 })
 const loading = ref(false)
 const error = ref('')
@@ -686,6 +722,28 @@ function isManual(doc) {
   return doc.source_type === 'manual'
 }
 
+/**
+ * 只读徽标按来源域给不同的话：灌入器维护的与代理写入的不是一回事 ——
+ * 代理写入的（source_type='agent'）归那个代理自己管（kb_remove），
+ * 说成「灌入器维护」会把人引到错的方向。
+ */
+function readonlyBadge(doc) {
+  const st = doc?.source_type || ''
+  if (st === 'agent') return '只读 · 代理写入'
+  return '只读 · 灌入器维护'
+}
+
+/** 来源代理 chip 的文字（有归属给显示名，无归属给「无归属」）。 */
+function ownerText(doc) {
+  return agentOwnerLabel(doc?.agent_id, agentNames.value)
+}
+
+/** 归属 chip 的悬浮说明：有归属给 id，没有就说清「没有归属」。 */
+function ownerTitle(doc) {
+  const id = String(doc?.agent_id || '').trim()
+  return id ? `来源代理：${id}` : '这篇没有归属代理（无主）'
+}
+
 // 防串：请求序号。发请求前 ++，回来时序号对不上 ⇒ 过期响应直接丢弃（utils/kb.js 的 isStale）。
 // 不用 AbortController 是因为 axios 层不接 signal（api 客户端本轮只增不改），序号已足够防覆盖。
 let reqSeq = 0
@@ -710,7 +768,7 @@ async function loadDocs() {
   const seq = ++reqSeq
   loading.value = true
   try {
-    const data = await api.kbDocuments({ source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, page: page.value, page_size: pageSize.value })
+    const data = await api.kbDocuments({ source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, agents: agentParam.value, page: page.value, page_size: pageSize.value })
     if (isStale(seq, reqSeq)) return
     docs.value = data.items
     docCount.value = data.count
@@ -737,7 +795,7 @@ async function loadBoth(term) {
   let docRes, hitRes
   try {
     [docRes, hitRes] = await Promise.all([
-      api.kbDocuments({ q: term, source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, page: page.value, page_size: pageSize.value }),
+      api.kbDocuments({ q: term, source_type: sourceType.value, content_type: contentType.value, tag: activeTag.value, agents: agentParam.value, page: page.value, page_size: pageSize.value }),
       api.kbSearch({ q: term, page: hitPage.value, page_size: hitSize.value }),
     ])
   } catch (e) {
@@ -787,6 +845,25 @@ function onType(v) {
   page.value = 1
   hitPage.value = 1
   return search()
+}
+
+/** 换来源代理：与 onSource / onType 同一条路（页码各回第 1 页） */
+function onAgents() {
+  page.value = 1
+  hitPage.value = 1
+  return search()
+}
+
+/** 代理筛选参数（空 = 不过滤 = 现状不变；不传这个键，后端就不加谓词）。 */
+const agentParam = computed(() => (agents.value.length ? agents.value.join(',') : undefined))
+
+/** 下拉选项：拉全部代理（注册表是服务端分页的 ⇒ 翻页取完，不能只取第一页）。 */
+async function loadAgents() {
+  try {
+    agentOptions.value = await loadAgentOptions(api.listAgents)
+  } catch (e) {
+    agentOptions.value = []
+  }
 }
 
 /** Tab 计数：老库未迁移 content_type 列时后端给 {} ⇒ 这里保持 {}，Tab 上不显示数字 */
@@ -885,6 +962,8 @@ function refresh() {
   loadTags()
   // 指路行的待审数也跟着走（批准/驳回都在审核页做，这里只是别让旧数字留着）
   loadKbPending()
+  // 来源代理选项也跟着刷（代理刚被批准 / 改名的，下拉要能选到）
+  loadAgents()
   return searching.value ? loadBoth(q.value.trim()) : loadDocs()
 }
 
@@ -1136,6 +1215,8 @@ onMounted(() => {
   // 指路行的待审数（进页面就拉：没待审项那行不渲染，但不该等用户先点别的才知道）
   loadKbPending()
   loadDocs()
+  // 来源代理下拉的选项（来自 /api/v1/agents；拉不到就空列表 —— 下拉空着，不编代理）
+  loadAgents()
 })
 </script>
 

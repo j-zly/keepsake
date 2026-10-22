@@ -51,6 +51,21 @@ export function filterByOwners(rows, ids) {
 }
 
 /**
+ * 知识库文档的「来源代理」chip 文字（`documents.agent_id` 列）。
+ *
+ * 判据与上面那把尺子同源：知识库的归属**不在 tags 里**（那是记忆的判据），
+ * 而在 documents 表自己的一根列上 —— 空值 = **无主**（历史文档全是无主）。
+ *
+ * @param {string} agentId  documents.agent_id 的值
+ * @param {object} names    agent_id → 显示名（注册表备注名）
+ */
+export function agentOwnerLabel(agentId, names) {
+  const id = String(agentId || '').trim()
+  if (!id) return NO_OWNER_LABEL
+  return (names && names[id]) || id
+}
+
+/**
  * 拉**全部**代理（注册表是服务端分页的 ⇒ 翻页取完，不能只取第一页）。
  * `listAgents` 由调用方注入（api 层带 baseURL / 鉴权，utils 不自己 import）。
  * @returns {Promise<{id: string, name: string}[]>}

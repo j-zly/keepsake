@@ -17,6 +17,12 @@ v3 口径，控制台的写端点（`api/routers/kb.py`）也走这里 —— �
 **审核状态**（status/review_meta）：状态判据与「什么时候切块」都在这里
 （`upsert_document(chunk=...)` + `patch_review_meta`），控制台端点只负责判定
 「这条写入是谁发起的」并翻译 HTTP 语义 —— 与切块/幂等同一口径，不另起一套。
+
+**归属（agent_id）**：这篇文档是**哪个代理**存进来的（凭据反查的调用方）。
+列的定义（`AGENT_ID_COLUMN` / `AGENT_ID_COLUMN_DECL`）与迁移 SQL
+（`AGENT_ID_MIGRATION_HINT`）**只此一处**（纪律同 `govern.registry` 的
+`share_memory` 列）；写路径经 `upsert_document(agent_id=...)`，**只在 INSERT 时
+写**（撞键不改归属 —— 归属是文档的身份）。控制台手建**不传**这根列 ⇒ NULL = 无主。
 """
 
 from __future__ import annotations
@@ -80,6 +86,25 @@ MAX_CHUNK_LEN = 1200
 #: meta->>'skill')` 元组比对 v3 的 live 集，不属"两处共用"），这里只留类型白名单。
 INGEST_SOURCE_TYPES = ("skill", "skill_hk")
 
+# --------------------------------------------------------------------------
+# 归属列（documents.agent_id）：这篇文档是**哪个代理**存进来的
+# --------------------------------------------------------------------------
+# 🔴 **本模块是这根列的唯一定义处**（建表与补列共用同一份 ⇒ 两边不会漂），
+# 纪律与 `govern.registry` 的 `share_memory` 列同款。
+#:
+#: 列名。
+AGENT_ID_COLUMN = "agent_id"
+#: 列声明：**可空** —— NULL = **无主**（历史文档全是无主：加了列也不改存量语义）。
+#: 与 `share_memory` 那种 NOT NULL + 默认值不同：这里「没有值」本身就是一种状态
+#: （无主 = 收紧前的公共数据）。
+AGENT_ID_COLUMN_DECL = "text NULL"
+#: 老库补列的迁移 SQL —— **报给人看的，不自己跑**（生产迁移由主脑执行；
+#: 代码擅自 ALTER 生产表不是本项目的活）。与 `content_type` / `tags` / `status`
+#: 那几条提示同款纪律。
+AGENT_ID_MIGRATION_HINT = (
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS agent_id text NULL;"
+)
+
 #: 表名与列名（生产 `keepsake` 库 documents/chunks 的口径）。
 #: 值是**标识符**，会拼进 SQL 文本 ⇒ 调用方传进来的覆盖值必须过白名单
 #: （`api/routers/kb.py` 用的是 `_ident()`）。
@@ -99,6 +124,9 @@ DEFAULT_NAMES: Dict[str, str] = {
     # 由 `_need_status()` 给人话 500，读路径按「缺列 = 全 effective」降级。
     "status": "status",
     "rmeta": "review_meta",
+    # 归属列（存这篇的代理 id）。🟡 **可选列**：老库未迁移时探不到这根键，
+    # 读路径降级（空串=无主）、写路径由调用方先确认（不给就不碰这根列）。
+    "agent": AGENT_ID_COLUMN,
     "title": "title",
     "meta": "meta",
     "hash": "content_hash",
@@ -220,6 +248,23 @@ def content_hash(title: str, content: str) -> str:
     return "sha256:" + _digest(title, content)
 
 
+def agent_source_key(source_type: str, title: str, content: str,
+                     agent_id: str = "") -> str:
+    """**代理写入**的文档键：`<source_type>:<agent_id>:<sha256(title+content)[:12]>`。
+
+    🔴 **键里必须带归属代理 id**：`(source_type, source_key)` 是唯一约束，
+    键不带代理 ⇒ 两个代理存同一篇内容会撞成**同一行**（后写的覆盖先写的，
+    归属也被改写成后写的那个 —— 代理的归属被别人的写入悄悄改掉，是最难查的一类坏）。
+    带归属 id ⇒ 各自一行、各自的归属；同代理同内容重复提交仍是 `unchanged`
+    （内容级幂等不变）。
+
+    无归属（`agent_id` 空）⇒ 退成 `<source_type>:<hash>`（本机手建路径）。
+    """
+    owner = str(agent_id or "").strip()
+    digest = _digest(title, content)[:12]
+    return f"{source_type}:{owner}:{digest}" if owner else f"{source_type}:{digest}"
+
+
 # --------------------------------------------------------------------------
 # SQL 组装
 # --------------------------------------------------------------------------
@@ -265,6 +310,19 @@ def _rmeta_col(n: Dict[str, str]) -> str:
             "请先执行迁移：ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
             "review_meta jsonb NOT NULL DEFAULT '{}'")
     return n["rmeta"]
+
+
+def _agent_col(n: Dict[str, str]) -> str:
+    """要写归属就得确认这根列在：不在 ⇒ 抛，**不静默丢归属**。
+
+    与 `_tags_col` / `_status_col` 同款纪律：「存进去了但归属没存上」是最坏的
+    那种坏（代理以为这篇归自己，其实成了无主的公共数据，谁都能删）。
+    """
+    if not n.get("agent"):
+        raise RuntimeError(
+            "documents 表未找到 agent_id 列，拒绝静默丢掉归属；"
+            f"请先执行迁移：{AGENT_ID_MIGRATION_HINT}")
+    return n["agent"]
 
 
 def _scalar(row: Any) -> Any:
@@ -322,7 +380,8 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
                     text: str, names: Optional[Dict[str, str]] = None,
                     content_type: str = DEFAULT_CONTENT_TYPE,
                     url: str = "", tags: Optional[Sequence[str]] = None,
-                    status: Optional[str] = None, chunk: bool = True) -> Tuple[str, Any, int]:
+                    status: Optional[str] = None, chunk: bool = True,
+                    agent_id: Optional[str] = None) -> Tuple[str, Any, int]:
     """按 `(source_type, source_key)` 幂等落一篇文档，返回 `(状态, doc_id, 切片数)`。
 
     状态判据与 v3 同款，三种：
@@ -351,6 +410,10 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
     🆕 `chunk=False`：**不切块**（pending 阶段的专用姿势）。返回的切片数是 0，
     正文改由调用方存进 review_meta.body，等批准时才 `replace_chunks` ——
     未经审的正文不落 chunks，检索索引就不会被它污染。
+
+    🆕 `agent_id`：**`None` = 不碰这根列**（站内手建路径：库里留着 NULL = 无主，
+    存量语义不变）；给了就在 **INSERT 时**写死归属（**不进 ON CONFLICT 的 SET** ——
+    归属是这篇文档的身份，撞键时那一行已经有个归属了，不许被后来的写入改掉）。
     """
     n = _names(names)
     if status is not None and status not in STATUSES:
@@ -384,6 +447,14 @@ def upsert_document(cur: Any, schema: str, *, source_type: str, source_key: str,
         vals += ", %s::text"
         params.append(status)
         sets.append(f"{scol} = EXCLUDED.{scol}")
+    if agent_id is not None:
+        acol = _agent_col(n)
+        cols.append(acol)
+        vals += ", %s::text"
+        params.append(str(agent_id))
+        # 🔴 **归属只在 INSERT 时写**（不进 ON CONFLICT 的 SET）：归属是这篇文档的
+        # **身份**，写进去就不该被后来的写入悄悄改掉 —— 键相同（内容级幂等）时
+        # 那一行已经有个归属了，改它等于「别人的文档被我抢了归属」。
     cur.execute(
         f"INSERT INTO {schema}.{n['documents']}"
         f"({', '.join(cols)}) VALUES({vals}) "
@@ -470,20 +541,25 @@ def update_document(cur: Any, schema: str, doc_id: Any, *, title: str,
 def load_document(cur: Any, schema: str, doc_id: Any, *,
                   names: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """取一行文档，**返回逻辑键**（`id`/`source_type`/`source_key`/`title`/
-    `content_hash`/`content_type`/`status`），不存在 ⇒ None。调用方不用关心真实列名。
+    `content_hash`/`content_type`/`status`/`agent_id`），不存在 ⇒ None。
+    调用方不用关心真实列名。
 
-    🟡 `content_type` / `status` 是**可选投影**：`names["ctype"]` / `names["status"]`
-    为假值（调用方探到表里没这列）时 SELECT `''` —— 老库未迁移时读路径照常返回，
-    不裸炸（写路径另由 `_write_names` 的必需列判据挡住，见 `routers/kb.py`）。
+    🟡 `content_type` / `status` / `agent_id` 是**可选投影**：`names["ctype"]` /
+    `names["status"]` / `names["agent"]` 为假值（调用方探到表里没这列）时
+    SELECT `''` —— 老库未迁移时读路径照常返回，不裸炸（写路径另由 `_write_names`
+    的必需列判据挡住，见 `routers/kb.py`）。
     🔴 缺 status 列时这里给 `effective`：**缺列 = 全 effective**（存量行全可见，
     与未迁移时的既有行为一字不差）。
+    🔴 缺 agent_id 列时这里给空串 = **无主**（与「库里就是 NULL」同义）——
+    存量文档全是无主，缺列不能把可见性判成「不可见」。
     """
     n = _names(names)
     # 显式 AS：dict_row 拿的是列名，裸 `SELECT ''` 的键是 "?column?"，取不到
     sel_ctype = f"{n['ctype']} AS content_type" if n.get("ctype") else "'' AS content_type"
     sel_status = f"{n['status']} AS status" if n.get("status") else "'' AS status"
+    sel_agent = f"{n['agent']} AS agent_id" if n.get("agent") else "'' AS agent_id"
     cur.execute(f"SELECT {n['doc_id']}, {n['src_type']}, {n['src_key']}, "
-                f"{n['title']}, {n['hash']}, {sel_ctype}, {sel_status} "
+                f"{n['title']}, {n['hash']}, {sel_ctype}, {sel_status}, {sel_agent} "
                 f"FROM {schema}.{n['documents']} WHERE {n['doc_id']} = %s", [doc_id])
     row = cur.fetchone()
     if row is None:
@@ -494,7 +570,8 @@ def load_document(cur: Any, schema: str, doc_id: Any, *,
             "title": _val(row, n["title"], 3),
             "content_hash": _val(row, n["hash"], 4),
             "content_type": _val(row, "content_type", 5) or DEFAULT_CONTENT_TYPE,
-            "status": _val(row, "status", 6) or DEFAULT_STATUS}
+            "status": _val(row, "status", 6) or DEFAULT_STATUS,
+            "agent_id": str(_val(row, "agent_id", 7) or "")}
 
 
 def document_chunks(cur: Any, schema: str, doc_id: Any, *,

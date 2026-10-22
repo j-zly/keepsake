@@ -182,6 +182,13 @@ class KbDocument(BaseModel):
                     "`GET /kb/documents?tag=` 按它精确筛。空数组（没打标 / 表里没这列）"
                     "时**不出这个键**，前端当「没打标」渲染",
     )
+    agent_id: str = Field(
+        "",
+        exclude_if=lambda v: v == "",
+        description="**来源代理**（存这篇的代理 id；`documents.agent_id` 列）。"
+                    "空串（表里没这列 / 这篇无主）时**不出这个键** —— "
+                    "无主 = 收紧前的公共数据（历史文档全是），前端按「无主」渲染",
+    )
 
 
 class KbDocumentList(BaseModel):

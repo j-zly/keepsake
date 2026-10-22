@@ -614,6 +614,18 @@ python3 scripts/kb_ingest.py           # 实跑
 
 **控制台端点**：文档列表（分页、关键词与 `source_type` 双过滤，且响应里**必带** `source_type`，前端据此判断哪些可写）、增 / 改（改正文连带重切）/ 删（confirm = 文档标题全文，删前先写快照备份）、JSONL 导入（dry-run 预演，实跑须手输 `would_add` 计数）、JSONL 导出。
 
+### 知识库对代理开放（kb_store / kb_search / kb_get / kb_remove）
+
+知识库原来只对控制台开放，现在对**所有代理**开放，治理口径与记忆**同一把尺子**（`keepsake.govern.visibility` —— 一份实现，不是两份）。三条规则：
+
+| 规则 | 行为 |
+|------|------|
+| **归属** | 每篇文档记下**存它的那个代理**（`documents.agent_id`，凭据反查的调用方 —— 凭据换发不影响归属）。控制台手建的仍是 `NULL`（= 无主），存量文档一个都没动过。 |
+| **可见性** | 非 primary 只看得见**自己名下** + 开了 `share_memory` 的代理名下 + **无主的老文档**（历史那 1844 篇全是无主）；primary 永远全量。 |
+| **删除** | 非 primary 只能删**自己名下**的（或无主老文档）；删别人的一律拒且**零内容回显** —— 「看不见」与「不是你的」回同一句，存在性本身也不泄露。真删必须 `confirm=true`；primary 全量可删。 |
+
+四个工具走**既有 ingest 管线**（切块 / 幂等 / 审核 status 链一个字没改）：子代理提交落控制台待审队列（`pending`，批准时才切块），主代理的直进 `effective`。控制台知识库页给每篇文档加「来源代理」chip，并可按代理筛（`?agents=a,b`，服务端过滤、切页之前）。`agent_id` 是新增列，老库迁移 SQL：`ALTER TABLE documents ADD COLUMN IF NOT EXISTS agent_id text NULL;`（未迁移前全库按无主读 —— 可见性与迁移前逐字相同，而 `kb_store` 会带迁移提示拒写）。
+
 ## 通用记忆接口与 MCP
 
 `keepsake.adapters.generic.protocol.MemoryProvider` 是一个 `runtime_checkable` 的 `typing.Protocol`，描述「一个记忆系统对宿主暴露什么」。该模块不 import 任何宿主的东西 —— 描述的是形状，与调用方是谁无关；依赖方向严格是 `adapters.hermes → adapters.generic`。

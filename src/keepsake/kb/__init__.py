@@ -1,8 +1,12 @@
-"""知识库**写入**的共用层（`ingest`）：控制台写端点与灌入器 CLI 同源。
+"""知识库的**共用层**：`ingest`（写判据）+ `service`（数据层与代理面服务）。
 
-只读检索在 `keepsake.api.routers.kb`；这里管的是「一篇文档怎么切块、
-怎么幂等落库」——两处必须共用同一份判据，否则 API 写进去的文档会被
-灌入器切成另一种粒度，检索命中与页面显示对不上。
+* `ingest` —— 控制台写端点、灌入器 CLI、代理面的 `kb_store` **同源**：
+  「一篇文档怎么切块、怎么幂等落库、审核 status 链怎么走」只有这一份。
+* `service` —— 连接 / 探列 / 写事务 + **代理面**的知识库服务（`kb_store` /
+  `kb_search` / `kb_get` / `kb_remove` 的实现）。**FastAPI-free**：MCP 服务面
+  不一定装了控制台的 fastapi（`pyproject.toml` 里 fastapi 压根不是依赖）。
+
+控制台的 HTTP 端点在 `keepsake.api.routers.kb`（薄薄一层，转译 HTTP 语义）。
 """
 
 from __future__ import annotations

@@ -717,6 +717,18 @@ It also prunes dead documents: `skill` / `skill_hk` entries whose `(source_type,
 
 **Console endpoints**: document list (paged, free-text and `source_type` filters, and `source_type` always present in the response so the UI knows which entries are writable), create / update (re-chunking) / delete (confirm = the document's full title; snapshot + backup written before the delete), JSONL import (dry-run preview, real run requires typing the `would_add` count), and JSONL export.
 
+### The knowledge base is open to agents (kb_store / kb_search / kb_get / kb_remove)
+
+The knowledge base used to be console-only; it is now open to **every agent** over MCP, governed by **the same yardstick as memory** (`keepsake.govern.visibility` — one implementation, not two). Three rules:
+
+| Rule | Behaviour |
+|------|-----------|
+| **Ownership** | Every document records the agent that stored it (`documents.agent_id`, the credential-derived caller — a re-issued credential does not change it). Console-created documents stay `NULL` (= unowned), so the existing corpus is untouched. |
+| **Visibility** | A non-primary agent sees only **its own** documents + those of agents with `share_memory` on + **unowned legacy documents** (the existing 1844 are all unowned). A primary agent sees everything. |
+| **Deletion** | A non-primary agent may delete only **its own** documents (or unowned legacy ones); someone else's ⇒ refused with **zero content echoed** — and "not visible" and "not yours" answer identically, so existence is not leaked either. `confirm=true` is required. A primary agent may delete anything. |
+
+The four tools reuse the existing ingest pipeline unchanged (chunking / idempotency / the review status chain): a sub-agent's submission lands in the console's review queue (`pending`, not chunked until approved), a primary agent's lands directly as `effective`. The console's knowledge base page shows a **source-agent chip** per document and filters by agent (`?agents=a,b`, server-side, before pagination). `agent_id` is a new column — the migration for an existing database is `ALTER TABLE documents ADD COLUMN IF NOT EXISTS agent_id text NULL;` (until it is applied every document reads as unowned, and `kb_store` refuses to write with a human-readable error).
+
 ## Generic Memory Interface & MCP
 
 `keepsake.adapters.generic.protocol.MemoryProvider` is a runtime-checkable `typing.Protocol` describing what a memory system exposes to its host. The module imports nothing host-specific — it describes the shape, not the caller — and the dependency direction is strictly `adapters.hermes → adapters.generic`.

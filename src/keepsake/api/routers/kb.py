@@ -4,6 +4,13 @@
 环境变量读，代码里不出现任何连接串/口令。读端点只跑 `SELECT`；写端点只碰
 `source_type='manual'` 的文档（skill/skill_hk 是灌入器的地盘，见文末说明）。
 
+🔴 **连接 / 探列 / 写事务这一层在 `keepsake.kb.service`**（本模块 import 它）：
+那一层是 **FastAPI-free** 的 —— 代理面的知识库工具（MCP 的 `kb_store` /
+`kb_search` / `kb_get` / `kb_remove`）也要用同一份，而 MCP 那边**不一定装了
+控制台的 fastapi**（`pyproject.toml` 里 fastapi 压根不是依赖）。**口径只有一份**：
+检索 / 归属 / 可见性 / 删除判据全在 service 层（它调 `govern.visibility` 那一把
+尺子），控制台与代理面共用。
+
 表结构按任务书口径：schema 下的 `skill_docs` / `documents` / `chunks`。
 列名在本仓库里没有权威定义（KB 库不在 keepsake 里），所以启动后按
 `information_schema.columns` **探一次真实列名**再拼查询 —— 表名/列名不能参数化，
@@ -20,17 +27,24 @@
    备份写不成功 ⇒ 一行都不删。
 
 **来源 vs 内容类型（两根列，别混）**：`source_type` 分「谁维护」（manual=控制台
-可改删；skill/skill_hk=灌入器只读）；`content_type` 分「这是个什么东西」
-（skill 技能 / note 手记 / article 长文 / link 链接卡片 / image 图文占位）。
-分类的作用是**按类型切块**（link 单块、其余逐字走 `split_chunks`）与**按类型过滤**，
-不改任何既有的域隔离与幂等判据。类型创建后不可变（双挡：前端不给入口 +
-后端带异值 400）。`image` 本期只占枚举位：创建端点 400（依赖向量路，后置）。
+可改删；agent=代理写入；skill/skill_hk=灌入器只读）；`content_type` 分
+「这是个什么东西」（skill 技能 / note 手记 / article 长文 / link 链接卡片 /
+image 图文占位）。分类的作用是**按类型切块**（link 单块、其余逐字走
+`split_chunks`）与**按类型过滤**，不改任何既有的域隔离与幂等判据。类型创建后
+不可变（双挡：前端不给入口 + 后端带异值 400）。`image` 本期只占枚举位：
+创建端点 400（依赖向量路，后置）。
 
 **自由标签（tags）是第三个维度，不是第二个类型**：content_type 是封闭枚举（写面
 校验白名单），标签是开放维度（一篇可挂多个、随时可改、只影响筛选）。标签**不进**
 `source_key`/`content_hash`（进了就等于「改个标签变成换一篇文档」），也**不碰**切块与
 来源域；skill 文档标签恒空 —— 灌入器一个字都不往那根列写，界面也不给它开打标入口
 （沿用 isManual 那套 409 纪律）。
+
+**归属列（documents.agent_id）**：存这篇的**代理 id**（凭据反查的调用方）。
+控制台手建**不写**这根列（NULL = 无主，存量语义不变）；代理写入经
+`keepsake.kb.service.store_document` 打上归属。列表出参带 `agent_id`（无主时
+**不出这个键**），并支持 `?agents=a,b` 服务端筛选（切页之前）。列的定义与迁移
+SQL 在 `keepsake.kb.ingest`（唯一定义处）。
 
 **审核状态**（批2）：`status` ∈ pending/effective/rejected + `review_meta` jsonb。
 判据只有一条 —— **谁在写**：站内会话（require_session 的界面路径）与灌入器是可信
@@ -47,10 +61,8 @@ from __future__ import annotations
 
 import json
 import re
-import threading
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import)
@@ -59,6 +71,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from keepsake.govern.registry import CREDENTIAL_PREFIX, ROLE_PRIMARY, Registry
 from keepsake.kb import ingest
+from keepsake.kb import service as kb_service
+from keepsake.kb.service import KbError
 
 from .. import audit, config
 from ..deps import get_storage, require_session
@@ -67,27 +81,25 @@ from ..schemas import KbChunkList, KbDocument, KbDocumentList
 from ..schemas import KbPendingItem, KbPendingList
 from .ops import _need_flag, _need_text, _reject, write_guard
 
+# ---- 数据层（连接 / 探列 / 写事务）搬到 `keepsake.kb.service` ---------------
+# 那一层是 **FastAPI-free** 的：MCP 工具面（代理的知识库四工具 kb_store /
+# kb_search / kb_get / kb_remove）也要用它，而 MCP 那边**不一定装了控制台的
+# fastapi**（`pyproject.toml` 里 fastapi 压根不是依赖）。
+# 名字在本模块照旧可见（既有测试与运维脚本按 `kb_router._connect` 这类名字打
+# 补丁 / 探针）—— **位置不变、语义不变**，只有实现在 service 里。
+from keepsake.kb.service import (  # noqa: F401 —— 搬走但名字不变的公共面
+    _CAND_AGENT_ID, _CAND_CTYPE, _CAND_DOC, _CAND_ID, _CAND_RMETA,
+    _CAND_SRC_KEY, _CAND_SRC_TYPE, _CAND_STATUS, _CAND_TAGS, _CAND_TEXT,
+    _CAND_TIME, _CAND_TITLE, _CAND_TSV,
+    _COLS_CACHE,                      # 列名缓存：既有测试按 `kb_router._COLS_CACHE` 清它
+    _STATUS_MIGRATION_HINT, _TAGS_MIGRATION_HINT, _CTYPE_MIGRATION_HINT,
+    SOURCE_TYPE_RE as _SOURCE_TYPE_RE,
+    connect as _connect, ident as _ident, missing as _missing, pick as _pick,
+    table_columns as _table_columns, write_conn as _write_conn,
+    write_names as _write_names,
+)
+
 router = APIRouter(tags=["kb"])
-
-#: 标识符白名单：小写字母/数字/下划线，且不以数字开头
-_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-
-#: 候选列名（按优先级；探到哪个用哪个）
-_CAND_TEXT = ("content", "text", "body", "chunk_text", "page_content")
-_CAND_ID = ("id", "chunk_id", "key", "uuid")
-_CAND_DOC = ("doc_id", "document_id", "doc", "knowledge_id")
-_CAND_TITLE = ("title", "name", "doc_title", "document_title")
-_CAND_TSV = ("content_tsv", "tsv", "search_vector", "content_vector_ts")
-#: documents 表的时间列（可选）：探到就用，探不到就留空串 —— 时间列不是识别表结构的硬要求
-_CAND_TIME = ("updated_at", "modified_at", "last_modified_at", "updated", "created_at", "date")
-
-# ---- 写端点要的列（**必需**：探不到就 500，不许拿别的列凑合着写）----
-_CAND_SRC_TYPE = ("source_type",)
-_CAND_SRC_KEY = ("source_key",)
-_CAND_META = ("meta",)
-_CAND_HASH = ("content_hash",)
-_CAND_ORD = ("ord", "ordinal", "seq", "chunk_no")
-_CAND_SRC_PATH = ("source_path", "path", "key")
 
 #: 导出护栏：默认 2000 条、封顶 20000（切片正文体积大，别一次拖全库）
 EXPORT_LIMIT_DEFAULT = 2000
@@ -95,21 +107,6 @@ EXPORT_LIMIT_MAX = 20000
 
 #: 单次导入条数上限（同上：超了 400，不默默截断）
 IMPORT_MAX_ITEMS = 2000
-
-#: 来源类型的合法形态（只作为 WHERE 参数值校验，挡住 `'; drop` 这类噪声）
-_SOURCE_TYPE_RE = _IDENT_RE
-
-#: 内容类型列（documents）。**可选探测**：老库未迁移时读路径 SELECT '' 降级
-#: （出参不带这个键），真要按类型筛/真要写类型时由 `_need_ctype` 给出人话 500。
-_CAND_CTYPE = ("content_type",)
-
-#: 老库未迁移 content_type 列时的修复 SQL —— **报给人看的，不自己跑**
-#: （生产迁移由主脑执行；代码擅自 ALTER 生产表不是本项目的活）。
-_CTYPE_MIGRATION_HINT = (
-    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_type text NOT NULL DEFAULT 'note'; "
-    "UPDATE documents SET content_type='skill' WHERE source_type IN ('skill','skill_hk'); "
-    "CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type);"
-)
 
 #: 链接卡片的 URL 形态：只放行 http/https，别的（file://、javascript:）一律 400。
 #: 🔴 **不抓取网页**（SSRF 与外网依赖都不要，抓取是接入方/助手的事）—— 这里只存字符串。
@@ -123,40 +120,10 @@ _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 # 只多一根可筛选的列（`'tag' = ANY(tags)` 走 GIN 索引，与 Dify metadata filtering
 # 同一套做法）。审核队列是批2另单，本期不碰。
 
-#: 标签列（documents）。兼容纪律与 content_type **一字同款**：读路径缺列降级成
-#: 空数组（出参不带 tags 键，不假装每篇都打了标），写路径由 `_need_tags` 给人话 500。
-_CAND_TAGS = ("tags",)
-
-#: 老库未迁移 tags 列时的修复 SQL —— **报给人看的，不自己跑**（与 ctype 同款）
-_TAGS_MIGRATION_HINT = (
-    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}'; "
-    "CREATE INDEX IF NOT EXISTS idx_documents_tags_gin ON documents USING gin(tags);"
-)
-
-#: 标签净化后的硬上限（前端即时提示引的就是这两个数 —— 一处定、两处抄，勿各自写死）
-TAG_MAX_ITEMS = 12
-TAG_MAX_LEN = 32
-
-#: 控制字符（含 `\n` `\r` `\t` `\0`）—— 一律 400：标签要渲成 chip、还要进导出文件，
-#: 串进换行/制表能把版面和 JSONL 行一起搞坏。
-_TAG_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-# --------------------------------------------------------------------------
-# 审核状态（documents.status + documents.review_meta）
-# --------------------------------------------------------------------------
-# 与 tags/content_type 同款纪律：**可选列**。老库未迁移时读路径一律当「全
-# effective」（存量行照常可见、照常可检索，与迁移前一字不差），真要写审核状态的
-# 路径（代理提交 / 批准 / 驳回）由 `_need_status()` 给人话 500 带迁移 SQL。
-# 状态常量本体在 `ingest`（写路径的唯一判据来源），这里只放探列候选与提示文案。
-
-_CAND_STATUS = ("status",)
-_CAND_RMETA = ("review_meta",)
-
-_STATUS_MIGRATION_HINT = (
-    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'effective'; "
-    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS review_meta jsonb NOT NULL DEFAULT '{}'; "
-    "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);"
-)
+#: 标签净化后的硬上限（前端即时提示引的就是这两个数 —— 一处定、两处抄，勿各自写死）。
+#: **本体在 `keepsake.kb.service`**（代理面与控制台共用同一份净化口径）。
+TAG_MAX_ITEMS = kb_service.TAG_MAX_ITEMS
+TAG_MAX_LEN = kb_service.TAG_MAX_LEN
 
 #: 待审面板的正文预览长度（前端照抄这个数，别自己定另一档）
 PENDING_PREVIEW_LEN = 500
@@ -167,128 +134,6 @@ AGENT_DENIED_NOTE = (
     "代理 {agent_id} 未批准/已吊销（或凭据无效），知识库写入一律拒绝 —— "
     "请到控制台代理治理页批准该代理并领取 ksk_ 凭据后重试"
 )
-
-_COLS_CACHE: Dict[str, Dict[str, set]] = {}
-_COLS_LOCK = threading.Lock()
-
-
-def _ident(name: str) -> str:
-    """标识符过白名单才允许进 SQL 文本（表名/列名无法参数化，只能这样拦）。"""
-    if not _IDENT_RE.match(name):
-        raise HTTPException(status_code=500,
-                            detail={"error": "bad_identifier", "message": f"非法标识符：{name}"})
-    return name
-
-
-def _dsn() -> str:
-    dsn = config.pg_dsn()
-    if not dsn:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "kb_unconfigured",
-                    "message": f"知识库连接串未配置（{config.PG_DSN_ENV}）"},
-        )
-    return dsn
-
-
-def _pg() -> Tuple[Any, Any]:
-    """返回 (驱动模块, 行工厂)。psycopg2 优先，退 psycopg3 —— 两版 API 基本同构。
-
-    🔴 **两版都要求显式 `import` 子模块**：`import psycopg2` 不会加载
-    `psycopg2.extras`，直接取 `.RealDictCursor` 会裸炸
-    `AttributeError: module 'psycopg2' has no attribute 'extras'`；
-    psycopg3 同理（`psycopg.rows.dict_row`）。所以下面两行 import 都必须写。
-    子模块缺失按「这版驱动不可用」处理（`AttributeError` 一起兜住），
-    退另一版；两版都不可用 ⇒ 结构化 500 `kb_no_driver`，绝不漏裸 AttributeError。
-    """
-    try:
-        import psycopg2                      # noqa: PLC0415 —— 延迟导入：没装也不影响非 KB 接口
-        import psycopg2.extras               # noqa: PLC0415,F401 —— 行工厂在这个子模块里
-
-        return psycopg2, psycopg2.extras.RealDictCursor
-    except (ImportError, AttributeError) as e:
-        first_error = e
-    try:
-        import psycopg                       # noqa: PLC0415
-        import psycopg.rows                  # noqa: PLC0415,F401 —— 行工厂在这个子模块里
-
-        return psycopg, psycopg.rows.dict_row
-    except (ImportError, AttributeError) as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "kb_no_driver",
-                    "message": "未安装可用的 PostgreSQL 驱动（psycopg2 或 psycopg）："
-                               f"{first_error.__class__.__name__}/{e.__class__.__name__}"},
-        ) from e
-
-
-def _connect_kwargs(pg: Any, row_factory: Any) -> Dict[str, Any]:
-    """行工厂传给**哪个参数**取决于驱动版本（同名不同义）：
-
-    * psycopg2：`cursor_factory=RealDictCursor`；
-    * psycopg3：`row_factory=dict_row` —— 传 `cursor_factory` 会得到
-      `dict_row() got an unexpected keyword argument 'row_factory'`（500）。
-
-    🔴 **按模块名分流，不按签名猜**：两个驱动的 `connect()` 签名里两个参数都有，
-    猜不出来；而假驱动（测试里塞进 `sys.modules` 的）没有 `__name__` ⇒ 走
-    psycopg2 老口径，88/91 上的既有假驱动测试零改动。
-    """
-    if getattr(pg, "__name__", "") == "psycopg":
-        return {"row_factory": row_factory}
-    return {"cursor_factory": row_factory}
-
-
-def _connect() -> Any:
-    """打开只读连接（上下文管理器）。
-
-    🔴 **判断顺序硬约束**：先 `_dsn()` 判未配置，再 `_pg()` 载驱动。
-    顺序反了的话，未配置 DSN 会被「驱动没装/不完整」盖住，客户端拿到的是
-    `kb_no_driver` 而不是 `kb_unconfigured`，定位不了真因。所有取数都走这里，
-    顺序只此一处，不再散落在各接口里。
-    """
-    dsn = _dsn()
-    pg, row_factory = _pg()
-    return pg.connect(dsn, connect_timeout=5, **_connect_kwargs(pg, row_factory))
-
-
-def _table_columns(schema: str, tables: Sequence[str]) -> Dict[str, set]:
-    """探一次三表的真实列名（进程级缓存，只读 information_schema）。"""
-    key = f"{schema}:{','.join(tables)}"
-    cached = _COLS_CACHE.get(key)
-    if cached is not None:
-        return cached
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                # 🔴 显式 cast 到 text[]：ANY 的元素类型 PG 没法从上下文推断，
-                # 驱动会替我们选 —— psycopg2 把 str 列表适配成 text[]，
-                # `sql_identifier = text` 无操作符 ⇒ 探列直接 500。
-                "SELECT table_name, column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = ANY(%s::text[])",
-                (schema, list(tables)),
-            )
-            cols: Dict[str, set] = {t: set() for t in tables}
-            for row in cur.fetchall():
-                cols.setdefault(str(row["table_name"]), set()).add(str(row["column_name"]))
-    with _COLS_LOCK:
-        _COLS_CACHE[key] = cols
-    return cols
-
-
-def _pick(cols: set, candidates: Sequence[str], table: str, what: str) -> str:
-    """在真实列里挑第一个候选；挑不到 ⇒ 500（结构不识别，不能装作没数据）。"""
-    for c in candidates:
-        if c in cols:
-            return _ident(c)
-    raise HTTPException(
-        status_code=500,
-        detail={"error": "kb_schema_unknown",
-                "message": f"{table} 表未找到 {what} 列（候选：{', '.join(candidates)}）"},
-    )
-
-
-def _missing(tables: Dict[str, set]) -> List[str]:
-    return [t for t, cols in tables.items() if not cols]
 
 
 @router.get("/api/v1/kb/summary", response_model=KbSummary,
@@ -326,77 +171,26 @@ def kb_search(
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
 ) -> KbSearchResult:
-    """知识库全文命中：有 tsvector 列走 tsquery，否则退 ILIKE（只读，不建索引）。"""
-    schema = _ident(config.pg_schema())
-    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
-    if _missing(tabs):
-        raise HTTPException(status_code=500,
-                            detail={"error": "kb_table_missing",
-                                    "message": "知识库 documents/chunks 表不存在"})
-    chunks = tabs[config.KB_TABLE_CHUNKS]
-    docs = tabs[config.KB_TABLE_DOCUMENTS]
+    """知识库全文命中：有 tsvector 列走 tsquery，否则退 ILIKE（只读，不建索引）。
 
-    c_text = _pick(chunks, _CAND_TEXT, config.KB_TABLE_CHUNKS, "正文")
-    c_id = _pick(chunks, _CAND_ID, config.KB_TABLE_CHUNKS, "主键")
-    c_doc = _pick(chunks, _CAND_DOC, config.KB_TABLE_CHUNKS, "外键(文档)")
-    d_id = _pick(docs, _CAND_ID, config.KB_TABLE_DOCUMENTS, "主键")
-    c_tsv = next((_ident(c) for c in _CAND_TSV if c in chunks), None)
-
-    joined = (f"FROM {schema}.{config.KB_TABLE_CHUNKS} c "
-              f"LEFT JOIN {schema}.{config.KB_TABLE_DOCUMENTS} d "
-              f"ON d.{d_id} = c.{c_doc}")
-    d_title = next((_ident(t) for t in _CAND_TITLE if t in docs), None)
-    select_doc = f"COALESCE(d.{d_title}, '')" if d_title else "''"
-    d_ctype = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
-    select_ctype = f"COALESCE(d.{d_ctype}, '')" if d_ctype else "''"
-    d_tags = next((_ident(c) for c in _CAND_TAGS if c in docs), None)
-    # 老库没有 tags 列 ⇒ 投影**空数组**（不是 NULL、不是缺键）：出参据此省掉 tags 键，
-    # 前端按「没打标」渲染，而不是把 NULL 当成一个标签。
-    select_tags = f"COALESCE(d.{d_tags}, '{{}}'::text[])" if d_tags else "'{}'::text[]"
-    # 🆕 审核过滤：**待审/已驳回的文档检索一律不可见**（pending 阶段压根没切块，
-    # 这里仍要带上谓词 —— 防的是「批准前的行被人绕过写面塞了块」与已驳回行残留的旧块）。
-    # 老库没有 status 列 ⇒ 不加这个谓词（存量行照常可检索，与迁移前一字不差）。
-    d_status = next((_ident(c) for c in _CAND_STATUS if c in docs), None)
-
-    if c_tsv:
-        # 中文语料用 simple 分词（PG 默认 english 会把中文切成一坨）
-        mode, where, params = "tsvector", f"c.{c_tsv} @@ plainto_tsquery('simple', %s)", [q]
-        rank = f"ts_rank(c.{c_tsv}, plainto_tsquery('simple', %s))"
-        rank_params: List[Any] = [q]
-    else:
-        mode, where, params = "ilike", f"c.{c_text} ILIKE %s", [f"%{q}%"]
-        rank, rank_params = "0.0::float8", []
-    if d_status:
-        where, params = f"{where} AND d.{d_status} = %s", [*params, ingest.STATUS_EFFECTIVE]
-
-    sql = (
-        f"SELECT c.{c_id} AS chunk_id, CAST(c.{c_doc} AS text) AS doc_id, "
-        f"{select_doc} AS title, LEFT(c.{c_text}, 300) AS snippet, "
-        f"{select_ctype} AS content_type, {select_tags} AS tags, "
-        f"{rank} AS score {joined} WHERE {where} "
-        f"ORDER BY score DESC, chunk_id ASC LIMIT %s OFFSET %s"
-    )
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            # 🔴 占位符顺序 = SQL 文本里的出现顺序：ts_rank(%s) 在 SELECT（第 1 个），
-            # WHERE 的 tsquery(%s) 与 status(%s) 在后 ⇒ 必须 **rank_params 在前**、
-            # params 在后。批2 前两边都是同一个 q、顺序无所谓；批2 往 params 里追加了
-            # status 值后，[*params, *rank_params] 会把 'effective' 喂给 tsquery、
-            # 把 q 喂给 status ⇒ 迁移后生产（有 tsv 列）检索恒 0（91 测试库无 tsv 列
-            # 走 ILIKE 路径，逮不住这个错位 —— 回归判据见 test_kb_review 的 tsvector 用例）。
-            cur.execute(sql, [*rank_params, *params, page_size, (page - 1) * page_size])
-            rows = cur.fetchall()
+    🔴 **检索本体在 `keepsake.kb.service.search_documents`**（与代理面的
+    `kb_search` 工具**同一个函数**）：控制台不过滤（人看全量），代理面传自己的
+    可见集合（非 primary 只看得见自己 + 已共享代理名下的 + 无主的老文档）。
+    **可见性判据只有一份**（`govern.visibility.visible_agent_ids`），
+    两处各写一份必然漂。
+    """
+    out = kb_service.search_documents(query=q, limit=page_size, page=page)
     items = [
         KbHit(chunk_id=str(r["chunk_id"]), doc_id=str(r["doc_id"] or ""),
               title=str(r["title"] or ""), snippet=str(r["snippet"] or ""),
               # 老表没这列时投影是 '' ⇒ 出参按 schema 规则省略该键（与 source_type 同款）
               content_type=str(r.get("content_type") or ""),
               tags=_tags_out(r.get("tags")),
-              rank=round(float(r["score"] or 0.0), 6))
-        for r in rows
+              rank=round(float(r.get("score") or 0.0), 6))
+        for r in out["items"]
     ]
     return KbSearchResult(q=q, items=items, count=len(items), page=page,
-                          page_size=page_size, mode=mode)
+                          page_size=page_size, mode=str(out.get("mode") or "ilike"))
 
 
 @router.get("/api/v1/kb/type-counts", response_model=KbTypeCounts,
@@ -466,6 +260,9 @@ def kb_documents(
     content_type: str = "",
     # 🔴 同上（`Query` 对象会让直接调本函数的护栏测试炸）：裸串默认值 + 参数化取值
     tag: str = "",
+    # 🆕 **来源代理筛选**（`agents=a,b`）：与记忆页的 `agents` 参数同款 ——
+    # 逗号分隔的 agent_id 列表，空 = 不过滤（= 现状不变）。
+    agents: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
 ) -> KbDocumentList:
@@ -491,6 +288,12 @@ def kb_documents(
     拼串就等于把库里内容当代码解释）。与 q / source_type / content_type 取 AND。
     值不查枚举（标签是开放维度，没有白名单可查），所以只 `strip()` 后原样当参数；
     老库没有 tags 列而调用方要按标签筛 ⇒ 400（筛不了就说筛不了）。
+
+    🆕 `agents` 是**来源代理**的精确过滤（`d.agent_id = ANY(...)`，值走参数）。
+    🔴 **这是控制台的读面筛选**（按归属过滤显示哪些文档），**不是权限判定** ——
+    权限在 `govern.visibility`（谁看得见）与 MCP 工具面（谁能删）那边，两件事。
+    🔴 **过滤必须发生在切页之前**（服务端过滤）：只在前端切当前页 = 看着筛了、
+    其实漏了（总数与翻页都会骗人）。
     """
     st = (source_type or "").strip()
     if st and not _SOURCE_TYPE_RE.match(st):
@@ -503,6 +306,7 @@ def kb_documents(
                 f"content_type 只能是：{', '.join(ingest.CONTENT_TYPES)}；收到 {content_type}",
                 "kb.documents", "list")
     tg = (tag or "").strip()
+    agent_ids = [a.strip() for a in str(agents or "").split(",") if a.strip()]
     schema = _ident(config.pg_schema())
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
     gone = _missing(tabs)
@@ -522,6 +326,7 @@ def kb_documents(
     d_ct = next((_ident(c) for c in _CAND_CTYPE if c in docs), None)
     d_tags = next((_ident(c) for c in _CAND_TAGS if c in docs), None)
     d_status = next((_ident(c) for c in _CAND_STATUS if c in docs), None)
+    d_agent = next((_ident(c) for c in _CAND_AGENT_ID if c in docs), None)
 
     keyword = (q or "").strip()
     if keyword and d_tsv:
@@ -561,6 +366,17 @@ def kb_documents(
         # 与检索/导出同一口径。放在最后 ⇒ 与 q / source_type / content_type / tag 取 AND。
         # 老库没有 status 列 ⇒ 不加这个谓词（存量行照常可见，与迁移前一字不差）。
         where, params = f"{where} AND d.{d_status} = %s", [*params, ingest.STATUS_EFFECTIVE]
+    if agent_ids:
+        # 🆕 **来源代理筛选**（控制台读面筛选，与记忆页的 `agents` 参数同款模式）：
+        # 服务端过滤（**切页之前**）—— 只在前端切当前页 = 看着筛了、其实漏了。
+        # 值走参数（`= ANY(%s::text[])`），不拼进 SQL 文本。
+        if not d_agent:
+            _reject(400, "kb_schema_unknown",
+                    f"{config.KB_TABLE_DOCUMENTS} 表未找到 agent_id 列，无法按来源代理过滤"
+                    f"（请先执行迁移：{ingest.AGENT_ID_MIGRATION_HINT}）",
+                    "kb.documents", "list")
+        where, params = (f"{where} AND d.{d_agent} = ANY(%s::text[])",
+                         [*params, agent_ids])
 
     src = f"FROM {schema}.{config.KB_TABLE_DOCUMENTS} d"
     chunk_ct = (f"(SELECT COUNT(*) FROM {schema}.{config.KB_TABLE_CHUNKS} c "
@@ -573,10 +389,12 @@ def kb_documents(
     sel_ct = f"d.{d_ct}" if d_ct else "''"
     # 老库没 tags 列 ⇒ 投影空数组（出参按 schema 规则省略 tags 键，不假装每篇都打了标）
     sel_tags = f"d.{d_tags}" if d_tags else "'{}'::text[]"
+    # 归属列同理：老库没这列 ⇒ 投影空串（出参省略该键 = 无主），不假装每篇都有归属
+    sel_agent = f"d.{d_agent}" if d_agent else "''"
 
     sql = (f"SELECT CAST(d.{d_id} AS text) AS doc_id, {sel_title} AS title, "
            f"{sel_time} AS updated_at, {sel_src} AS source_type, "
-           f"{sel_ct} AS content_type, {sel_tags} AS tags, "
+           f"{sel_ct} AS content_type, {sel_tags} AS tags, {sel_agent} AS agent_id, "
            f"{chunk_ct} {src} WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s")
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -595,7 +413,9 @@ def kb_documents(
                    # 前端按 note 缺省渲染（不假装每篇都是技能）
                    content_type=str(r.get("content_type") or ""),
                    # 同款降级：老表没这列 ⇒ 行里给的是空数组 ⇒ 出参省略该键
-                   tags=_tags_out(r.get("tags")))
+                   tags=_tags_out(r.get("tags")),
+                   # 同款降级：归属列探不到 ⇒ 空串（= 无主），出参省略该键
+                   agent_id=str(r.get("agent_id") or ""))
         for r in rows
     ]
     return KbDocumentList(items=items, count=total, page=page, page_size=page_size)
@@ -729,30 +549,6 @@ class KbImportBody(BaseModel):
     items: List[KbImportItem] = []
     dry_run: bool = True
     confirm: Optional[str] = None
-
-
-@contextmanager
-def _write_conn() -> Iterator[Any]:
-    """写连接：**成功提交 / 异常回滚 / 结束必关**。
-
-    与读端点的 `_connect()` 不同：读端点靠 GC 回收，写端点每请求一条连接不能攒；
-    且「删旧 chunks + 插新 chunks」必须同事务 —— 提交权收在这里，路由里不出现
-    `commit()`，路由抛出的 400/404/409 都会走回滚分支（数据一行没动）。
-    """
-    dsn = _dsn()
-    pg, row_factory = _pg()
-    conn = pg.connect(dsn, connect_timeout=5, **_connect_kwargs(pg, row_factory))
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:                # noqa: BLE001 —— 回滚失败也得报原始异常
-            pass
-        raise
-    finally:
-        conn.close()
 
 
 def _now_iso() -> str:
@@ -894,48 +690,6 @@ def _dup_of(cur: Any, schema: str, names: Dict[str, str], title: str,
             "dup_exact": bool(exact)}
 
 
-def _write_names(schema: str) -> Dict[str, str]:
-    """写端点要的表名/列名（复用读端点那套进程级探列缓存 + 标识符白名单）。
-
-    写路径**没有降级余地**：缺哪根列都 500 `kb_schema_unknown`，
-    不许「这根列探不到就少写一个字段」—— 那会静默丢内容还报成功。
-
-    🆕 `ctype`（content_type）与 `tags`（自由标签）是**仅有的两个例外：探不到就给
-    空串**。老库未迁移时，不写这两样的端点（导出、真删）仍能跑；真要写类型的/
-    标签的端点（新增/改/导入）由 `_need_ctype()` / `_need_tags()` 给出**人话 500**
-    （提示跑迁移），而不是让 PG 抛 `column "content_type" does not exist` 的裸 500。
-    """
-    tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS))
-    gone = _missing(tabs)
-    if gone:
-        raise HTTPException(status_code=500,
-                            detail={"error": "kb_table_missing",
-                                    "message": f"知识库表不存在：{', '.join(gone)}"})
-    docs, chunks = tabs[config.KB_TABLE_DOCUMENTS], tabs[config.KB_TABLE_CHUNKS]
-    d, c = config.KB_TABLE_DOCUMENTS, config.KB_TABLE_CHUNKS
-    return {
-        "documents": _ident(d), "chunks": _ident(c),
-        "doc_id": _pick(docs, _CAND_ID, d, "主键"),
-        "src_type": _pick(docs, _CAND_SRC_TYPE, d, "来源类型"),
-        "src_key": _pick(docs, _CAND_SRC_KEY, d, "来源键"),
-        "ctype": next((_ident(x) for x in _CAND_CTYPE if x in docs), ""),
-        "tags": next((_ident(x) for x in _CAND_TAGS if x in docs), ""),
-        # 审核两件套与 ctype/tags 同款降级纪律：**探不到就给空串**，
-        # 不写审核状态的端点（站内会话的增改、导出）照样跑；真要写的由
-        # `_need_status()` 给人话 500（带迁移 SQL）。
-        "status": next((_ident(x) for x in _CAND_STATUS if x in docs), ""),
-        "rmeta": next((_ident(x) for x in _CAND_RMETA if x in docs), ""),
-        "title": _pick(docs, _CAND_TITLE, d, "标题"),
-        "meta": _pick(docs, _CAND_META, d, "元数据"),
-        "hash": _pick(docs, _CAND_HASH, d, "内容哈希"),
-        "updated": _pick(docs, _CAND_TIME, d, "更新时间"),
-        "chunk_doc": _pick(chunks, _CAND_DOC, c, "外键(文档)"),
-        "chunk_ord": _pick(chunks, _CAND_ORD, c, "切片序号"),
-        "chunk_text": _pick(chunks, _CAND_TEXT, c, "正文"),
-        "chunk_path": _pick(chunks, _CAND_SRC_PATH, c, "来源路径"),
-    }
-
-
 def _need_ctype(names: Dict[str, str], action: str, target: str) -> str:
     """写 content_type 前必须确认这根列在（老库未迁移 ⇒ 人话报错，不裸崩）。"""
     if not names.get("ctype"):
@@ -989,48 +743,18 @@ def _check_url(url: str, action: str, target: str) -> str:
 def _clean_tags(raw: Any, action: str, target: str) -> List[str]:
     """自由标签的**唯一净化入口**（新增 / 改 / 导入三处共用，一处一个口径）。
 
-    规则按序执行，违规一律 400 人话（**不静默截断**：用户打了 13 个标却被悄悄
-    砍掉一个，回头按那个标筛会以为「标签坏了」）：
+    🔴 **净化本体在 `keepsake.kb.service.clean_tags`**（代理面的 `kb_store` 工具
+    与控制台三个写端点**共用同一份**规则）—— 这里只把它的错误翻译成控制台的
+    400（先审计再抛，与 `_reject` 同纪律）。
 
-    1. 非列表（None / 标量）⇒ 当作没给；元素必须都是字符串（非字符串 400）；
-    2. 逐项 `strip()`，空串直接丢（`["量化", ""]` 与 `["量化"]` 等价）；
-    3. 含控制字符（含换行 / 制表 / 回车）⇒ 400 `bad_tag`；
-    4. 单项 > `TAG_MAX_LEN` 字符 ⇒ 400 `bad_tag`（超长标签在 chip 行里必然折行）；
-    5. 去重**保序**（先出现的赢 ⇒ 卡片上的顺序与用户输入一致，可预期）；
-    6. 去重后 > `TAG_MAX_ITEMS` 项 ⇒ 400 `too_many_tags`。
-
-    🟡 **长度按字符数**（中文按字算，不是字节）：限的是「chip 行看不看得下」。
+    规则（本体那份）：非列表当没给 / 逐项 strip / 空串丢 / 控制字符拒 /
+    单项 ≤32 字 / 去重保序 / 最多 12 个。**不静默截断**：用户打了 13 个标却被
+    悄悄砍掉一个，回头按那个标筛会以为「标签坏了」。
     """
-    if raw is None:
-        return []
-    if not isinstance(raw, (list, tuple)):
-        _reject(400, "bad_tag", f"tags 必须是字符串数组：收到 {type(raw).__name__}",
-                action, target)
-    out: List[str] = []
-    seen = set()
-    for item in raw:
-        if not isinstance(item, str):
-            _reject(400, "bad_tag", f"tags 里每一项都必须是字符串：收到 {type(item).__name__}",
-                    action, target)
-        t = item.strip()
-        if not t:
-            continue                       # 空串不是「一个空标签」，直接丢
-        if _TAG_CTRL_RE.search(t):
-            _reject(400, "bad_tag",
-                    f"标签不许含换行/制表等控制字符：{t[:40]!r}", action, target)
-        if len(t) > TAG_MAX_LEN:
-            _reject(400, "bad_tag",
-                    f"单个标签最多 {TAG_MAX_LEN} 字（收到 {len(t)} 字）：{t[:40]!r}",
-                    action, target)
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    if len(out) > TAG_MAX_ITEMS:
-        _reject(400, "too_many_tags",
-                f"每篇最多 {TAG_MAX_ITEMS} 个标签，本次 {len(out)} 个：请先摘掉几个",
-                action, target)
-    return out
+    try:
+        return kb_service.clean_tags(raw)
+    except KbError as e:
+        _reject(e.status, e.code, e.message, action, target)
 
 
 def _tags_out(raw: Any) -> List[str]:
@@ -1124,12 +848,30 @@ def _manual_only(doc: Dict[str, Any], doc_id: str, action: str) -> None:
     改了当晚那轮会被**覆盖**（重新灌入）或因技能消失被**清理**掉：
     控制台看着「改成功了」，第二天就没了。所以直接 409 并说明原因，
     别给一个会被静默回滚的假成功。
+
+    🆕 **代理域（source_type='agent'）的文档也不许从控制台改/删**：那是代理自己
+    名下的内容（归属写在 `documents.agent_id`），归它自己管（`kb_remove`）——
+    控制台的手建域只管手建的。
     """
     if str(doc.get("source_type") or "") != ingest.MANUAL_SOURCE_TYPE:
         _reject(409, "kb_doc_immutable",
                 f"只有手动文档（source_type={ingest.MANUAL_SOURCE_TYPE}）能改/删："
                 f"{doc_id} 来自 {doc.get('source_type') or '未知来源'}，"
                 "由夜间灌入器维护（改动会被覆盖或被死文档清理扫掉）",
+                action, doc_id)
+
+
+def _not_ingester_doc(doc: Dict[str, Any], doc_id: str, action: str) -> None:
+    """**审核面**（批准 / 驳回）只挡灌入器的地盘 —— 代理域的文档也得能审。
+
+    🔴 代理通过 `kb_store` 提交的知识文档落 `source_type='agent'`（归属在
+    `documents.agent_id`），**本来就进待审队列** —— 审核端点若只认手动域，
+    这些文档就永远批不了（进了队列却没人能批 = 死队列）。
+    """
+    if str(doc.get("source_type") or "") in ingest.INGEST_SOURCE_TYPES:
+        _reject(409, "kb_doc_immutable",
+                f"{doc_id} 来自 {doc.get('source_type') or '未知来源'}，"
+                "由夜间灌入器维护（改动会被覆盖或被死文档清理扫掉），不进审核队列",
                 action, doc_id)
 
 
@@ -1178,7 +920,17 @@ def kb_create_document(body: KbCreateBody,
     if pending:
         _need_status(names, action, title or "-")
     basis = _doc_basis(title, content, ctype, url)
+    # 🆕 **归属**：代理身份写进来的（请求头带 ksk_ 凭据，**主代理也打**）打上那个
+    # 代理的 id；站内会话手建的**不写**这根列（NULL = 无主，存量语义不变）。
+    # 🔴 **键不动**（仍是 `manual:<hash>`）：内容级幂等是这条路径的既有判据
+    # （「重复提交同一篇 = unchanged，不搅已生效那篇」），改键就改了语义。
+    # 归属只在 INSERT 时写 ⇒ 撞键时那一行的归属**不被改**（不许抢别人的归属）。
+    agent_id = (str(writer.get("agent_id") or "")
+                if str(writer.get("kind") or "") == "agent" else "")
     key = ingest.manual_source_key(title, basis)
+    # 老库未迁移归属列 ⇒ **不写这根列**（降级：全库无主，可见性=迁移前）。
+    # （代理面 `kb_store` 那条路是 fail-loudly：写不了归属就明确报错拒写。）
+    owner = agent_id if (agent_id and names.get("agent")) else ""
     meta = {"origin": "console" if not pending else "agent"}
     if is_link:
         meta["url"] = url
@@ -1193,7 +945,8 @@ def kb_create_document(body: KbCreateBody,
                 # 🔴 待审时**不切块**（chunk=False）：正文改存 review_meta.body，
                 # 等批准时才 replace_chunks —— 未审正文不进检索索引。
                 status=ingest.STATUS_PENDING if pending else None,
-                chunk=not pending)
+                chunk=not pending,
+                agent_id=owner or None)
             # `unchanged` = 同键同 hash，一行都没动 ⇒ 这次提交没进队列，也**不许**往
             # 已生效那篇的 review_meta 里塞「待审正文」（那会把一篇在用的文档搅进审核
             # 台账；它已经审过了 —— 键同就意味着内容与被批准的那次逐字相同）。
@@ -1519,7 +1272,7 @@ def kb_approve_document(id: str, body: KbApproveBody,
             doc = ingest.load_document(cur, schema, doc_id, names=names)
             if doc is None:
                 _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
-            _manual_only(doc, str(id), action)
+            _not_ingester_doc(doc, str(id), action)
             st = str(doc.get("status") or ingest.STATUS_EFFECTIVE)
             if st == ingest.STATUS_EFFECTIVE:
                 _reject(409, "kb_doc_not_pending",
@@ -1581,7 +1334,7 @@ def kb_reject_document(id: str, body: KbRejectBody,
             doc = ingest.load_document(cur, schema, doc_id, names=names)
             if doc is None:
                 _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
-            _manual_only(doc, str(id), action)
+            _not_ingester_doc(doc, str(id), action)
             st = str(doc.get("status") or ingest.STATUS_EFFECTIVE)
             if st == ingest.STATUS_EFFECTIVE:
                 _reject(409, "kb_doc_not_pending",
@@ -1778,6 +1531,9 @@ def probe() -> Optional[Dict[str, Any]]:
         detail = e.detail if isinstance(e.detail, dict) else {"error": "kb_failed",
                                                               "message": str(e.detail)}
         return {"available": False, **detail}
+    except KbError as e:
+        # 数据层抛的结构化错误（未配置 / 没驱动 / 表不存在 / 结构不识别）
+        return {"available": False, "error": e.code, "message": e.message}
     except Exception as e:                    # noqa: BLE001 —— 探针不许把总览接口带崩
         return {"available": False, "error": "kb_failed",
                 "message": f"{e.__class__.__name__}: {e}"}

@@ -21,6 +21,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from keepsake.kb.service import KbError
+
 from . import config
 from .routers import agents, auth, core, crons, fragments, hits, kb, messages, ops, stats
 
@@ -76,6 +78,17 @@ def create_app() -> FastAPI:
                      request.method, request.url.path, exc.__class__.__name__)
         return _error(500, "internal_error",
                       f"数据源或处理异常：{exc.__class__.__name__}")
+
+    # ---- 知识库数据层的结构化错误（KbError）→ 与 HTTPException **同形** ----
+    # 数据层（`keepsake.kb.service`）是 FastAPI-free 的（代理面也要用它），
+    # 所以它抛自己的 `KbError`（code + 人话 + 状态码）。这里把它转成与
+    # `HTTPException(detail={"error","message"})` **逐字同形**的响应 ——
+    # 客户端（前端 / 脚本）看到的错误体一个字都没变。
+    @app.exception_handler(KbError)
+    def _kb_error(request: Request, exc: KbError) -> JSONResponse:
+        logger.warning("api 知识库错误 %s %s: %s",
+                       request.method, request.url.path, exc.code)
+        return _error(exc.status, exc.code, exc.message)
 
     # ---- 静态文件（前端构建产物）：**放在最后**，别盖住 /api ----
     # SPA 外壳必须免认证可达 —— 否则没 token 时连「输入 token」那一页都打不开。

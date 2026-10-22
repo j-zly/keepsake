@@ -76,6 +76,16 @@ INSTRUCTIONS = (
     "删除必须显式 confirm；merge/forget 默认 dry-run，只统计不写。"
 )
 
+#: 知识库工具面的用法说明（**什么时候用知识库，而不是记忆**）。
+#:
+#: 🔴 三条语义要分清：知识库存的是**文档**（长的、可被人直接读的），
+#: 记忆存的是**条目**（碎片、供检索召回）；两者归属与可见性同一把尺子。
+KB_HINT = (
+    "知识库：kb_store 存一篇文档（归属自动按你的身份打），kb_search 检索（只看得见"
+    "自己名下与无主的老文档），kb_get 取全文，kb_remove 删除（必须 confirm=true，"
+    "且只能删自己名下的）。"
+)
+
 #: 代理互聊信箱的用法说明（**什么时候用信箱，而不是 memory_add**）。
 #:
 #: 🔴 两条路各有各的语义，混用会把「传话」变成「广播」：
@@ -108,11 +118,13 @@ GOVERN_HINT = (
 #: 写类工具（其余算读）：决定 `touch(read|write)` 的口径。
 #: `agent_*` 治理写口自然算写 —— 批准/吊销/改角色/改上下文开关都动注册表。
 #: `message_*` 三个信箱工具**也算写**：收信即消费（标已读）是状态变更，不是纯读。
+#: 🆕 `kb_store` / `kb_remove` 也算写（知识库文档的增删）。
 GATE_WRITE_TOOLS = frozenset({
     "memory_add", "memory_remove", "memory_merge", "memory_forget",
     "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
     "agent_set_share",
     "message_send", "message_inbox", "message_recent",
+    "kb_store", "kb_remove",
 })
 
 #: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
@@ -480,7 +492,8 @@ def _sync_view(fn: Any, *, str_uri: bool = False) -> Any:
 
 
 def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any:
-    """构造挂好 8 个记忆 tool（+ 2 个 resource，可选再加 6 个治理 tool）的 MCP 服务。
+    """构造挂好 8 个记忆 tool（+ 2 个 resource，+ 4 个知识库 tool，可选再加 6 个治理
+    tool）的 MCP 服务。
 
     `provider` 省略时用 keepsake 默认装配（`factory.default_provider()`，
     按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连接）。
@@ -508,7 +521,7 @@ def build_server(provider: Optional[Any] = None, *, govern: bool = False) -> Any
     if provider is None:
         provider = default_provider()
     server = FastMCP(name=SERVER_NAME,
-                     instructions=INSTRUCTIONS + MESSAGING_HINT
+                     instructions=INSTRUCTIONS + MESSAGING_HINT + KB_HINT
                      + (GOVERN_HINT if govern else ""))
     gate = AgentGate.for_provider(provider, server)
     register_tools(server, provider, gate=gate, govern=govern)

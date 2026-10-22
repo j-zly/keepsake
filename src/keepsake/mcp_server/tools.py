@@ -1,4 +1,4 @@
-"""MCP 工具面 —— 8 个记忆 tool + 3 个信箱 tool + 6 个治理 tool 的实现。
+"""MCP 工具面 —— 8 个记忆 tool + 3 个信箱 tool + 6 个治理 tool + 4 个知识库 tool 的实现。
 
 **取数只经 `MemoryProvider` 协议**：数据出口只有
 `provider.search/get/add/remove/merge/forget/capabilities/system_prompt_block`。
@@ -6,8 +6,9 @@
 本模块不 import 任何宿主的东西（`agent` / `hermes` 一律不许出现），
 也不自建存储 —— 治理面那 5 个 `agent_*` 工具只经**同一个 `Registry` 实例**
 （`gate.registry`，即 `provider._registry`）与控制台共用一套方法，不另开连线。
-import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯文件 /
-纯常量与后端适配），与「宿主」无关：`audit.py` 只 import 标准库。
+import 的 `..api.audit` / `..govern.registry` / `..kb.service` 是 keepsake 自家模块
+（纯文件 / 纯常量与后端适配），与「宿主」无关：`audit.py` 只 import 标准库，
+`kb/service.py` **FastAPI-free**（控制台的 fastapi 是可选依赖，MCP 那边不一定装）。
 
 --------------------------------------------------------------------------
 写语义（与 P2 控制台一致，这几条是硬约束不是建议）
@@ -23,6 +24,21 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
    本机直写（caller 空）仍落进程默认身份。
 🔴 **删除按归属收窄**（2026-10 ks_perm_scope）：子代理只能删**自己的**条目
    （无归属的老条目也行）；`memory_forget` 是**批处理治理面** ⇒ **仅主代理可用**。
+
+--------------------------------------------------------------------------
+知识库工具面（kb_store / kb_search / kb_get / kb_remove）
+--------------------------------------------------------------------------
+知识库原来只对控制台开放，现在对**所有代理**开放，治理口径与记忆**同一把尺子**
+（`govern.visibility`）：
+
+* **归属**：每篇文档记**存它的那个代理**（`documents.agent_id`，凭据反查的调用方）；
+* **可见性**：非 primary 只看得见**自己名下 + 已共享代理名下 + 无主老文档**
+  （无主 = 收紧前的公共数据，历史文档全是）；primary 全量；
+* **删除**：非 primary 只能删**自己名下**的（或无主老文档）；**看得见 ≠ 能删**；
+  拒时只说「不是你的」，**零内容回显**。
+
+🔴 四工具**全走 `_authorize`**（凭据闸）：未批准 / 凭据无效 ⇒ 全部拒绝，
+与记忆工具同一道闸（fail-closed 一致）。
 
 --------------------------------------------------------------------------
 可选扩展：core 层枚举
@@ -63,12 +79,16 @@ from ..govern.visibility import (
     fragment_owner,
     truncate_core_fragments,
 )
+# 知识库的数据层与代理面服务（**FastAPI-free**：控制台的 fastapi 是可选依赖，
+# MCP 那边不一定装 —— 这一层不许 import fastapi）。
+from ..kb import service as kb_service
+from ..kb.service import KbError
 
 logger = logging.getLogger("keepsake.mcp_server.tools")
 
 __all__ = ["ToolError", "StorageIntrospection", "register_tools",
            "SEARCH_PREVIEW_CHARS", "CORE_PREVIEW_CHARS",
-           "GOVERN_TOOLS", "GOVERN_DENIED", "MESSAGE_TOOLS"]
+           "GOVERN_TOOLS", "GOVERN_DENIED", "MESSAGE_TOOLS", "KB_TOOLS"]
 
 #: `memory_search` 结果里单条正文的截断长度（全文走 `memory_get` / resource）
 SEARCH_PREVIEW_CHARS = 300
@@ -260,6 +280,12 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
         # 🔴 归属语义（2026-10 ks_owner_stamp）：写入方身份 = **凭据反查**的调用方
         #    （`caller_credential`）—— 写的记忆归自己，不是 provider 进程的身份。
         "write_owner": "caller_credential",
+        # 🆕 知识库工具面（kb_store / kb_search / kb_get / kb_remove）：
+        #    声明这一项 = 承诺「知识库对代理开放，且归属 / 可见性 / 删除与记忆
+        #    同一把尺子」（`govern.visibility`）。没装知识库连接串时调用会明确
+        #    报错，不会静默装成功。
+        "kb": True,
+        "kb_tools": list(KB_TOOLS),
     }
 
 
@@ -767,12 +793,147 @@ def message_recent(box: Any, caller: str, peer: str, limit: int = 20) -> List[Di
 
 
 # --------------------------------------------------------------------------
+# 知识库工具面（kb_store / kb_search / kb_get / kb_remove）
+#
+# 🔴 **归属 / 可见性 / 删除口径与记忆同一把尺子**（`govern.visibility`）：
+#   非 primary 看得见的归属 = {自己} ∪ {share_memory=1 的已批准代理} ∪ {无主}；
+#   非 primary 能删的 = {自己} ∪ {无主}。**看得见 ≠ 能删**。
+#   判据本体在 `keepsake.kb.service`（那里调 `govern.visibility` 的那两份），
+#   这里只做「身份 → 可见集合」的翻译与错误翻译。
+# --------------------------------------------------------------------------
+
+#: 知识库四工具的名字（`kb_store` / `kb_remove` 也登记在 `server.GATE_WRITE_TOOLS`）
+KB_TOOLS = ("kb_store", "kb_search", "kb_get", "kb_remove")
+
+#: 子代理删**别人**的知识库文档时的拒绝文案（🔴 **不回显任何正文**，
+#: 与记忆面 `REMOVE_NOT_OWNER` 同款口径）。
+KB_REMOVE_NOT_OWNER = "这篇知识库文档不是你的 —— 子代理只能删自己名下的文档"
+
+#: 知识库工具需要代理注册表（没有 ⇒ 明确报错，不静默放行）
+KB_NEED_REGISTRY = "知识库工具需要代理注册表（当前 provider 未装配 ks_agent）"
+
+
+def _kb_registry(registry: Any) -> Any:
+    """知识库工具的**身份前提**：没有注册表就没有「谁是谁」⇒ 明确报错。
+
+    🔴 **fail-closed**：知识库装的是用户与主脑的东西，「判不出身份就当本机」
+    那条兜底（`_is_primary_caller`）在这儿**不适用** —— 那是记忆面「本机直连」
+    的兼容口径，不是「谁都能读知识库」的许可证。
+    """
+    if registry is None:
+        raise ToolError(KB_NEED_REGISTRY)
+    return registry
+
+
+def _kb_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """把数据层的 `KbError` 翻译成 `ToolError`（只带人话，不带内部结构）。"""
+    try:
+        return fn(*args, **kwargs)
+    except KbError as e:
+        raise ToolError(e.message) from e
+
+
+def _split_tags(raw: str) -> List[str]:
+    """`"a,b"` → `["a","b"]`（与记忆面的 `tags` 参数同款：逗号分隔的字符串）。"""
+    return [t.strip() for t in str(raw or "").replace("|", ",").split(",") if t.strip()]
+
+
+def kb_store(title: str, content: str, tags: str = "", source_type: str = "agent", *,
+             caller_agent_id: str = "", caller_role: str = "",
+             registry: Any = None) -> Dict[str, Any]:
+    """存一篇知识库文档（**走既有 ingest 管线**：切块 / 幂等 / 审核 status 链不变）。
+
+    * **归属** = 凭据反查出的调用方（primary 也打 —— 主脑写的归主脑）；
+    * **审核链不变**：非 primary 写进来的落 `pending`（不切块，正文在审核队列里，
+      控制台批准后才可检索）；primary 直进 `effective`；
+    * 返回 `{id, status, review, agent_id, chunks_count}`。
+    """
+    _kb_registry(registry)
+    is_primary = _is_primary_caller(caller_agent_id, caller_role)
+    return _kb_call(kb_service.store_document,
+                    title=title, content=content, tags=_split_tags(tags),
+                    source_type=source_type, agent_id=caller_agent_id,
+                    is_primary=is_primary)
+
+
+def kb_search(query: str, limit: int = 10, *, caller_agent_id: str = "",
+              caller_role: str = "", registry: Any = None) -> Dict[str, Any]:
+    """检索知识库。返回 `id` / `title` / 摘要（**不含全文** —— 要全文用 `kb_get`）。
+
+    🔴 可见范围 = **自己名下 + 已共享代理名下 + 无主老文档**（primary 全量）。
+    """
+    _kb_registry(registry)
+    is_primary = _is_primary_caller(caller_agent_id, caller_role)
+    scope = kb_service.visible_scope(caller_agent_id, registry, is_primary=is_primary)
+    out = _kb_call(kb_service.search_documents, query=query,
+                    limit=max(1, min(int(limit), 100)), agent_scope=scope)
+    return {
+        "query": str(query or "").strip(),
+        "count": len(out["items"]),
+        "results": [
+            {"id": r["doc_id"], "title": r["title"], "snippet": r["snippet"],
+             "chunk_id": r["chunk_id"]}
+            for r in out["items"]
+        ],
+    }
+
+
+def kb_get(id: str, *, caller_agent_id: str = "", caller_role: str = "",
+           registry: Any = None) -> Dict[str, Any]:
+    """取一篇知识库文档的详情（标题 + 全文 + 归属 + 状态）。
+
+    🔴 **不可见 = 不存在**（存在性本身也不许泄露，与 `memory_get` 同纪律）。
+    """
+    _kb_registry(registry)
+    is_primary = _is_primary_caller(caller_agent_id, caller_role)
+    scope = kb_service.visible_scope(caller_agent_id, registry, is_primary=is_primary)
+    doc = _kb_call(kb_service.get_document, doc_id=id, agent_scope=scope)
+    if not doc:
+        raise ToolError(f"知识库文档不存在：{id}")
+    return {"id": str(doc.get("id") or id),
+            "title": str(doc.get("title") or ""),
+            "content": str(doc.get("content") or ""),
+            "chunks": list(doc.get("chunks") or []),
+            "source_type": str(doc.get("source_type") or ""),
+            "content_type": str(doc.get("content_type") or ""),
+            "status": str(doc.get("status") or ""),
+            "agent_id": str(doc.get("agent_id") or "")}
+
+
+def kb_remove(id: str, confirm: bool = False, *, caller_agent_id: str = "",
+              caller_role: str = "", registry: Any = None) -> Dict[str, Any]:
+    """删一篇知识库文档。**必须 `confirm=True`**，否则拒绝（绝不动数据）。
+
+    🔴 **删除比读可见性更严**：非 primary 只能删**自己名下**的（或无主老文档）；
+    别人的 —— **含已共享代理的** —— 一律拒（只回「不是你的」，**零内容回显**）。
+    primary 全量可删。
+    """
+    _kb_registry(registry)
+    if not confirm:
+        raise ToolError(
+            f"删除需要显式确认：确认后请重新调用 kb_remove(id={id!r}, confirm=True)")
+    is_primary = _is_primary_caller(caller_agent_id, caller_role)
+    scope = kb_service.visible_scope(caller_agent_id, registry, is_primary=is_primary)
+    try:
+        out = _kb_call(kb_service.remove_document, doc_id=id, confirm=True,
+                       caller_agent_id=caller_agent_id, is_primary=is_primary,
+                       agent_scope=scope)
+    except KbError as e:
+        # 拒时**只回人话**（正文/标题一律不回显）—— 与记忆面同款。
+        if e.code == "kb_not_owner":
+            raise ToolError(KB_REMOVE_NOT_OWNER) from e
+        raise ToolError(e.message) from e
+    return out
+
+
+# --------------------------------------------------------------------------
 # 注册到 FastMCP/MCPServer
 # --------------------------------------------------------------------------
 
 def register_tools(server: Any, provider: Any, gate: Any = None, *,
                    govern: bool = False) -> Any:
-    """把 8 个记忆 tool + 3 个信箱 tool（+ `govern=True` 时再挂 6 个治理 tool）挂到 `server` 上。
+    """把 8 个记忆 tool + 3 个信箱 tool + 4 个知识库 tool（+ `govern=True` 时再挂
+    6 个治理 tool）挂到 `server` 上。
 
     `gate` 非 None 时（默认装配的 keepsake provider 才有），**每个 tool 调用前**
     先过一道身份闸门（`gate.check(工具名)`，未批准即 `ToolError`）——
@@ -785,6 +946,10 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     信箱那 3 个（`message_*`）与治理面**无关**：所有已批准代理都能用（判定走
     `gate.check` 那条身份链）；没有注册表时同样照常注册并明确报错。
+
+    知识库那 4 个（`kb_*`）同样与治理面**无关**：所有已批准代理都能用，归属 /
+    可见性 / 删除与记忆同一把尺子（`govern.visibility`）；没有注册表时照常注册，
+    但每次调用明确报「需要代理注册表」（fail-closed：判不出身份就不许碰知识库）。
     """
     registry = getattr(gate, "registry", None)
     #: 信箱句柄（与注册表**同一个 storage** ⇒ 不另开连接、不另拼 DSN）。
@@ -885,6 +1050,61 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         return memory_forget(provider, dry_run, confirm,
                              caller_agent_id=str(ident.get("agent_id") or ""),
                              caller_role=str(ident.get("role") or ""))
+
+    # ---- 知识库工具面：所有**已批准**代理可用（与 govern 无关）----------
+    # 身份判定走 `gate.check`（与记忆工具同一条身份链）：归属 = 凭据反查出来的
+    # 调用方，**工具签名里没有 agent_id** —— 不给调用侧自报身份留口子。
+    @server.tool(
+        name="kb_store",
+        description="往知识库存一篇文档（标题 + 正文 + 可选逗号分隔的标签）。"
+                    "归属按凭据反查出的调用方打：非主代理写进来的进待审队列"
+                    "（控制台批准后才可检索），主代理直进。返回 {id, status}。"
+                    "source_type 缺省 agent（只能 agent / manual —— skill 是夜间"
+                    "灌入器的地盘，代理不许写）。",
+    )
+    def _kb_store(title: str, content: str, tags: str = "",
+                  source_type: str = "agent") -> Dict[str, Any]:
+        ident = _authorize("kb_store")
+        return kb_store(title, content, tags, source_type,
+                        caller_agent_id=str(ident.get("agent_id") or ""),
+                        caller_role=str(ident.get("role") or ""),
+                        registry=registry)
+
+    @server.tool(
+        name="kb_search",
+        description="检索知识库，返回 id / title / 摘要（不含全文；要全文用 kb_get）。"
+                    "只看得到自己名下 + 已共享代理名下 + 无主的老文档。",
+    )
+    def _kb_search(query: str, limit: int = 10) -> Dict[str, Any]:
+        ident = _authorize("kb_search")
+        return kb_search(query, limit,
+                         caller_agent_id=str(ident.get("agent_id") or ""),
+                         caller_role=str(ident.get("role") or ""),
+                         registry=registry)
+
+    @server.tool(
+        name="kb_get",
+        description="按 id 取一篇知识库文档的详情（标题 + 全文 + 归属）。"
+                    "看不到的文档按「不存在」回。",
+    )
+    def _kb_get(id: str) -> Dict[str, Any]:
+        ident = _authorize("kb_get")
+        return kb_get(id,
+                      caller_agent_id=str(ident.get("agent_id") or ""),
+                      caller_role=str(ident.get("role") or ""),
+                      registry=registry)
+
+    @server.tool(
+        name="kb_remove",
+        description="删一篇知识库文档。必须 confirm=True，否则拒绝。"
+                    "子代理只能删自己名下的文档（别人的一律拒）。",
+    )
+    def _kb_remove(id: str, confirm: bool = False) -> Dict[str, Any]:
+        ident = _authorize("kb_remove")
+        return kb_remove(id, confirm,
+                         caller_agent_id=str(ident.get("agent_id") or ""),
+                         caller_role=str(ident.get("role") or ""),
+                         registry=registry)
 
     # ---- 代理互聊信箱：所有**已批准**代理可用（与 govern 无关）----------
     # 身份判定走 `gate.check`（与记忆工具同一条身份链）：发件人 = 凭据反查出来的
