@@ -103,22 +103,25 @@ def warn_if_domain_dict_missing() -> bool:
 def tsv_lexemes(text: str, stem: bool = True) -> List[str]:
     r"""正文/查询 → tsvector 词元（**分词口径的唯一实现**，入库与查询共用）。
 
-    流程与原 `_tsv_tokens` / `_tok_string` 逐字相同：jieba 切 → 按 `\w+` 取词元
-    （PG `to_tsvector('simple')` 与 SQLite `unicode61` 本来就这么切，提前切只是为了
-    让 Python 侧的 doclen/tf/df 计数与索引侧的词元逐字对齐）。
+    口径 = `domain.splitter.segment_lexemes`：**ASCII 词先摘出（不过 jieba）**，
+    其余段才进 jieba 切；再按 `\w+` 取词元（PG `to_tsvector('simple')` 与
+    SQLite `unicode61` 本来就这么切，提前切只是为了让 Python 侧的
+    doclen/tf/df 计数与索引侧的词元逐字对齐）。
+
+    🔴 2026-10 ks_stem_fix：**英文不再喂 jieba**。旧口径把整句先喂 jieba，
+    用户词典里一有英文条目/碎片，整句英文就被切成 "vis" / "it" / "ed" 这类碎块
+    ⇒ 索引侧存碎片、查询侧发整词 ⇒ 恒 0 命中（且不报错、不告警）。
+    分词管道挪到 `domain/splitter.py` 单点实现（那里是 domain 层，不许反向
+    import core ⇒ 词元正则另列一份，`LEXEME_RE` 与它逐字同形）。
 
     🔴 `stem=True`（默认）：**英文词元追加 Porter2 词干化**（`splitter.stem_english`）
     —— 这是「索引侧」那一半，与查询侧 `query_lexemes` 调**同一个函数**
     （对称铁律，见 domain/splitter.py 的注释）。
     `stem=False` 用于**标签流**（标签是精确逗号边界判据，词干化会破坏它）。
     """
-    import jieba                                        # noqa: PLC0415 — 首调建词典
     warn_if_domain_dict_missing()
-    lexemes = LEXEME_RE.findall(" ".join(w.strip() for w in jieba.lcut(text or "")))
-    if not stem:
-        return lexemes
-    from ..domain.splitter import stem_english_tokens   # noqa: PLC0415 — 避免加载期环
-    return stem_english_tokens(lexemes)
+    from ..domain.splitter import segment_lexemes       # noqa: PLC0415 — 避免加载期环
+    return segment_lexemes(text or "", stem=stem)
 
 
 def query_lexemes(terms: List[str]) -> List[str]:
@@ -1239,10 +1242,14 @@ def synonym_words(content: str) -> List[str]:
 def jieba_dict_words(content: str) -> List[str]:
     """正文 → jieba 用户词典的候选词（比 `synonym_words` 宽一档）。
 
-    🔴 两条口径**故意不同**（与 Redis/SQLite 侧逐条一致）：用户词典要把
-    「短英文碎片」也收进去（用户自己可能就拿它当词条），所以这里**不**套
+    🔴 两条口径**故意不同**（与 Redis/SQLite 侧逐条一致）：同义词表要的是
+    「能扩召回的词」，用户词典要的是「jieba 切不开的词」⇒ 这里**不**套
     `DENOISE_STOPWORDS` 与 ASCII 短词判据，只保留长度/停用词/纯数字三条。
-    改成一致 = 两个后端的词典文件对不齐，不是收敛是回归。
+
+    🔴 2026-10 ks_stem_fix：**纯 ASCII 候选不进词典**（判据在选词那一步，
+    `jieba_dict_keep`）—— 英文词此后永不经过 jieba，词典里留英文条目/碎片
+    只会把整句英文按碎片切开（"visited" → "vis" + "it" + "ed"）。
+    本函数仍照旧**收**这些候选（候选集 ≠ 选词结果），由选词那一步统一剔。
     """
     import jieba                                        # noqa: PLC0415
     from ..domain.splitter import _STOP_WORDS                   # noqa: PLC0415
@@ -1385,6 +1392,24 @@ def synonym_rows(merged: Dict[str, set]) -> List[Tuple[str, str]]:
     return [(w, json.dumps(sorted(s), ensure_ascii=False)) for w, s in merged.items()]
 
 
+def jieba_dict_keep(word: str) -> bool:
+    """词条该不该进 jieba 用户词典（**纯 ASCII 一律不进**）。
+
+    🔴 2026-10 ks_stem_fix：英文词此后**永远不经过 jieba** —— 分词管道改成
+    「ASCII 词先摘出、其余段才进 jieba」（`domain/splitter.py` 的
+    `segment_lexemes`）⇒ 词典里再留英文条目/碎片**只会制造切词碎片**：
+    jieba 拿 "it" / "ie" / "ed" 这类碎片去切**整句英文**
+    （"visited" → "vis" + "it" + "ed"）⇒ 索引侧存碎片、查询侧发整词 ⇒ 恒 0 命中。
+
+    中英混排（"Redis缓存"）**留**（`isascii()` 为假）—— 那种词 jieba 切不开，
+    正是词典该管的事。
+
+    判据单点在这里（PG / SQLite / Redis 三个 `generate_jieba_dict` 都调它），
+    别处再抄一份就会漂。
+    """
+    return not str(word).isascii()
+
+
 def jieba_dict_entries(
     word_freq: Dict[str, int],
     synonym_terms: List[str],
@@ -1396,25 +1421,20 @@ def jieba_dict_entries(
     排序键固定成字典序（Redis 侧只按 `-词频` + dict 插入序，同频词的行序跨后端
     对不齐）—— 见 `generate_jieba_dict` 的 docstring。
 
-    🔴 2026-10 ks_en_stem：**被词干化过的英文词条不再直接进分词词典**。
-    词典是给 jieba 切**原文**用的，而同义词表里的英文词条现在是**词干**
-    （"generate" → "generat"）—— 把它写进词典，jieba 会把原文里的
-    "generating" 切成 "generat" + "ing"（实测），正文分词被词典污染。
-    ⇒ 纯 ASCII 英文形态的词条**只在语料里原样出现过**（= 真词）才提频；
-    中文 / 标识符 / 含数字的形态维持旧口径：照常提频到 3。
-
-    🔴 为什么不能用「词干化前后是否相同」来判：词干化是**幂等**的
-    （"emb" 的词干还是 "emb"）⇒ 判不出「emb」是词干还是原词。
+    🔴 2026-10 ks_stem_fix：**纯 ASCII 词条一律不进分词词典**（判据见
+    `jieba_dict_keep`）。旧口径只挡了「被词干化过的英文词条」，结果两字碎片
+    （"it" / "ie" / "ed"）照进词典 ⇒ jieba 按碎片切整句英文 ⇒ 索引侧碎、
+    查询侧整、恒 0 命中。现在是「英文永不进 jieba」，碎片从源头断掉。
+    中文 / 中英混排维持旧口径：照常提频到 3。
     """
     freq = dict(word_freq)
     for term in synonym_terms:
         t = str(term)
-        if t.isascii() and t.isalpha():
-            # 纯 ASCII 英文形态：只在语料词汇表里原样出现过才提频
-            if t not in freq:
-                continue
+        if not jieba_dict_keep(t):
+            continue          # 纯 ASCII：此后永不经过 jieba ⇒ 不进词典
         freq[t] = max(freq.get(t, 0), 3)
-    return sorted(((w, f) for w, f in freq.items() if f >= min_freq),
+    return sorted(((w, f) for w, f in freq.items()
+                   if f >= min_freq and jieba_dict_keep(w)),
                   key=lambda x: (-x[1], x[0]))
 
 

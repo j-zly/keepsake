@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -16,6 +17,24 @@ logger = logging.getLogger("keepsake.splitter")
 # 自定义领域词典路径（由 discover_synonyms 自动生成）
 _DOMAIN_DICT = Path.home() / '.config' / 'keepsake' / 'jieba_dict.txt'
 
+#: 🔴 **测试钩子**：注入「主脑式」用户词典（含英文词条）的路径环境变量。
+#:
+#: 为什么需要它：本仓（88）默认**没有**用户词典 ⇒ jieba 切英文时走 finalseg 的
+#: `re_skip` 分支，英文整词原样保留 ⇒ `tests/test_english_stemming.py` 全绿。
+#: 那是**同态自证**：两个后端在「同一份词典」下同生共死，看不见「词典里有英文
+#: 词条」这一档（主脑树那份 3026 行词典就踩在这档上）。
+#: 带 `KEEPSAKE_TEST_USERDICT=tests/fixtures/mini_userdict.txt` 跑第二遍，
+#: 才真的踩到主脑那条路。
+#:
+#: 只在**测试**里用：生产环境永远是 `~/.config/keepsake/jieba_dict.txt` 那一份。
+TEST_USERDICT_ENV = "KEEPSAKE_TEST_USERDICT"
+
+#: 已加载过的测试词典（绝对路径）—— 同一份只加载一次。
+#: 理由：`jieba.load_userdict` 是**累加**的（`add_word` 每次 `total += freq`），
+#: 重复加载会把 jieba 的总词频抬高 ⇒ DAG 的切分口径随加载次数漂移 ⇒
+#: 测试结果不可复现。领域词典**不**受此限（它必须能重载，见下面的 docstring）。
+_loaded_test_dicts: set = set()
+
 
 def init_domain_dict() -> None:
     """加载/重载自定义领域词典。
@@ -23,9 +42,35 @@ def init_domain_dict() -> None:
     首次 import 时自动调用一次。插件 initialize() 时也调用一次，
     确保发 /new 后词典被重新加载（此时词典文件可能已被 discover_synonyms 更新）。
     重复调用安全（jieba.load_userdict 是累加的）。
+
+    另加载 `KEEPSAKE_TEST_USERDICT` 指定的测试词典（同一份只加载一次）——
+    见 `TEST_USERDICT_ENV` 的说明。路径不存在时**告警**（不静默跳过：
+    静默跳过会让「双词典环境自测」变成又一次同态自证）。
     """
     if _DOMAIN_DICT.exists():
         jieba.load_userdict(str(_DOMAIN_DICT))
+    _load_test_userdict()
+
+
+def _load_test_userdict() -> None:
+    """加载 `KEEPSAKE_TEST_USERDICT` 指定的词典（未设置 ⇒ 什么都不做）。"""
+    raw = os.environ.get(TEST_USERDICT_ENV)
+    if not raw:
+        return
+    path = Path(raw)
+    if not path.exists():
+        logger.warning(
+            "keepsake: %s=%s 指向的文件不存在 —— 测试词典**没加载**，"
+            "这一轮跑的是「无用户词典」环境（双词典自测不成立）",
+            TEST_USERDICT_ENV, raw,
+        )
+        return
+    key = str(path.resolve())
+    if key in _loaded_test_dicts:
+        return
+    jieba.load_userdict(key)
+    _loaded_test_dicts.add(key)
+    logger.info("keepsake: 已加载测试用户词典 %s", key)
 
 
 # 首次 import 时自动加载
@@ -125,6 +170,103 @@ def stem_english_tokens(tokens: Iterable[str]) -> List[str]:
     for t in tokens or ():
         out.append(stem_english(t) if isinstance(t, str) else t)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 分词管道：**ASCII 词先行摘出**，其余段才进 jieba
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么英文不能喂 jieba**（2026-10 ks_stem_fix 的根因）：
+#    jieba 的 DAG / HMM 是**按中文语料训练**的。用户词典里一旦出现英文条目
+#    —— 哪怕只是 "it" / "ie" / "ed" 这种两字碎片（旧口径的
+#    `generate_jieba_dict` 恰恰会把它们收进去）—— jieba 就会拿词典里的碎片
+#    去切**整句英文**：
+#        "many cities were visited during the trip"
+#          → many / cities / were / vis / it / ed / during / the / trip
+#    ⇒ **索引侧存碎片、查询侧发整词** ⇒ 恒 0 命中；碎片还污染 BM25 词频
+#      （doclen 变长、tf 变噪），检索名次被垃圾 token 带偏。
+#    这类失败**不报错、不告警**，只是静默搜不到 —— 最难查的一类。
+#
+# 🔴 **口径**（对外函数签名不变，只改内部顺序）：
+#    1. 正则先摘 **ASCII 词**（`[A-Za-z][A-Za-z0-9_\-']*`，含驼峰 / 带连字符词）；
+#    2. 剩下的段（中文 / 数字 / 标点）才进 jieba 切；
+#    3. 两段按**原文位置序**合并（BM25 不吃顺序，保序只为 token 流可读可比对）。
+#
+# 🔴 **纯数字不进 ASCII 词正则**（"2026" 以数字开头）⇒ 它留在「其余段」里
+#    由 jieba 原样吐出，不会被丢；"XG-Alpha" 这类**驼峰/连字符**整词则由正则
+#    整块摘出，再按词元口径切成 "XG" / "Alpha"（与 PG `to_tsvector('simple')`
+#    和 SQLite `unicode61` 同口径，doclen 计数才对得上）。
+
+#: **ASCII 词**（英文 / 驼峰 / 带连字符）：`[A-Za-z][A-Za-z0-9_\-']*`
+#:
+#: 🔴 前置断言 `(?<![A-Za-z0-9])`：**不许从字母数字串的中间切**。
+#:    "3f9a2b1c"（uuid 前 8 位、版本号…）以数字开头 ⇒ 字母 'f' 处**不是**词首；
+#:    若在这里切开，"3f9a2b1c" 就被劈成 "3" + "f9a2b1c" ⇒ 索引侧少了整块
+#:    ⇒ 查询侧发整块、命中恒 0（改前的 jieba 是整块保留的）。整块留给 jieba，
+#:    切法与改前逐字相同。
+ASCII_WORD_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9_\-']*")
+
+#: 词元口径 = `\w+`（与 `core/shared.py` 的 `LEXEME_RE` **逐字同形**）。
+#: domain 层不许 import core（依赖方向单向）⇒ 这里单列一份；
+#: 两边不同步会漂 ⇒ `tests/test_stem_ascii_pipeline.py` 有断言盯着。
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+#: **ASCII 词**的词元口径 = 词字符（不含下划线）或下划线串。
+#:
+#: 🔴 为什么单独一份：`\w+` 把下划线算作词字符 ⇒ "claude_user" 会是一个词元；
+#:    但**查询侧** `_sanitize_terms` 按 `/-_.` 拆子词（"claude" + "user"），
+#:    索引侧不拆 ⇒ 两侧口径对不齐 ⇒ 查 "claude_user" 恒 0 命中。
+#:    这里跟 jieba 自己的切法一致（`jieba.lcut("claude_user")` = claude / _ / user），
+#:    下划线单独成词元 ⇒ 索引侧与查询侧逐字对齐。
+_ASCII_LEXEME_RE = re.compile(r"[^\W_]+|_+")
+
+
+def _jieba_lexemes(chunk: str) -> List[str]:
+    """一段**非 ASCII 词**的文本 → 词元（jieba 切 + `\w+` 切）。"""
+    if not chunk or not chunk.strip():
+        return []
+    return _WORD_RE.findall(" ".join(w.strip() for w in jieba.lcut(chunk)))
+
+
+def iter_ascii_parts(text: str):
+    """文本 → 按**原文位置序**的 `(片段, 是不是 ASCII 词)` 序列。
+
+    🔴 这是「英文不进 jieba」那条规则的**唯一**切分实现：索引侧词元
+    （`segment_lexemes`）与实体抽取（`extract_entities`）都走它 ⇒ 两侧口径
+    不会漂（各写一份切分器就会漂，漂了就是索引/实体两路词元对不齐）。
+    """
+    pos = 0
+    for m in ASCII_WORD_RE.finditer(text or ""):
+        if m.start() > pos:
+            yield text[pos:m.start()], False
+        yield m.group(), True
+        pos = m.end()
+    if pos < len(text or ""):
+        yield text[pos:], False
+
+
+def segment_lexemes(text: str, stem: bool = True) -> List[str]:
+    """文本 → 词元列表（**ASCII 先行摘出** + 非 ASCII 段才进 jieba）。
+
+    🔴 这是索引侧（`content_tsv`）与查询侧共用的**唯一**分词管道；
+    英文词**永远不经过 jieba** ⇒ 用户词典里有没有英文条目都不影响切分
+    （治的正是「同态自证」：两侧在有没有词典两种环境下都得全绿）。
+
+    `stem=True` 时对词元追加 Porter2 词干化（`stem_english`）：中文词元与
+    含数字的标识符原样返回（见 `stem_english` 的 docstring）。
+    `stem=False` 用于**标签流**（标签是精确逗号边界判据，词干化会破坏它）。
+    """
+    if not text:
+        return []
+    lexemes: List[str] = []
+    for part, is_word in iter_ascii_parts(text):
+        if is_word:
+            lexemes.extend(_ASCII_LEXEME_RE.findall(part))
+        else:
+            lexemes.extend(_jieba_lexemes(part))
+    if not stem:
+        return lexemes
+    return stem_english_tokens(lexemes)
 
 # ---------------------------------------------------------------------------
 # 常见英文缩写（不在此边界断句）
@@ -493,9 +635,16 @@ def segment_query(query: str) -> list[str]:
         # 纯英文/数字：按空格切分
         return [t for t in query.split() if t.strip()]
 
-    # 中文：jieba 分词
-    words = jieba.lcut(query)
-    words = [w for w in words if w.strip()]
+    # 中文：jieba 只切**非 ASCII 词段** —— 英文整词先摘出来。
+    # 🔴 为什么不能把整句喂 jieba：用户词典里的英文条目/碎片会把整句英文切碎
+    #    （"visited" → "vis" + "it" + "ed"）⇒ 查询侧跟着碎，与索引侧（整词）
+    #    口径不一致 ⇒ 假召回。理由与 `segment_lexemes` 同一份，见那里的说明。
+    words: List[str] = []
+    pos = 0
+    for m in ASCII_WORD_RE.finditer(query):
+        words.extend(w for w in jieba.lcut(query[pos:m.start()]) if w.strip())
+        pos = m.end()
+    words.extend(w for w in jieba.lcut(query[pos:]) if w.strip())
 
     # v1.4: 补充完整英文/数字词 — jieba 可能把英文切碎（embedding → em/be/dd/in/g），
     # 整词追加保证 TAG/entities 精确匹配能命中
@@ -531,42 +680,60 @@ def extract_entities(text: str) -> list[str]:
                 entities.append(known)
                 seen.add(key)
 
-    # 1. jieba posseg 提取
-    try:
-        words = jieba.posseg.lcut(text)
-        for w, flag in words:
-            w_stripped = w.strip()
-            if len(w_stripped) < 2:
-                continue
-            # 人名/机构/地名
-            if flag in ("nr", "nr1", "nr2", "nrj", "nrf", "nt", "ns", "nsf"):
-                key = w_stripped.lower()
-                if key not in seen:
-                    entities.append(w_stripped)
+    # 1. 实体提取：**英文整词走正则，其余段才进 jieba posseg**
+    #
+    # 🔴 2026-10 ks_stem_fix：英文**永不经过 jieba**。用户词典里有英文条目时，
+    #    posseg 会把整句英文按词典碎片切开（"deployment" → "deploy" + "ment"）
+    #    ⇒ 碎片被当"实体"收进索引（实体流与正文流**都**进 content_tsv）
+    #    ⇒ 垃圾 token 进索引、污染 BM25 词频，还造出一堆垃圾实体。
+    #    口径：按原文位置序走 —— ASCII 词走正则（沿用下面 'eng' 分支的规则），
+    #    非 ASCII 段才进 posseg。
+    for part, is_ascii_word in iter_ascii_parts(text):
+        if is_ascii_word:
+            # 英文词（BTC, ETH 等）—— 与 posseg 的 'eng' 分支同规则，
+            # 但拿的是**整词**（jieba 给的是碎片）
+            for tok in _ASCII_LEXEME_RE.findall(part):
+                key = tok.lower()
+                # v1.5: 过滤英文碎词噪音（jieba 把长英文拆成 in/an/ce 等）+ 常见虚词
+                if len(key) >= 3 and key not in _ENTITY_ENG_STOP and key not in seen:
+                    entities.append(tok.upper())
                     seen.add(key)
-            # 其他专名（nz）— 只收含中文或首字母大写的英文词
-            # （HMM/领域词典会把英文碎片标 nz，如 Binance→in/an；也会把 Redis 标 nz）
-            elif flag == "nz":
-                is_chinese = bool(re.search(r"[\u4e00-\u9fff]", w_stripped))
-                is_title_eng = (
-                    w_stripped[0].isupper()
-                    and w_stripped.isalnum()
-                    and len(w_stripped) >= 3
-                )
-                if is_chinese or is_title_eng:
+            continue
+        try:
+            words = jieba.posseg.lcut(part)
+            for w, flag in words:
+                w_stripped = w.strip()
+                if len(w_stripped) < 2:
+                    continue
+                # 人名/机构/地名
+                if flag in ("nr", "nr1", "nr2", "nrj", "nrf", "nt", "ns", "nsf"):
                     key = w_stripped.lower()
                     if key not in seen:
                         entities.append(w_stripped)
                         seen.add(key)
-            # 英文词（BTC, ETH 等）
-            elif flag == "eng":
-                key = w_stripped.lower()
-                # v1.5: 过滤英文碎词噪音（jieba 把长英文拆成 in/an/ce 等）+ 常见虚词
-                if len(key) >= 3 and key not in _ENTITY_ENG_STOP and key not in seen:
-                    entities.append(w_stripped.upper())
-                    seen.add(key)
-    except Exception:
-        pass
+                # 其他专名（nz）— 只收含中文或首字母大写的英文词
+                # （HMM/领域词典会把英文碎片标 nz，如 Binance→in/an；也会把 Redis 标 nz）
+                elif flag == "nz":
+                    is_chinese = bool(re.search(r"[\u4e00-\u9fff]", w_stripped))
+                    is_title_eng = (
+                        w_stripped[0].isupper()
+                        and w_stripped.isalnum()
+                        and len(w_stripped) >= 3
+                    )
+                    if is_chinese or is_title_eng:
+                        key = w_stripped.lower()
+                        if key not in seen:
+                            entities.append(w_stripped)
+                            seen.add(key)
+                # 英文词（BTC, ETH 等）—— 非 ASCII 段里只剩数字/符号时会走到这里
+                elif flag == "eng":
+                    key = w_stripped.lower()
+                    # v1.5: 过滤英文碎词噪音（jieba 把长英文拆成 in/an/ce 等）+ 常见虚词
+                    if len(key) >= 3 and key not in _ENTITY_ENG_STOP and key not in seen:
+                        entities.append(w_stripped.upper())
+                        seen.add(key)
+        except Exception:
+            pass
 
     # 2. regex 补充 — 大写缩写
     for m in _ENTITY_ENGLISH_RE.finditer(text):

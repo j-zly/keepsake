@@ -54,6 +54,8 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
 )
 # 分词口径单源（2026-10 ks_recall_v1 / ks_en_stem）：与 PG / SQLite 侧同一个函数对象。
 from .shared import query_lexemes
+# 词典收词判据单源（2026-10 ks_stem_fix）：纯 ASCII 词一律不进 jieba 词典。
+from .shared import jieba_dict_keep
 from ..domain.splitter import extract_keywords, extract_entities, segment_query, stem_english
 from ..domain.emotion import analyze_emotion
 from .attention import ATTENTION_SET, record_attention
@@ -2588,8 +2590,11 @@ class RedisStorage(StorageBase):
         except Exception:
             pass
 
-        # 3. 过滤：至少出现 2 次
-        selected = [(w, f) for w, f in word_freq.items() if f >= 2]
+        # 3. 过滤：至少出现 2 次；纯 ASCII 词**一律不进词典**
+        #    （判据与 PG / SQLite 侧同一个 `jieba_dict_keep` —— 英文此后永不
+        #     经过 jieba，词典里留着英文碎片只会把整句英文按碎片切开）
+        selected = [(w, f) for w, f in word_freq.items()
+                    if f >= 2 and jieba_dict_keep(w)]
 
         # 4. 按词频降序写文件
         selected.sort(key=lambda x: -x[1])
