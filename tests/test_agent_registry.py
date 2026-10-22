@@ -376,14 +376,15 @@ class _BoomRegistry(Registry):
 def test_写闸按注册表角色而非自报is_primary(lite):
     """🔴 治理收口的核心一行：config 自报 primary，但注册表说是 sub ⇒ 照降级。
 
-    子代理写 core 落候选但**不带提名日戳**（它不是「提名」，班车不自动审它）。
+    子代理写 core 落候选（**带提名日戳** —— 2026-10 ks_perm_scope：子代理
+    自荐常驻 = 与主脑同一条审核/班车链，不再是死候选）。
     """
     lite.register("worker-1")
     spy = _StoreSpy()
     _provider(spy, registry=lite).add("子代理写常驻", tags="core")
     tags = spy.store_calls[0]["tags"]
     assert "core_candidate" in tags
-    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+    assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
 
 def test_写闸在注册表里是primary时落候选带提名戳(lite):
@@ -391,8 +392,8 @@ def test_写闸在注册表里是primary时落候选带提名戳(lite):
 
     🔴 2026-10 常驻层入口改革：**primary 写 core 也不再直通**（常驻层只剩
     「审核页人工批准」与「候选满观察期自动通过」两个入口），落候选 + 提名日戳。
-    两条分支（primary 有戳 / 子代理没戳）的差别，正是「判定源是注册表角色」
-    在改革后仍可观测的证据。
+    两条分支（primary 有戳 / 子代理也有戳）的差别在于**人工显式直写**那条路：
+    primary 走 `core_direct` 才直通，子代理永远走候选。
     """
     lite.register("main")
     lite.bootstrap_local("main", as_primary=True)

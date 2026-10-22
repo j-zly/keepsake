@@ -17,6 +17,9 @@
 🔴 **只影响「读可见性」**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
 一个都不动（那是别的语义）。
 
+🔴 **删除口径比读更严**（2026-10 ks_perm_scope，另见 `can_remove_fragment`）：
+非 primary 只能删**自己的**（或无归属的老条目）—— 「看得见」≠「能删」。
+
 ## 为什么单点
 
 可见性判据散在多处就一定漂：检索侧要按 `agent:` 标签过滤，直取侧（按 key 取
@@ -46,6 +49,7 @@ __all__ = [
     "fragment_owner",
     "visible_core_fragments",
     "truncate_core_fragments",
+    "can_remove_fragment",
 ]
 
 
@@ -127,6 +131,28 @@ def fragment_owner(tags: Any) -> str:
         if part.startswith(AGENT_TAG_PREFIX):
             return part[len(AGENT_TAG_PREFIX):].strip()
     return ""
+
+
+def can_remove_fragment(owner: str, caller_agent_id: str, *, is_primary: bool) -> bool:
+    """这个调用方能不能**删**这条（删除口径 —— 2026-10 ks_perm_scope）。
+
+    🔴 **删除比读可见性更严**：「看得见」≠「能删」。
+
+    * **primary** ⇒ 全量可删（= 主脑现状逐字不变）；
+    * **非 primary** ⇒ 只有**自己的**条目（`owner == caller`）与
+      **无归属的老条目**（收紧前的公共数据，与检索口径一致）可删；
+      别人的条目 —— **含 `share_memory=1` 的共享代理的** —— 一律不许。
+
+    判据只有这一份：MCP 工具面（`mcp_server/tools.py::memory_remove`）与
+    provider 侧的归属校验都调它 —— 两处各写一份必然漂（漂了就是「子代理能删
+    别人的记忆」）。
+    """
+    if is_primary:
+        return True
+    owner = str(owner or "").strip()
+    if not owner:
+        return True                      # 无归属老条目 = 收紧前的公共数据
+    return owner == str(caller_agent_id or "").strip()
 
 
 def visible_core_fragments(

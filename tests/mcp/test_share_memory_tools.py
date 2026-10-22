@@ -207,8 +207,9 @@ def _stored_tags(gov, key: str) -> List[str]:
 def test_子代理写core落候选不进常驻(gov, tmp_path):
     """🔴 外部代理带 `core` 标签进来 ⇒ 不许直写常驻层。
 
-    落 `core_candidate` 且**不带提名日戳**（与既有降级路径同款）—— 提名日戳是
-    「进 7 天观察期」的凭据，带上它就等于给这条候选开了自动审核的后门。
+    落 `core_candidate` **且带提名日戳**（2026-10 ks_perm_scope：子代理自荐
+    常驻 = 与主脑候选**同一条审核/班车链** —— 此前「降级但不打戳」等于死候选，
+    班车永远不审它）。**常驻层本体它仍写不进**（没有裸 `core` 标签）。
     """
     _seed(gov, tmp_path)
     _as_caller(gov, "worker-sub")
@@ -216,7 +217,7 @@ def test_子代理写core落候选不进常驻(gov, tmp_path):
     tags = _stored_tags(gov, key)
     assert "core_candidate" in tags, tags
     assert "core" not in tags, tags
-    assert not any(t.startswith("tier:auto-hot:") for t in tags), tags
+    assert any(t.startswith("tier:auto-hot:") for t in tags), tags
 
 
 def test_primary写core仍直写(gov):

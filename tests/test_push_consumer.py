@@ -768,3 +768,105 @@ def test_唤醒载荷只含三键且不平铺套层(cred_env, wake_env, wake_cal
 
     payload = json.loads(_wakes(wake_calls)[0]["content"].decode("utf-8"))
     assert set(payload) == {"from", "unread", "seq"}, payload
+
+
+# --------------------------------------------------------------------------
+# ⑧ 通知出口的 HMAC 签名（2026-10 ks_notify_hmac）—— 打通「飞书弹通知」最后一米
+#
+# 两条判据（对应任务书）：
+#   ① **有密钥** ⇒ 头含 `X-Hub-Signature-256: sha256=…`，且能用**收到的原始
+#      字节**复算一致（签的必须是实发的字节）；
+#   ② **无密钥** ⇒ **没有**该头（裸 POST = 现状逐字回归，兼容钉钉类免签渠道）。
+#
+# 与唤醒出口**同源**（`_wake_signature` 同一份实现）。
+# --------------------------------------------------------------------------
+
+#: 假通知签名密钥（**不是**真值 —— 任务书红线：密钥真值不得进提交物）。
+FAKE_NOTIFY_SECRET = "test-notify-secret-not-a-real-one"
+
+
+class _MockWebhook:
+    """假 webhook 接收端（stdlib http.server，127.0.0.1 随机端口）。
+
+    记下**收到的原始字节**与头 —— 签名必须能用收到的字节复算出来
+    （签「等价」的字节没用：收方复算的是它**收到**的那份）。
+    """
+
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._server: Any = None
+        self.url = ""
+
+    def __enter__(self) -> "_MockWebhook":
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):                    # noqa: N802 —— BaseHTTPRequestHandler 的命名
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                with outer._lock:
+                    outer.calls.append({"body": body,
+                                        "headers": dict(self.headers)})
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):           # 静音（别把测试日志冲花）
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/hook"
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+        return False
+
+
+def test_notify有密钥时带签名头且可复算_notify(cred_env, monkeypatch):
+    """🔴 ① 有密钥 ⇒ 头含 `X-Hub-Signature-256`，且用**收到的字节**复算一致。"""
+    import hashlib
+    import hmac
+
+    monkeypatch.setenv("TEST_NOTIFY_SECRET", FAKE_NOTIFY_SECRET)
+    with _MockSse([[_dm_frame()]]) as srv, _MockWebhook() as hook:
+        p = _provider()
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+            "notify_url": hook.url,
+            "notify_secret_env": "TEST_NOTIFY_SECRET",
+        }})
+        assert _wait_until(lambda: bool(hook.calls)), "通知没发出去"
+
+    call_ = hook.calls[0]
+    sig = call_["headers"].get("X-Hub-Signature-256") or ""
+    assert sig.startswith("sha256="), call_["headers"]
+    expect = hmac.new(FAKE_NOTIFY_SECRET.encode("utf-8"), call_["body"],
+                      hashlib.sha256).hexdigest()
+    assert sig == f"sha256={expect}", (sig, expect)
+
+
+def test_notify无密钥时没有签名头_notify(cred_env):
+    """🔴 ② 无密钥 ⇒ **没有**签名头（裸 POST = 现状逐字回归，免签渠道照旧能用）。"""
+    with _MockSse([[_dm_frame()]]) as srv, _MockWebhook() as hook:
+        p = _provider()
+        p._init_push_consumer({"push_consumer": {
+            "enabled": True, "base_url": srv.base_url,
+            "credential_env": "TEST_PUSH_CREDENTIAL",
+            "notify_url": hook.url,
+        }})
+        assert _wait_until(lambda: bool(hook.calls)), "通知没发出去"
+
+    assert "X-Hub-Signature-256" not in hook.calls[0]["headers"], \
+        hook.calls[0]["headers"]
+    # 载荷照旧只有元数据（无正文）
+    assert json.loads(hook.calls[0]["body"].decode("utf-8")) == {
+        "text": "📩 你有 2 条未读私信（来自: worker-1）"}

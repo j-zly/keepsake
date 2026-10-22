@@ -68,7 +68,9 @@
    **候选满观察期自动通过**。
    写闸在 `adapters/hermes/provider.py::_apply_write_gate`（本模块只提供
    候选标与提名函数，**判据不在两处各写一份**）：
-   * 非 primary 写 core ⇒ `core_candidate`（既有降级行为，本单不动）；
+   * 非 primary 写 core ⇒ 也落 `core_candidate` **+ 提名日戳**（2026-10
+     ks_perm_scope：**子代理自荐常驻 = 与主脑同流程**；此前「降级但不打戳」
+     等于**死候选**，班车永远不审它）；
    * primary 写 core ⇒ 也落 `core_candidate` + 提名日戳（**不再直通**）；
    * 人工显式直写（控制台 promote / CoreView / MCP `memory_add` 显式 core）
      ⇒ 仍是直写 —— 那是「人在批」的等价动作。
@@ -448,7 +450,7 @@ def feedback_of(row: Dict[str, Any]) -> float:
 def _age_days(row: Dict[str, Any], now: datetime) -> float:
     """挂了候选标的天数。
 
-    有提名日标就用它；**没有的（老数据 / 子代理直接打的 `core_candidate`）回落到
+    有提名日标就用它；**没有的（老数据 / 收紧前子代理打的 `core_candidate`）回落到
     条目的 `updated_at`/`created`** —— 与条目同生共死，判据偏保守（老条目算挂得久），
     但绝不因此崩掉或当成刚挂上（那会让老候选第二天集体自动升）。
     """
@@ -503,7 +505,7 @@ def _hits_since_nomination(storage: Any, rows: List[Dict[str, Any]]) -> Dict[str
     每组一次 `hits_stats(since=提名日)` —— 锚点是**绝对时刻**，
     不受「挂钟 vs 注入的 now」的漂移影响（滚动窗做不到这点）。
 
-    没有提名日戳的（老数据 / 子代理降级落的候选）⇒ 不在本函数里算数，
+    没有提名日戳的（老数据 / 收紧前子代理降级落的候选）⇒ 不在本函数里算数，
     调用方按「仍待审」处理（它们本来也不该被自动批）。
     """
     groups: Dict[datetime, List[str]] = {}
@@ -563,10 +565,11 @@ def _hits_by_key(storage: Any, keys: List[str], window_days: Optional[int] = Non
 def candidate_tags(tags: Any, now: Optional[datetime] = None) -> str:
     """候选标签形态：`core` → `core_candidate`；给了 `now` 就补提名日戳。
 
-    * `now=None` ⇒ **只换标签不补戳**（子代理写 core 的降级路径：它没有
-      提名日，班车规则二就不会去自动审它 —— 保持既有语义不动）；
     * 给了 `now` ⇒ 追加 `tier:auto-hot:<提名日>`（规则二判「挂多久了」与
-      审核页显示「哪来的申请」都靠这个戳）。
+      审核页显示「哪来的申请」都靠这个戳）—— **primary 与子代理都走这一支**
+      （2026-10 ks_perm_scope：子代理自荐常驻 = 与主脑同一条审核/班车链）；
+    * `now=None` ⇒ **只换标签不补戳**（不提名 ⇒ 班车规则二不去自动审它；
+      保留这个口子给「只是打个候选标、没打算提名」的调用方）。
 
     其余标签原样保留、顺序不变（只把 `core` 那一项换掉）。
     """

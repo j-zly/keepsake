@@ -136,7 +136,8 @@ _DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 _CORE_TAG = "core"
 
 #: **非 primary 写 core 的降级目标**（多代理治理）：子代理对常驻层只读，
-#: 它写 `core` 只能落成候选（`core_candidate`），经审核后才由主脑转正。
+#: 它写 `core` 只能落成候选（`core_candidate`）—— **带提名日戳**（2026-10
+#: ks_perm_scope：与主脑候选同一条审核/班车链），经审核后才由主脑转正。
 #: 同时是主脑检索出口 `retrieval.exclude_tags` 的缺省排除标签。
 CORE_CANDIDATE_TAG = "core_candidate"
 
@@ -250,14 +251,34 @@ def _notify_payload(text: str, fmt: str) -> Dict[str, Any]:
     return {"text": text}
 
 
-def _notify(url: str, payload: Dict[str, Any], timeout: float = 5.0) -> None:
+def _json_body(payload: Dict[str, Any]) -> bytes:
+    """载荷 → **实发的原始字节**（签名必须签这个，不是签「等价」的字节）。
+
+    🔴 参数与 httpx 内部 `encode_json` **逐字一致**（`ensure_ascii=False` /
+    `separators=(",", ":")` / `allow_nan=False`）—— 不一致的话，收方拿**收到的
+    字节**复算出来的签名对不上（签了等于没签）。
+    """
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
+def _notify(url: str, payload: Dict[str, Any], secret: str = "",
+            timeout: float = 5.0) -> None:
     """POST 通知载荷到渠道 webhook（`httpx.post(url, json=..., timeout=...)`）。
+
+    🔴 **有密钥才签名**（2026-10 ks_notify_hmac）：头
+    `X-Hub-Signature-256: sha256=HMAC(secret, raw body)` —— 与唤醒出口 `_wake`
+    **同款**（签名实现同源，见 `_wake_signature`）。**无密钥 ⇒ 裸 POST**
+    （兼容钉钉类免签渠道，行为与上线前逐字相同）。
 
     🔴 **不吞异常**：调用方据此判断「这一帧算不算已通知」—— 吞掉异常会把
     失败的通知记成已送达。异常一律由调用方记 warning（fail-open）。
     """
     import httpx                   # 延迟 import：没装 httpx 也不影响记忆功能
-    httpx.post(url, json=payload, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Hub-Signature-256"] = _wake_signature(secret, _json_body(payload))
+    httpx.post(url, json=payload, headers=headers, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +335,7 @@ def _wake(url: str, secret: str, payload: Dict[str, Any], timeout: float = 5.0) 
     🔴 **不碰正文**：载荷只有 from / unread / seq 三个元数据键。
     """
     import httpx                   # 延迟 import：没装 httpx 也不影响记忆功能
-    body = json.dumps(payload, ensure_ascii=False,
-                      separators=(",", ":")).encode("utf-8")
+    body = _json_body(payload)     # 与通知出口**同一份**序列化（签名同源）
     headers = {"Content-Type": "application/json"}
     if secret:
         headers["X-Hub-Signature-256"] = _wake_signature(secret, body)
@@ -414,6 +434,7 @@ class _PushConsumer:
                  notify_url: str = "",
                  notify_format: str = "generic",
                  notify_min_interval_s: float = _NOTIFY_DEFAULT_MIN_INTERVAL_S,
+                 notify_secret: str = "",
                  wake_url: str = "",
                  wake_secret: str = "") -> None:
         self._url = base_url.rstrip("/") + "/events"
@@ -421,6 +442,8 @@ class _PushConsumer:
         # 通知出口（可选）：notify_url 为空 ⇒ 零外呼（功能关，现状逐字回归）
         self._notify_url = str(notify_url or "").strip()
         self._notify_format = str(notify_format or "generic").strip().lower() or "generic"
+        # 通知签名密钥（**有才签**；空 = 裸 POST，兼容钉钉类免签渠道）
+        self._notify_secret = str(notify_secret or "").strip()
         try:
             self._notify_interval = max(0.0, float(notify_min_interval_s))
         except (TypeError, ValueError):
@@ -454,6 +477,8 @@ class _PushConsumer:
         只喊一次；水位一变（升高）立刻再喊 —— 不让人干等窗口。
 
         🔴 载荷**永不含正文**：只带未读条数与发件人（正文永远走信箱本体）。
+        🔴 **有密钥才签名**（`X-Hub-Signature-256`，与唤醒出口同款）：没配密钥
+        ⇒ 裸 POST（兼容钉钉类免签渠道，行为与上线前逐字相同）。
         🔴 失败只记 warning：既不重试轰炸，也不影响水位/主路径。
         """
         if not self._notify_url:
@@ -469,7 +494,8 @@ class _PushConsumer:
         text = (f"📩 你有 {count} 条未读私信（来自: {sender}）" if sender
                 else f"📩 你有 {count} 条未读私信")
         try:
-            _notify(self._notify_url, _notify_payload(text, self._notify_format))
+            _notify(self._notify_url, _notify_payload(text, self._notify_format),
+                    self._notify_secret)
         except Exception as e:      # noqa: BLE001 —— 通知层永远 fail-open
             logger.warning("keepsake: 私信通知发送失败（已吞掉，不影响水位/主路径）: %s: %s",
                            type(e).__name__, e)
@@ -937,6 +963,11 @@ class KeepsakeProvider(MemoryProvider):
                 "notify_url": "",
                 "notify_min_interval_s": 120,
                 "notify_format": "generic",
+                # 通知签名密钥（**只写来源，不写真值**）：配了才带
+                # `X-Hub-Signature-256: sha256=HMAC(secret, raw body)`；
+                # 不配 = 裸 POST（兼容钉钉类免签渠道，现状逐字不变）。
+                "notify_secret_env": "KEEPSAKE_NOTIFY_SECRET",
+                "notify_secret_file": "",
             },
         }
 
@@ -1508,6 +1539,9 @@ class KeepsakeProvider(MemoryProvider):
           * `notify_url` —— 渠道 webhook 地址（**空 = 通知功能关，零外呼**）；
           * `notify_min_interval_s` —— 同水位限频窗口（缺省 120s）；
           * `notify_format` —— 载荷格式（`generic` / `feishu`，缺省 generic）；
+          * `notify_secret_env` / `notify_secret_file` —— 通知签名密钥来源
+            （**不落真值**；**有密钥才签名** `X-Hub-Signature-256`，
+            读不到 ⇒ 裸 POST = 现状逐字不变，兼容免签渠道）；
           * `wake_url` —— 宿主唤醒 webhook 地址（**空 = 唤醒功能关，零外呼**）；
           * `wake_secret_env` / `wake_secret_file` —— 订阅密钥来源
             （**不落真值**；读不到 ⇒ 不唤醒）。
@@ -1537,6 +1571,10 @@ class KeepsakeProvider(MemoryProvider):
                 notify_interval = _NOTIFY_DEFAULT_MIN_INTERVAL_S
             if notify_interval < 0:
                 notify_interval = 0.0
+            # 通知签名密钥（**有才签**）：读不到 ⇒ 裸 POST（免签渠道照旧能用）
+            notify_secret = _read_secret(settings, "notify_secret_env",
+                                         "notify_secret_file",
+                                         "KEEPSAKE_NOTIFY_SECRET", "通知订阅密钥")
             # 唤醒出口（可选）：wake_url 为空 ⇒ 零外呼；密钥读不到 ⇒ 也不唤醒
             #（没有签名 = 订阅鉴权过不去，发了也是白发）
             wake_url = str(settings.get("wake_url") or "").strip()
@@ -1554,6 +1592,7 @@ class KeepsakeProvider(MemoryProvider):
                     notify_url=notify_url,
                     notify_format=notify_format,
                     notify_min_interval_s=notify_interval,
+                    notify_secret=notify_secret,
                     wake_url=wake_url,
                     wake_secret=wake_secret,
                 )
@@ -2302,8 +2341,10 @@ class KeepsakeProvider(MemoryProvider):
         三条分支（标签判据是**逗号边界的完整标签相等**，复用 `_has_tag`，
         `core_x` / `xcore` 不算命中；其余标签原样保留、顺序不变）：
 
-        * **非 primary** 写 `core` ⇒ 降级为 `core_candidate`（既有行为，本单不动：
-          子代理对常驻层只读，经审核后由主脑转正）；
+        * **非 primary** 写 `core` ⇒ 降级为 `core_candidate` **+ 提名日戳**
+          （2026-10 ks_perm_scope：**子代理自荐常驻 = 与主脑同流程** —— 此前
+          「降级但不打戳」等于**死候选**，班车永远不审它；打上提名戳后与主脑
+          候选**同一条审核/班车链**：人工批准、热度自动过，一视同仁）；
         * **primary** 写 `core` ⇒ **不再直通**：落 `core_candidate` + 提名日戳
           （2026-10 常驻层入口改革：常驻层从此只有「审核页人工批准」与
           「候选满观察期自动通过」两个入口）；
@@ -2330,11 +2371,13 @@ class KeepsakeProvider(MemoryProvider):
                 "keepsake: primary 写 core 不再直通常驻层，落候选（tags: %r → %r）",
                 tags, new_tags)
             return new_tags, True
-        new_tags = tiering_mod.candidate_tags(tags)
+        # 非 primary：候选 + **提名日戳照打**（与主脑候选同一条链）
+        new_tags = tiering_mod.candidate_tags(tags, datetime.now(timezone.utc))
         logger.warning(
-            "keepsake: 非 primary 写 core 降级为 %s（tags: %r → %r）",
+            "keepsake: 非 primary 写 core 降级为 %s（提名日戳照打，"
+            "与主脑候选同一条审核链）（tags: %r → %r）",
             CORE_CANDIDATE_TAG, tags, new_tags)
-        return new_tags, False
+        return new_tags, True
 
     def add(
         self,

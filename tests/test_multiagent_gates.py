@@ -260,13 +260,18 @@ def test_write_gate_primary_也不再直通常驻层():
     assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
 
-def test_write_gate_非primary降级不带提名日戳():
-    """子代理写 core 落候选但**没有提名日**：它不是「提名」，班车不自动审它。"""
+def test_write_gate_非primary降级带提名日戳():
+    """子代理写 core 落候选**且带提名日戳**（2026-10 ks_perm_scope）。
+
+    🔴 此前子代理写的候选**没有提名日** ⇒ 班车规则二压根不审它（死候选），
+    等于「子代理不能自荐常驻」。现在与主脑候选**同一条审核/班车链**：
+    人工批准、热度自动过，一视同仁。
+    """
     st = _FakeStorage()
     _provider(st, is_primary=False).add("子代理写常驻记忆", tags="core")
     tags = st.store_calls[0]["tags"]
     assert _has_tag(tags, CORE_CANDIDATE_TAG), tags
-    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+    assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
 
 def test_write_gate_人工显式直写放行():
@@ -291,8 +296,8 @@ def test_write_gate_显式直写只对primary凭据生效():
     """🔴 2026-10 ks_share_tighten：显式直写**只对 primary 生效**（凭据说了算）。
 
     远端调用方（MCP）的身份由**凭据反查**得出 —— 一个外部代理带着 core 标签
-    进来，显式直写**不生效**：照常降级成候选，且**不带提名日戳**（班车不会
-    自动审它 ⇒ 它进不了常驻层）。
+    进来，显式直写**不生效**：照常降级成候选（**带提名日戳** ⇒ 与主脑候选
+    同一条审核链，人工批准才进常驻层）。
     """
     st = _FakeStorage()
     _provider(st, is_primary=True).add("外部代理想直写", tags="core",
@@ -300,7 +305,7 @@ def test_write_gate_显式直写只对primary凭据生效():
     tags = st.store_calls[0]["tags"]
     assert _has_tag(tags, CORE_CANDIDATE_TAG), tags
     assert not _has_tag(tags, "core"), tags
-    assert not any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
+    assert any(t.startswith("tier:auto-hot:") for t in tags.split(",")), tags
 
     # 判不出角色（空串）⇒ 按 sub（fail-closed）
     st2 = _FakeStorage()

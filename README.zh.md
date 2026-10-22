@@ -188,6 +188,7 @@ pip install git+https://github.com/j-zly/keepsake.git
   //   "notify_url": "https://example.invalid/hooks/xxx",// 通知出口（渠道 webhook）；空 = 零外呼
   //   "notify_min_interval_s": 120,                     // 同水位限频窗口（秒）
   //   "notify_format": "generic",                       // generic | feishu
+  //   "notify_secret_env": "KEEPSAKE_NOTIFY_SECRET",    // 或 "notify_secret_file": "/path/to/secret"（有密钥才带签名头）
   //   "wake_url": "http://127.0.0.1:8210/hooks/dm-wake",// 唤醒出口（宿主 webhook）；空 = 零外呼
   //   "wake_secret_env": "KEEPSAKE_WAKE_SECRET"         // 或 "wake_secret_file": "/path/to/secret"
   // },
@@ -236,6 +237,7 @@ pip install git+https://github.com/j-zly/keepsake.git
 | `OPENAI_API_KEY` | `embedder.api_key` | 嵌入 API 密钥 |
 | `KEEPSAKE_PUSH_CREDENTIAL` | `push_consumer.credential_env` | 私信推送消费者的建流凭据（**默认环境变量名 —— 名字本身可配**） |
 | `KEEPSAKE_WAKE_SECRET` | `push_consumer.wake_secret_env` | 唤醒出口 webhook 的订阅密钥（`X-Hub-Signature-256` 的 HMAC 签名密钥；**默认环境变量名 —— 名字本身可配**） |
+| `KEEPSAKE_NOTIFY_SECRET` | `push_consumer.notify_secret_env` | 通知出口 webhook 的签名密钥（`X-Hub-Signature-256` 的 HMAC 签名密钥；**不配 = 裸 POST**；**默认环境变量名 —— 名字本身可配**） |
 
 > **其余配置项一律只走 `config.json`，没有对应环境变量。** 特别是 `bm25_limit`、`decay_half_days`、`hot_topic_decay_half_days`、`embed_cache_ttl`、`storage.backend`、`embed_dim`、`consolidate_min_group`、`consolidate_min_overlap`、`consolidate_max_age_hours`、`forget_max_age_days`、`forget_dry_run`、`emotion_intensity_factor` 都只从配置文件读。默认值见下方[配置参考](#配置参考)表。
 
@@ -384,6 +386,7 @@ yeah
 | `push_consumer.notify_url` | — | `""` | 通知出口的渠道 webhook 地址（例：飞书群机器人）。**空 = 功能关** ⇒ 零外呼 |
 | `push_consumer.notify_min_interval_s` | — | `120` | 通知出口的限频窗口（秒）：**同一未读数**在窗口内只喊一次；水位升高立刻再喊 |
 | `push_consumer.notify_format` | — | `generic` | 通知载荷形状：`generic`（`{"text": …}`）或 `feishu`（`{"msg_type": "text", "content": {"text": …}}`） |
+| `push_consumer.notify_secret_env` | `KEEPSAKE_NOTIFY_SECRET` | `KEEPSAKE_NOTIFY_SECRET` | 通知出口的签名密钥**环境变量名**（`X-Hub-Signature-256` 的 HMAC-SHA256 密钥；**密钥真值不落 config.json**）。另有 `push_consumer.notify_secret_file` 指 secrets 文件。**有密钥才签名**，不配 = 裸 POST（兼容钉钉类免签渠道） |
 
 | `nudge.publish_endpoint` | — | `http://127.0.0.1:8210/internal/publish` | 控制台把提醒帧 **POST** 到哪儿（跨进程投递 —— 流挂在 MCP 进程里）。env 覆盖：`KEEPSAKE_NUDGE_PUBLISH_ENDPOINT`。见「nudge 跨进程投递」节 |
 | `push_consumer.wake_url` | — | `""` | 唤醒出口的宿主 webhook 地址（Hermes 网关的 webhook 订阅）⇒ 宿主起一轮代理会话自己去读信。**空 = 功能关** ⇒ 零外呼 |
@@ -843,11 +846,13 @@ session 造多个 provider —— 所以消费者与回调表挂在**模块级**
 | 闸 | 行为 | 配置键 | 生效层 |
 |----|------|--------|--------|
 | **A — 非 primary 检索放开 `core`** | 子代理也能召回常驻层，而不只是自己的私有条目；但仍写不进去 | `is_primary` | 存储过滤 —— 三个后端的 BM25 路径均生效；PG 与 SQLite 共用同一个 `_search_filter_sql` 出口，BM25 与 KNN 一并覆盖 |
-| **B — 写 `core` 自动降级** | 非 primary 代理写 `core` 标签时，该标签被改写成 `core_candidate`（其余标签保留），并打一条告警 | — | `provider._apply_write_gate`，挂在 `provider.add()` 上；MCP 的 `memory_add` 走同一条 |
+| **B — 写 `core` 自动降级** | 非 primary 代理写 `core` 标签时，该标签被改写成 `core_candidate`（其余标签保留）**并打上提名日戳 `tier:auto-hot:<日>`** —— 与主脑候选同一条审核/班车链（人工批准或热度自动过，一视同仁），并打一条告警 | — | `provider._apply_write_gate`，挂在 `provider.add()` 上；MCP 的 `memory_add` 走同一条 |
 | **C — 控制台候选审核队列** | 控制台「记忆维护」页分页列出 `core_candidate` 条目。批准 = 先 promote 进 `core` 再摘掉候选标（顺序不能反，反了可能两头空）；驳回 = 只摘候选标，条目仍留在检索层 | — | 控制台 |
 | **D — 主脑噪音过滤** | `retrieval.exclude_tags` 在检索出口按标签丢弃条目。缺省挡掉 `core_candidate`，不让「待审申请」在主脑自己的召回里当成事实重复出现；写空串即关闸 | `retrieval.exclude_tags` | `search` / `prefetch` 的同一出口，**先过滤再截断** |
 
 第 D 闸的值在 `initialize()` 里解析一次，所以**改它要重启**；过滤本身每次查询都跑，但跑的是那份冻结下来的集合。
+
+**删除也按归属收窄**（2026-10）：MCP 的 `memory_remove` 里，子代理**只能删自己的**条目（无归属的老条目也行 —— 收紧前的公共数据）；别人的条目 —— 含已共享代理的 —— 一律拒（「不是你的记忆」，不回显正文）。primary 全量可删（主脑现状不变）。`memory_forget` 是**批处理治理面**（一次按时间衰减删一批），收归 **primary-only**。
 
 `core_candidate` 的语义因此是「进入常驻层的待审申请」，而不是 LLM 可以自己发明的标签。保留字判据全仓只有一份实现 —— `core/shared.py` 的 `sanitize_reserved_tags()`，提炼 cron（剥掉保留字并记日志）与控制台新增/导入（打 `core` 直接 400）共用。保留集合：精确标签 `core` / `core_candidate` / `shared`，外加 `agent:` 前缀族；按逗号边界精确匹配，所以 `core_x` 不算保留字。
 

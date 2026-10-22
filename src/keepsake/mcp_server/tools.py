@@ -21,6 +21,8 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
    `agent:<id>` 是**这次调用方**，不是 provider 进程的身份（否则它写完自己搜不到，
    写的还全混进主脑库）；调用方自报的 `agent:xxx` 一律被覆写（**不许自报归属**），
    本机直写（caller 空）仍落进程默认身份。
+🔴 **删除按归属收窄**（2026-10 ks_perm_scope）：子代理只能删**自己的**条目
+   （无归属的老条目也行）；`memory_forget` 是**批处理治理面** ⇒ **仅主代理可用**。
 
 --------------------------------------------------------------------------
 可选扩展：core 层枚举
@@ -56,7 +58,11 @@ from ..govern.registry import (
     STATUS_REVOKED,
 )
 # core 层的两把尺子（归属可见性 + 注入预算）—— 与注入路径同一份口径。
-from ..govern.visibility import truncate_core_fragments
+from ..govern.visibility import (
+    can_remove_fragment,
+    fragment_owner,
+    truncate_core_fragments,
+)
 
 logger = logging.getLogger("keepsake.mcp_server.tools")
 
@@ -192,6 +198,54 @@ def _unread_dm(box: Any, agent_id: str) -> int:
 # --------------------------------------------------------------------------
 # 8 个 tool 的实现（纯函数，provider 显式传参 —— 不靠闭包，方便单测直接调）
 # --------------------------------------------------------------------------
+
+#: 子代理删**别人**条目时的拒绝文案（🔴 **不回显任何正文**，只说「不是你的」）。
+REMOVE_NOT_OWNER = "这条记忆不是你的 —— 子代理只能删自己的记忆"
+
+#: 子代理调 `memory_forget`（批处理治理面）时的拒绝文案。
+FORGET_DENIED = ("治理动作仅主代理可用：memory_forget 是批处理治理面"
+                 "（按时间衰减一次删一批），只有主代理能跑")
+
+
+def _is_primary_caller(caller_agent_id: str, caller_role: str) -> bool:
+    """这个调用方是不是 primary。
+
+    🔴 **判不出身份 ⇒ 当本机直连**（= 主脑现状逐字不变）：MCP 侧的身份永远
+    来自闸门（凭据反查），非 primary 的调用方一定带 agent_id + role ⇒ 走不到
+    这条兜底。
+    """
+    if not str(caller_agent_id or "").strip():
+        return True
+    return str(caller_role or "").strip() == ROLE_PRIMARY
+
+
+def _can_remove(provider: Any, key: str, caller_agent_id: str,
+                caller_role: str) -> bool:
+    """这个调用方能不能删这条 —— **按归属收窄**（2026-10 ks_perm_scope）。
+
+    🔴 判据（谁能删谁）在 `govern.visibility.can_remove_fragment` **唯一一份**：
+    非 primary 只能删**自己的**条目（`owner == caller`）或**无归属的老条目**
+    （收紧前的公共数据，与检索口径一致）；别人的条目 —— **含已共享代理的**
+    —— 一律不许（「看得见」≠「能删」）。
+
+    🔴 **用 `provider.get` 取条目**（通用契约里的原语）：它已经按**同一份
+    可见性口径**过滤过了 ⇒ 非 primary **看不见**的条目（别人的 / 不存在的）
+    一律不许删（fail-closed：判不出归属就不许删）。
+    """
+    if _is_primary_caller(caller_agent_id, caller_role):
+        return True                     # primary 全量可删（= 主脑现状逐字不变）
+    try:
+        frag = provider.get(
+            key, **_caller_kwargs(provider.get, caller_agent_id, caller_role))
+    except Exception as e:      # noqa: BLE001 —— 归属判不出来就不许删
+        raise ToolError(
+            f"删除失败：读不到这条记忆的归属（{type(e).__name__}）—— 拒绝实删，请稍后重试"
+        ) from e
+    if not frag:
+        return False                    # 看不见（别人的 / 不存在）⇒ 不许删
+    owner = fragment_owner(frag.get("tags", ""))
+    return can_remove_fragment(owner, caller_agent_id, is_primary=False)
+
 
 def memory_capabilities(provider: Any) -> Dict[str, Any]:
     """能力声明：调用方据此决定能不能问后端要某项能力，而不是 try/except 猜。"""
@@ -361,14 +415,23 @@ def _add_memory(provider: Any, text: str, tags: str, *,
     return provider.add(text, tags=tags, **kwargs)
 
 
-def memory_remove(provider: Any, key: str, confirm: bool = False) -> Dict[str, Any]:
-    """删除一条记忆条目。`confirm=False` ⇒ **拒绝并说明**，绝不动数据。"""
+def memory_remove(provider: Any, key: str, confirm: bool = False, *,
+                  caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+    """删除一条记忆条目。`confirm=False` ⇒ **拒绝并说明**，绝不动数据。
+
+    🔴 **删除权限按归属收窄**（2026-10 ks_perm_scope）：子代理**只能删自己的**
+    条目；**无归属的老条目**也行（收紧前的公共数据，与检索口径一致）；
+    别人的条目 —— **含已共享代理的** —— 一律拒（只回「不是你的记忆」，
+    **不回显任何正文**）。primary 全量可删（= 主脑现状逐字不变）。
+    """
     if not key:
         raise ToolError("key 不能为空")
     if not confirm:
         raise ToolError(
             f"删除需要显式确认：确认后请重新调用 memory_remove(key={key!r}, confirm=True)"
         )
+    if not _can_remove(provider, key, caller_agent_id, caller_role):
+        raise ToolError(REMOVE_NOT_OWNER)
     ok = provider.remove(key)
     if not ok:
         raise ToolError(f"删除失败（key 不存在或后端不可用）：{key}")
@@ -390,8 +453,16 @@ def memory_merge(provider: Any, dry_run: bool = True, confirm: str = "") -> Dict
     return stats
 
 
-def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
-    """遗忘（按时间衰减筛过期条目）。默认 dry-run；实跑必须 `confirm` = 当前记忆条目总数。"""
+def memory_forget(provider: Any, dry_run: bool = True, confirm: str = "", *,
+                  caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+    """遗忘（按时间衰减筛过期条目）。默认 dry-run；实跑必须 `confirm` = 当前记忆条目总数。
+
+    🔴 **仅主代理可用**（2026-10 ks_perm_scope）：`forget` 是**批处理治理面**
+    （按时间衰减一次删掉一批条目）—— 子代理调用 ⇒ 拒（「治理动作仅主代理可用」）。
+    别让它圈到别人的量：单条删除有归属闸，这条批量闸没有。
+    """
+    if not _is_primary_caller(caller_agent_id, caller_role):
+        raise ToolError(FORGET_DENIED)
     total_before = _count_fragments(provider)
     if not dry_run:
         if confirm != str(total_before):
@@ -787,11 +858,14 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_remove",
-        description="删除一条记忆。必须 confirm=True，否则拒绝。",
+        description="删除一条记忆。必须 confirm=True，否则拒绝。"
+                    "子代理只能删自己的条目（别人的条目一律拒）。",
     )
     def _remove(key: str, confirm: bool = False) -> Dict[str, Any]:
-        _authorize("memory_remove")
-        return memory_remove(provider, key, confirm)
+        ident = _authorize("memory_remove")
+        return memory_remove(provider, key, confirm,
+                             caller_agent_id=str(ident.get("agent_id") or ""),
+                             caller_role=str(ident.get("role") or ""))
 
     @server.tool(
         name="memory_merge",
@@ -803,11 +877,14 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_forget",
-        description="遗忘过期记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前记忆条目总数。",
+        description="遗忘过期记忆条目。默认 dry_run=True 只统计；实跑需 confirm = 当前记忆条目总数。"
+                    "仅主代理可用（批处理治理面）。",
     )
     def _forget(dry_run: bool = True, confirm: str = "") -> Dict[str, Any]:
-        _authorize("memory_forget")
-        return memory_forget(provider, dry_run, confirm)
+        ident = _authorize("memory_forget")
+        return memory_forget(provider, dry_run, confirm,
+                             caller_agent_id=str(ident.get("agent_id") or ""),
+                             caller_role=str(ident.get("role") or ""))
 
     # ---- 代理互聊信箱：所有**已批准**代理可用（与 govern 无关）----------
     # 身份判定走 `gate.check`（与记忆工具同一条身份链）：发件人 = 凭据反查出来的
