@@ -80,12 +80,18 @@ class StorageBase(ABC):
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
         applicability: str = "",
+        owner_agent_id: str = "",
     ) -> bool:
         """将一段文本写入碎片库（同名内容去重：保留 feedback 并版本化归档旧版）。
 
         `applicability` 是契约 v2 的可选入参（默认空串 = 环境无关的记忆照常写，
         老调用方逐字不受影响）。**不传**时后端连列都不写；**传了**却缺列 ⇒
         写路径报人话错误（附迁移 SQL），绝不静默丢字段。
+
+        `owner_agent_id` 是**归属章的覆盖值**（2026-10 ks_owner_stamp）：
+        非空 ⇒ 落库时把 `agent:<id>` 盖成它（调用方自报的 `agent:xxx` 一律剥掉
+        —— 不许自报归属）；为空 ⇒ 落**进程默认身份**（`self._agent_id`），
+        本机直写/提炼管线路径逐字不变。
         """
 
     @abstractmethod

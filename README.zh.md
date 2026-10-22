@@ -635,6 +635,8 @@ server.run("stdio")                         # 任何 MCP 客户端连上就能�
 
 `build_server(provider)` 挂 8 个 tool —— `memory_capabilities`、`memory_search`、`memory_get`、`memory_core_list`、`memory_add`、`memory_remove`、`memory_merge`、`memory_forget` —— 外加两个 resource：`memory://core`（常驻层全文，取的就是每轮注入上下文那份渲染的逐字原件）与 `memory://fragment/{key}`。不传参则用 keepsake 自己的默认装配（`factory.default_provider()`，按 `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json` 连库）。MCP 的写 tool 与 `provider.add()` 共用同一道写闸，下面的治理规则对 MCP 调用方同样成立。
 
+**归属章（2026-10 ks_owner_stamp）。** 经 MCP 写进去的记忆归**凭据反查出的调用方**（`agent:<它的 id>`），**不是** MCP 进程的身份 —— 否则它写完自己搜不到（可见性收紧后），写的还全混进主脑库。它在 `tags` 里自报 `agent:xxx` 会被**覆写**回真实身份（**不许自报归属**）；本机直写（不经凭据的进程内路径）仍落进程默认身份。能力声明里的 `write_owner` 字段就是这条语义。
+
 **传输。** `stdio` 是缺省。`http`（streamable-http）**只听 `127.0.0.1`** —— 绑非回环地址直接以退出码 2 终止，不启动。记忆库没有自带认证，把它暴露到网络上等于把一个人的长期记忆公开读；要对外请走反向代理。CLI：`python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`。
 
 ## 私信实时推送（SSE 长连接）

@@ -46,6 +46,7 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     rrf_fuse,
     rerank_with_decay,
     row_visible_after_core_narrow,
+    stamp_owner_tag,
     tiebreak_by_key,
 )
 from ..domain.splitter import extract_keywords, extract_entities, segment_query
@@ -1030,6 +1031,7 @@ class RedisStorage(StorageBase):
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
         applicability: str = "",
+        owner_agent_id: str = "",
     ) -> bool:
         """将一段文本写入碎片库。
 
@@ -1041,6 +1043,9 @@ class RedisStorage(StorageBase):
         支持去重：内容相同则更新已有碎片（覆盖 feedback 外字段）。
 
         `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
+
+        `owner_agent_id` 非空 ⇒ 归属章盖成它（凭据反查出的调用方），
+        空 ⇒ 落进程默认身份（`self._agent_id`）。
         """
         client = self._get_client()
         if not client:
@@ -1079,20 +1084,9 @@ class RedisStorage(StorageBase):
                 pass
 
             # 处理 tags：自动添加 agent tag
-            final_tags = tags
-            if self._agent_id:
-                # 将 agent tag 添加到 tags 列表中
-                if not final_tags:
-                    final_tags = f"agent:{self._agent_id}"
-                else:
-                    # 检查是否已经有 agent: 开头的 tag
-                    tag_list = [t.strip() for t in final_tags.split(",") if t.strip()]
-                    agent_tag = f"agent:{self._agent_id}"
-
-                    # 移除已有的 agent tag
-                    filtered_tags = [t for t in tag_list if not t.startswith("agent:")]
-                    filtered_tags.append(agent_tag)
-                    final_tags = ",".join(filtered_tags)
+            # 🔴 `owner_agent_id` 非空 ⇒ 归属是**这次调用方**（MCP 凭据反查），
+            #    自报的 agent: 标签一律被剥掉（不许自报归属）。
+            final_tags = stamp_owner_tag(tags, str(owner_agent_id or "").strip() or self._agent_id)
 
             mapping: Dict[str, Any] = {
                 "content": text,

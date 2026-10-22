@@ -555,6 +555,26 @@ def replace_agent_tag(tags: str, old_id: str, new_id: str) -> str:
     return ",".join(parts)
 
 
+def stamp_owner_tag(tags: str, owner_agent_id: str) -> str:
+    """按归属代理 id 盖 `agent:<id>` 标签（**旧的 `agent:` 全替换**）。
+
+    🔴 归属**只认这一处注入**：调用方自报的 `agent:xxx` 一律剥掉 ——
+    **不许自报归属**。远端代理的归属由**凭据反查**得出
+    （MCP `memory_add` → `provider.add(caller_agent_id=…)` →
+    存储层 `store(owner_agent_id=…)`）；本机直写/提炼管线路径不传这个参数
+    ⇒ 落进程默认身份（`self._agent_id`）。
+
+    `owner_agent_id` 为空 ⇒ **原样返回**（不盖任何归属标签）。
+    """
+    owner = str(owner_agent_id or "").strip()
+    if not owner:
+        return tags or ""
+    parts = [t.strip() for t in str(tags or "").split(",") if t.strip()]
+    kept = [t for t in parts if not t.startswith(RESERVED_TAG_PREFIX)]
+    kept.append(agent_tag(owner))
+    return ",".join(kept)
+
+
 # ---------------------------------------------------------------------------
 # 检索可见性（非 primary）—— 三后端共用一份口径
 # ---------------------------------------------------------------------------

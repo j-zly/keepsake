@@ -741,6 +741,8 @@ server.run("stdio")                         # any MCP client connects and is don
 
 `build_server(provider)` registers 8 tools — `memory_capabilities`, `memory_search`, `memory_get`, `memory_core_list`, `memory_add`, `memory_remove`, `memory_merge`, `memory_forget` — plus the resources `memory://core` (the resident-layer text, returned verbatim as the same rendering injected every turn) and `memory://fragment/{key}`. Called with no argument it assembles keepsake's own provider (`factory.default_provider()`, connecting per `KEEPSAKE_CONFIG` / `~/.config/keepsake/config.json`). The MCP write tools share the provider's write gate, so the governance rules below apply to MCP callers too.
 
+**Ownership stamp (2026-10 ks_owner_stamp).** A memory written through MCP belongs to the **credential-derived caller** (`agent:<its id>`), **not** to the MCP process's own identity — otherwise the agent cannot retrieve what it just wrote (once visibility was tightened), and everything it writes lands in the main brain's library. An `agent:xxx` it puts in `tags` itself is **overwritten** with the real identity (no self-declared ownership); in-process writes (no credential) still fall back to the process default. The `write_owner` field of the capability declaration states exactly this.
+
 **Transport.** `stdio` is the default. `http` (streamable-http) listens on `127.0.0.1` only — a non-loopback bind address exits with code 2 rather than starting. The memory store has no authentication of its own, so exposing it on the network is equivalent to publishing a person's long-term memory; put a reverse proxy in front of it instead. CLI: `python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`.
 
 ## Private-Message Push over SSE

@@ -17,6 +17,10 @@ import 的 `..api.audit` / `..govern.registry` 是 keepsake 自家模块（纯�
 🔴 merge/forget 实跑必须回填 `confirm` = 当前 core 条数 / 当前记忆条目总数
    （字符串比较）—— 防「以为自己在跑 A 库」与「以为自己在跑 dry-run」。
 🔴 失败抛 `ToolError`（结构化错误），**绝不静默 ok**。
+🔴 **归属章 = 凭据反查出的调用方**（2026-10 ks_owner_stamp）：`memory_add` 落库的
+   `agent:<id>` 是**这次调用方**，不是 provider 进程的身份（否则它写完自己搜不到，
+   写的还全混进主脑库）；调用方自报的 `agent:xxx` 一律被覆写（**不许自报归属**），
+   本机直写（caller 空）仍落进程默认身份。
 
 --------------------------------------------------------------------------
 可选扩展：core 层枚举
@@ -199,6 +203,9 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
         "knn": bool(getattr(caps, "knn", False)),
         "dry_run_merge": bool(getattr(caps, "dry_run_merge", False)),
         "core_listing": hasattr(provider, "list_core"),
+        # 🔴 归属语义（2026-10 ks_owner_stamp）：写入方身份 = **凭据反查**的调用方
+        #    （`caller_credential`）—— 写的记忆归自己，不是 provider 进程的身份。
+        "write_owner": "caller_credential",
     }
 
 
@@ -308,6 +315,11 @@ def memory_add(provider: Any, text: str, tags: str = "",
 
     判不出身份（没有闸门 / 没有凭据）⇒ **不带** `core_direct`（fail-closed：
     判不出就别当 primary）。
+
+    🔴 **归属章按凭据反查的调用方打**（2026-10 ks_owner_stamp）：远端代理写的
+    记忆归它自己（`agent:<它>`），不是 provider 进程默认身份 —— 否则它写完
+    自己搜不到（可见性收紧后），还混进主脑全库。`caller_agent_id` 为空 ⇒ 本机
+    直写 ⇒ 归属仍走进程默认（既有行为逐字不变）。
     """
     if not text or not text.strip():
         raise ToolError("text 不能为空")
@@ -316,7 +328,8 @@ def memory_add(provider: Any, text: str, tags: str = "",
     is_primary = known and role == ROLE_PRIMARY
     key = _add_memory(provider, text.strip(), tags or "",
                       core_direct=is_primary,
-                      caller_role=(role if known else None))
+                      caller_role=(role if known else None),
+                      caller_agent_id=(caller_agent_id.strip() if known else ""))
     if not key:
         raise ToolError("写入失败：provider 未返回 key（fail-closed）")
     return {"key": key, "tags": tags or ""}
@@ -324,13 +337,15 @@ def memory_add(provider: Any, text: str, tags: str = "",
 
 def _add_memory(provider: Any, text: str, tags: str, *,
                 core_direct: bool = False,
-                caller_role: Optional[str] = None) -> str:
-    """调 `provider.add`；provider 支持 `core_direct` / `caller_role` 就带上（可选扩展）。
+                caller_role: Optional[str] = None,
+                caller_agent_id: str = "") -> str:
+    """调 `provider.add`；provider 支持 `core_direct` / `caller_role` /
+    `caller_agent_id` 就带上（可选扩展）。
 
     `core_direct` **不在通用契约里**（契约不该为某一个宿主的「显式直写」开洞），
-    `caller_role` 同理（那是 keepsake 自己的治理扩展）—— 所以这里先看签名再决定
-    带不带：别的记忆系统没有这两个参数 ⇒ 照常调，不猜、不用 try/except 吞异常
-    （那会把 provider 自己的写失败吞成「没写进去」）。
+    `caller_role` / `caller_agent_id` 同理（那是 keepsake 自己的治理扩展）——
+    所以这里先看签名再决定带不带：别的记忆系统没有这几个参数 ⇒ 照常调，
+    不猜、不用 try/except 吞异常（那会把 provider 自己的写失败吞成「没写进去」）。
     """
     try:
         params = inspect.signature(provider.add).parameters
@@ -341,6 +356,8 @@ def _add_memory(provider: Any, text: str, tags: str, *,
         kwargs["core_direct"] = core_direct
     if "caller_role" in params:
         kwargs["caller_role"] = caller_role
+    if "caller_agent_id" in params:
+        kwargs["caller_agent_id"] = caller_agent_id
     return provider.add(text, tags=tags, **kwargs)
 
 
@@ -759,7 +776,8 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_add",
-        description="写入一条记忆，返回它的 key。",
+        description="写入一条记忆，返回它的 key。归属按凭据反查出的调用方打"
+                    "（写进的是你自己的记忆，别人默认看不见）。",
     )
     def _add(text: str, tags: str = "") -> Dict[str, Any]:
         ident = _authorize("memory_add")

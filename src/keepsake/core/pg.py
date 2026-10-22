@@ -110,6 +110,7 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     rrf_fuse,
     rerank_with_decay,
     scoring_now_ts,
+    stamp_owner_tag,
     tag_match_sql,
     visibility_filter_sql,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
@@ -2533,12 +2534,16 @@ class PgStorage(StorageBase):
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
         applicability: str = "",
+        owner_agent_id: str = "",
     ) -> bool:
         """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store 一致。
 
         `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
         缺列降级：**不传**时连列都不写（老库照常写碎片）；**传了**却缺列 ⇒ 抛
         `_ContractColumnMissing` 带迁移 SQL，绝不静默把适用条件丢掉。
+
+        `owner_agent_id` 非空 ⇒ 归属章盖成它（凭据反查出的调用方），
+        空 ⇒ 落进程默认身份（`self._agent_id`）。
         """
         # 写路径让检索快照立即失效：本次会改 ks_fragment 的 content_tsv（→ N/avgdl/df）、
         # 并累加 ks_hot_topic / ks_attention（→ 重排加权信号）。
@@ -2553,15 +2558,9 @@ class PgStorage(StorageBase):
         keywords = extract_keywords(text, max_keywords=5)
 
         # agent tag 注入（与 Redis 侧同一套规则）
-        final_tags = tags
-        if self._agent_id:
-            if not final_tags:
-                final_tags = f"agent:{self._agent_id}"
-            else:
-                tag_list = [t.strip() for t in final_tags.split(",") if t.strip()]
-                filtered_tags = [t for t in tag_list if not t.startswith("agent:")]
-                filtered_tags.append(f"agent:{self._agent_id}")
-                final_tags = ",".join(filtered_tags)
+        # 🔴 `owner_agent_id` 非空 ⇒ 归属是**这次调用方**（MCP 凭据反查），
+        #    自报的 agent: 标签一律被剥掉（不许自报归属）。
+        final_tags = stamp_owner_tag(tags, str(owner_agent_id or "").strip() or self._agent_id)
 
         entities = extract_entities(text)
         now = datetime.now(timezone.utc)

@@ -139,6 +139,7 @@ from .shared import (
     scoring_now_ts,
     synonym_rows,
     synonym_words,
+    stamp_owner_tag,
     tag_match_sql,
     visibility_filter_sql,
     # 分词口径单源 + 确定性 tiebreaker（2026-10 ks_recall_v1，见 storage_shared 的说明）
@@ -852,14 +853,13 @@ class SqliteStorage(StorageBase):
         """碎片 key —— 与 Redis/PG store() 同一套算法（sha256 前 12 位）。"""
         return f"memory:frag:{_sha12(text)}"
 
-    def _agent_tags(self, tags: str) -> str:
-        """注入 `agent:<id>` 标签（与 Redis/PG 同一套规则：旧的 agent: 全替换）。"""
-        if not self._agent_id:
-            return tags
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-        filtered = [t for t in tag_list if not t.startswith("agent:")]
-        filtered.append(f"agent:{self._agent_id}")
-        return ",".join(filtered)
+    def _agent_tags(self, tags: str, owner_agent_id: str = "") -> str:
+        """注入 `agent:<id>` 标签（与 Redis/PG 同一套规则：旧的 agent: 全替换）。
+
+        `owner_agent_id` 非空 ⇒ 归属是**这次调用方**（MCP 凭据反查），
+        空 ⇒ 落进程默认身份（`self._agent_id`）。
+        """
+        return stamp_owner_tag(tags, str(owner_agent_id or "").strip() or self._agent_id)
 
     def upsert_fragment(self, fields: Dict[str, Any]) -> bool:
         """按给定字段**原样**写一条碎片（迁移专用，幂等）。
@@ -929,10 +929,14 @@ class SqliteStorage(StorageBase):
         sentiment_score: Optional[float] = None,
         sentiment_label: Optional[str] = None,
         applicability: str = "",
+        owner_agent_id: str = "",
     ) -> bool:
         """写入碎片。字段/去重/版本化/热词语义与 RedisStorage.store、PgStorage.store 一致。
 
         `applicability` 是契约 v2 的可选入参（默认空串 = 老调用方逐字不受影响）。
+
+        `owner_agent_id` 非空 ⇒ 归属章盖成它（凭据反查出的调用方），
+        空 ⇒ 落进程默认身份（`self._agent_id`）。
         """
         # 情绪分析（除非明确传入）
         if sentiment_score is None or sentiment_label is None:
@@ -941,7 +945,7 @@ class SqliteStorage(StorageBase):
             intensity, label = sentiment_score, sentiment_label
 
         keywords = extract_keywords(text, max_keywords=5)
-        final_tags = self._agent_tags(tags)
+        final_tags = self._agent_tags(tags, owner_agent_id)
         entities = extract_entities(text)
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()

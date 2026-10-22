@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -712,6 +713,30 @@ def _has_tag(tags: Any, tag: str) -> bool:
     for ch in ((" ,", ","), (", ", ",")):
         norm = norm.replace(*ch)
     return f",{tag}," in f",{norm},"
+
+
+def _owner_kwargs(store_fn: Any, caller_agent_id: str) -> Dict[str, Any]:
+    """存储层 `store()` 的**归属章覆盖值**（2026-10 ks_owner_stamp）。
+
+    🔴 `owner_agent_id` **不在通用契约里**（契约不该为某一个宿主的「远端写入」
+    开洞）—— 所以这里先看签名再决定带不带：别的存储实现没有这个参数 ⇒
+    照常调（不猜、不用 try/except 吞异常，那会把写失败吞成「没写进去」）。
+
+    空 `caller_agent_id`（本机直写/提炼管线）⇒ **不带** ⇒ 存储层落进程默认身份。
+    """
+    owner = str(caller_agent_id or "").strip()
+    if not owner:
+        return {}
+    try:
+        params = inspect.signature(store_fn).parameters
+    except (TypeError, ValueError):       # 签名取不到（内置/C 扩展）⇒ 按不支持处理
+        params = {}
+    if "owner_agent_id" not in params:
+        logger.warning(
+            "keepsake: 存储层 store() 不认 owner_agent_id —— 本次写入的归属章"
+            "会落进程默认身份而不是调用方 %s", owner)
+        return {}
+    return {"owner_agent_id": owner}
 
 
 def _load_json_config() -> dict:
@@ -2319,6 +2344,7 @@ class KeepsakeProvider(MemoryProvider):
         meta: Optional[Dict[str, Any]] = None,
         core_direct: bool = False,
         caller_role: Optional[str] = None,
+        caller_agent_id: str = "",
     ) -> str:
         """写入一条记忆，返回它的 key；写入失败返回空串（falsy）。
 
@@ -2333,6 +2359,11 @@ class KeepsakeProvider(MemoryProvider):
         🔴 `caller_role` = **谁在写**（2026-10 ks_share_tighten 收紧）：MCP 远端
         调用方的角色（凭据反查得出）。`None` ⇒ 本进程自己（按本进程的身份判，
         既有行为逐字不变）；给了值就以它为准（判不出角色 ⇒ 按 sub，fail-closed）。
+
+        🔴 `caller_agent_id` = **归属章盖谁的**（2026-10 ks_owner_stamp）：MCP 远端
+        调用方的 agent_id（凭据反查得出）。非空 ⇒ 落库时归属打 `agent:<它>`
+        （它自报的 `agent:xxx` 一律被剥掉 —— **不许自报归属**）；空 ⇒ 落
+        **进程默认身份**（本机直写/提炼管线路径逐字不变）。
         """
         meta = meta or {}
         try:
@@ -2356,6 +2387,7 @@ class KeepsakeProvider(MemoryProvider):
                 category=str(meta.get("category", "")),
                 source=str(meta.get("source", "")),
                 fragment_type=str(meta.get("fragment_type", "")),
+                **_owner_kwargs(storage.store, caller_agent_id),
             )
         except Exception as e:
             logger.warning("keepsake: add 失败（fail-closed，返回空串）: %s", e)
