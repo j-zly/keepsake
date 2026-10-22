@@ -100,16 +100,25 @@ def warn_if_domain_dict_missing() -> bool:
     return True
 
 
-def tsv_lexemes(text: str) -> List[str]:
+def tsv_lexemes(text: str, stem: bool = True) -> List[str]:
     r"""正文/查询 → tsvector 词元（**分词口径的唯一实现**，入库与查询共用）。
 
     流程与原 `_tsv_tokens` / `_tok_string` 逐字相同：jieba 切 → 按 `\w+` 取词元
     （PG `to_tsvector('simple')` 与 SQLite `unicode61` 本来就这么切，提前切只是为了
     让 Python 侧的 doclen/tf/df 计数与索引侧的词元逐字对齐）。
+
+    🔴 `stem=True`（默认）：**英文词元追加 Porter2 词干化**（`splitter.stem_english`）
+    —— 这是「索引侧」那一半，与查询侧 `query_lexemes` 调**同一个函数**
+    （对称铁律，见 domain/splitter.py 的注释）。
+    `stem=False` 用于**标签流**（标签是精确逗号边界判据，词干化会破坏它）。
     """
     import jieba                                        # noqa: PLC0415 — 首调建词典
     warn_if_domain_dict_missing()
-    return LEXEME_RE.findall(" ".join(w.strip() for w in jieba.lcut(text or "")))
+    lexemes = LEXEME_RE.findall(" ".join(w.strip() for w in jieba.lcut(text or "")))
+    if not stem:
+        return lexemes
+    from ..domain.splitter import stem_english_tokens   # noqa: PLC0415 — 避免加载期环
+    return stem_english_tokens(lexemes)
 
 
 def query_lexemes(terms: List[str]) -> List[str]:
@@ -119,7 +128,17 @@ def query_lexemes(terms: List[str]) -> List[str]:
     在索引里不存在对应 lexeme ⇒ 恒 0 命中。这里按 `LEXEME_RE` 拆成子词（超集），
     再丢掉纯符号词元（拆完可能只剩标点）与纯数字里长度 ≤ 2 的碎渣（`09`/`22` 这类
     日期残片，留着只会把候选池灌满噪声）。**只增不减**：原来能命中的词一个都没丢。
+
+    🔴 2026-10 ks_en_stem：每个英文词元额外产出**词干**那一枚
+    （`splitter.stem_english`，与索引侧同一个函数）⇒ 查 "runs" 能命中索引里的
+    "run"（索引侧 "running" 也存成 "run"）。
+    🔴 **为什么原形那一枚还留着**（不是二选一）：存量行的 `content_tsv` 还没重算
+    （重建脚本未跑）时，索引里是**未词干化**的旧词形；只发词干 ⇒ 那批数据在重建
+    前**一条都搜不到**（单边词干化 = 召回全废）。原形留着 ⇒ 新旧两种索引都能命中，
+    召回面只增不减（同本节「只增不减」的老纪律）。
     """
+    from ..domain.splitter import stem_english           # noqa: PLC0415 — 避免加载期环
+
     out: List[str] = []
     seen = set()
     for t in terms or []:
@@ -135,12 +154,27 @@ def query_lexemes(terms: List[str]) -> List[str]:
                 continue
             seen.add(low)
             out.append(lex)
+            # 词干那一枚（英文才有效；中文/数字原样返回 ⇒ 不会重复入列）
+            st = stem_english(lex)
+            sl = st.lower()
+            if sl and sl != low and sl not in seen:
+                seen.add(sl)
+                out.append(st)
     return out
 
 
 # ---------------------------------------------------------------------------
 # 排序权重常量（原本写在 storage.py 模块顶部，两个后端共用同一份定义）
 # ---------------------------------------------------------------------------
+
+#: **零命中救援档**（子串匹配，见 PG 的 `_trgm_fallback_rows` / SQLite 的
+#: `_like_fallback_rows`）的**常数分**。
+#:
+#: 🔴 为什么是常数：子串命中没有 tf / doclen / df 口径 ⇒ BM25 公式用不了；
+#:    而「检索融合评分（RRF / BM25 公式）不动」是硬约束 ⇒ 不在这里新造一套
+#:    打分公式，只给一个固定值，让这些行能过 v2 的相似度地板（0.05）。
+#: 🔴 它**只在主路零命中时**出现 ⇒ 不与任何 BM25 分同场比较。
+TRGM_FALLBACK_SCORE = 1.0
 
 DECAY_HALF_DAYS = 60                     # 时间衰减半衰期（天）
 FEEDBACK_POSITIVE_BOOST = 1.3           # 正反馈 ×1.3
@@ -432,6 +466,23 @@ def tag_match_sql(col: str, tags: List[str], placeholder: str,
     hay = _TAG_COL_NORM.format(col=col)
     sql = "(" + " OR ".join([f"{pos_fn}({hay}, {placeholder}) > 0"] * len(tags)) + ")"
     return sql, [f",{t}," for t in tags]
+
+
+def tags_match_exact(tags: Any, wanted: Iterable[str]) -> bool:
+    """「tags 里含其中任一标签」的**行级**判据（`tag_match_sql` 的 Python 镜像）。
+
+    口径逐条对齐 SQL 侧：逗号边界上的**完整标签**相等（`agent:a` 不会命中
+    `agent:ab`）；逗号两侧各一个空格的容错也照抄（`_TAG_COL_NORM` 那两轮 replace）。
+
+    用途：Redis 后端的**子串兜底档** —— RediSearch 的查询式表达不了这一层，
+    只能在候选取回后用 Python 判（与 `_visible_rows` 同一路的做法）。
+    """
+    hay = "," + str(tags or "").replace(", ", ",").replace(" ,", ",") + ","
+    for w in wanted or ():
+        t = str(w).strip()
+        if t and ("," + t + ",") in hay:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1322,31 @@ def discover_synonym_pairs(
     return capped, discovered_groups
 
 
+def stem_synonym_map(syn_map: Dict[str, set]) -> Dict[str, set]:
+    """同义词表 → **英文词条按词干**的形态（中文词条原样）。
+
+    🔴 **为什么要词干化**（2026-10 ks_en_stem）：索引侧与查询侧现在都按 Porter2
+    词干建索引（`tsv_lexemes` / `query_lexemes`），同义词表若还存原形，
+    扩出来的词进查询式后被词干化 → 与索引里的词干对不上 ⇒ 「同义词联动」这条
+    召回面静默失效（查 "discover" 命中不了索引里的 "generat"）。
+    🔴 **为什么要在这里（合并边界）而不是写入边界**：合并后再词干化会把
+    "generate" 与 "generates" 折成同一个 key ⇒ 两次 INSERT 撞同一行 ⇒
+    **后写的覆盖先写的，同义词被洗掉**。在合并前词干化 ⇒ 全表只有一条轨道。
+    词干化后出现的「自己指自己」（"generat" → {"generat"}）在这里剔掉。
+    """
+    from ..domain.splitter import stem_english           # noqa: PLC0415 — 避免加载期环
+
+    out: Dict[str, set] = {}
+    for term, syns in (syn_map or {}).items():
+        t = stem_english(str(term))
+        bucket = out.setdefault(t, set())
+        for s in syns or ():
+            ss = stem_english(str(s))
+            if ss and ss != t:
+                bucket.add(ss)
+    return out
+
+
 def merge_synonym_maps(existing: Dict[str, set], discovered: Dict[str, set]) -> Dict[str, set]:
     """已有（手工/历史）项 + 自动发现项 → 最终 `{词: {同义词}}`。
 
@@ -1280,7 +1356,11 @@ def merge_synonym_maps(existing: Dict[str, set], discovered: Dict[str, set]) -> 
     「谁先被遍历」，而遍历序来自 `set` 迭代序（PYTHONHASHSEED 随机化）⇒
     同一份语料两次运行结果不同，逐 term 对照无从谈起。先按 term 排序、先铺已有
     项、再统一补反向 ⇒ 结果与遍历序完全无关。
+    🔴 2026-10 ks_en_stem：合并**之前**两侧都按词干归一（`stem_synonym_map`）——
+    同义词表因此只有一条轨道（词干），不会「原形一行、词干一行」双轨并存。
     """
+    existing = stem_synonym_map(existing)
+    discovered = stem_synonym_map(discovered)
     merged: Dict[str, set] = {t: set(s) for t, s in existing.items()}
     for word in sorted(discovered):
         if word in existing:
@@ -1315,10 +1395,25 @@ def jieba_dict_entries(
     同义词表里的 term 至少算 3 次：手工加的词不该因为语料里没出现过就被筛掉。
     排序键固定成字典序（Redis 侧只按 `-词频` + dict 插入序，同频词的行序跨后端
     对不齐）—— 见 `generate_jieba_dict` 的 docstring。
+
+    🔴 2026-10 ks_en_stem：**被词干化过的英文词条不再直接进分词词典**。
+    词典是给 jieba 切**原文**用的，而同义词表里的英文词条现在是**词干**
+    （"generate" → "generat"）—— 把它写进词典，jieba 会把原文里的
+    "generating" 切成 "generat" + "ing"（实测），正文分词被词典污染。
+    ⇒ 纯 ASCII 英文形态的词条**只在语料里原样出现过**（= 真词）才提频；
+    中文 / 标识符 / 含数字的形态维持旧口径：照常提频到 3。
+
+    🔴 为什么不能用「词干化前后是否相同」来判：词干化是**幂等**的
+    （"emb" 的词干还是 "emb"）⇒ 判不出「emb」是词干还是原词。
     """
     freq = dict(word_freq)
     for term in synonym_terms:
-        freq[term] = max(freq.get(term, 0), 3)
+        t = str(term)
+        if t.isascii() and t.isalpha():
+            # 纯 ASCII 英文形态：只在语料词汇表里原样出现过才提频
+            if t not in freq:
+                continue
+        freq[t] = max(freq.get(t, 0), 3)
     return sorted(((w, f) for w, f in freq.items() if f >= min_freq),
                   key=lambda x: (-x[1], x[0]))
 

@@ -47,9 +47,14 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     rerank_with_decay,
     row_visible_after_core_narrow,
     stamp_owner_tag,
+    stem_synonym_map,
+    tags_match_exact,
     tiebreak_by_key,
+    TRGM_FALLBACK_SCORE,
 )
-from ..domain.splitter import extract_keywords, extract_entities, segment_query
+# 分词口径单源（2026-10 ks_recall_v1 / ks_en_stem）：与 PG / SQLite 侧同一个函数对象。
+from .shared import query_lexemes
+from ..domain.splitter import extract_keywords, extract_entities, segment_query, stem_english
 from ..domain.emotion import analyze_emotion
 from .attention import ATTENTION_SET, record_attention
 from .query_expansion import (
@@ -497,6 +502,11 @@ def _tag_safe(term: str) -> str:
     return ''.join(out)
 
 
+#: 子串兜底档的 **SCAN 键数上限**（Redis 后端）—— 触顶时明确告警，
+#: 不静默截断（静默截断会让兜底档「看着像搜过了没有」）。
+TRGM_FALLBACK_SCAN_CAP = 5000
+
+
 def _escape_glob(term: str) -> str:
     """转义 Redis ZSCAN/ZSCAN MATCH 模式中的 glob 特殊字符。"""
     for ch in ('*', '?', '[', ']', '\\'):
@@ -545,14 +555,22 @@ def _sanitize_terms(terms: List[str], limit: int = 40) -> List[str]:
 
 
 def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
-    """用同义词表展开搜索词列表。"""
+    """用同义词表展开搜索词列表。
+
+    🔴 2026-10 ks_en_stem：同义词表里的英文词条**按词干存储**
+    （`core/shared.stem_synonym_map`），所以查表**原形与词干各试一次** ——
+    老表（原形键）与新表（词干键）都能命中，不会出现「扩不出来 ⇒ 这条召回面
+    静默失效」。扩出来的词已是词干，查询侧再词干化一次是幂等的（不变）。
+    """
     if not synonym_map:
         return terms
     expanded = list(terms)
     for t in terms:
         tl = t.lower()
-        if tl in synonym_map:
-            for syn in synonym_map[tl]:
+        for key in (tl, stem_english(tl)):
+            if key not in synonym_map:
+                continue
+            for syn in synonym_map[key]:
                 if syn not in expanded:
                     expanded.append(syn)
     return expanded
@@ -956,6 +974,9 @@ class RedisStorage(StorageBase):
                         if s not in synonym_map:
                             synonym_map[s] = set()
                         synonym_map[s].add(term)
+            # 🔴 2026-10 ks_en_stem：同义词表统一按**词干**归一（老行原形 /
+            # 新行词干 → 归一后只有一条轨道，扩展出来的词才与索引里的词干对得上）。
+            synonym_map = stem_synonym_map(synonym_map)
             self._synonym_cache = synonym_map
             # 回填模块缓存 + 本地文件缓存（下一次冷启动/新会话免跨网拉取）
             with _SYN_CACHE_LOCK:
@@ -1883,6 +1904,94 @@ class RedisStorage(StorageBase):
         return [f for f in fragments
                 if row_visible_after_core_narrow(f.get("tags", ""), owners)]
 
+    def _like_fallback(self, query: str, tag_filter: str, agent_id: str,
+                        is_primary: bool,
+                        visible_agents: Optional[Iterable[str]]) -> List[Dict[str, Any]]:
+        """**零命中救援档**：正文子串匹配（等价于 PG 的 pg_trgm 档 / SQLite 的 LIKE 档）。
+
+        🔴 **为什么需要这一档**：字面路（RediSearch 全文）对**连体标识符**无能为力
+        —— `StrategyCompare01(2026` 这类串切不成词元 ⇒ 恒 0 命中（生产实测的
+        已知病灶）。子串匹配绕开分词，直接在正文上找。
+
+        🔴 **只在 BM25 零命中时走**（调用点在 `search_bm25`）：有命中就**不多查**。
+
+        🔴 **可见性不许破口**：非 primary 用 `row_visible_after_core_narrow`
+        （= 主路 `_visible_rows` 用的**同一个函数对象**）；标签过滤用逗号边界
+        精确匹配（`tags_match_exact` = SQL 侧 `tag_match_sql` 的行级镜像）。
+
+        🔴 **有上限**：SCAN 的键数封顶（`TRGM_FALLBACK_SCAN_CAP`），触顶时
+        **明确告警** —— 静默截断会让兜底档「看着像搜过了没有」。
+
+        ponytail: RediSearch 没有 trigram / ILIKE ⇒ 这一档只能 SCAN + 取回 +
+        Python 侧判。数据量小才可接受；要提速就把「正文的 trigram 键」另存一份
+        （换存储形态，不是换语义）。
+        """
+        text = (query or "").strip()
+        if not text:
+            return []
+        client = self._get_client()
+        if not client:
+            return []
+        needle = text.casefold()
+        wanted = [t.strip() for t in (tag_filter or "").split(",") if t.strip()]
+        keys: List[str] = []
+        cursor = ""
+        try:
+            while len(keys) < TRGM_FALLBACK_SCAN_CAP:
+                cursor, batch = self.scan_fragment_keys(cursor, limit=500)
+                keys.extend(batch)
+                if not cursor:
+                    break
+            if len(keys) >= TRGM_FALLBACK_SCAN_CAP:
+                logger.warning(
+                    "storage: 子串兜底档扫到上限 %d 个碎片键（结果不完整，不是「没有」）",
+                    TRGM_FALLBACK_SCAN_CAP,
+                )
+            docs = self.get_fragments_batch(keys)
+        except Exception as e:      # noqa: BLE001 — 兜底档失败不许拖垮主路
+            logger.warning("storage: 子串兜底档失败 (%s: %s) —— 返回空结果",
+                           type(e).__name__, e)
+            return []
+
+        out: List[Dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
+        for key, doc in docs.items():
+            content = str(doc.get("content") or "")
+            if not content or needle not in content.casefold():
+                continue
+            tags = str(doc.get("tags") or "")
+            if wanted and not tags_match_exact(tags, wanted):
+                continue
+            # 🔴 「还算不算活记忆」三条判据**与主路逐条同源**（PG/SQLite 侧由
+            #    `where_sql` 带，这里 RediSearch 侧是取回后判）：
+            #    ① invalid_at 非空 ⇒ 已作废；② valid_until 是**过去** ⇒ 版本化/归档
+            #    （未来时间戳 = 意图过期标记，交给 v2 惰性降级，不在这里剔）；
+            #    ③ 契约 v2 链身（is_latest='0'）不进检索面。
+            if doc.get("invalid_at"):
+                continue
+            vu_raw = doc.get("valid_until")
+            if vu_raw:
+                vu_dt = _parse_iso_dt(str(vu_raw))
+                if vu_dt is not None and vu_dt <= now:
+                    continue
+            if not is_chain_head(doc.get("is_latest")):
+                continue
+            frag: Dict[str, Any] = {}
+            for field in ("content", "tags", "category", "source", "created",
+                          "sentiment_score", "sentiment_label", "feedback_score",
+                          "invalid_at", "valid_until", "entities", "fragment_type",
+                          "applicability"):
+                val = doc.get(field)
+                if val is None or val == "":
+                    continue
+                frag[field] = val if isinstance(val, str) else str(val)
+            frag["_key"] = key
+            # 子串命中没有词频口径 ⇒ 常数分（见 storage_shared.TRGM_FALLBACK_SCORE）
+            frag["_bm25_score"] = TRGM_FALLBACK_SCORE
+            out.append(frag)
+        out = self._visible_rows(out, agent_id, is_primary, visible_agents)
+        return out[: self._final_limit]
+
     def search_bm25(
         self,
         query: str,
@@ -1924,6 +2033,15 @@ class RedisStorage(StorageBase):
             # 2026-09-14: 必须先 sanitize — 扩展词里可能混入带空格短语/纯符号/英文碎渣，
             # 直接拼进查询式会被 RediSearch 判语法错 → 整条查询被拒 → 静默空召回
             search_terms = _sanitize_terms(search_terms)
+            # 🔴 2026-10 ks_en_stem：**三后端的分词入口走同一个函数**
+            # （`core/shared.query_lexemes` —— PG / SQLite 侧同一个函数对象）：
+            # 拆成与索引侧逐字同形的词元，并给英文词**追加词干那一枚**
+            # （查 "runs" 也能命中索引里的 "run"）。
+            # 🔴 **本后端的索引侧是 RediSearch 的分词器**（索引里存的是原形，
+            #    改索引要动 FT schema + 全量重建）⇒ 词干那一枚只是**额外召回**
+            #    （索引里正好是 "run" 时命中），原形那一枚照旧 ⇒ 只增不减，
+            #    不会出现「单边词干化 ⇒ 召回全废」。
+            search_terms = query_lexemes(search_terms)
             if not search_terms:
                 return []
             safe_terms = "|".join(_escape_query_term(t) for t in search_terms)
@@ -2114,6 +2232,12 @@ class RedisStorage(StorageBase):
             # 🔴 非 primary 的可见性收窄（core 按归属判）——见 `_visible_rows`
             fragments = self._visible_rows(fragments, effective_agent_id,
                                            effective_is_primary, visible_agents)
+            # 🔴 2026-10 ks_en_stem：**零命中救援档**（正文子串匹配，等价于
+            #    PG 侧的 pg_trgm 档 / SQLite 侧的 LIKE 档）。
+            #    BM25 一条都没命中时才走 —— 有命中就**不多查**。
+            if not fragments:
+                fragments = self._like_fallback(query, tag_filter, effective_agent_id,
+                                                effective_is_primary, visible_agents)
             fragments = self._rerank_with_decay(fragments, score_key="_bm25_score")
             # 🔴 2026-10 ks_recall_v1：Redis 侧此前**没有** tiebreaker（PG/SQLite 早就有）。
             # 共用重排只按一个分字段排，而分是浮点连乘、同分极常见 ⇒ 同分行的相对名次
@@ -2717,6 +2841,10 @@ class RedisStorage(StorageBase):
 
         # 写入 Redis Hash
         if merged_synonym_map:
+            # 🔴 2026-10 ks_en_stem：同义词表的英文词条**按词干存**（与 PG/SQLite
+            #    侧同一口径 ⇒ 三后端的表只有一条轨道，不会「原形一行、词干一行」）。
+            #    归一放在**合并之后**：合并前的「手工项优先」逻辑逐字不动。
+            merged_synonym_map = stem_synonym_map(merged_synonym_map)
             pipe = client.pipeline()
             for word, synonyms in merged_synonym_map.items():
                 pipe.hset(SYNONYM_HASH_KEY, word, _json.dumps(list(synonyms)))

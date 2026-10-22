@@ -1,14 +1,17 @@
-"""文本切分工具 + 情感分析 — 按语义完整性切分文本，检测情感倾向。"""
+"""文本切分工具 + 情感分析 + **英文词干化** — 按语义完整性切分文本，检测情感倾向。"""
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import jieba
 import jieba.posseg  # 显式导入（该版本 jieba 无 lazy 加载，否则 posseg.lcut 抛 AttributeError 被吞）
+
+logger = logging.getLogger("keepsake.splitter")
 
 # 自定义领域词典路径（由 discover_synonyms 自动生成）
 _DOMAIN_DICT = Path.home() / '.config' / 'keepsake' / 'jieba_dict.txt'
@@ -29,6 +32,99 @@ def init_domain_dict() -> None:
 init_domain_dict()
 
 NEWLINE = "\n"
+
+# ---------------------------------------------------------------------------
+# 英文词干化（Porter2）—— 索引侧与查询侧共用的**唯一**归一函数
+# ---------------------------------------------------------------------------
+#
+# 🔴 **对称铁律**（本节存在的全部理由）：词干化必须是**同一个函数**在
+#    **索引侧（content_tsv 生成）**与**查询侧（tsquery / FTS MATCH 构造）**
+#    各调一次。只在一侧词干化 = 召回全废（索引侧存 'run'、查询侧查 'runs'
+#    ⇒ 恒 0 命中），而且**不报错、不告警**，只是静默地搜不到。
+#    ⇒ 归一逻辑单点在本模块（domain 层，跨后端共用），三个后端的分词入口
+#    都调它，谁都不许自己写一份。
+#
+# 🔴 **为什么只对「纯 ASCII 字母词」词干化**：
+#    * 中文词元（"回测"）—— Porter 是英文算法，碰了就是噪声；
+#    * 含数字/符号的**标识符**（"StrategyCompare01"、"v2"）—— 它们是精确名，
+#      词干化会把 "strategycompare01" 砍成 "strategycompare"，于是「按名字找」
+#      反而找不到了；这类词原样进索引（子串兜底档负责它们，见 PG 的 trgm 档）；
+#    * 长度 < 3 的短词 —— 词干化收益为负（"is"/"as" 这类虚词本就不该变）。
+#
+# 🔴 **豁免：标签前缀与系统保留字**（"agent" / "tier" / "core" / "shared" …）。
+#    标签是**精确逗号边界**判据（`storage_shared.tag_match_sql`），一旦被词干化
+#    （"shared" → "share"）就会与标签列对不上 ⇒ 写闸与可见性判据失效。
+#    标签那一路的词元另走 `tsv_lexemes(..., stem=False)`（见 core/shared.py）。
+
+try:  # 依赖缺失时**降级为「不词干化」**，绝不 import 期炸掉整个包
+    from snowballstemmer import stemmer as _snowball_stemmer
+except ImportError:  # pragma: no cover — 依赖装不上时的降级路径
+    _snowball_stemmer = None
+
+#: **不进词干化**的词：标签前缀 + 治理保留字 + 可见性相关标签。
+#: 与 `storage_shared.RESERVED_TAG_EXACT` / `RESERVED_TAG_PREFIX` 同一套词，
+#: 在本模块单列一份是因为 domain 层不许 import core（依赖方向单向）。
+STEM_EXEMPT = frozenset({
+    "agent", "tier", "core", "core_candidate", "shared",
+    "corrected", "consumed", "superseded",
+})
+
+#: 词干化的最大迭代轮数（Porter2 的不动点迭代，实测 ≤4 轮收敛）。
+_STEM_MAX_ROUNDS = 4
+
+_STEMMER = None
+_STEM_WARNED = False
+
+
+def _get_stemmer():
+    """取（或懒建）英文词干器；依赖缺失返回 None（= 不词干化）。"""
+    global _STEMMER, _STEM_WARNED
+    if _STEMMER is None and _snowball_stemmer is not None:
+        _STEMMER = _snowball_stemmer("english")
+    if _STEMMER is None and not _STEM_WARNED:
+        _STEM_WARNED = True
+        logger.warning(
+            "keepsake: snowballstemmer 不可用 —— 英文词干化降级为「不词干化」"
+            "（召回面变小，但不会错召回；装依赖：pip install 'snowballstemmer>=2.2'）"
+        )
+    return _STEMMER
+
+
+def stem_english(word: str) -> str:
+    """纯 ASCII 英文词 → Porter2 词干；其余词原样返回。
+
+    🔴 **幂等**（对词干再词干化仍是同一个词干）：Porter2 **不是**幂等的
+    （"achilles" → "achill" → "achil"），所以这里迭代到**不动点**为止。
+    幂等是必须的：同义词表按词干存储、查询侧再词干化一次，两次不一致
+    ⇒ 映射双轨错位（扩出来的同义词对不上索引里的词干）。
+    """
+    if not word:
+        return word
+    if len(word) < 3:
+        return word
+    if not word.isascii() or not word.isalpha():
+        return word          # 中文 / 含数字或符号的标识符 / 短词：一律原样
+    low = word.lower()
+    if low in STEM_EXEMPT:
+        return low          # 标签与保留字：词干化会破坏精确匹配判据
+    stemmer = _get_stemmer()
+    if stemmer is None:
+        return low
+    cur = low
+    for _ in range(_STEM_MAX_ROUNDS):
+        nxt = stemmer.stemWord(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return cur or low
+
+
+def stem_english_tokens(tokens: Iterable[str]) -> List[str]:
+    """逐词词干化（列表版；非字符串元素原样返回）。"""
+    out: List[str] = []
+    for t in tokens or ():
+        out.append(stem_english(t) if isinstance(t, str) else t)
+    return out
 
 # ---------------------------------------------------------------------------
 # 常见英文缩写（不在此边界断句）

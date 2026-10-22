@@ -137,6 +137,8 @@ from .shared import (
     rrf_fuse,
     rerank_with_decay,
     scoring_now_ts,
+    stem_synonym_map,
+    TRGM_FALLBACK_SCORE,
     synonym_rows,
     synonym_words,
     stamp_owner_tag,
@@ -432,7 +434,7 @@ def _tsv_lexemes(text: str) -> List[str]:
     return _WORD_RE.findall(text or "")
 
 
-def _tok_string(text: str) -> str:
+def _tok_string(text: str, stem: bool = True) -> str:
     """文本 → FTS5 可索引的**空格分隔 token 串**（jieba 切词，与 PG 同路）。
 
     🔴 为什么必须切：FTS5 的 `unicode61` 分词器按「非字母数字」切，
@@ -446,7 +448,7 @@ def _tok_string(text: str) -> str:
     （PG 侧 `_tsv_tokens` 用的同一个函数对象）⇒ 入库侧与查询侧共用一份分词实现，
     词典缺失时统一 WARNING，不静默退回另一套分词。
     """
-    return " ".join(tsv_lexemes(text))
+    return " ".join(tsv_lexemes(text, stem=stem))
 
 
 def _fts_match_expr(terms: List[str]) -> str:
@@ -1032,9 +1034,14 @@ class SqliteStorage(StorageBase):
 
         与 PG 侧 `content_tsv = A(content) || B(entities + tags)` **同一召回面**：
         正文、实体、标签三路都进索引（对应 Redis 的 `@content|@entities|@tags`）。
+
+        🔴 2026-10 ks_en_stem：**标签流不进词干化**（`stem=False`）—— 标签是
+        「精确逗号边界」判据，词干化会破坏它（见 PG 侧 `tsv_expr_params` 的注释）。
+        正文与实体是内容词，与 PG 侧同路词干化 ⇒ 两后端索引逐字同形。
         """
         return " ".join(x for x in (_tok_string(content or ""),
-                                    _tok_string(f"{entities or ''} {tags or ''}")) if x)
+                                    _tok_string(entities or ""),
+                                    _tok_string(tags or "", stem=False)) if x)
 
     def _fts_write(self, cur: sqlite3.Cursor, key: str, tokens: str) -> None:
         """FTS 行 upsert（先删后插 —— FTS5 没有 ON CONFLICT）。"""
@@ -1797,7 +1804,9 @@ class SqliteStorage(StorageBase):
                     out.setdefault(sl, set()).add(key)
         if broken:
             logger.warning("storage_sqlite: 同义词表 %d/%d 行格式非法已跳过", broken, len(rows))
-        return out
+        # 🔴 2026-10 ks_en_stem：同义词表统一按**词干**归一（老行原形 / 新行词干
+        # → 归一后只有一条轨道，扩展出来的词才与索引里的词干对得上）。
+        return stem_synonym_map(out)
 
     def _fetch_superseded_by(self, keys: List[str]) -> Dict[str, str]:
         """storage_shared 的后端钩子：批量读封边标记（一条 SQL，不 N+1）。"""
@@ -1985,9 +1994,19 @@ class SqliteStorage(StorageBase):
                     [expr, *params, self._bm25_limit],
                 )
                 rows = cur.fetchall()
+            # 🔴 2026-10 ks_en_stem：**零命中救援档**（子串匹配，等价于 PG 侧的
+            #    pg_trgm 档）。BM25 一条都没命中时才走 —— 有命中就**不多查**。
+            #    过滤条件**原样带上**（`where_sql` 就是主路那套）⇒ 兜底档不破口。
+            is_fallback = False
+            if not rows:
+                rows = self._like_fallback_rows(query, where_sql, params)
+                is_fallback = bool(rows)
             if not rows:
                 return []      # 0 候选就不必算语料统计（N/avgdl 是全表聚合）
-            n_docs, avgdl, dfs = self._bm25_stats(where_sql, params, terms)
+            if is_fallback:
+                n_docs, avgdl, dfs = 0, 0.0, {}
+            else:
+                n_docs, avgdl, dfs = self._bm25_stats(where_sql, params, terms)
         except sqlite3.OperationalError as e:
             # FTS5 查询式语法错/表缺失 → **显式告警**（PG/Redis 都犯过「语法错被
             # debug 吞掉 ⇒ 整类查询静默 0 召回」的错，这里提到 warning 并向上抛）。
@@ -2007,7 +2026,10 @@ class SqliteStorage(StorageBase):
             words = [w.lower() for w in (tsv or "").split()]
             counts = Counter(words)
             tfs = {t: float(c) for t, c in counts.items() if c and t in lower_terms}
-            score = bm25_score(tfs, float(len(words)), n_docs, avgdl, dfs)
+            # 兜底档是子串命中：没有 tf/doclen/df 口径 ⇒ 给常数分（见
+            # `storage_shared.TRGM_FALLBACK_SCORE`），不新造打分公式。
+            score = (TRGM_FALLBACK_SCORE if is_fallback
+                     else bm25_score(tfs, float(len(words)), n_docs, avgdl, dfs))
             frag: Dict[str, Any] = {"_key": key, "_bm25_score": score}
             for name, value in (
                 ("content", content), ("tags", tags), ("category", category),
@@ -2031,6 +2053,51 @@ class SqliteStorage(StorageBase):
         final = self._tiebreak(ranked)[: self._final_limit]
         self._fire_hits(final)      # 侧写打点：命中 keys，后台 + fail-open
         return final
+
+    def _like_fallback_rows(self, query: str, where_sql: str,
+                            params: List[Any]) -> List[tuple]:
+        """**零命中救援档**：正文子串匹配（`content LIKE '%query%'`）。
+
+        🔴 **为什么需要这一档**：字面路（FTS5 MATCH）对**连体标识符**无能为力
+        —— `StrategyCompare01(2026` 这类串切不成词元 ⇒ 恒 0 命中（生产实测的
+        已知病灶）。子串匹配绕开分词，直接在正文上找。
+
+        🔴 **只在 FTS 零命中时走**（调用点在 `search_bm25`）：有命中就**不多查**。
+
+        🔴 **可见性不许破口**：`where_sql` 就是主路那套（标签过滤 + agent 归属
+        + 活记忆 + 链头），**原样带上** ⇒ 非 primary 依然搜不到别人的正文。
+
+        🔴 **等价物说明**：PG 侧这一档是 `pg_trgm` + GIN 索引；SQLite 没有
+        trigram 扩展，数据量也小 ⇒ 直接 LIKE（顺序扫）即可，语义等价。
+
+        返回列序与主路**逐字同形**（含 `content_tsv` 与窗口分位），调用方
+        的组包代码不用分叉。
+        """
+        text = (query or "").strip()
+        if not text:
+            return []
+        # SQLite 的 LIKE 默认**没有**转义符 ⇒ 显式 ESCAPE '\\'，并把
+        # % _ \ 三个字符自己转义（否则用户搜 "50%" 会变成通配）。
+        pattern = ("%" + text.replace("\\", "\\\\").replace("%", "\\%")
+                   .replace("_", "\\_") + "%")
+        try:
+            with self._lock:
+                cur = self._db().cursor()
+                cur.execute(
+                    f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
+                    f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
+                    f"f.entities, f.fragment_type, f.invalid_at, f.valid_until, "
+                    f"f.applicability, f.content_tsv, 0 AS bm25_pos "
+                    f"FROM ks_fragment f "
+                    f"WHERE f.content LIKE ? ESCAPE '\\' AND {where_sql} "
+                    f"ORDER BY f.key LIMIT ?",
+                    [pattern, *params, self._bm25_limit],
+                )
+                return cur.fetchall()
+        except Exception as e:      # noqa: BLE001 — 兜底档失败不许拖垮主路
+            logger.warning("storage_sqlite: 子串兜底档失败 (%s: %s) —— 返回空结果",
+                           type(e).__name__, e)
+            return []
 
     # ------------------------------------------------------------------
     # 加权信号（批 2）

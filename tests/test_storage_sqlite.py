@@ -1698,11 +1698,16 @@ def test_discover_synonyms_denoises_short_ascii_and_stopwords(maint_store):
     assert noise, f"样例语料应当能造出碎渣词，实测 {sorted(raw)}"
 
     terms = {t for (t,) in _frags(maint_store, "SELECT term FROM ks_synonym")}
+    # 🔴 2026-10 ks_en_stem：同义词表的**英文词条按词干存**（"embedding" → "emb"），
+    #    而降噪判据仍作用在**分词器的字面输出**上 ⇒ 表里的词 = 存活词的**词干**。
+    #    降噪的意图（碎渣词不许进表）原样保留。
+    from keepsake.splitter import stem_english
+    expected = {stem_english(w) for w in survivors}
     # 该滤的：被降噪判据滤掉的 token（含纯 ASCII 短词/内置虚词）一个都不许进表
     assert not (noise & terms), f"碎渣词混进了同义词表: {sorted(noise & terms)}"
-    assert terms <= survivors, f"表里有没走降噪判据的词: {sorted(terms - survivors)}"
+    assert terms <= expected, f"表里有没走降噪判据的词: {sorted(terms - expected)}"
     # 该进的：每条记忆条目都出现的候选词两两共现 >= min_co_occurrence ⇒ 必成对进表
-    assert survivors <= terms, f"该进的候选词没进表: {sorted(survivors - terms)}"
+    assert expected <= terms, f"该进的候选词没进表: {sorted(expected - terms)}"
     # stats 自洽：表里几行就报几个词条
     assert stats["degraded"] == [], stats["degraded"]
     assert stats["total_terms"] == len(terms), stats

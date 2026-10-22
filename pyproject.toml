@@ -28,6 +28,9 @@ classifiers = [
 dependencies = [
     "redis>=5.0",
     "jieba>=0.42",
+    # 英文词干化（Porter2）—— 纯 Python 实现，无模型下载、无外部服务。
+    # 索引侧与查询侧共用同一个归一函数（见 keepsake/domain/splitter.py 的对称铁律）。
+    "snowballstemmer>=2.2",
 ]
 
 [project.optional-dependencies]

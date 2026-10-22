@@ -192,8 +192,13 @@ def test_denoises_short_ascii_and_stopwords(pg_store):
 
     table = _terms(pg_store)
     assert not (noise & set(table)), f"碎渣词混进了同义词表: {sorted(noise & set(table))}"
-    assert set(table) <= survivors, f"表里有没走降噪判据的词: {sorted(set(table) - survivors)}"
-    assert survivors <= set(table), f"该进的候选词没进表: {sorted(survivors - set(table))}"
+    # 🔴 2026-10 ks_en_stem：同义词表的**英文词条按词干存**（"embedding" → "emb"），
+    #    而降噪判据仍作用在**分词器的字面输出**上 ⇒ 表里的词 = 存活词的**词干**。
+    #    降噪的意图（碎渣词不许进表）原样保留：碎渣词与它们的词干都不许出现。
+    from keepsake.splitter import stem_english
+    expected = {stem_english(w) for w in survivors}
+    assert set(table) <= expected, f"表里有没走降噪判据的词: {sorted(set(table) - expected)}"
+    assert expected <= set(table), f"该进的候选词没进表: {sorted(expected - set(table))}"
     assert stats["degraded"] == [], stats["degraded"]
     assert stats["total_terms"] == len(table), stats
 

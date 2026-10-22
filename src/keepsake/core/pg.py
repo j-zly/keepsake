@@ -111,6 +111,8 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     rerank_with_decay,
     scoring_now_ts,
     stamp_owner_tag,
+    stem_synonym_map,
+    TRGM_FALLBACK_SCORE,
     tag_match_sql,
     visibility_filter_sql,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
@@ -395,9 +397,14 @@ def tsv_expr_params(content: str, entities: str = "", tags: str = "") -> List[st
 
     三处写路径都调它 —— 拼接口径（`TSV_SETWEIGHT_SQL`）与分词口径
     （`tsv_lexemes`）**同源**。要改权重位或换分词器，只改这一处。
+
+    🔴 2026-10 ks_en_stem：**标签流不进词干化**（`stem=False`）。
+    标签是「精确逗号边界」判据（`storage_shared.tag_match_sql` / 写闸 / 可见性
+    都按它判），而词干化会把 "shared" 砍成 "share" ⇒ 索引里的标签词与标签列
+    对不上 ⇒ 写闸与可见性失效。实体是内容词（"Redis"），与正文同路词干化。
     """
     return [" ".join(tsv_lexemes(content)),
-            " ".join(tsv_lexemes(f"{entities or ''} {tags or ''}"))]
+            " ".join(tsv_lexemes(entities or "") + tsv_lexemes(tags or "", stem=False))]
 
 
 def _maintenance_column_ddl() -> tuple:
@@ -486,6 +493,27 @@ def _search_index_ddl() -> tuple:
          "CREATE INDEX IF NOT EXISTS idx_ks_fragment_embedding_hnsw "
          "ON ks_fragment USING hnsw (embedding vector_cosine_ops)"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 零命中救援档：pg_trgm 子串匹配（2026-10 ks_en_stem）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么要有这一档：字面路（tsquery）对**连体标识符**无能为力 ——
+#   `StrategyCompare01(2026` 这种串切不成词元 ⇒ 整块进不了 tsquery ⇒ 恒 0 命中
+#   （生产实测的已知病灶）。子串匹配绕开分词，直接在正文上找。
+#
+# 🔴 **只在 BM25 零命中时走**（调用点在 `_bm25_thin`）：有命中就**不多查**。
+#
+# 🔴 **可见性不许破口**：兜底档带的是**与主路同一套**的过滤条件
+#   （`storage_shared.visibility_filter_sql` / `tag_match_sql`）⇒ 非 primary
+#   依然搜不到未共享代理的正文。
+
+#: `content` 列上的 GIN trigram 索引（子串匹配的加速件，**非必需**：
+#: 没有它兜底档退化成顺序扫，慢一点而已）。
+TRGM_INDEX_NAME = "idx_ks_fragment_content_trgm"
+TRGM_INDEX_SQL = ("CREATE INDEX IF NOT EXISTS idx_ks_fragment_content_trgm "
+                  "ON ks_fragment USING GIN (content gin_trgm_ops)")
 
 
 # =============================================================================
@@ -1270,6 +1298,10 @@ class PgStorage(StorageBase):
                 backoff *= 2
                 continue
             _SCHEMA_READY[memo_key] = True
+            # 🔴 2026-10 ks_en_stem：pg_trgm 兜底档的扩展 + 索引 —— **best-effort**，
+            #    失败只降级「没有 trgm 索引」（兜底档退化成顺序扫），**绝不影响启动**
+            #    （主迁移段失败 ⇒ ensure_index 返回 False ⇒ provider 起不来）。
+            self._ensure_trgm_support()
             logger.info(
                 "storage_pg: schema ready on %s:%s/%s (tsv+GIN, embedding vector(%d) + HNSW cosine)",
                 self._host, self._port, self._dbname, self._embed_dim,
@@ -1285,6 +1317,43 @@ class PgStorage(StorageBase):
         if self._dsn:
             return "dsn:" + hashlib.sha256(self._dsn.encode("utf-8")).hexdigest()[:16]
         return f"{self._host}:{self._port}/{self._dbname}"
+
+    def _ensure_trgm_support(self) -> bool:
+        """**best-effort**：pg_trgm 扩展 + `content` 列的 GIN trigram 索引。
+
+        🔴 **为什么单独拎出来、不进主迁移段**：主迁移段失败 ⇒ `ensure_index`
+        重试 3 次后返回 False ⇒ **provider 起不来**（线上事故级）。而
+        `CREATE EXTENSION pg_trgm` 需要建扩展的权限（PG 13+ 是 trusted 扩展，
+        仍要库级 CREATE 权限）—— 没权限就让它在这里失败，**只降级速度**
+        （兜底档退化成顺序扫），不降级功能、不挡启动。
+
+        🔴 **幂等且「齐备时一条 DDL 都不发」**（主迁移段的同一纪律，见
+        `tests/test_storage_lock.py::test_ensure_index_issues_no_ddl_when_schema_present`）：
+        先查扩展与索引，**缺什么才发什么** ⇒ 老库自动补建，稳态零 DDL。
+
+        🔴 **挡写窗口用 lock_timeout 兜住**（同主迁移段的口径）：建索引最多
+        等 5s，超时即失败 ⇒ 绝不无限期挡住并发 DML。
+        """
+        try:
+            with self._tx() as cur:
+                cur.execute(f"SET LOCAL lock_timeout = {int(SCHEMA_LOCK_TIMEOUT_MS)}")
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+                has_ext = cur.fetchone() is not None
+                cur.execute("SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() "
+                            "AND indexname = %s", (TRGM_INDEX_NAME,))
+                has_idx = cur.fetchone() is not None
+                if not has_ext:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                if not has_idx:
+                    cur.execute(TRGM_INDEX_SQL)
+            logger.info("storage_pg: pg_trgm 兜底档就绪（%s）", TRGM_INDEX_NAME)
+            return True
+        except Exception as e:      # noqa: BLE001 — 兜底档不可用不影响主路
+            logger.warning(
+                "storage_pg: pg_trgm 兜底档不可用（%s: %s）—— 子串兜底退化为顺序扫，"
+                "主检索不受影响", type(e).__name__, e,
+            )
+            return False
 
     def _migrate_schema(self) -> None:
         """跑一遍迁移段（advisory lock 包裹）。失败向上抛，由 ensure_index 重试。
@@ -1458,6 +1527,10 @@ class PgStorage(StorageBase):
                 if sl and sl != key:
                     bucket.add(sl)
                     out.setdefault(sl, set()).add(key)
+        # 🔴 2026-10 ks_en_stem：读出来的同义词表统一按**词干**归一（老库里是
+        # 原形、新写进去的是词干 —— 归一后只有一条轨道，查询侧扩展出来的词
+        # 才与索引里的词干对得上；词干化幂等，词干再归一仍是同一个词干）。
+        out = stem_synonym_map(out)
         self._snap_put("syn", (), out)
         return out
 
@@ -1862,12 +1935,21 @@ class PgStorage(StorageBase):
 
         need_n = n_avgdl is None
         need_df = df_cached is None
+        is_fallback = False
 
         with self._ro() as cur:
             cur.execute(sql, [tsquery, tsquery, *params, self._bm25_limit, lexemes,
                               topic_t, topic_w, topic_k])
             rows = cur.fetchall()
-            if need_n or need_df:
+            # 🔴 2026-10 ks_en_stem：**零命中救援档**（pg_trgm 子串匹配）。
+            #    BM25 一条都没命中时才走 —— 有命中就**不多查**（多查 = 白扫一遍表）。
+            #    可见性/标签过滤条件**原样带上**（`where_sql` 就是 BM25 那套），
+            #    兜底档不因「是兜底」而破口。
+            if not rows:
+                rows = self._trgm_fallback_rows(cur, query, where_sql, params,
+                                                topic_t, topic_w, topic_k)
+                is_fallback = bool(rows)
+            if not is_fallback and (need_n or need_df):
                 which = "both" if (need_n and need_df) else ("df" if need_df else "n")
                 stat_sql, stat_params = stat_sqls[which]
                 cur.execute(stat_sql, stat_params)
@@ -1886,14 +1968,21 @@ class PgStorage(StorageBase):
                     self._snap_put("n_avgdl", n_key, n_avgdl)
 
         # 3. Python 侧 BM25（候选集不变，只把 ts_rank_cd 换成 BM25 分）
-        dfs = df_cached
-        n_docs, total_len = n_avgdl
+        dfs = df_cached or {}
+        # 兜底档没有语料统计（不需要 BM25）⇒ 给中性值，避免解包 None
+        n_docs, total_len = (0, 0) if is_fallback else n_avgdl
         avgdl = (float(total_len or 0.0) / n_docs) if n_docs > 0 else 0.0
         scored = []
         for row in rows:
-            # 列序：… SELECT_FIELDS, doclen, tfs, ts_rank_cd（row[-1] 只是粗排分）
-            score = bm25_score(_parse_tfs(row[-2]), float(row[-3] or 0.0),
-                               n_docs, avgdl, dfs)
+            if is_fallback:
+                # 子串命中没有词频口径（tf/doclen/df 都不成立）⇒ 给一个**常数分**。
+                # 🔴 它只在「BM25 一条都没命中」时才出现 ⇒ 不与任何 BM25 分同场比较，
+                #    作用仅是让这些行能过 v2 的相似度地板（0.05）。
+                score = TRGM_FALLBACK_SCORE
+            else:
+                # 列序：… SELECT_FIELDS, doclen, tfs, ts_rank_cd（row[-1] 只是粗排分）
+                score = bm25_score(_parse_tfs(row[-2]), float(row[-3] or 0.0),
+                                   n_docs, avgdl, dfs)
             scored.append(tuple(row[:-1]) + (score,))
 
         pre_weights: Dict[str, tuple] = {}
@@ -1903,6 +1992,73 @@ class PgStorage(StorageBase):
                                           pre_weights=pre_weights)
         # 🔴 tiebreak 在截断之前（理由同 `_knn_thin`）。
         return self._tiebreak(fragments)[: self._final_limit]
+
+    def _trgm_fallback_rows(
+        self,
+        cur: Any,
+        query: str,
+        where_sql: str,
+        params: List[Any],
+        topic_t: List[str],
+        topic_w: List[float],
+        topic_k: List[int],
+    ) -> List[tuple]:
+        """**零命中救援档**：`content ILIKE '%query%'` 的子串匹配（pg_trgm）。
+
+        🔴 **为什么需要这一档**：字面路（tsquery）对「连体标识符」无能为力
+        —— `StrategyCompare01(2026` 这类串整体进不了 tsquery（词元切不开），
+        于是**恒 0 命中**（生产实测的已知病灶）。子串匹配绕开分词，直接在正文
+        上找。
+
+        🔴 **只在 BM25 零命中时走**（调用点判据）：有命中就**不多查** ——
+        多查一遍 = 白扫一次全表。
+
+        🔴 **可见性不许破口**：`where_sql` 就是 BM25 那套（标签过滤 + agent
+        归属 + 活记忆 + 链头），**原样带上** ⇒ 兜底档与主路召回面同权，
+        非 primary 依然搜不到别人的正文。
+
+        🔴 **打分是常数**：子串命中没有 tf / doclen / df 口径（BM25 公式用不了），
+        而「检索融合评分不动」是硬约束 ⇒ 给一个常数分（`TRGM_FALLBACK_SCORE`），
+        只保证能过 v2 的相似度地板，不与 BM25 分同场比较。
+
+        索引：见 `ensure_index` 里的 `_ensure_trgm_support`（`content` 列上的
+        `gin_trgm_ops` GIN 索引，老库自动补建）。**没有索引也能跑**（顺序扫，
+        慢一点而已）⇒ 扩展装不上时只降级速度，不降级功能。
+        """
+        text = (query or "").strip()
+        if not text:
+            return []
+        pattern = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        sql = (
+            "WITH cand AS MATERIALIZED ("
+            "  SELECT f.key, left(md5(f.content), 16) AS chash, f.created, f.sentiment_score, "
+            "         f.feedback_score, "
+            "         CASE WHEN strpos(f.tags, 'corrected') > 0 THEN 1 ELSE 0 END AS corrected, "
+            "         CASE WHEN f.fragment_type = 'consumed' THEN 1 ELSE 0 END AS consumed, "
+            "         lower(f.content) AS clower "
+            "  FROM ks_fragment f "
+            "  WHERE f.content ILIKE %s "
+            f"    AND {where_sql} "
+            "  ORDER BY f.key LIMIT %s"
+            ") "
+            "SELECT cand.key, cand.chash, cand.created, cand.sentiment_score, "
+            "cand.feedback_score, cand.corrected, cand.consumed, "
+            + self._TOPIC_HITS_SELECT + ", "
+            f"{TRGM_FALLBACK_SCORE}::float AS score "
+            "FROM cand "
+            + self._TOPIC_HITS_JOIN.format(c="cand.clower") + " "
+            "GROUP BY cand.key, cand.chash, cand.created, cand.sentiment_score, "
+            "cand.feedback_score, cand.corrected, cand.consumed "
+            "ORDER BY cand.key"
+        )
+        try:
+            cur.execute(sql, [pattern, *params, self._bm25_limit,
+                              topic_t, topic_w, topic_k])
+            return cur.fetchall()
+        except Exception as e:      # noqa: BLE001 — 兜底档失败不许拖垮主路
+            logger.warning("storage_pg: pg_trgm 兜底档失败（%s: %s）—— 返回空结果",
+                           type(e).__name__, e)
+            return []
 
     def _text_to_vector(self, text: str) -> Optional[List[float]]:
         """文本 → float 向量（无 embedder 或取不到返回 None）。"""
