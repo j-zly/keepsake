@@ -34,12 +34,25 @@
         hint="每个代理一份独立注入预算；占比的分母是水位总量"
       />
     </div>
-    <div class="panel pad agent-split">
-      <div v-for="row in agentShares" :key="row.agent_id" class="agent-line">
-        <span class="agent-name" :title="row.agent_id">{{ row.label }}</span>
-        <span class="num agent-num">{{ row.chars }} 字符 · 占 {{ row.percent }}%</span>
+    <div v-if="agentShares.length" class="agent-cards">
+      <div
+        v-for="row in agentShares"
+        :key="row.agent_id || 'none'"
+        class="agent-card"
+        :class="{ 'agent-card--warn': row.percent >= 90 }"
+      >
+        <div class="agent-card-top">
+          <span class="agent-card-name" :title="row.agent_id || row.label">{{ row.label }}</span>
+          <span class="agent-card-pct num">{{ row.percent }}%</span>
+        </div>
+        <div class="agent-card-bar">
+          <i :style="{ width: barWidth(row.percent) + '%' }"></i>
+        </div>
+        <div class="agent-card-foot num">{{ row.chars }} 字符</div>
       </div>
-      <p v-if="!agentShares.length" class="src">没有可分列的代理数据</p>
+    </div>
+    <div v-else class="panel empty-mini">
+      <span>没有可分列的代理数据 —— 常驻层里还没有带代理归属的条目。</span>
     </div>
 
     <!-- 退居提名（班车建议退出常驻层）：归属代理一眼可见 ——
@@ -47,24 +60,31 @@
          免得「班车要把谁踢出去」看半天看不出来。批准/驳回在审核页做（这里只读）。 -->
     <h3 class="section-title">退居提名（班车建议退出常驻层）</h3>
     <div v-if="demoteError" class="banner banner--danger">{{ demoteError }}</div>
-    <div v-if="!demotes.length" class="panel">
-      <div class="empty">
-        <p><b>没有退居提名</b>常驻层水位没到告警线，或建议都已经审完了。</p>
-      </div>
+    <div v-if="!demotes.length" class="panel empty-mini">
+      <span>没有退居提名 —— 常驻层水位没到告警线，或建议都已经审完了。</span>
     </div>
-    <div v-else class="panel pad agent-split">
-      <div v-for="row in demotes" :key="row.key" class="agent-line">
-        <span class="cell-key">
+    <!-- 退居提名：按列排（条目 / 归属 / 提名时间）—— 关键列对齐，
+         眼睛往下扫时时间那一列是一条直线，不用每行自己找。 -->
+    <div v-else class="panel demote-list">
+      <div class="demote-head">
+        <span class="col-key">记忆条目</span>
+        <span class="col-owner">归属代理</span>
+        <span class="col-time">提名时间</span>
+      </div>
+      <div v-for="row in demotes" :key="row.key" class="demote-row">
+        <span class="cell-key col-key">
           <span class="k" :title="row.key">{{ row.key }}</span>
         </span>
-        <span
-          v-if="ownerChip(row)"
-          class="tag tag--owner"
-          :title="`归属代理：${ownerOf(row.tags)}`"
-        >{{ ownerChip(row) }}</span>
-        <span class="num agent-num">{{ toLocal(row.updated_at) }}</span>
+        <span class="col-owner">
+          <span
+            v-if="ownerChip(row)"
+            class="tag tag--owner"
+            :title="`归属代理：${ownerOf(row.tags)}`"
+          >{{ ownerChip(row) }}</span>
+        </span>
+        <span class="num col-time">{{ toLocal(row.updated_at) }}</span>
       </div>
-      <p class="src">
+      <p class="src list-foot">
         共 {{ demoteCount }} 条<template v-if="demoteCount > demotes.length">（这里只列前 {{ demotes.length }} 条）</template>；
         批准 / 驳回在「记忆审核」页的「退居建议」里做（这里只读）。
       </p>
@@ -75,10 +95,8 @@
          自动标废弃等于替人做决定。要销账去「待办」页做。 -->
     <h3 class="section-title">建议废弃的待办（到期过 7 天仍未销）</h3>
     <div v-if="obsoleteError" class="banner banner--danger">{{ obsoleteError }}</div>
-    <div v-if="!obsoleteTodos.length" class="panel">
-      <div class="empty">
-        <p><b>没有建议废弃的待办</b>没有过了 7 天还没销的开放待办。</p>
-      </div>
+    <div v-if="!obsoleteTodos.length" class="panel empty-mini">
+      <span>没有建议废弃的待办 —— 没有过了 7 天还没销的开放待办。</span>
     </div>
     <div v-else class="panel pad agent-split">
       <div v-for="row in obsoleteTodos" :key="row.id" class="agent-line">
@@ -97,9 +115,11 @@
       </p>
     </div>
 
-    <div class="banner">
+    <!-- 页脚说明：降为 secondary 小字（12px 灰）—— 它是脚注，不该跟正文抢视觉；
+         安全要点在按钮文案（dry-run / 实跑）与确认弹框里都写着。 -->
+    <p class="src foot-note foot-note--lead">
       dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
-    </div>
+    </p>
     <div class="ops">
       <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
       <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
@@ -111,10 +131,10 @@
         分级班车设置（{{ tStatus?.enabled ? '已开' : '默认关' }}）
       </el-button>
     </div>
-    <div class="src">
+    <p class="src foot-note">
       分级班车：每天一次 cron 跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
       <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
-    </div>
+    </p>
     <pre v-if="opResult" class="pre">{{ opResult }}</pre>
 
     <!-- 分级班车设置：总开关 + 阈值。confirm 要手输当前生效的 enabled（防手滑） -->
@@ -334,6 +354,16 @@ async function loadObsoleteTodos() {
 }
 
 /**
+ * 卡片进度条宽度（百分比）：封顶 100 —— 超预算另走警示/危险色，
+ * 条不许画出卡片（条溢出 = 看起来像 300%）。
+ */
+function barWidth(percent) {
+  const p = Number(percent)
+  if (!Number.isFinite(p)) return 0
+  return Math.min(100, Math.max(0, p))
+}
+
+/**
  * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
  * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
  * 实跑前后都会把受影响记忆条目全量导出到备份目录，路径回显在结果里。
@@ -485,7 +515,163 @@ async function saveTiering() {
   color: var(--text-faint);
   font-size: 12px;
 }
-/* 按代理分列 / 退居提名：一行一条。零新色 —— 归属 chip 走全局 .tag--owner，
+/* 页脚说明：secondary 小字（脚注不跟正文抢视觉）。 */
+.foot-note {
+  margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.foot-note--lead {
+  margin: 0 0 12px;
+}
+
+/* ---------------------------------------------------------------- 代理占用卡
+ * 原来是一行行裸文字（「名字 + 字符数 · 占 X%」），一屏看下去全是字 ——
+ * 改成一张代理一张卡：名字 + 大号占比 + 细进度条 + 字符数小字。
+ * 零新色：进度条走 --accent，≥90% 转 --warn（临期告警色）。 */
+.agent-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+@media (max-width: 900px) {
+  .agent-cards {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+}
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+}
+.agent-card-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.agent-card-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+.agent-card-pct {
+  flex: none;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  line-height: 1.1;
+}
+.agent-card--warn .agent-card-pct {
+  color: var(--warn);
+}
+/* 细进度条：6px 高 + chip 圆角（令牌圆角，不写裸 px） */
+.agent-card-bar {
+  height: 6px;
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  overflow: hidden;
+}
+.agent-card-bar i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-chip);
+  background: var(--accent);
+}
+.agent-card--warn .agent-card-bar i {
+  background: var(--warn);
+}
+.agent-card-foot {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* 空态：矮卡片 + 一句灰字（不再留一整块 44px padding 的空区）。 */
+.empty-mini {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- 退居提名表
+ * 三列对齐：条目（自适应）/ 归属代理（定宽）/ 提名时间（定宽、右对齐）。
+ * 行分隔线走 --line-3（卡内分隔线那一档），表头带一条浅灰底。 */
+.demote-list {
+  padding: 0;
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+.demote-head,
+.demote-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 160px 150px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+}
+.demote-head {
+  padding: 10px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.demote-row {
+  border-top: 1px solid var(--line-3);
+}
+/* 表头下边线已经画了一道，第一行别再叠一道 */
+.demote-head + .demote-row {
+  border-top: none;
+}
+.col-key {
+  min-width: 0;
+}
+.col-owner {
+  min-width: 0;
+}
+.col-time {
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: right;
+}
+.list-foot {
+  margin: 0;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line-3);
+}
+@media (max-width: 600px) {
+  /* 窄屏：表头收起，三列各占一行（定宽列在窄屏里会挤掉条目 key）。 */
+  .demote-head {
+    display: none;
+  }
+  .demote-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .col-time {
+    text-align: left;
+  }
+}
+
+/* 「建议废弃的待办」清单：一行一条。零新色 —— 归属 chip 走全局 .tag--owner，
    数字走 .num，行分隔线走 --border-2。 */
 .agent-split {
   margin-bottom: 20px;
@@ -499,14 +685,6 @@ async function saveTiering() {
 }
 .agent-line + .agent-line {
   border-top: 1px solid var(--border-2);
-}
-.agent-name {
-  font-weight: 600;
-  color: var(--text);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .agent-num {
   color: var(--text-dim);

@@ -66,13 +66,50 @@
     </p>
     <div v-if="perAgentError" class="banner banner--danger">{{ perAgentError }}</div>
 
-    <!-- 水位与趋势：环形仪表两块（总预算水位 / 待办完成率）+ 近 7 天增量图。
-         🔴 数字**全部来自后端**（前端不自己算比例）：预算水位 = tiering 给的 ratio，
-         完成率 = 待办计数给的 done/obsolete/total（口径写在卡片 hint 里）。 -->
-    <h3 class="section-title">水位与趋势</h3>
+    <!-- 水位与趋势：**按代理水位条组** + 待办完成率环形 + 近 7 天增量图。
+         🔴 数字**全部来自后端**（前端不自己算比例）：每代理水位 = 该代理的常驻字符
+         ÷ 它**自己**生效的注入预算（`stats/core-per-agent` 的 budget_effective）；
+         完成率 = 待办计数给的 done/obsolete/total（口径写在卡片 hint 里）。
+         🔴 **总预算环删了** —— 总量放在几十个代理上是准的，放在几百个代理上
+         就是一句「整体还行」，看不出是谁快满了；每个代理一份独立预算，
+         要看的就是「谁的条快满了」。总量仍在下面「分级班车」那张卡上（同一份数）。 -->
+    <h3 class="section-title">按代理水位与趋势</h3>
     <div class="chart-grid">
+      <!-- 按代理水位：**每代理一行**（名字 + 百分比 + 细条 + 字符/预算）。
+           内联 CSS 条（零新依赖）；按占用降序，前 8 个 + 「其余 N 个」折叠。
+           ≥90% 走警示色、≥100% 走危险色（与全站占用条同一把尺子）。 -->
       <div class="panel pad">
-        <div class="chart-title">水位</div>
+        <div class="chart-title">水位 · 按代理</div>
+        <div v-if="waterRows.length" class="water-list">
+          <div v-for="r in waterShown" :key="r.agent_id" class="water-row">
+            <div class="water-head">
+              <span class="water-name" :title="r.agent_id">{{ r.label }}</span>
+              <span class="water-pct num" :class="r.toneClass">{{ r.percent }}%</span>
+              <span class="water-num num">{{ r.chars }} / {{ r.budget }} 字符</span>
+            </div>
+            <div class="water-track">
+              <i :class="r.toneClass" :style="{ width: r.width + '%' }"></i>
+            </div>
+          </div>
+          <button
+            v-if="waterRest.length"
+            type="button"
+            class="ghost-btn water-more"
+            @click="waterRestOpen = !waterRestOpen"
+          >
+            {{ waterRestOpen ? '收起其余代理' : `其余 ${waterRest.length} 个代理（最高 ${waterRest[0].percent}%）` }}
+          </button>
+        </div>
+        <div v-else class="empty">
+          <b>没有可分列的代理水位</b>
+          <span>常驻层里还没有带代理归属的条目。</span>
+        </div>
+        <p class="src">{{ waterHint }}</p>
+      </div>
+
+      <!-- 待办完成率：**全局单一指标** ⇒ 环形仍然合理（总量环删了，它留着）。 -->
+      <div class="panel pad">
+        <div class="chart-title">待办完成率</div>
         <RingGauge :metrics="gaugeMetrics" :height="gaugeHeight" />
         <p class="src">{{ gaugeHint }}</p>
       </div>
@@ -686,44 +723,55 @@ const dailyByAgentHint = computed(() => {
     + '；没打归属标签的老条目归「未标注」一栏，不摊到别人头上。'
 })
 
-/** 总预算水位（%）—— tiering 给的 ratio（与「常驻预算水位」卡同一份数）。 */
-const budgetPercent = computed(() => {
-  const r = tiering.value?.budget?.ratio
-  return typeof r === 'number' ? r : null
-})
+/* ---------------------------------------------------------------- 按代理水位
+ * 水位**按代理**看：每个代理一份独立的注入预算（`core_budget_chars` ?? 全局），
+ * 总量环在几百代理规模下没有信息量 —— 要看的是「谁的条快满了」。
+ *
+ * 🔴 口径与上面那张 ECharts 分列图**同一把尺子**（同一个 `agentUsageRows`）：
+ *   占比 = 该代理常驻字符 ÷ **它自己**生效的预算（不是占全库总量 ——
+ *   那另一个口径在「记忆维护」页，写在那一页的说明行里）。
+ * 🔴 数字全部来自接口，前端零写死。 */
+
+/** 水位条组最多列几个（其余折叠成一行「其余 N 个」）。 */
+const WATER_TOP_N = 8
+
+/** 水位行：按占用降序；≥90% 警示色、≥100% 危险色。 */
+const waterRows = computed(() =>
+  coreAgentCards.value
+    .filter((r) => r.chars > 0)          // 没占常驻层的代理没有水位可言
+    .slice()
+    .sort((a, b) => b.percent - a.percent)
+    .map((r) => ({
+      ...r,
+      width: Math.min(100, Math.max(0, r.percent)),   // 条长封顶 100%（超预算另走危险色）
+      toneClass: r.percent >= 100 ? 'is-danger' : (r.percent >= 90 ? 'is-warn' : ''),
+    })),
+)
+
+/** 折叠：前 8 个 + 「其余 N 个」（点开才列全）。 */
+const waterTop = computed(() => waterRows.value.slice(0, WATER_TOP_N))
+const waterRest = computed(() => waterRows.value.slice(WATER_TOP_N))
+const waterRestOpen = ref(false)
+const waterShown = computed(() => (waterRestOpen.value ? waterRows.value : waterTop.value))
+
+const waterHint = '占比 = 该代理的常驻字符 ÷ 它自己生效的注入预算；≥90% 走警示色，≥100% 走危险色。'
+  + '只列有常驻条目的代理，其余折叠在「其余 N 个」里。'
 
 /** 待办完成率（%）—— 已销掉（done + obsolete）占全部（口径写在 hint 里）。 */
 const todoPercent = computed(() => completionPercent(todoSummary.value))
 
-/** 两块环形仪表：总预算水位 + 待办完成率（颜色取自 chart-theme 的色板）。 */
+/** 环形仪表只剩一块：待办完成率（全局单一指标，环形合理）。 */
 const gaugeMetrics = computed(() => {
   const p = chartPalette()
-  const metrics = []
-  if (budgetPercent.value !== null) {
-    metrics.push({
-      label: '总预算水位',
-      percent: budgetPercent.value,
-      color: usageColor(budgetPercent.value, p),
-    })
-  }
-  metrics.push({
+  return [{
     label: '待办完成率',
     percent: todoPercent.value,
     color: usageColor(todoPercent.value, p),
-  })
-  return metrics
+  }]
 })
 
-const gaugeHint = computed(() => {
-  const bits = []
-  if (budgetPercent.value !== null) {
-    bits.push(`总预算水位 ${budgetPercent.value}%`)
-  } else {
-    bits.push('总预算水位未读到')
-  }
-  bits.push(`待办完成率 ${todoPercent.value}%（已销掉的 done + obsolete ÷ 全部）`)
-  return bits.join(' · ')
-})
+const gaugeHint = computed(() =>
+  `待办完成率 ${todoPercent.value}%（已销掉的 done + obsolete ÷ 全部）`)
 
 async function fetchTodoSummary() {
   // 单独 fetch：待办端点挂了不许把整张看板拖红（只掉这一小节）
@@ -866,8 +914,78 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;   /* 三块面板高度各自贴合内容（条组比环形高得多，别硬拉齐） */
   gap: 14px;
 }
+/* ---------------------------------------------------------------- 按代理水位条组
+ * 每代理一行：名字 + 百分比 + 细条 + 「字符 / 预算」。
+ * 内联 CSS 条（零新依赖 —— 本页不引 ECharts）；颜色全走 tokens.css 的既有令牌。 */
+.water-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.water-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.water-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.water-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+}
+.water-pct {
+  flex: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.water-pct.is-warn {
+  color: var(--warn);
+}
+.water-pct.is-danger {
+  color: var(--danger);
+}
+.water-num {
+  flex: none;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+/* 细条：6px 高 + chip 圆角（令牌圆角，不写裸 px） */
+.water-track {
+  height: 6px;
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  overflow: hidden;
+}
+.water-track i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-chip);
+  background: var(--accent);
+}
+.water-track i.is-warn {
+  background: var(--warn);
+}
+.water-track i.is-danger {
+  background: var(--danger);
+}
+.water-more {
+  align-self: flex-start;
+  height: 28px;
+  font-size: 12px;
+}
+
 .chart-title {
   font-size: 13px;
   color: var(--text-dim);

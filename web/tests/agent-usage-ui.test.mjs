@@ -127,7 +127,10 @@ test('在线判据：last_seen_at 5 分钟内 = 在线，解析不出来 = 离�
 test('维护页：常驻水位总量下面有每代理字符占比行', () => {
   assert.match(MAINT, /常驻层水位/, '维护页要有常驻水位这一节')
   assert.match(MAINT, /agentShares/, '每代理占比行')
-  assert.match(MAINT, /占 \{\{ row\.percent \}\}%/, '占比要显示出来')
+  // 2026-10-23 UI 美化：裸文字行改成**卡片**（名字 + 大号占比 + 细条 + 字符数），
+  // 占比的写法从行内的「占 {{ row.percent }}%」收成卡片上的大号「{{ row.percent }}%」
+  // （分母口径没变，仍是水位总量 —— 下一条断言盯着）。
+  assert.match(MAINT, /\{\{ row\.percent \}\}%/, '占比要显示出来')
   assert.match(MAINT, /api\.corePerAgent\(\)/)
 })
 
