@@ -66,7 +66,7 @@
     </p>
     <div v-if="perAgentError" class="banner banner--danger">{{ perAgentError }}</div>
 
-    <!-- 水位与趋势：环形仪表两块（总预算水位 / 待办完成率）+ 近 7 天增量折线。
+    <!-- 水位与趋势：环形仪表两块（总预算水位 / 待办完成率）+ 近 7 天增量图。
          🔴 数字**全部来自后端**（前端不自己算比例）：预算水位 = tiering 给的 ratio，
          完成率 = 待办计数给的 done/obsolete/total（口径写在卡片 hint 里）。 -->
     <h3 class="section-title">水位与趋势</h3>
@@ -76,80 +76,119 @@
         <RingGauge :metrics="gaugeMetrics" :height="gaugeHeight" />
         <p class="src">{{ gaugeHint }}</p>
       </div>
+
+      <!-- 近 7 天记忆增量：**一张图** = 按代理堆叠柱 + 柱顶当日总量数字
+           （原先「总量折线小图」已删 —— 同一件事不画两遍）。
+           🔴 横轴 = `daily` 段（后端补齐了每一天），色带 = `daily_by_agent` 段
+           （只给有写入的格子）—— 横轴只补一次（后端补一次、前端再补一次必漂）。
+           序列 = 7 天总量降序前 6 + 「其他」桶；数字全部来自接口，零写死。
+           悬停**整列**（不必精准点到某一段）出浮层：日期 / 当日总量 / 各代理分项。
+           内联 SVG + 绝对定位浮层 —— 不引任何新依赖。 -->
       <div class="panel pad">
         <div class="chart-title">近 7 天记忆增量</div>
-        <SparkLine :points="dailyPoints" :height="sparkHeight" />
-        <p class="src">{{ dailyHint }}</p>
+        <div class="chart-wrap" @mouseleave="hoverDay = ''">
+          <svg
+            v-if="agentChart.segs.length"
+            class="stack-chart"
+            :viewBox="agentChart.viewBox"
+            role="img"
+            :aria-label="agentChartAria"
+          >
+            <!-- 网格线：0 / 中值 / 满值（值标在左侧） -->
+            <g class="grid">
+              <line
+                v-for="g in agentChart.grid"
+                :key="`g${g.v}`"
+                :x1="agentChart.padL"
+                :x2="agentChart.right"
+                :y1="g.y"
+                :y2="g.y"
+              />
+            </g>
+            <!-- 堆叠柱：一格 = 一天 × 一个代理 -->
+            <g class="bars">
+              <rect
+                v-for="seg in agentChart.segs"
+                :key="seg.key"
+                :x="seg.x"
+                :y="seg.y"
+                :width="seg.w"
+                :height="seg.h"
+                :fill="seg.color"
+              />
+            </g>
+            <!-- 柱顶：当日总量（数字来自接口，零写死） -->
+            <g class="totals">
+              <text
+                v-for="c in agentChart.cols"
+                :key="`n${c.day}`"
+                v-show="c.total > 0"
+                :x="c.cx"
+                :y="c.topY - 5"
+                text-anchor="middle"
+              >{{ c.total }}</text>
+            </g>
+            <!-- 坐标文字 -->
+            <g class="axis">
+              <text
+                v-for="g in agentChart.grid"
+                :key="`t${g.v}`"
+                :x="agentChart.padL - 6"
+                :y="g.y + 3"
+                text-anchor="end"
+              >{{ g.v }}</text>
+              <text
+                v-for="x in agentChart.xLabels"
+                :key="`x${x.text}`"
+                :x="x.x"
+                :y="x.y"
+                text-anchor="middle"
+              >{{ x.text }}</text>
+            </g>
+            <!-- 整列命中：透明 rect 逐日捕获 mouseenter（不必精准点到某一段） -->
+            <g class="hit">
+              <rect
+                v-for="c in agentChart.cols"
+                :key="`h${c.day}`"
+                :x="c.hitX"
+                :y="agentChart.padT"
+                :width="c.hitW"
+                :height="agentChart.plotH"
+                fill="transparent"
+                @mouseenter="hoverDay = c.day"
+              />
+            </g>
+          </svg>
+          <div v-else class="empty">
+            <b>近 7 天没有可分列的增量</b>
+            <span>这段时间没有新增的记忆条目（接口没给到任何按代理的格子）。</span>
+          </div>
+          <!-- 悬停浮层：绝对定位在柱子旁边（左右自动翻转 ⇒ 永不出图） -->
+          <div v-if="hoverTip" class="chart-tip" :style="hoverTip.style" role="tooltip">
+            <div class="tip-head">
+              <span class="tip-date">{{ hoverTip.date }}</span>
+              <span class="num tip-total">{{ hoverTip.total }} 条</span>
+            </div>
+            <ul v-if="hoverTip.parts.length" class="tip-list">
+              <li v-for="p in hoverTip.parts" :key="p.key">
+                <span class="dot" :style="{ background: p.color }"></span>
+                <span class="tip-name">{{ p.label }}</span>
+                <span class="num tip-num">{{ p.count }}</span>
+              </li>
+            </ul>
+            <p v-else class="tip-empty">当天没有新增</p>
+          </div>
+        </div>
+        <!-- 图例：色点 + 名字 + 7 天总量（数字来自接口） -->
+        <ul v-if="agentChart.series.length" class="legend">
+          <li v-for="s in agentChart.series" :key="s.key" :title="s.title">
+            <span class="dot" :style="{ background: s.color }"></span>
+            <span class="lg-label">{{ s.label }}</span>
+            <span class="lg-num num">{{ s.total }}</span>
+          </li>
+        </ul>
+        <p class="src">{{ dailyByAgentHint }}</p>
       </div>
-    </div>
-
-    <!-- 近 7 天增量 · **按代理**：内联 SVG 堆叠柱（每个代理一条色带）。
-         🔴 横轴 = `daily` 段（后端补齐了每一天），色带 = `daily_by_agent` 段
-         （只给有写入的格子）—— 横轴只补一次（后端补一次、前端再补一次必漂）。
-         序列 = 7 天总量降序前 6 + 「其他」桶；数字全部来自接口，零写死。 -->
-    <div class="panel pad">
-      <div class="chart-title">近 7 天记忆增量 · 按代理</div>
-      <svg
-        v-if="agentChart.segs.length"
-        class="stack-chart"
-        :viewBox="agentChart.viewBox"
-        role="img"
-        :aria-label="agentChartAria"
-      >
-        <!-- 网格线：0 / 中值 / 满值（值标在左侧） -->
-        <g class="grid">
-          <line
-            v-for="g in agentChart.grid"
-            :key="`g${g.v}`"
-            :x1="agentChart.padL"
-            :x2="agentChart.right"
-            :y1="g.y"
-            :y2="g.y"
-          />
-        </g>
-        <!-- 堆叠柱：一格 = 一天 × 一个代理 -->
-        <g class="bars">
-          <rect
-            v-for="seg in agentChart.segs"
-            :key="seg.key"
-            :x="seg.x"
-            :y="seg.y"
-            :width="seg.w"
-            :height="seg.h"
-            :fill="seg.color"
-          />
-        </g>
-        <!-- 坐标文字 -->
-        <g class="axis">
-          <text
-            v-for="g in agentChart.grid"
-            :key="`t${g.v}`"
-            :x="agentChart.padL - 6"
-            :y="g.y + 3"
-            text-anchor="end"
-          >{{ g.v }}</text>
-          <text
-            v-for="x in agentChart.xLabels"
-            :key="`x${x.text}`"
-            :x="x.x"
-            :y="x.y"
-            text-anchor="middle"
-          >{{ x.text }}</text>
-        </g>
-      </svg>
-      <div v-else class="empty">
-        <b>近 7 天没有可分列的增量</b>
-        <span>这段时间没有新增的记忆条目（接口没给到任何按代理的格子）。</span>
-      </div>
-      <!-- 图例：色点 + 名字 + 7 天总量（数字来自接口） -->
-      <ul v-if="agentChart.series.length" class="legend">
-        <li v-for="s in agentChart.series" :key="s.key" :title="s.title">
-          <span class="dot" :style="{ background: s.color }"></span>
-          <span class="lg-label">{{ s.label }}</span>
-          <span class="lg-num num">{{ s.total }}</span>
-        </li>
-      </ul>
-      <p class="src">{{ dailyByAgentHint }}</p>
     </div>
 
     <!-- 待办小节：开放 N / 逾期 M，点进去就是待办页。 -->
@@ -194,10 +233,6 @@
         <span class="num agent-num">累计读 {{ a.reads }} · 累计写 {{ a.writes }}</span>
         <span class="num agent-num">最近活动 {{ toLocal(a.last_seen_at) }}</span>
       </div>
-      <p class="src">
-        读写是注册表的累计计数（注册表没有按日打点 ⇒ 不给「今日」增量）；
-        「在线」= 最近活动落在 5 分钟内。
-      </p>
     </div>
 
     <h3 class="section-title">分级班车</h3>
@@ -298,7 +333,6 @@
         </template>
       </ItemCard>
     </div>
-    <div class="src">来源：{{ cronSource }}</div>
 
     <!-- 暂停 / 恢复：一句后果 + 确认（不写无信息量的那句问话） -->
     <ConfirmDialog
@@ -352,12 +386,11 @@ import AgentUsageBars from '../components/AgentUsageBars.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import RingGauge from '../components/RingGauge.vue'
-import SparkLine from '../components/SparkLine.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, isOnline, loadAgentRows, ONLINE_HINT } from '../utils/agents'
 import { chartPalette, usageColor } from '../utils/chart-theme.js'
-import { bucketByAgent, OTHER_KEY, stackLayout, topSeries } from '../utils/daily-by-agent'
+import { bucketByAgent, dayBreakdown, OTHER_KEY, stackLayout, topSeries } from '../utils/daily-by-agent'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -365,7 +398,6 @@ import { completionPercent } from '../utils/todo'
 
 const data = ref(null)
 const crons = ref([])
-const cronSource = ref('')
 const schedulerStatus = ref('')
 const loading = ref(false)
 const error = ref('')
@@ -387,7 +419,6 @@ function onViewportResize() {
 }
 const barsHeight = computed(() => (chartWidth.value < 900 ? 220 : 300))
 const gaugeHeight = computed(() => (chartWidth.value < 900 ? 200 : 240))
-const sparkHeight = computed(() => (chartWidth.value < 900 ? 180 : 220))
 
 // 待审条目计数（侧栏同一份数据，独立 fetch 让这页不至于因 review 端点挂了而红）
 // — 顶部「待审核 N 条」卡专用。三个数全库口径，与 GET /api/v1/review/counts 一致。
@@ -549,26 +580,14 @@ function schedLabel(raw) {
   return bits.join(' · ') || '未知'
 }
 
-/* ---------------------------------------------------------------- 图表数据
- * 近 7 天每日新增（`?days=7` 那段 `daily`）—— 后端补齐了没写入的那天（= 0，
- * 不是空白），前端只画。 */
-const dailyPoints = computed(() => (data.value?.daily || []).map((d) => ({
-  date: d.date, count: Number(d.count || 0),
-})))
-
-const dailyHint = computed(() => {
-  const sum = dailyPoints.value.reduce((acc, p) => acc + p.count, 0)
-  return `近 7 天新增 ${sum} 条（每天一格，没写入的那天是 0）`
-})
-
-/* ---------------------------------------------------------------- 近 7 天 · 按代理
+/* ---------------------------------------------------------------- 近 7 天增量图
  * `daily_by_agent`（`GET /api/v1/stats?days=7` 新增的一段）= 每日增量**按代理分列**
  * 的格子（`{d, agent, n}`，**只给有写入的格子**）。横轴用 `daily` 段（后端补齐了
  * 每一天），色带用这一段 —— 横轴是图表口径，只补一次（后端补一次、前端补一次必漂）。
  * 数值全部来自接口 —— 前端零写死。
  *
  * 🔴 图表是**内联 SVG**（不是 ECharts）：SVG 里的 `var(--*)` 直接吃 CSS 变量，
- *    切主题不用重画（canvas 那套得订阅主题变化再重画一次，见 components/SparkLine.vue）。
+ *    切主题不用重画（canvas 那套得订阅主题变化再重画一次，见 components/RingGauge.vue）。
  * 🔴 色板只用 tokens.css 的既有令牌（DESIGN.md：组件里不许散落硬编码色值）。 */
 const DAILY_TOP_N = 6
 
@@ -596,13 +615,16 @@ function agentLabel(agent) {
   return agentNames.value[agent] || agent
 }
 
+/** 按代理分桶（`daily_by_agent` 汇总）—— 堆叠柱与悬停浮层共用这一份。 */
+const agentBuckets = computed(() => bucketByAgent(data.value?.daily_by_agent || []))
+
 /** 序列 = 7 天总量降序前 6 + 「其他」桶（其余代理合并进去）。
  *  分组 / 排序 / 归并 / 摆位置都在 `utils/daily-by-agent.js`（纯函数，可单测）。 */
-const agentSeries = computed(() =>
-  topSeries(bucketByAgent(data.value?.daily_by_agent || []), DAILY_TOP_N, agentLabel))
+const agentSeries = computed(() => topSeries(agentBuckets.value, DAILY_TOP_N, agentLabel))
 
-/** 内联 SVG 的画布尺寸（viewBox 坐标系，与实际像素解耦 ⇒ 窄屏不横向滚动）。 */
-const CHART = { w: 720, h: 240, padL: 38, padR: 12, padT: 14, padB: 30 }
+/** 内联 SVG 的画布尺寸（viewBox 坐标系，与实际像素解耦 ⇒ 窄屏不横向滚动）。
+ *  🔴 padT 留出 22px：柱顶要写当日总量数字（数字压在柱顶上会糊）。 */
+const CHART = { w: 720, h: 240, padL: 38, padR: 12, padT: 22, padB: 30 }
 
 /** 堆叠柱的几何：每一格（天 × 代理）一个矩形 + 网格线 + 坐标文字。
  *  🔴 颜色**挂在序列上**（图例色点与柱子里的是同一份，不会两处各画一份）。 */
@@ -619,6 +641,41 @@ const agentChart = computed(() => {
 
 const agentChartAria = computed(() =>
   `近 7 天记忆增量按代理分列，共 ${agentChart.value.total} 条`)
+
+/** 悬停浮层：当前悬停的那天（整列命中，不必精准点到某一段）。 */
+const hoverDay = ref('')
+
+/** 代理 → 柱子里那条色带（浮层里的色点跟柱子同色，视线不用来回找）。
+ *  被归并进「其他」桶的代理没有自己的色带 ⇒ 用「其他」那档中性灰。 */
+function seriesColorOf(agent) {
+  const s = agentChart.value.series.find((x) => x.key === agent)
+  return s && s.key !== OTHER_KEY ? s.color : OTHER_COLOR
+}
+
+/**
+ * 浮层内容 + 落位：日期 / 当日总量 / 各代理分项（按条数降序，含「未标注」桶）。
+ *
+ * 🔴 落位 = 挂在柱子**旁边**（左半屏挂右、右半屏挂左 ⇒ 永不出图）：
+ *    浮层宽度固定，左半边放右边、右半边放左边，两种情况都塞得进图里。
+ */
+const hoverTip = computed(() => {
+  const day = hoverDay.value
+  if (!day) return null
+  const col = agentChart.value.cols.find((c) => c.day === day)
+  if (!col) return null
+  const info = dayBreakdown(agentBuckets.value, day, agentLabel)
+  const flip = col.cx > CHART.w / 2
+  return {
+    date: day,
+    total: info.total,
+    parts: info.parts.map((p) => ({ ...p, color: seriesColorOf(p.key) })),
+    style: {
+      left: `${((flip ? col.cx - 8 : col.cx + 8) / CHART.w) * 100}%`,
+      top: `${(CHART.padT / CHART.h) * 100}%`,
+      transform: flip ? 'translate(-100%, 0)' : 'translate(0, 0)',
+    },
+  }
+})
 
 const dailyByAgentHint = computed(() => {
   const c = agentChart.value
@@ -706,7 +763,6 @@ async function load() {
   try {
     const c = await api.crons()
     crons.value = c.jobs
-    cronSource.value = c.source
     // 无 hermes CLI 时后端给 null —— 这一行显示「未知」，不许把整页拖成报错
     schedulerStatus.value = c.scheduler_status || ''
     schedulerStatus.value = schedLabel(schedulerStatus.value)
@@ -910,10 +966,14 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
  * 内联 SVG：viewBox 720×240 + `width:100%` ⇒ 窄屏不横向滚动；
  * `max-width` 封顶（宽屏上别把一张图拉成 1500px 宽的稀疏柱阵）。
  * 颜色全在 :fill 里给 var(--*)，CSS 变量直接生效 ⇒ 切主题不用重画。 */
+.chart-wrap {
+  position: relative;      /* 浮层按柱子横向跟随（绝对定位的参照） */
+  max-width: 760px;        /* 与 svg 同宽 ⇒ 浮层的百分比落位与图内坐标对齐 */
+}
 .stack-chart {
   display: block;
   width: 100%;
-  max-width: 760px;
+  max-width: 100%;
   height: auto;
   overflow: visible;
 }
@@ -932,6 +992,85 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
   fill: var(--text-faint);
   font-size: 10px;
   font-family: var(--font);
+}
+/* 柱顶当日总量：弱一档的字（它压着柱子，不必抢眼） */
+.stack-chart .totals text {
+  fill: var(--text-dim);
+  font-size: 10px;
+  font-family: var(--font);
+  font-variant-numeric: tabular-nums;
+}
+/* 整列命中区：透明 rect（只吃鼠标事件，不画东西） */
+.stack-chart .hit rect {
+  cursor: crosshair;
+}
+
+/* 悬停浮层：白底细边框圆角（DESIGN.md：靠边框分层，不靠阴影堆）。
+   高度封顶 + 内部滚动：代理多的时候不让浮层长到把图压塌。 */
+.chart-tip {
+  position: absolute;
+  z-index: 5;
+  width: 180px;
+  max-height: 150px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-inset);
+  box-shadow: var(--shadow-pop);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.tip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--line-3);
+}
+.tip-date {
+  color: var(--text);
+  font-weight: 600;
+}
+.tip-total {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.tip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tip-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tip-list .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: none;
+}
+.tip-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tip-num {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.tip-empty {
+  margin: 0;
+  color: var(--text-faint);
 }
 /* 图例：色点 + 名字 + 7 天总量（数字来自接口） */
 .legend {

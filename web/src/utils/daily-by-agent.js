@@ -1,5 +1,5 @@
 /**
- * 「近 7 天记忆增量 · 按代理」的**纯计算**（看板那张内联 SVG 堆叠柱）。
+ * 「近 7 天记忆增量」图的**纯计算**（看板那张内联 SVG 堆叠柱 + 悬停浮层）。
  *
  * 🔴 本模块**不 import Vue**（纯函数 + 纯数据）⇒ `node --test` 直接跑
  *    （与 `utils/chart-kit.js` 同一套路）。
@@ -80,6 +80,33 @@ export function topSeries(buckets, topN, labelOf) {
 }
 
 /**
+ * 某一天的**悬停浮层明细**：当日总量 + 各代理分项（按条数降序）。
+ *
+ * 🔴 **总量 = 分项之和**（浮层里的数必须自洽 —— 柱高也是这个总和）。
+ * 🔴 分项按**真实代理**列（不按「其他」桶归并）：浮层要看得清「谁写了多少」，
+ *    「未标注」（无归属的老条目）自己占一行，不摊到别人头上。
+ *
+ * @param {Array} buckets `bucketByAgent` 的结果
+ * @param {string} day     哪一天（`YYYY-MM-DD`）
+ * @param {(agent: string) => string} labelOf 显示名（注册表备注名 → id → 未标注）
+ * @returns {{day: string, total: number, parts: Array<{key, label, count}>}}
+ */
+export function dayBreakdown(buckets, day, labelOf) {
+  const label = typeof labelOf === 'function' ? labelOf : (a) => a
+  const parts = []
+  let total = 0
+  for (const b of buckets || []) {
+    const n = Number(b?.byDay?.get(day) || 0)
+    if (!n) continue
+    total += n
+    parts.push({ key: b.agent, label: label(b.agent), count: n })
+  }
+  // 降序；同量按 agent id 排（次序稳定 ⇒ 每次渲染顺序一样）
+  parts.sort((a, b) => b.count - a.count || String(a.key).localeCompare(String(b.key)))
+  return { day, total, parts }
+}
+
+/**
  * 堆叠柱的几何（viewBox 坐标系 —— 与实际像素解耦 ⇒ 窄屏不横向滚动）。
  *
  * 每格 = 一天 × 一个代理：一个矩形 `{x, y, w, h, color}`；`y` 越小越靠上
@@ -111,32 +138,49 @@ export function stackLayout(days, series, opts = {}) {
   const yOf = (v) => padT + plotH * (1 - v / max)
 
   const segs = []
+  const cols = []
   list.forEach((day, i) => {
     const x = padL + i * band + (band - barW) / 2
     let cum = 0
+    let topY = baseY
     for (const s of rows) {
       const n = s.byDay.get(day) || 0
       if (n > 0) {
+        const y = yOf(cum + n)
         segs.push({
           key: `${s.key}|${day}`,
           x,
-          y: yOf(cum + n),
+          y,
           w: barW,
-          h: Math.max(0, yOf(cum) - yOf(cum + n)),
+          h: Math.max(0, yOf(cum) - y),
           color: colorOf(s, rows.indexOf(s)),
         })
+        if (y < topY) topY = y
       }
       cum += n
     }
+    // 逐日一列的锚点：柱顶数字（total）、悬停浮层的横向位置（cx）
+    // 与整列命中区（hitX/hitW）都从这里出。
+    cols.push({
+      day,
+      cx: padL + i * band + band / 2,
+      topY,
+      total: totals[i],
+      hitX: padL + i * band,
+      hitW: band,
+    })
   })
 
   return {
     viewBox: `0 0 ${w} ${h}`,
     segs,
+    cols,
     max,
     total: totals.reduce((a, b) => a + b, 0),
     padL,
     padR,
+    padT,
+    plotH,
     right: w - padR,
     baseY,
     grid: [0, max / 2, max].map((v) => ({ v: Math.round(v), y: yOf(v) })),

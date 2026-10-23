@@ -82,7 +82,10 @@ test('看板用 daily_by_agent 段画按代理的图（不是自己造数）', (
 
 test('序列 = 7 天总量降序前 6 + 「其他」桶', () => {
   assert.match(STATS, /const DAILY_TOP_N = 6/, '前 6 个代理 + 「其他」桶')
-  assert.match(STATS, /topSeries\(bucketByAgent\(data\.value\?\.daily_by_agent \|\| \[\]\), DAILY_TOP_N/,
+  // 分桶单独算一份（堆叠柱与悬停浮层共用同一份分桶，数字不许两处各算一遍）
+  assert.match(STATS, /const agentBuckets = computed\(\(\) => bucketByAgent\(data\.value\?\.daily_by_agent \|\| \[\]\)\)/,
+    '分桶走纯函数模块（utils/daily-by-agent.js，可单测）')
+  assert.match(STATS, /topSeries\(agentBuckets\.value, DAILY_TOP_N, agentLabel\)/,
     '分组 / 排序 / 归并走纯函数模块（utils/daily-by-agent.js，可单测）')
   assert.match(STATS, /from '\.\.\/utils\/daily-by-agent'/, '看板必须用那份纯函数模块')
   // 排序与归并的实现细节在纯函数模块里（单测见 tests/daily-by-agent.test.mjs）

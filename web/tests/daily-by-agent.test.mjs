@@ -1,5 +1,5 @@
 /**
- * 「近 7 天记忆增量 · 按代理」的纯计算（`utils/daily-by-agent.js`）。
+ * 「近 7 天记忆增量」图的纯计算（`utils/daily-by-agent.js`）。
  *
  * 钉死三件最容易悄悄错的事：
  *   1) **分组**：同一天的多个代理各归各（不合并成一行「总」），无归属归 `-`；
@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   bucketByAgent,
+  dayBreakdown,
   OTHER_KEY,
   stackLayout,
   topSeries,
@@ -130,4 +131,66 @@ test('堆叠柱：空数据不炸（max 兜底为 1，不除零）', () => {
   assert.equal(L.segs.length, 0)
   assert.equal(L.max, 1)
   assert.equal(L.total, 0)
+})
+
+/* ---------------------------------------------------------------- 悬停浮层明细
+ * 浮层显示「某日全量 + 各代理分项」—— 数字必须自洽（总量 = 分项之和），
+ * 否则用户看到的总量和分项对不上，整张图就不敢信了。 */
+
+test('浮层：同一天多个代理按条数降序', () => {
+  const b = bucketByAgent([
+    { d: '2026-10-23', agent: 'win', n: 2 },
+    { d: '2026-10-23', agent: 'mac', n: 7 },
+    { d: '2026-10-22', agent: 'mac', n: 100 },
+  ])
+  const info = dayBreakdown(b, '2026-10-23', label)
+  assert.deepEqual(info.parts.map((p) => p.key), ['mac', 'win'], '按条数降序（不是按 agent id）')
+  assert.deepEqual(info.parts.map((p) => p.count), [7, 2])
+  assert.equal(info.total, 9, '只看那一天 —— 别的天不许混进来')
+})
+
+test('浮层：「未标注」桶参与合计（不摊到别人头上）', () => {
+  const b = bucketByAgent([
+    { d: '2026-10-23', agent: 'win', n: 3 },
+    { d: '2026-10-23', agent: '-', n: 4 },
+  ])
+  const info = dayBreakdown(b, '2026-10-23', label)
+  const un = info.parts.find((p) => p.key === '-')
+  assert.ok(un, '未标注自己占一行')
+  assert.equal(un.label, '未标注')
+  assert.equal(un.count, 4)
+  assert.equal(info.total, 7, '总量含未标注那 4 条')
+})
+
+test('浮层：总量 = 分项之和（数字自洽）', () => {
+  const rows = []
+  for (let i = 1; i <= 5; i += 1) rows.push({ d: '2026-10-23', agent: `a${i}`, n: i })
+  rows.push({ d: '2026-10-23', agent: '-', n: 3 })
+  const info = dayBreakdown(bucketByAgent(rows), '2026-10-23', label)
+  assert.equal(info.total, info.parts.reduce((a, p) => a + p.count, 0))
+  assert.equal(info.total, 18)
+})
+
+test('浮层：没有写入的那天 ⇒ 0 条、无分项（不编一条代理出来）', () => {
+  const b = bucketByAgent([{ d: '2026-10-23', agent: 'win', n: 2 }])
+  const info = dayBreakdown(b, '2026-10-22', label)
+  assert.equal(info.total, 0)
+  assert.deepEqual(info.parts, [])
+})
+
+test('堆叠柱：逐日一列的锚点（柱顶数字 + 整列命中区）', () => {
+  const days = ['2026-10-22', '2026-10-23']
+  const series = topSeries(bucketByAgent([
+    { d: '2026-10-22', agent: 'win', n: 3 },
+    { d: '2026-10-23', agent: 'win', n: 5 },
+  ]), 6, label)
+  const L = stackLayout(days, series, {})
+  assert.equal(L.cols.length, 2)
+  assert.deepEqual(L.cols.map((c) => c.day), days)
+  assert.deepEqual(L.cols.map((c) => c.total), [3, 5], '逐日总量')
+  for (const c of L.cols) {
+    assert.ok(c.cx > 0 && c.cx < 720, '列中心在画布内')
+    assert.ok(c.topY < L.baseY, '柱顶在基线之上')
+    assert.ok(c.hitW > 0 && c.hitX >= 0, '整列命中区在画布内')
+  }
 })
