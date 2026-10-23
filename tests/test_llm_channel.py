@@ -825,7 +825,7 @@ class TestCallLlmConsumesRequestExtra:
     设计点：
       * channel["request_extra"] 非空 dict → body.update() 之（extra 覆盖默认）
       * 缺/非 dict/空 dict → 不合并，body 保持 OpenAI 兼容基线
-      * 全 mock urlopen 零网络（任务书红线）
+      * 全 mock HTTP client 零网络（任务书红线；2026-10 ks_perf_stdlib 传输层换 httpx）
     """
 
     def _channel(self, **overrides):
@@ -841,31 +841,32 @@ class TestCallLlmConsumesRequestExtra:
         ch.update(overrides)
         return ch
 
-    def _capture_urlopen(self, monkeypatch, payload):
-        """把 urlopen 换成返回 payload 的 fake；req.data 暴露给断言。"""
+    def _capture_post(self, monkeypatch, payload):
+        """把 HTTP client 换成返回 payload 的 fake；请求体暴露给断言。
+
+        2026-10 ks_perf_stdlib：传输层从 `urllib.request.urlopen` 换成
+        `httpx.Client`（连接池复用）——**断言一字未改**，只换了打桩的缝。
+        """
         captured = {}
 
         class _FakeResp:
             def __init__(self, body_bytes):
-                self._body = body_bytes
+                self.content = body_bytes
+                self.status_code = 200
 
-            def read(self):
-                return self._body
+            def raise_for_status(self):
+                return None
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        def fake_urlopen(req, **kw):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.headers)
-            captured["body"] = req.data
-            return _FakeResp(json.dumps(payload).encode())
+        class _FakeClient:
+            def post(self, url, content=None, headers=None, **kw):
+                captured["url"] = url
+                captured["headers"] = dict(headers or {})
+                captured["body"] = content
+                return _FakeResp(json.dumps(payload).encode())
 
         monkeypatch.setattr(
-            "keepsake.consolidator.urllib.request.urlopen", fake_urlopen
+            "keepsake.consolidator.get_client",
+            lambda *a, **kw: _FakeClient(),
         )
         return captured
 
@@ -873,7 +874,7 @@ class TestCallLlmConsumesRequestExtra:
         """channel 含 request_extra → body 合并之；标准字段不被覆盖。"""
         from keepsake.consolidator import _call_llm
 
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         ch = self._channel(request_extra={"thinking": {"type": "disabled"}})
@@ -891,7 +892,7 @@ class TestCallLlmConsumesRequestExtra:
         """request_extra 与默认冲突时以 extra 为准（与 build_chat_request 同语义）。"""
         from keepsake.consolidator import _call_llm
 
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         # 极端场景：max_tokens 被 extra 覆盖
@@ -906,7 +907,7 @@ class TestCallLlmConsumesRequestExtra:
         """channel 无 request_extra 字段 → body 保持 OpenAI 兼容基线（不注入 thinking）。"""
         from keepsake.consolidator import _call_llm
 
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         ch = self._channel()  # 没 request_extra
@@ -926,7 +927,7 @@ class TestCallLlmConsumesRequestExtra:
         """request_extra={}（resolve 默认值）→ 不合并，body 保持基线。"""
         from keepsake.consolidator import _call_llm
 
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         ch = self._channel(request_extra={})
@@ -941,7 +942,7 @@ class TestCallLlmConsumesRequestExtra:
         """request_extra 配错类型（字符串）→ 不合并；调用方不抛。"""
         from keepsake.consolidator import _call_llm
 
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         ch = self._channel(request_extra="bad-type")
@@ -959,7 +960,7 @@ class TestCallLlmConsumesRequestExtra:
         from keepsake.consolidator import _call_llm
 
         # 路径 A：成功响应（caplog 应为空；body 不应被记）
-        captured = self._capture_urlopen(
+        captured = self._capture_post(
             monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
         )
         ch = self._channel(
@@ -976,15 +977,17 @@ class TestCallLlmConsumesRequestExtra:
         # api_key 仍不打
         assert "FAKE_KEY_DO_NOT_LEAK_42" not in all_text
 
-        # 路径 B：urlopen 抛错 → 错误日志绝不打 api_key/request_extra 字段
+        # 路径 B：HTTP 请求抛连接错 → 错误日志绝不打 api_key/request_extra 字段
         caplog.clear()
-        from urllib.error import URLError
+        import httpx
 
-        def boom(req, **kw):
-            raise URLError("connection refused")
+        class _BoomClient:
+            def post(self, url, content=None, headers=None, **kw):
+                raise httpx.ConnectError("connection refused")
 
         monkeypatch.setattr(
-            "keepsake.consolidator.urllib.request.urlopen", boom
+            "keepsake.consolidator.get_client",
+            lambda *a, **k: _BoomClient(),
         )
         with caplog.at_level(logging.DEBUG):
             _call_llm([{"role": "user", "content": "hi"}], channel=ch)

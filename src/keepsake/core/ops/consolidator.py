@@ -33,12 +33,13 @@ import json
 import logging
 import os
 import re
-import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+
+from ..http import get_client, retrying
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
@@ -394,7 +395,7 @@ def _missing_concrete_tokens(sources: List[str], summary: str, limit: int = 20) 
 
 def _call_llm(messages: List[Dict[str, str]], model: str = "",
               *, channel: Optional[Dict[str, Any]] = None,
-              max_retries: int = 2) -> Optional[str]:
+              max_retries: int = 3) -> Optional[str]:
     """调用 chat API 获取 LLM 回复。带重试。
 
     channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key/request_extra）；
@@ -403,6 +404,9 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
     channel['request_extra']（r3 起消费）: 非空 dict → 合并进请求 body，厂商特异字段
         （如 {"thinking": {"type": "disabled"}}）走配置注入；缺/非 dict → 不合并，
         body 保持 OpenAI 兼容基线。
+    max_retries: 重试次数（不含首次尝试）。**2026-10 ks_perf_stdlib**：默认 2 → 3，
+        退避表从 2s/4s 改成 1s/2s/4s（与 embedder 同款策略，见 `core.http`）。
+        调用方显式传 0 仍然表示「不重试」（查询扩展的热路径就靠这个）。
     """
     if channel is None:
         # 旧调用方兜底：仅查 OPENAI_API_KEY
@@ -452,37 +456,56 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
     if isinstance(request_extra, dict) and request_extra:
         body_dict.update(request_extra)
     payload = json.dumps(body_dict).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
-    for attempt in range(1 + max_retries):
-        if attempt > 0:
-            wait = 2.0 * (2 ** (attempt - 1))  # 2s, 4s
-            logger.debug("consolidator: retry %d/%d after %.0fs", attempt, max_retries, wait)
-            time.sleep(wait)
+    # 2026-10 ks_perf_stdlib：httpx.Client（连接池复用）+ tenacity 重试。
+    # 手写的 sleep-retry 循环全部退役；退避表从 2s/4s 改成任务书要求的
+    # **1s/2s/4s**（`core.http.retrying` 是唯一真值源，embedder 同款）。
+    # 语义对齐：
+    #   * 429 / 连接类异常 ⇒ 重试（原来 urllib 把所有 HTTP 错误都当 URLError
+    #     重试了；现在只对限流与连接问题重试，请求本身的错（400/401…）不重试）；
+    #   * 坏 JSON（JSONDecodeError）⇒ 仍旧重试（旧手写重试覆盖它）；
+    #   * 「拿到响应但没有 choices」⇒ **不重试**（逐字保持原行为）；
+    #   * 重试耗尽 ⇒ 原异常上抛 ⇒ 落进原来的 except ⇒ 记 warning + 返回 None
+    #     （**降级链与留痕一字未改**）。
+    client = get_client(base_url, LLM_TIMEOUT)
+    attempts = {"n": 0}
 
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-                data = json.loads(resp.read())
-                choices = data.get("choices", [])
-                if choices:
-                    return choices[0].get("message", {}).get("content", "").strip()
-            # Got response but no choices — don't retry
-            logger.warning("consolidator: LLM returned no choices (attempt %d)", attempt + 1)
-            return None
-        except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-            if attempt < max_retries:
-                logger.debug("consolidator: LLM attempt %d failed: %s", attempt + 1, e)
-            else:
-                logger.warning("consolidator: LLM call failed after %d attempts: %s",
-                               attempt + 1, e)
-    return None
+    def _attempt() -> Optional[str]:
+        attempts["n"] += 1
+        resp = client.post(url, content=payload, headers=headers)
+        resp.raise_for_status()
+        data = json.loads(resp.content)
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "").strip()
+        # Got response but no choices — don't retry
+        logger.warning("consolidator: LLM returned no choices (attempt %d)", attempts["n"])
+        return None
+
+    def _log_retry(retry_state) -> None:
+        # 留痕与改造前逐字对齐：先「这次失败了」（带原因），再「多久之后重试」。
+        outcome = retry_state.outcome
+        exc = outcome.exception() if outcome is not None else None
+        logger.debug("consolidator: LLM attempt %d failed: %s",
+                     retry_state.attempt_number, exc)
+        logger.debug("consolidator: retry %d/%d after %.0fs",
+                     retry_state.attempt_number, max_retries,
+                     retry_state.next_action.sleep)
+
+    try:
+        return retrying(
+            retries=max_retries,
+            extra_retryable=lambda e: isinstance(e, json.JSONDecodeError),
+            before_sleep=_log_retry,
+        )(_attempt)
+    except (httpx.HTTPError, json.JSONDecodeError, OSError) as e:
+        logger.warning("consolidator: LLM call failed after %d attempts: %s",
+                       attempts["n"], e)
+        return None
 
 
 class Consolidator:

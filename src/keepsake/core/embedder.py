@@ -7,7 +7,8 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from typing import Optional
-from urllib.request import Request, urlopen
+
+from .http import get_client, retrying
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
@@ -110,6 +111,9 @@ class Embedder(ABC):
 _DEFAULT_OPENAI_URL = "https://api.openai.com/v1/embeddings"
 _DEFAULT_OPENAI_MODEL = "text-embedding-3-small"
 
+#: 单次请求超时（秒）—— 与改造前 `urlopen(timeout=30)` 逐字一致。
+EMBED_TIMEOUT_S = 30.0
+
 
 class OpenAIEmbedder(Embedder):
     """兼容 OpenAI Embedding API 的客户端。
@@ -171,34 +175,43 @@ class OpenAIEmbedder(Embedder):
             "input": text,
         }).encode("utf-8")
 
-        req = Request(
-            f"{self._base_url}/embeddings",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        url = f"{self._base_url}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        # 2026-10 ks_perf_stdlib：httpx.Client 复用连接池（省 TLS 握手）+
+        # tenacity 重试（429 / 连接类异常 3 次，退避 1s/2s/4s）。
+        # 语义与改造前逐字对齐：
+        #   * 4xx/5xx ⇒ `raise_for_status()` 抛 HTTPStatusError（原 urlopen 也抛）
+        #     —— **400 这类请求本身的错不重试**（重试只是浪费配额）；
+        #   * 重试耗尽 ⇒ 原异常原样上抛 ⇒ 落进下面那个 `except Exception`
+        #     ⇒ debug 日志 + 返回 None（**降级链一字未改**）。
+        client = get_client(self._base_url, EMBED_TIMEOUT_S)
+
+        def _post():
+            resp = client.post(url, content=payload, headers=headers)
+            resp.raise_for_status()
+            return resp
 
         try:
-            with urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-                emb = data["data"][0]["embedding"]
-                # 如果服务返回的维度与预期不符，更新 self._dim
-                # 2026-09 ks_embed_dim：提为 WARN，明确提示需重建索引
-                # 历史坑：INFO 静默自更新会让「登记维度 ≠ 实际维度」的真相
-                # 被推迟到下游才发现（KNN 静默 0 条、blob size 不匹配）。
-                if len(emb) != self._dim:
-                    logger.warning(
-                        "embedder: model %s returned %d dims (registered as %d), "
-                        "updating self._dim. NOTE: existing RediSearch index "
-                        "dim=%d will NOT match — drop and recreate the index, "
-                        "or re-register the model in _MODEL_DIMENSIONS.",
-                        self._model, len(emb), self._dim, self._dim,
-                    )
-                    self._dim = len(emb)
-                return emb
+            resp = retrying()(_post)
+            data = json.loads(resp.content)
+            emb = data["data"][0]["embedding"]
+            # 如果服务返回的维度与预期不符，更新 self._dim
+            # 2026-09 ks_embed_dim：提为 WARN，明确提示需重建索引
+            # 历史坑：INFO 静默自更新会让「登记维度 ≠ 实际维度」的真相
+            # 被推迟到下游才发现（KNN 静默 0 条、blob size 不匹配）。
+            if len(emb) != self._dim:
+                logger.warning(
+                    "embedder: model %s returned %d dims (registered as %d), "
+                    "updating self._dim. NOTE: existing RediSearch index "
+                    "dim=%d will NOT match — drop and recreate the index, "
+                    "or re-register the model in _MODEL_DIMENSIONS.",
+                    self._model, len(emb), self._dim, self._dim,
+                )
+                self._dim = len(emb)
+            return emb
         except Exception as e:
             logger.debug("embedder: request failed: %s", e)
             return None

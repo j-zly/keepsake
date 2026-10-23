@@ -137,14 +137,16 @@ class TestUnknownModelExplicitFail:
     ):
         """未知模型的 embedder.get_embedding 必须直接返回 None —— 不得发任何请求。
 
-        用哨兵 urlopen：若 urlopen 被调用一次就直接 raise，让测试失败（任务书红线）。
+        用哨兵 client 工厂：若真的去取 HTTP client 就直接 raise，让测试失败（任务书红线）。
+        （2026-10 ks_perf_stdlib：传输层从 urlopen 换成 httpx.Client，哨兵跟着换，
+        **断言一字未改**。）
         """
-        def _fail_urlopen(*args, **kwargs):
+        def _fail_client(*args, **kwargs):
             raise AssertionError(
                 "未知模型 embedder.get_embedding 不应发任何 HTTP 请求（任务书红线）"
             )
 
-        monkeypatch.setattr("keepsake.embedder.urlopen", _fail_urlopen)
+        monkeypatch.setattr("keepsake.embedder.get_client", _fail_client)
 
         emb = OpenAIEmbedder(api_key="sk-fake-test-key-002",
                              base_url="http://127.0.0.1:9999/v1",
@@ -227,17 +229,19 @@ class TestDimensionMismatchWarning:
 
     def test_mismatch_logs_warning_not_info(self, caplog, monkeypatch):
         """服务返回 2048 维，但登记为 1536 → 应打 WARN（不再是 INFO）。"""
-        # mock urlopen 返回 2048 维向量
-        def _fake_urlopen(req, timeout=30):
-            resp = MagicMock()
-            resp.__enter__ = lambda self: resp
-            resp.__exit__ = lambda self, *args: None
-            resp.read = lambda: json.dumps({
-                "data": [{"embedding": [0.0] * 2048}],
-            }).encode("utf-8")
-            return resp
+        # mock httpx client 返回 2048 维向量（2026-10 ks_perf_stdlib：传输层换 httpx）
+        def _fake_client(base_url, timeout=30.0):
+            class _FakeClient:
+                def post(self, url, content=None, headers=None):
+                    resp = MagicMock()
+                    resp.raise_for_status = lambda: None
+                    resp.content = json.dumps({
+                        "data": [{"embedding": [0.0] * 2048}],
+                    }).encode("utf-8")
+                    return resp
+            return _FakeClient()
 
-        monkeypatch.setattr("keepsake.embedder.urlopen", _fake_urlopen)
+        monkeypatch.setattr("keepsake.embedder.get_client", _fake_client)
 
         emb = OpenAIEmbedder(api_key="sk-fake-mismatch-key",
                              base_url="http://127.0.0.1:9999/v1",
@@ -265,16 +269,18 @@ class TestDimensionMismatchWarning:
 
     def test_no_warning_when_dim_matches(self, caplog, monkeypatch):
         """维度一致 → 不打任何 WARN（正常路径无噪音）。"""
-        def _fake_urlopen(req, timeout=30):
-            resp = MagicMock()
-            resp.__enter__ = lambda self: resp
-            resp.__exit__ = lambda self, *args: None
-            resp.read = lambda: json.dumps({
-                "data": [{"embedding": [0.0] * 1536}],
-            }).encode("utf-8")
-            return resp
+        def _fake_client(base_url, timeout=30.0):
+            class _FakeClient:
+                def post(self, url, content=None, headers=None):
+                    resp = MagicMock()
+                    resp.raise_for_status = lambda: None
+                    resp.content = json.dumps({
+                        "data": [{"embedding": [0.0] * 1536}],
+                    }).encode("utf-8")
+                    return resp
+            return _FakeClient()
 
-        monkeypatch.setattr("keepsake.embedder.urlopen", _fake_urlopen)
+        monkeypatch.setattr("keepsake.embedder.get_client", _fake_client)
 
         emb = OpenAIEmbedder(api_key="sk-fake-match-key",
                              base_url="http://127.0.0.1:9999/v1",

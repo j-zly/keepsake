@@ -31,6 +31,13 @@ dependencies = [
     # 英文词干化（Porter2）—— 纯 Python 实现，无模型下载、无外部服务。
     # 索引侧与查询侧共用同一个归一函数（见 keepsake/domain/splitter.py 的对称铁律）。
     "snowballstemmer>=2.2",
+    # HTTP 栈统一（2026-10 ks_perf_stdlib）：httpx 客户端（连接池复用，省 TLS 握手）
+    # + tenacity 重试（429/连接类异常退避重试）。原先 embedder / LLM 通道各用一套
+    # urllib.request，超时与重试口径两套 —— 现在只有 core/http.py 一份真值源。
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    # `python -m keepsake.jobs` —— 定时任务统一入口（distill/dedup/tiering）。
+    "typer>=0.12",
 ]
 
 [project.optional-dependencies]
