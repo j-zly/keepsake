@@ -21,6 +21,13 @@
   - **按钮不许折字**：操作行按钮一律 `white-space: nowrap`，容器 `flex-wrap`
     （放不下整组换行，不许把字竖排成两行）。插槽内容用 `:deep` 才够得着。
 
+  2026-10-23 默认态改「开放」（用户拍板「一眼就能看到」）：
+  - 状态筛选**默认 = 开放**（`status` 初值 `'open'`）⇒ 打开页面只看还欠着的；
+    状态下拉清空（全部状态）才看三段分组。
+  - 「清除筛选」回的是**开放**（默认态），不是全量；「有没有筛选」的判定
+    也把默认态排除在外 ⇒ 页脚那颗按钮不会常驻。
+  - 顶部三张 StatCard 仍走 summary 接口的**全量**计数，不受默认态影响。
+
   样式守 web/DESIGN.md：卡片 1px 描边 + --shadow-card、chip 走既有档、
   零硬编码色值。
 -->
@@ -58,7 +65,7 @@
     <div class="filter-panel">
       <div class="filter-title">筛选待办</div>
       <p class="filter-desc">
-        按归属代理与状态筛；清空回全量。三态（开放 / 已完成 / 已废弃）分三段摆。
+        按归属代理与状态筛；默认只看开放，状态清空（全部状态）看三段。
       </p>
       <div class="filter-ctl">
         <el-select v-model="owner" class="sel" placeholder="全部归属" clearable @change="search">
@@ -69,7 +76,7 @@
             :value="a.agent_id"
           />
         </el-select>
-        <el-select v-model="status" class="sel" placeholder="全部状态" clearable @change="search">
+        <el-select v-model="status" class="sel" placeholder="全部状态（含已完成 / 已废弃）" clearable @change="search">
           <el-option v-for="s in TODO_STATUSES" :key="s" :label="STATUS_LABEL[s]" :value="s" />
         </el-select>
         <button class="soft-btn" :disabled="loading" @click="search">查询</button>
@@ -107,10 +114,14 @@
           <circle cx="19" cy="17.4" r="3.1" />
           <path d="m21.3 19.7 1.5 1.5" stroke-linecap="round" />
         </svg>
-        <!-- 空态两分支：筛完没结果 vs 全库为空，说的不是同一件事 -->
+        <!-- 空态三分支：筛完没结果 / 开放段空了 / 全库真的空，说的不是同一件事 -->
         <p v-if="dirty">
           <b>没有匹配到这个筛选</b>
-          换个归属或状态试试，或点「清除筛选」回全量。
+          换个归属或状态试试，或点「清除筛选」回只看开放。
+        </p>
+        <p v-else-if="summary.total">
+          <b>没有开放的待办</b>
+          都销掉了？状态清空选「全部状态」看已完成 / 已废弃。
         </p>
         <p v-else>
           <b>还没有待办</b>
@@ -203,7 +214,14 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(50)
 const owner = ref('')
-const status = ref('')
+/**
+ * 状态筛选的**默认值 = 开放**（2026-10-23 用户拍板「一眼就能看到」）。
+ *
+ * 打开页面 = 只看还欠着的那些；把状态下拉清空（全部状态）才看三段分组。
+ * 🔴 这个默认值**不参与**「有没有筛选」的判定（见 `dirty`）——
+ *   否则「清除筛选」按钮会一直亮着，等于常驻一个没用的按钮。
+ */
+const status = ref('open')
 const loading = ref(false)
 const busy = ref(false)
 const creating = ref(false)
@@ -222,8 +240,14 @@ const groups = computed(() => [
   { key: 'obsolete', label: '已废弃', rows: grouped.value.obsolete },
 ])
 
-/** 有筛选在生效吗：空态分支与「清除筛选」按钮都看它。 */
-const dirty = computed(() => !!(owner.value || status.value))
+/**
+ * 有筛选在生效吗：空态分支与「清除筛选」按钮都看它。
+ *
+ * 口径：归属非空 **或** 状态不是默认的「开放」⇒ 算有筛选。
+ * （状态选了「全部状态」也是筛选的一种 —— 与默认不同 ⇒ 算 dirty，
+ *  这样「清除筛选」能把人带回默认的只看开放。）
+ */
+const dirty = computed(() => !!(owner.value || status.value !== 'open'))
 
 /** 勾选集合（跨页保留，与记忆条目页同款口径）。 */
 const selected = ref(new Set())
@@ -325,10 +349,13 @@ function search() {
   load()
 }
 
-/** 清空筛选：无条件回全量（不是空态），与常驻层/知识库同一口径。 */
+/**
+ * 清除筛选：归属回空、状态回**默认的开放**（不是全量 —— 默认值就是开放）。
+ * 与常驻层/知识库同一口径：清的是「筛」不是「数据」。
+ */
 function clearFilter() {
   owner.value = ''
-  status.value = ''
+  status.value = 'open'
   search()
 }
 

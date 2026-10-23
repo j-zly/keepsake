@@ -257,6 +257,31 @@ def test_规则一_batch_cap封顶(storage):
     assert sum(1 for r in rows if CANDIDATE_TAG in _tags(storage, r["key"])) == 2
 
 
+def test_规则一_孤儿命中不进提名也不计失败(storage):
+    """条目已删、命中事件还留着 ⇒ 静默跳过（2026-10-23 案）。
+
+    防的是「删条目 → 命中残留 → 次日班车红」：孤儿 key **零提名零 failed**
+    （进 failed 就是失败 ⇒ 班车报警）。同时钉死回归：**活着的**候选照常提名
+    （过滤别把正常候选一起滤掉）。
+    """
+    _seed(storage, [{"key": "memory:frag:alive", "content": "活着的条目" * 10,
+                     "tags": "demo"}])
+    _seed_hits(storage, "memory:frag:alive", 5)
+    _seed_hits(storage, "memory:frag:ghost", 5)     # 条目不存在 ⇒ 孤儿命中
+    cfg = {"tiering": {"enabled": True,
+                       "promote_nominate": {"window_days": 7, "nominate_min_hits": 5}},
+           "retrieval": {"core_char_budget": 1000}}
+
+    stats = run_tiering(storage, cfg, dry_run=False, now=NOW)
+
+    assert "memory:frag:ghost" not in stats["nominate"]["keys"], "孤儿 key 不该进提名"
+    assert stats["nominate"]["count"] == 1
+    assert stats["nominate"]["keys"] == ["memory:frag:alive"], "活着的照常提名"
+    assert CANDIDATE_TAG in _tags(storage, "memory:frag:alive")
+    assert stats["failed"] == [], "孤儿命中不许算失败（否则次日班车红）"
+    assert stats["nominate"]["orphaned"] == 1
+
+
 # ---------------------------------------------------------------------------
 # 提名基数（2026-10 常驻层入口改革）：提名即带基数
 #

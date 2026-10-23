@@ -86,6 +86,46 @@ test('完成率口径：已销掉（done + obsolete）÷ 全部', () => {
   assert.equal(completionPercent({}), 0)
 })
 
+// ------------------------------------------------------------ 默认态 = 开放
+//
+// 2026-10-23 用户拍板「一眼就能看到」：打开待办页**默认只看开放**。
+// 联动三处一起钉死：① 默认值 ②「有没有筛选」的判定（默认态不算筛选，
+// 否则页脚清除按钮常驻）③「清除筛选」回的是开放（不是全量）。
+
+test('默认态 = 开放：首屏只看开放，「清除筛选」回开放（不是全量）', () => {
+  // ① 默认值：状态筛选初值是 open（打开页面 = 只看还欠着的）
+  assert.match(VIEW, /const status = ref\('open'\)/, '状态筛选默认 = 开放')
+  // 首屏把 status 透传给后端（前端不自己藏行 —— 后端按状态筛）
+  assert.match(VIEW, /if \(status\.value\) params\.status = status\.value/,
+    '状态非空就作为参数透传（默认态即 status=open）')
+
+  // ② dirty：默认态（open）不算「有筛选」⇒ 页脚清除按钮不常驻
+  assert.match(VIEW, /const dirty = computed\(\(\) => !!\(owner\.value \|\| status\.value !== 'open'\)\)/,
+    '默认态不算有筛选（只有归属非空或状态≠open 才算）')
+
+  // ③ 清除筛选：状态回 open、归属回空
+  const clear = VIEW.match(/function clearFilter\(\)[\s\S]*?\n}/)[0]
+  assert.match(clear, /status\.value = 'open'/, '清除筛选回默认的开放')
+  assert.match(clear, /owner\.value = ''/, '归属仍重置为空')
+})
+
+test('回归：状态选「全部状态」⇒ 三段分组都在，done 不被藏起来', () => {
+  // 接线：状态下拉可清空（清空 = 全部状态）；空值时不透传 status ⇒ 后端回全量
+  assert.match(VIEW, /<el-select v-model="status"[^>]*clearable/, '状态下拉可清空 = 全部状态')
+  assert.match(VIEW, /placeholder="全部状态/, 'placeholder 说明清空后是全部状态')
+
+  // 真函数：全量回来后 done 仍在「已完成」分组里（不被默认态藏掉）
+  const g = groupByStatus([{ status: 'open' }, { status: 'done' }, { status: 'obsolete' }])
+  assert.equal(g.open.length, 1)
+  assert.equal(g.done.length, 1, 'done 行进「已完成」分组')
+  assert.equal(g.obsolete.length, 1, 'obsolete 行进「已废弃」分组')
+
+  // 页面确实摆了三段（选全部状态时三段都在）
+  assert.match(VIEW, /\{ key: 'open', label: '开放'/, '页面有开放段')
+  assert.match(VIEW, /\{ key: 'done', label: '已完成'/, '页面有已完成段')
+  assert.match(VIEW, /\{ key: 'obsolete', label: '已废弃'/, '页面有已废弃段')
+})
+
 // ---------------------------------------------------------------- 接线
 
 test('页面走 /api/v1/todos（列表 / 计数 / 建议废弃）', () => {
@@ -178,7 +218,7 @@ test('① 筛选面板化：筛选区只管筛，不再混着新增表单', () =
   assert.match(VIEW, /<div class="filter-title">筛选待办<\/div>/, '面板标题说明这块只管筛')
   assert.match(VIEW, /v-model="owner"/, '归属筛选')
   assert.match(VIEW, /v-model="status"/, '状态筛选')
-  assert.match(VIEW, /清除筛选/, '有「清除筛选」回全量')
+  assert.match(VIEW, /清除筛选/, '有「清除筛选」回默认态')
   // 归属/到期日那句提示长句挪进弹框，不占页面主区
   assert.doesNotMatch(VIEW, /在册且已批准/, '那句提示长句不许留在页面主区')
   assert.match(DIALOG, /在册且已批准/, '提示长句在弹框表单下方')

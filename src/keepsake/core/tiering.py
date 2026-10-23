@@ -26,6 +26,9 @@
    tags，审核页一眼看出是哪来的申请）。**不新造表**：复用既有候选审核队列。
    🟡 阈值取 3000 是口语碎片凭高频检索打点也能进的现实压力 —— 现流量下基本
    等于关死本轨，但核心层手动 promote 端点不受影响（人批走另一条路）。
+   🔴 **孤儿命中不进提名**（2026-10-23 案）：条目已删、命中事件还留着 ⇒
+   静默跳过，**不计 failed**（否则次日班车无谓地红）。存在性判据复用
+   `get_fragments_batch`（三后端语义一致：缺失的 key 不出现在结果里）。
 2. **自动审核通过 / 驳回（替换旧 auto_promote）**：候选自提名日起满
    `promote_auto.review_window_days` 天（默认 7），评估**自提名日起累计命中**
    ≥ `promote_auto.promote_approve_hits`（默认 5000）⇒
@@ -667,7 +670,11 @@ def _demote(storage: Any, key: str, action: str, extra: List[str],
 
 def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
                    dry_run: bool, stats: Dict[str, Any]) -> None:
-    """窗口内够热 ⇒ 打候选标（进既有审核队列，不直接升常驻）。"""
+    """窗口内够热 ⇒ 打候选标（进既有审核队列，不直接升常驻）。
+
+    🔴 **孤儿命中（条目已删、命中残留）静默跳过**：不进提名、不计 failed
+    （三后端同一入口 ⇒ 一处改好；判据见 `get_fragments_batch` 的契约）。
+    """
     cfg = t["promote_nominate"]
     cap = t["batch_cap"]
     backfill = int(t.get("nominate_backfill_hits") or 0)
@@ -677,11 +684,27 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
                              keys=None, limit=limit) or []
     keys = [str(r.get("key") or "") for r in hot if r.get("key")]
     rows = storage.get_fragments_batch(keys) if keys else {}
+    if keys and not rows:
+        # 🔴 整批读回来一条都没有 ⇒ 更像**后端读失败**（Redis 侧
+        # `get_fragments_batch` 失败只打 warning 并返回空 dict），不是
+        # 「所有 key 都是孤儿」⇒ 留一条痕迹，免得班车安安静静一条不提名。
+        logger.warning("keepsake: 提名候选批量读回空（%d 个 key）—— 可能后端读失败，"
+                       "本轮按孤儿命中跳过", len(keys))
     picked: List[str] = []
     skipped_candidate = 0
+    orphaned = 0
     backed_up = 0
     for key in keys:
-        row = rows.get(key) or {}
+        row = rows.get(key)
+        if row is None:
+            # 🔴 孤儿命中（2026-10-23 案）：条目已删、命中事件还留着 ⇒
+            #   **静默跳过**：不进提名、**不计 failed**（否则次日班车无谓地红）。
+            #   存在性判据用 `get_fragments_batch` 的同一份读（契约：缺失的 key
+            #   不出现在结果里）⇒ PG / SQLite / Redis 三个后端一处改好。
+            #   数据层已清过 3312 条孤儿命中，本条防的是**未来**「删条目 →
+            #   命中残留 → 次日班车红」重现。
+            orphaned += 1
+            continue
         tags = tag_list(row.get("tags"))
         if CORE_TAG in tags or CANDIDATE_TAG in tags:
             skipped_candidate += 1
@@ -707,6 +730,7 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
                          "already": skipped_candidate, "window_days": cfg["window_days"],
                          "nominate_min_hits": cfg["nominate_min_hits"],
                          "backfill_hits": backfill, "backfilled": backed_up,
+                         "orphaned": orphaned,
                          "dry_run": dry_run}
 
 
