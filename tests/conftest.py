@@ -65,6 +65,29 @@ def flat_routes(app) -> list:
 
 
 @pytest.fixture(autouse=True)
+def _reset_shared_pg_pools():
+    """每个用例后关闭并清空进程级共享池注册表（`_SHARED_POOLS`）。
+
+    🔴 生产语义是「注册表永不移除」（根治网关每会话泄漏，见 core/pg.py），
+    但**测试进程**里数百个真库用例各用不同 conninfo 变体（只读事务/库名后缀），
+    每个 key 一个池、每池至少养 min_size=1 条连接且实例 close() 不再关共享池
+    ⇒ 全量 pytest 跑几分钟连接数只涨不降，把 91（max_connections=50）打满，
+    表现为成片 `sorry, too many clients already`（2026-10-23 全量实踩）。
+    与 _reset_pg_snapshots 同理：清在 fixture，不改生产实现。
+    """
+    from keepsake.storage_pg import _SHARED_POOLS, _SHARED_POOL_SRC
+
+    yield
+    for pool in _SHARED_POOLS.values():
+        try:
+            pool.close()
+        except Exception:  # noqa: BLE001 —— 清理尽力而为
+            pass
+    _SHARED_POOLS.clear()
+    _SHARED_POOL_SRC.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_pg_snapshots():
     """每个用例前后清空 PG 检索快照（`_SNAPSHOTS`）。
 

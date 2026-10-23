@@ -242,6 +242,52 @@ POOL_MAX_LIFETIME_S = 3600.0
 #: 借连接的等待上限（秒）—— 超过就抛 PoolTimeout（fail-closed，不静默降级）
 POOL_CHECKOUT_TIMEOUT_S = 30.0
 
+# --------------------------------------------------------------------------
+# 进程级**共享**连接池注册表（2026-10 pg_pool_singleton）
+#
+# 🔴 为什么必须有（主脑 2026-10-23 实测取证）：
+#   Hermes 网关**每起一个会话就实例化一次 KeepsakeProvider** → 各自
+#   `storage_from_config` 建一个 PgStorage → 各带一个自己的 ConnectionPool
+#   （min1/max8）。会话销毁时 `provider.shutdown()` 未必被宿主调用 ⇒ 池与连接
+#   就滞留。实测：网关进程（uptime 6.5h）对 180:5432 挂了 95 条连接，其中
+#   73 条纯 idle>1h；180 的 max_connections=100 被打满 ⇒ kb 读写全阻。
+#   服务端闲时回收只是止血，根治只有一个办法：**同一 DSN 全进程只有一个池**，
+#   谁用都借它（借/还由池管，连接数恒定 ≤ max_size）。
+#
+# 🔴 键 = conninfo 字符串（**不另做归一解析**：DSN 形式与 host/port 形式本来就
+#   是两种写法，硬要归一反而会引入「归一错了 ⇒ 连错库」的新风险）。
+#   值 = 池对象。
+#
+# 🔴 **注册表里永不移除**：移了 ⇒ 下一个实例又会建一个新池 ⇒ 又是一批连接
+#   （正是本单要根治的那个泄漏）。连接的回收交给**池自身**的
+#   `max_idle=60s` / `max_lifetime=3600s` 机制。
+#   也**不加引用计数**：谁在用池由「借/还」决定，池空了自然被回收；
+#   引用计数只会把「谁最后走」这种说不清的事变成 bug 的温床。
+# --------------------------------------------------------------------------
+_SHARED_POOLS: Dict[str, Any] = {}
+
+#: 注册表的**独立**锁（与实例内的 `_conn_lock` 分开：注册表是**跨实例**的全局态，
+#: 而 `_conn_lock` 是实例私有的、还兼着检索线程池的惰性建）。
+_SHARED_POOLS_LOCK = threading.Lock()
+
+#: 每个 conninfo 的池是「**谁建的**」（`_build_pool` 的底层函数对象）。
+#: 建池实现换了（子类覆盖 / 测试注入）就说明池的口径变了，旧池不该再被别的
+#: 实现复用 —— 换新池。生产路径上这个函数恒定 ⇒ 判据退化成「同 DSN 即同池」。
+_SHARED_POOL_SRC: Dict[str, Any] = {}
+
+
+def _close_pool(pool: Any) -> None:
+    """关掉一个池 —— **关不掉也不许挡住别的清理**（只记警告）。"""
+    try:
+        pool.close()
+    except Exception as e:      # noqa: BLE001
+        logger.warning("storage_pg: 关连接池失败: %s: %s", type(e).__name__, e)
+
+
+def _pool_closed(pool: Any) -> bool:
+    """池是不是已经关了（判据用 `closed` 属性；没有这个属性的假池一律当没关）。"""
+    return bool(getattr(pool, "closed", False))
+
 # 🔴 **DDL 一律拆成 (对象名, 语句) 两元组**：`ensure_index()` 拿对象名去
 # information_schema / pg_indexes 核对，**只补真缺的那些**。
 # 为什么不能把整段 DDL 无脑重发（这正是线上死锁的根因，见 ensure_index 的 docstring）：
@@ -979,10 +1025,15 @@ class PgStorage(StorageBase):
         self._attention_base_increment = float(attention_base_increment)
         self._attention_emotion_factor = float(attention_emotion_factor)
         self._hot_topic_decay_half_days = int(hot_topic_decay_half_days)
-        # ---- 连接池（2026-10 ks_pg_pool）：进程级，惰性建 ----
+        # ---- 连接池（2026-10 ks_pg_pool）：**进程级共享**，惰性建 ----
+        # 同一个 conninfo 全进程只有一个池（见 `_SHARED_POOLS`）：
+        # 网关每会话一个 provider ⇒ 每会话一个 PgStorage ⇒ 不共享就会
+        # 每会话泄漏一批连接（实测把 PG 的 max_connections 打满）。
         self._conn_pool: Optional[Any] = None
         #: 建这个池时用的 conninfo（变了就重建，见 `_get_pool`）
         self._pool_conninfo: str = ""
+        #: 实例私有的锁（检索线程池的惰性建用它）；**连接池**的共享登记用
+        #: 模块级的 `_SHARED_POOLS_LOCK`（跨实例）。
         self._conn_lock = threading.Lock()
         #: 新建连接时的初始化回调（可注入）。测试用它把「精确 KNN 计划」钉到
         #: **每一条**池连接上（池化之后会话级设置不再只属于某一条连接）。
@@ -1038,6 +1089,10 @@ class PgStorage(StorageBase):
         重试**连库，客户端要等到 checkout 超时才拿到 `PoolTimeout` —— 那会让
         「DSN 写错了」变成「每次调用白等 30 秒」。先探一次：连不上就直接抛
         psycopg 的**连接类**异常（与改池之前 `psycopg.connect` 的口径逐字一致）。
+
+        🔴 **登记进共享注册表的是 `_get_pool`，不是这里** —— 谁「决定用哪个池」
+        的人负责登记；这里只管「造一个池出来」。`_rebuild_pool` 也因此能在
+        注册表锁内做「取旧换新」。
         """
         import psycopg  # noqa: PLC0415 — optional 依赖
         from psycopg_pool import ConnectionPool  # noqa: PLC0415 — optional 依赖
@@ -1066,28 +1121,72 @@ class PgStorage(StorageBase):
                     POOL_MIN_SIZE, POOL_MAX_SIZE, self._host, self._port, self._dbname)
         return pool
 
+    def _pool_source(self) -> Any:
+        """建池实现的身份 —— `_build_pool` 的**底层函数**（不是 bound method：
+        每次访问 bound method 都是新对象，比不了）。
+
+        注册表条目记着它：实现换了 ⇒ 池的口径（连接参数/构造方式）可能变了
+        ⇒ 旧池不该再被别的实现复用。生产路径上这个函数恒定 ⇒ 判据退化成
+        「同 DSN 即同池」。
+        """
+        fn = getattr(self._build_pool, "__func__", None)
+        return fn if fn is not None else self._build_pool
+
     def _get_pool(self) -> Any:
-        """取（必要时建）进程级连接池。
+        """取（必要时建）**进程级共享**连接池。
+
+        🔴 **同一 conninfo 全进程只有一个池**（见 `_SHARED_POOLS` 的说明）：
+        网关每会话一个 provider ⇒ 每会话一个 PgStorage ⇒ 不共享就是每会话一个池，
+        会话不销毁就泄漏（实测把 180 的 max_connections 打满）。
 
         🔴 **conninfo 变了就重建**（评测器给 DSN 追加
         `default_transaction_read_only=on` 那一套就靠这个生效）——
         池子是按旧 conninfo 建的，不重建就等于「改了配置没生效」。
         """
-        pool = self._conn_pool
-        if pool is not None and self._pool_conninfo == self._conninfo():
-            return pool
-        with self._conn_lock:
-            if self._conn_pool is not None and self._pool_conninfo == self._conninfo():
-                return self._conn_pool
-            old, self._conn_pool = self._conn_pool, None
-            if old is not None:
-                try:
-                    old.close()
-                except Exception as e:      # noqa: BLE001 —— 关不掉也要把新池建起来
-                    logger.warning("storage_pg: 关旧连接池失败: %s: %s", type(e).__name__, e)
-            self._conn_pool = self._build_pool()
-            self._pool_conninfo = self._conninfo()
-            return self._conn_pool
+        key = self._conninfo()
+        local = self._conn_pool
+        # 本实例手上已有的池：conninfo 没变且池还活着 ⇒ 直接用（省一次注册表查找）
+        if local is not None and self._pool_conninfo == key and not _pool_closed(local):
+            return local
+        old_local, old_conninfo = local, self._pool_conninfo
+        src = self._pool_source()
+        stale: Any = None
+        with _SHARED_POOLS_LOCK:
+            pool = _SHARED_POOLS.get(key)
+            if pool is not None and _SHARED_POOL_SRC.get(key) is not src:
+                # 建池实现换了 ⇒ 旧池口径不同 ⇒ 换掉（旧的照旧关闭，锁外做）
+                stale, pool = pool, None
+                _SHARED_POOLS.pop(key, None)
+                _SHARED_POOL_SRC.pop(key, None)
+        extra: Any = None
+        if pool is None:
+            # 🔴 **建池不占注册表锁**：建池要先探一次库（可能几秒），占着锁会把
+            #   别的 DSN 的取池一起拖住（网关里就是「一个慢 DSN 拖垮全部」）。
+            built = self._build_pool()
+            with _SHARED_POOLS_LOCK:
+                current = _SHARED_POOLS.get(key)
+                if current is None or _SHARED_POOL_SRC.get(key) is not src:
+                    _SHARED_POOLS[key] = built
+                    _SHARED_POOL_SRC[key] = src
+                    pool = built
+                else:
+                    # 并发首次取池：期间别人已经建好并登记了 ⇒ **以注册表为准**，
+                    # 自己多建的那份当场关掉（先登记的赢 ⇒ 所有人收敛到同一个池）。
+                    pool, extra = current, built
+        self._conn_pool = pool
+        self._pool_conninfo = key
+        if stale is not None:
+            _close_pool(stale)
+        if extra is not None:
+            _close_pool(extra)
+        # 本实例换 DSN 时留下的旧池：**共享池不动**（别的实例还在用），
+        # 只有「没登记在注册表里的私有池」才关掉。
+        if old_local is not None and old_local is not pool:
+            with _SHARED_POOLS_LOCK:
+                shared = _SHARED_POOLS.get(old_conninfo)
+            if shared is not old_local:
+                _close_pool(old_local)
+        return pool
 
     def _rebuild_pool(self) -> Any:
         """**池重建语义**：关掉旧池，另起一个。
@@ -1095,15 +1194,38 @@ class PgStorage(StorageBase):
         什么时候用：借连接时抛**连接类**异常（OperationalError / PoolClosed…）
         ⇒ 池里的连接整体坏了，重建比在坏池里空等更快。
         `PoolTimeout`（池被借空）**不重建** —— 那是并发太高，重建只会多开连接。
+
+        🔴 共享语义：**注册表同 key 换成新池，旧池照旧关闭**
+        （取旧换新在注册表锁内完成 ⇒ 并发重建不会各建各的）。
+        别的实例**已经**换过池（注册表里的池已经不是本实例手上这个坏的）⇒
+        **直接用那个现成的**，不再建第二个 —— 否则实例之间会互相把对方的池换掉，
+        来回重建 ⇒ 连接数翻倍（比不共享还糟）。
         """
-        with self._conn_lock:
-            old, self._conn_pool = self._conn_pool, None
-        if old is not None:
-            try:
-                old.close()
-            except Exception as e:      # noqa: BLE001 —— 关不掉也要把新池建起来
-                logger.warning("storage_pg: 关旧连接池失败: %s: %s", type(e).__name__, e)
-        return self._get_pool()
+        key = self._conninfo()
+        src = self._pool_source()
+        with _SHARED_POOLS_LOCK:
+            registered = _SHARED_POOLS.get(key)
+            broken = self._conn_pool
+        extra: Any = None
+        if registered is not None and registered is not broken:
+            new = registered                          # 别的实例已经换过了 ⇒ 用现成的
+        else:
+            built = self._build_pool()               # 🔴 锁外建池（探库慢，别占锁）
+            with _SHARED_POOLS_LOCK:
+                current = _SHARED_POOLS.get(key)
+                if current is not None and current is not broken:
+                    new, extra = current, built      # 期间别人换好了 ⇒ 用现成的
+                else:
+                    new = built
+                    _SHARED_POOLS[key] = new
+                    _SHARED_POOL_SRC[key] = src
+        self._conn_pool = new
+        self._pool_conninfo = key
+        if extra is not None:
+            _close_pool(extra)
+        if broken is not None and broken is not new:
+            _close_pool(broken)
+        return new
 
     def _checkout(self) -> Tuple[Any, Any]:
         """借一条连接 ⇒ `(pool, conn)`。
@@ -1436,17 +1558,28 @@ class PgStorage(StorageBase):
             )
 
     def close(self) -> None:
-        """关连接（连接池 + 检索线程池），可重复调用。"""
+        """关**本实例私有的**东西（检索线程池 + 私有连接池），可重复调用。
+
+        🔴 **共享池不随实例 close 而关闭**（2026-10 pg_pool_singleton）：
+        同一个池被同进程的其它 PgStorage 实例共用着，关掉它 = 把别人的连接
+        也断了（网关每会话一个实例 ⇒ 关一次就误伤一次）。
+        连接的回收交给**池自身**（`max_idle=60s` / `max_lifetime=3600s`），
+        注册表里那个条目**永不移除**（移了下一个实例又会建一个新池 ⇒ 又是一批
+        连接 —— 正是本单要根治的那个泄漏）。
+        """
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=True)
         with self._conn_lock:
             conn_pool, self._conn_pool = self._conn_pool, None
-        if conn_pool is not None:
-            try:
-                conn_pool.close()
-            except Exception as e:      # noqa: BLE001 —— 关池失败不许挡住后面的清理
-                logger.warning("storage_pg: 关连接池失败: %s: %s", type(e).__name__, e)
+            conninfo = self._pool_conninfo
+        if conn_pool is None:
+            return
+        with _SHARED_POOLS_LOCK:
+            shared = _SHARED_POOLS.get(conninfo)
+        if shared is conn_pool:
+            return          # 共享池：别的实例还在用 ⇒ 不关（只放掉本实例的引用）
+        _close_pool(conn_pool)
 
     # ------------------------------------------------------------------
     # 语料维护类仍未实现（显式抛错，绝不静默返回零统计）
