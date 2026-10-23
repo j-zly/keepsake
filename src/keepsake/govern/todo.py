@@ -465,6 +465,22 @@ class _TodoSqlBackend(_SqlBase):
         rows = self.read(f"SELECT {cols} FROM {TABLE}{where} ORDER BY id ASC", params)
         return [_norm_row(dict(zip(TODO_FIELDS, r))) for r in rows]
 
+    def group_by_owner(self, owner: str = "") -> List[Dict[str, Any]]:
+        """按 owner + status 分组计数（**一条 SQL**：`GROUP BY owner, status`）。
+
+        🔴 **只读聚合**：不写、不改状态、不碰 `done_at` —— 分列只是「谁欠多少」
+        的一次统计（看板「待办完成率按代理看」用）。
+        """
+        where = f" WHERE owner = {self.ph}" if owner else ""
+        params = (owner,) if owner else ()
+        rows = self.read(
+            f"SELECT owner, status, COUNT(*) FROM {TABLE}{where} "
+            f"GROUP BY owner, status",
+            params,
+        )
+        return [{"owner": str(r[0] or ""), "status": str(r[1] or ""), "n": int(r[2] or 0)}
+                for r in rows]
+
 
 class _RedisBackend:
     """Redis：每条待办一个 hash + 全量 id LIST + 发号计数器。
@@ -571,6 +587,19 @@ class _RedisBackend:
         total = len(rows)
         start = (page - 1) * size
         return rows[start:start + size], total
+
+    def group_by_owner(self, owner: str = "") -> List[Dict[str, Any]]:
+        """按 owner + status 分组计数（Redis 侧**内存分组**）。
+
+        🔴 与 SQL 侧**同一份语义**（同样的 `{owner, status, n}` 行）——
+        Redis 没有 GROUP BY，只能扫一遍全量 LIST（待办量级「几十条」，够用；
+        与本模块其它 Redis 原语同一取舍）。
+        """
+        out: Dict[Tuple[str, str], int] = {}
+        for row in self.all_rows(owner):
+            key = (str(row.get("owner") or ""), str(row.get("status") or ""))
+            out[key] = out.get(key, 0) + 1
+        return [{"owner": o, "status": s, "n": n} for (o, s), n in out.items()]
 
 
 # --------------------------------------------------------------------------
@@ -697,6 +726,35 @@ class TodoStore:
             "total": len(rows),
             "overdue": overdue,
         }
+
+    def summary_by_owner(self, owner: str = "") -> List[Dict[str, Any]]:
+        """**按归属代理**分列的计数：`[{owner, open, done, obsolete, total}]`。
+
+        🔴 **只读聚合**（SQL 侧一条 `GROUP BY owner, status`；Redis 侧内存分组）——
+        与 `summary()` 的口径一致，只是**按 owner 拆开**（看板「待办完成率按代理看」
+        用；`owner` 参数与 `summary()` 同义：空 = 全部）。
+
+        这里**不给名字** —— 名字由注册表（`ks_agent`）说了算，放在 API 层拼
+        （那一层本来就拿得到注册表）。
+        """
+        self._ready()
+        buckets: Dict[str, Dict[str, int]] = {}
+        for row in self._be.group_by_owner(str(owner or "").strip()):
+            key = str(row.get("owner") or "")
+            b = buckets.setdefault(key, {s: 0 for s in STATUSES})
+            st = str(row.get("status") or "")
+            if st in b:
+                b[st] += int(row.get("n") or 0)
+        return [
+            {
+                "owner": key,
+                "open": b[STATUS_OPEN],
+                "done": b[STATUS_DONE],
+                "obsolete": b[STATUS_OBSOLETE],
+                "total": sum(b.values()),
+            }
+            for key, b in buckets.items()
+        ]
 
     def obsolete_suggestions(self, days: int = OBSOLETE_SUGGEST_DAYS,
                              today: Optional[date] = None,

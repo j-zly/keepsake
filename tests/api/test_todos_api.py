@@ -143,7 +143,56 @@ def test_计数与看板小节口径一致(env):
     client.post(f"/api/v1/todos/{tid}/status", headers=AUTH,
                 json={"status": "done", "confirm": True})
     body = client.get("/api/v1/todos/summary", headers=AUTH).json()
-    assert body == {"open": 1, "done": 1, "obsolete": 0, "total": 2, "overdue": 0}
+    # 老字段一字不改（前端那几处计数都指着它们）
+    assert {k: body[k] for k in ("open", "done", "obsolete", "total", "overdue")} == {
+        "open": 1, "done": 1, "obsolete": 0, "total": 2, "overdue": 0}
+
+
+def test_summary按代理分列(env):
+    """🆕 `by_agent`：按归属代理拆开的同一份计数（看板「完成率按代理看」用）。"""
+    client, _, reg = env
+    _seed(reg)
+    _add(client, title="甲开放", owner="worker-1")
+    tid = _add(client, title="甲做完", owner="worker-1").json()["id"]
+    client.post(f"/api/v1/todos/{tid}/status", headers=AUTH,
+                json={"status": "done", "confirm": True})
+    _add(client, title="乙开放", owner="main")
+    body = client.get("/api/v1/todos/summary", headers=AUTH).json()
+    rows = {r["agent_id"]: r for r in body["by_agent"]}
+    assert set(rows) == {"worker-1", "main"}, "两个 owner 各一行"
+    w = rows["worker-1"]
+    assert (w["open"], w["done"], w["obsolete"], w["total"]) == (1, 1, 0, 2)
+    assert w["ratio"] == 50.0, "完成率 = (done+obsolete)/total*100"
+    assert w["agent"] == "工人", "显示名来自注册表（ks_agent.name）"
+    m = rows["main"]
+    assert (m["open"], m["done"], m["total"], m["ratio"]) == (1, 0, 1, 0.0)
+    # 降序：完成率高的排前面
+    assert body["by_agent"][0]["agent_id"] == "worker-1"
+
+
+def test_summary未在册的owner归未标注桶(env):
+    """🔴 owner 查不到注册表 ⇒ 归「未标注」桶 `-`（不假装它属于某个代理）。"""
+    client, storage, reg = env
+    _seed(reg)
+    store = TodoStore(storage)
+    store.add("没主的活", owner="ghost-agent", creator="main")
+    store.add("也是没主的", owner="ghost-agent", creator="main")
+    body = client.get("/api/v1/todos/summary", headers=AUTH).json()
+    rows = {r["agent_id"]: r for r in body["by_agent"]}
+    assert "ghost-agent" not in rows, "不在册的 owner 不单独成行"
+    assert rows["-"]["total"] == 2, "两个没主的待办合并进未标注桶"
+    assert rows["-"]["agent"] == "-"
+
+
+def test_summary按owner筛时by_agent同口径(env):
+    """🔴 `?owner=` 筛谁，`by_agent` 就只剩谁（同一把筛子）。"""
+    client, _, reg = env
+    _seed(reg)
+    _add(client, title="甲", owner="worker-1")
+    _add(client, title="乙", owner="main")
+    body = client.get("/api/v1/todos/summary?owner=worker-1", headers=AUTH).json()
+    assert body["total"] == 1
+    assert [r["agent_id"] for r in body["by_agent"]] == ["worker-1"]
 
 
 def test_建议废弃只提名不改状态(env):

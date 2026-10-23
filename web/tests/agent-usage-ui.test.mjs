@@ -142,9 +142,17 @@ test('占比的分母是水位总量（不是各代理自己的预算）', () =>
   assert.match(MAINT, /water\.value\?\.used/, '分母取水位总量')
 })
 
-test('维护页：退居提名条目显示归属代理 chip（主脑名下的不挂）', () => {
+test('维护页：退居提名条目显示归属代理 chip（每行都有；无归属走灰 chip）', () => {
   assert.match(MAINT, /DEMOTE_CANDIDATE_TAG/, '退居提名列表要用班车那一个标')
   assert.match(MAINT, /ownerChip/, '归属 chip 的判定')
   assert.match(MAINT, /tag--owner/, '归属 chip 走既有 .tag--owner（零新色）')
-  assert.match(MAINT, /primaryAgentId/, '主脑名下的条目不挂 chip（默认就是它的）')
+  // 🔴 2026-10-24 uipolish_r2：以前只在「非主脑」名下才挂 chip ⇒ 那一列整列是空的
+  //   （用户点名：「归属代理列全空」）。现在**每行都挂**：有归属走 .tag--owner，
+  //   没归属走灰色 .tag（与记忆条目页 / 常驻层页同款）。
+  assert.match(MAINT, /:class="ownerId\(row\) \? 'tag--owner' : ''"/,
+    '归属 chip 按「有没有归属」分两档（不是按是不是主脑）')
+  assert.match(MAINT, /NO_OWNER_LABEL/, '无归属显示「无归属」（复用既有常量）')
+  assert.doesNotMatch(MAINT, /primaryAgentId/, '不再有「主脑不挂 chip」那套逻辑')
+  // 归属 id 吃后端给的 `agent` 字段（后端那把尺子 = fragment_owner）
+  assert.match(MAINT, /row\?\.agent/, '归属优先读后端给的 agent 字段')
 })

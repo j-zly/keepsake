@@ -70,3 +70,33 @@ export function completionPercent(summary) {
   const closed = Number(summary?.done || 0) + Number(summary?.obsolete || 0)
   return Math.round((closed * 10000) / total) / 100
 }
+
+/**
+ * 按代理的待办完成率行（看板中卡那组小条）。
+ *
+ * 🔴 **数字全是后端给的**（`GET /api/v1/todos/summary` 的 `by_agent` 段 ——
+ *    一条 GROUP BY 聚合出来的）：这里只做「翻译 + 排序 + 条长封顶」，
+ *    **不自己数、不自己算比例**（两处各算一次必然漂）。
+ *
+ * * `agent` 是注册表里的显示名；`-` 桶 = 「未标注」（owner 查不到注册表），
+ *   页面上显示成「未标注」—— 不假装它属于某个代理；
+ * * 排序按完成率降序（谁完成得好排前面）；
+ * * `width` 是细条的长度，封顶 100%（条不许画出卡片）。
+ *
+ * @param {object[]} byAgent 后端 `by_agent` 段（`[{agent, agent_id, ratio, ...}]`）
+ * @returns {object[]} `{key, agent, agent_id, ratio, width}`
+ */
+export function todoAgentRows(byAgent) {
+  return (byAgent || [])
+    .map((r) => {
+      const ratio = Number(r?.ratio || 0)
+      return {
+        key: `${r?.agent_id || '-'}-${r?.agent || '-'}`,
+        agent: r?.agent === '-' ? '未标注' : (r?.agent || r?.agent_id || '未标注'),
+        agent_id: r?.agent_id || '-',
+        ratio,
+        width: Math.min(100, Math.max(0, ratio)),
+      }
+    })
+    .sort((a, b) => b.ratio - a.ratio)
+}

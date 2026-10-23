@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from keepsake.govern.visibility import fragment_owner
+
 from .. import config
 from ..agent_filter import filter_rows_by_agents, parse_agent_ids, rows_by_agent_tags
 from ..deps import get_storage, require_session
@@ -65,6 +67,10 @@ def _to_item(row: Dict[str, Any]) -> FragmentItem:
     return FragmentItem(
         key=str(row.get("key") or row.get("_key") or ""),
         tags=str(row.get("tags", "")),
+        # 归属代理 id：判据 = `govern.visibility.fragment_owner`（**全库同一把尺子**：
+        # tags 里的 `agent:<id>`，逗号边界的完整标签相等）。前端不必再自己拆一遍
+        # tags —— 拆两遍必漂（`agent:win` 命中 `agent:win-desktop` 的经典坑）。
+        agent=fragment_owner(row.get("tags", "")),
         content=_render(row),
         updated_at=_updated_at(row),
         score=_score(row),

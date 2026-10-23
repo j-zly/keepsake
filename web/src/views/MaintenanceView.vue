@@ -56,15 +56,17 @@
     </div>
 
     <!-- 退居提名（班车建议退出常驻层）：归属代理一眼可见 ——
-         主脑名下的条目不挂 chip（默认就是它的），别的代理的挂上，
-         免得「班车要把谁踢出去」看半天看不出来。批准/驳回在审核页做（这里只读）。 -->
+         **每一行都挂 chip**（无归属走灰色 chip，与记忆条目页同款）——
+         以前只在「非主脑」名下才挂，结果那一列整列是空的，看不出班车要踢谁。
+         批准/驳回在审核页做（这里只读）。 -->
     <h3 class="section-title">退居提名（班车建议退出常驻层）</h3>
     <div v-if="demoteError" class="banner banner--danger">{{ demoteError }}</div>
     <div v-if="!demotes.length" class="panel empty-mini">
       <span>没有退居提名 —— 常驻层水位没到告警线，或建议都已经审完了。</span>
     </div>
     <!-- 退居提名：按列排（条目 / 归属 / 提名时间）—— 关键列对齐，
-         眼睛往下扫时时间那一列是一条直线，不用每行自己找。 -->
+         眼睛往下扫时时间那一列是一条直线，不用每行自己找。
+         分页：每页 10 条（提名会越来越多，现在就把架子搭起来）。 -->
     <div v-else class="panel demote-list">
       <div class="demote-head">
         <span class="col-key">记忆条目</span>
@@ -76,19 +78,27 @@
           <span class="k" :title="row.key">{{ row.key }}</span>
         </span>
         <span class="col-owner">
-          <span
-            v-if="ownerChip(row)"
-            class="tag tag--owner"
-            :title="`归属代理：${ownerOf(row.tags)}`"
-          >{{ ownerChip(row) }}</span>
+          <span class="tag" :class="ownerId(row) ? 'tag--owner' : ''" :title="ownerTitle(row)">
+            {{ ownerChip(row) }}
+          </span>
         </span>
         <span class="num col-time">{{ toLocal(row.updated_at) }}</span>
       </div>
       <p class="src list-foot">
-        共 {{ demoteCount }} 条<template v-if="demoteCount > demotes.length">（这里只列前 {{ demotes.length }} 条）</template>；
-        批准 / 驳回在「记忆审核」页的「退居建议」里做（这里只读）。
+        共 {{ demotePagerTotal }} 条；批准 / 驳回在「记忆审核」页的「退居建议」里做（这里只读）。
       </p>
     </div>
+    <!-- 分页条：组件与「记忆条目」页同一个（总数由接口给，不写死） -->
+    <PagerBar
+      v-if="demotes.length"
+      :total="demotePagerTotal"
+      :page="demotePage"
+      :page-size="demotePageSize"
+      :sizes="DEMOTE_PAGE_SIZES"
+      :unknown="demoteCount === null"
+      @update:page="onDemotePage"
+      @update:page-size="onDemoteSize"
+    />
 
     <!-- 待办「建议废弃」（2026-10 ks_todo 班车）：到期日过了 7 天还开着的待办，
          这里**只提名**（不改状态）—— 「这条到底还有没有人管」只有人知道，
@@ -198,9 +208,10 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
-import { agentUsageRows, loadAgentRows, ownerLabel, ownerOf, sharePercent } from '../utils/agents'
+import { agentUsageRows, loadAgentRows, NO_OWNER_LABEL, ownerOf, sharePercent } from '../utils/agents'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
 
@@ -235,10 +246,18 @@ async function load() {
 const DEMOTE_CANDIDATE_TAG = 'tier:demote-candidate'
 
 const perAgent = ref({})       // GET /api/v1/stats/core-per-agent
-const agentRows = ref([])      // 注册表（要显示名 + 谁是 primary）
-const demotes = ref([])        // 退居提名条目
-const demoteCount = ref(0)     // 退居提名总条数（这一页只显示前 20 条）
+const agentRows = ref([])      // 注册表（要显示名）
+const demotes = ref([])        // 退居提名条目（当前页）
+const demoteCount = ref(null)  // 退居提名总条数（接口给的 count；null = 总数未知）
 const demoteError = ref('')
+const demoteHasMore = ref(false)
+
+/* 分页：提名会越来越多（每轮班车都可能提名新的），所以架子现在就搭起来 ——
+   每页 10 条（提名是「逐条看」的活儿，一屏铺 30 条看不过来）。 */
+const demotePage = ref(1)
+const demotePageSize = ref(10)
+/** 每页条数的可选档（PagerBar 的下拉认这个；含 10 ⇒ 不会显示空白）。 */
+const DEMOTE_PAGE_SIZES = [10, 20, 50]
 
 /* 待办「建议废弃」（2026-10 ks_todo）：只提名，不改状态 —— 这一页是只读面，
    改状态去「待办」页（那边有状态机与确认闸）。 */
@@ -249,11 +268,6 @@ const obsoleteError = ref('')
 const agentNames = computed(() =>
     Object.fromEntries(agentRows.value.map((a) => [a.agent_id, a.name || a.agent_id])),
 )
-/** 现役主代理（role=primary）：它名下的条目默认就是「主脑的」，不挂归属 chip。 */
-const primaryAgentId = computed(() => {
-    const p = agentRows.value.find((a) => a.role === 'primary')
-    return p ? p.agent_id : ''
-})
 
 /** 常驻水位总量：优先班车状态端点的 budget（与看板同一口径），退到 stats 的 core。 */
 const water = computed(() => {
@@ -306,11 +320,52 @@ const agentShareCount = computed(() =>
     agentShares.value.filter((r) => r.agent_id).length,
 )
 
-/** 退居提名条目的归属 chip：不是主脑的才挂（挂了就看得见「班车要踢谁」）。 */
+/**
+ * 提名条目的**归属代理 id**。
+ *
+ * 🔴 **那把尺子只有一把**：后端给的 `agent` 字段就是
+ * `govern.visibility.fragment_owner` 算出来的（逗号边界的完整标签相等）；
+ * 前端**不再自己拆一遍** tags。老后端没这个字段时退回 `utils/agents.js::ownerOf`
+ * （与后端逐字同口径的老尺子），不是为了造第二把尺子，是为了让新前端配老后端
+ * 时那一列不至于整列空白。
+ */
+function ownerId(row) {
+    const a = row?.agent
+    if (a !== undefined && a !== null) return String(a).trim()
+    return ownerOf(row?.tags)
+}
+
+/**
+ * 归属 chip 的文字：有归属给显示名（注册表备注名），没有归属给「无归属」。
+ * 🔴 **每一行都有 chip**（无归属走灰色 chip，与记忆条目页 / 常驻层页同款）——
+ * 以前只在「非主脑」名下才挂，那一列于是整列是空的。
+ */
 function ownerChip(row) {
-    const id = ownerOf(row?.tags)
-    if (!id || id === primaryAgentId.value) return ''
-    return ownerLabel(row.tags, agentNames.value)
+    const id = ownerId(row)
+    if (!id) return NO_OWNER_LABEL
+    return agentNames.value[id] || id
+}
+
+/** 归属 chip 的悬浮说明：有归属给 id，没有归属就说清「没有归属」。 */
+function ownerTitle(row) {
+    const id = ownerId(row)
+    return id ? `归属代理：${id}` : '这条提名没有归属代理'
+}
+
+/** 分页条的总条数：接口给了 count 就用它；没给时按 has_more 撑出「下一页」。 */
+const demotePagerTotal = computed(() =>
+    demoteCount.value ?? (demoteHasMore.value ? demotePage.value * demotePageSize.value + 1 : demotes.value.length),
+)
+
+function onDemotePage(p) {
+    demotePage.value = p
+    loadDemotes()
+}
+
+function onDemoteSize(n) {
+    demotePageSize.value = n
+    demotePage.value = 1
+    loadDemotes()
 }
 
 /** 读注册表（显示名 + 谁是 primary）与按代理分列。 */
@@ -327,16 +382,26 @@ async function loadAgentDimension() {
     }
 }
 
-/** 退居提名列表（只读；批准/驳回在审核页）。 */
+/** 退居提名列表（只读；服务端分页；批准/驳回在审核页）。 */
 async function loadDemotes() {
     try {
-        const res = await api.fragments({ tag: DEMOTE_CANDIDATE_TAG, page: 1, page_size: 20 })
+        const res = await api.fragments({
+            tag: DEMOTE_CANDIDATE_TAG,
+            page: demotePage.value,
+            page_size: demotePageSize.value,
+        })
         demotes.value = res?.items || []
-        demoteCount.value = Number(res?.count || demotes.value.length)
+        // count 是该标签的**全量条数**（按标签列的口径，不是本页条数）；
+        // 接口没给（count=null）时保持 null，由分页条按 has_more 撑出「下一页」。
+        demoteCount.value = (res?.count === null || res?.count === undefined)
+            ? null
+            : Number(res.count)
+        demoteHasMore.value = !!res?.has_more
         demoteError.value = ''
     } catch (e) {
         demotes.value = []
-        demoteCount.value = 0
+        demoteCount.value = null
+        demoteHasMore.value = false
         demoteError.value = `读取退居提名失败：${e.message}`
     }
 }

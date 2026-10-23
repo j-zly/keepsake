@@ -104,13 +104,42 @@
           <b>没有可分列的代理水位</b>
           <span>常驻层里还没有带代理归属的条目。</span>
         </div>
+        <!-- 图例压成**条组下方一行灰字**（阈值就在条上，不必另开一块地方说） -->
+        <p class="water-legend">≥90% 走警示色 · ≥100% 走危险色</p>
         <p class="src">{{ waterHint }}</p>
       </div>
 
-      <!-- 待办完成率：**全局单一指标** ⇒ 环形仍然合理（总量环删了，它留着）。 -->
+      <!-- 待办完成率：**全局总览的环**（缩小居中）+ 环下计数小字 +
+           **按代理小条组**（谁完成得好，一行一个代理）。
+           🔴 数字全部来自后端 `by_agent` 段（前端不自己数、不自己算比例）。 -->
       <div class="panel pad">
         <div class="chart-title">待办完成率</div>
-        <RingGauge :metrics="gaugeMetrics" :height="gaugeHeight" />
+        <div class="gauge-wrap">
+          <RingGauge :metrics="gaugeMetrics" :height="gaugeHeight" />
+          <p class="gauge-count num">已销掉 {{ todoClosed }} / 全部 {{ todoSummary.total }} 条</p>
+        </div>
+        <div v-if="todoAgentRows.length" class="todo-agents">
+          <div v-for="r in todoAgentShown" :key="r.key" class="todo-agent-row">
+            <div class="todo-agent-head">
+              <span class="todo-agent-name" :title="r.agent_id">{{ r.agent }}</span>
+              <span class="todo-agent-pct num">{{ r.ratio }}%</span>
+            </div>
+            <div class="todo-agent-track">
+              <i :style="{ width: r.width + '%' }"></i>
+            </div>
+          </div>
+          <button
+            v-if="todoAgentRest.length"
+            type="button"
+            class="ghost-btn water-more"
+            @click="todoAgentRestOpen = !todoAgentRestOpen"
+          >
+            {{ todoAgentRestOpen ? '收起其余代理' : `其余 ${todoAgentRest.length} 个代理（最高 ${todoAgentRest[0].ratio}%）` }}
+          </button>
+        </div>
+        <div v-else class="todo-agents-empty">
+          <span>没有可分列的代理待办 —— 这些待办还没记到代理名下。</span>
+        </div>
         <p class="src">{{ gaugeHint }}</p>
       </div>
 
@@ -431,7 +460,7 @@ import { bucketByAgent, dayBreakdown, OTHER_KEY, stackLayout, topSeries } from '
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
-import { completionPercent } from '../utils/todo'
+import { completionPercent, todoAgentRows as todoAgentRowsOf } from '../utils/todo'
 
 const data = ref(null)
 const crons = ref([])
@@ -443,7 +472,7 @@ const tiering = ref(null)
 const tieringError = ref('')
 
 // 待办小节（2026-10 ks_todo）：计数**全部由后端给**（前端不自己数）。
-const todoSummary = ref({ open: 0, done: 0, obsolete: 0, total: 0, overdue: 0 })
+const todoSummary = ref({ open: 0, done: 0, obsolete: 0, total: 0, overdue: 0, by_agent: [] })
 const todoError = ref('')
 
 /* ---------------------------------------------------------------- 图表
@@ -455,7 +484,8 @@ function onViewportResize() {
   chartWidth.value = window.innerWidth
 }
 const barsHeight = computed(() => (chartWidth.value < 900 ? 220 : 300))
-const gaugeHeight = computed(() => (chartWidth.value < 900 ? 200 : 240))
+/** 完成率环：**缩小**（环下面还要摆按代理的条组，环不许把那张卡撑高）。 */
+const gaugeHeight = computed(() => (chartWidth.value < 900 ? 140 : 160))
 
 // 待审条目计数（侧栏同一份数据，独立 fetch 让这页不至于因 review 端点挂了而红）
 // — 顶部「待审核 N 条」卡专用。三个数全库口径，与 GET /api/v1/review/counts 一致。
@@ -754,11 +784,18 @@ const waterRest = computed(() => waterRows.value.slice(WATER_TOP_N))
 const waterRestOpen = ref(false)
 const waterShown = computed(() => (waterRestOpen.value ? waterRows.value : waterTop.value))
 
-const waterHint = '占比 = 该代理的常驻字符 ÷ 它自己生效的注入预算；≥90% 走警示色，≥100% 走危险色。'
+const waterHint = '占比 = 该代理的常驻字符 ÷ 它自己生效的注入预算；'
   + '只列有常驻条目的代理，其余折叠在「其余 N 个」里。'
 
 /** 待办完成率（%）—— 已销掉（done + obsolete）占全部（口径写在 hint 里）。 */
 const todoPercent = computed(() => completionPercent(todoSummary.value))
+
+/**
+ * 已销掉的条数（done + obsolete）—— 环下面那行 `已销掉 N / 全部 M` 的 N。
+ * 🔴 数字全部来自 `todoSummary`（后端给的），前端不自己数。
+ */
+const todoClosed = computed(() =>
+    Number(todoSummary.value.done || 0) + Number(todoSummary.value.obsolete || 0))
 
 /** 环形仪表只剩一块：待办完成率（全局单一指标，环形合理）。 */
 const gaugeMetrics = computed(() => {
@@ -773,6 +810,25 @@ const gaugeMetrics = computed(() => {
 const gaugeHint = computed(() =>
   `待办完成率 ${todoPercent.value}%（已销掉的 done + obsolete ÷ 全部）`)
 
+/* ---------------------------------------------------------------- 待办按代理分列
+ * 「谁完成得好」要看**按代理**的完成率（全局一个 97.56% 看不出是谁拖后腿）。
+ * 🔴 数字**全部来自后端** `by_agent` 段（一条 GROUP BY 聚合出来的）——
+ *    前端不自己数、不自己算比例（口径两处各算一次必然漂）。
+ *    `agent` 是注册表里的显示名；`-` 桶 = 「未标注」（owner 查不到注册表）。 */
+
+/** 小条组最多列几个（其余折叠成一行「其余 N 个」）。 */
+const TODO_AGENT_TOP_N = 6
+
+/** 按代理的待办完成率行（按完成率降序；条长封顶 100%）。 */
+const todoAgentRows = computed(() => todoAgentRowsOf(todoSummary.value.by_agent))
+
+/** 折叠：前 6 个 + 「其余 N 个」（点开才列全）。 */
+const todoAgentTop = computed(() => todoAgentRows.value.slice(0, TODO_AGENT_TOP_N))
+const todoAgentRest = computed(() => todoAgentRows.value.slice(TODO_AGENT_TOP_N))
+const todoAgentRestOpen = ref(false)
+const todoAgentShown = computed(() =>
+  (todoAgentRestOpen.value ? todoAgentRows.value : todoAgentTop.value))
+
 async function fetchTodoSummary() {
   // 单独 fetch：待办端点挂了不许把整张看板拖红（只掉这一小节）
   try {
@@ -783,10 +839,12 @@ async function fetchTodoSummary() {
       obsolete: Number(s?.obsolete || 0),
       total: Number(s?.total || 0),
       overdue: Number(s?.overdue || 0),
+      // 🆕 按代理分列（后端给的聚合结果；老后端没这一段 ⇒ 空数组，页面不显示条组）
+      by_agent: Array.isArray(s?.by_agent) ? s.by_agent : [],
     }
     todoError.value = ''
   } catch (e) {
-    todoSummary.value = { open: 0, done: 0, obsolete: 0, total: 0, overdue: 0 }
+    todoSummary.value = { open: 0, done: 0, obsolete: 0, total: 0, overdue: 0, by_agent: [] }
     todoError.value = `读取待办计数失败：${e.message}`
   }
 }
@@ -914,8 +972,91 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  align-items: start;   /* 三块面板高度各自贴合内容（条组比环形高得多，别硬拉齐） */
+  /* 🔴 三卡**等高**（默认的 stretch）：条组 / 环 / 堆叠柱三块各按自己的内容长，
+     不拉齐就会一高一低、留白难看。卡内改成 flex 列 ⇒ 内容自己往下排。 */
+  align-items: stretch;
   gap: 14px;
+}
+/* 卡内布局：标题 / 主体 / 脚注竖着排，卡内区块间距 12px（DESIGN.md 那一档） */
+.chart-grid > .panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.chart-grid .chart-title {
+  margin-bottom: 0;
+}
+/* 脚注推到卡底（`margin-top: auto` 吃掉多余留白）—— 三卡的脚注在一条线上 */
+.chart-grid .src {
+  margin-top: auto;
+}
+/* 水位图例：条组下方**一行灰字**（阈值就在条上，不必另开一块地方说） */
+.water-legend {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.7;
+}
+/* 完成率那张卡：环（缩小）+ 计数小字竖着居中 */
+.gauge-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.gauge-count {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+/* 按代理的待办完成率条组（与水位条组同一把尺子：名字 + 百分比 + 细条） */
+.todo-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+/* 空态：矮卡片 + 一句灰字（不留 44px padding 的大空区） */
+.todo-agents-empty {
+  padding: 12px 0;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.todo-agent-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.todo-agent-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.todo-agent-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+}
+.todo-agent-pct {
+  flex: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.todo-agent-track {
+  height: 6px;
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  overflow: hidden;
+}
+.todo-agent-track i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-chip);
+  background: var(--accent);
 }
 /* ---------------------------------------------------------------- 按代理水位条组
  * 每代理一行：名字 + 百分比 + 细条 + 「字符 / 预算」。
@@ -1087,6 +1228,12 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 .chart-wrap {
   position: relative;      /* 浮层按柱子横向跟随（绝对定位的参照） */
   max-width: 760px;        /* 与 svg 同宽 ⇒ 浮层的百分比落位与图内坐标对齐 */
+  /* 🔴 右卡与左中两卡**等高**：这块占满卡里剩下的高度，柱子**垂直居中**
+     （svg 的 viewBox 保持比例 ⇒ 拉高盒子不会把图拉变形）。 */
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  min-height: 0;
 }
 .stack-chart {
   display: block;

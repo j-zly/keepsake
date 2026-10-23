@@ -70,6 +70,10 @@ class FragmentItem(BaseModel):
 
     key: str
     tags: str = ""
+    agent: str = Field(
+        "",
+        description="**归属代理 id**（条目 tags 里的 `agent:<id>`；判据 = "
+                    "`govern.visibility.fragment_owner` —— 全库同一把尺子；无归属 = ''）")
     content: str = Field("", description="截断后的正文")
     updated_at: str = ""
     score: Optional[float] = None
@@ -312,6 +316,47 @@ class Overview(BaseModel):
     daily_by_agent: List[DailyAgentCount] = Field(
         default_factory=list,
         description="近 N 天每日新增按代理分列（?days=N 时给；缺省 = 空列表 = 不查这一段）")
+
+
+# --------------------------------------------------------------------------
+# 待办（ks_todo）
+# --------------------------------------------------------------------------
+
+class TodoAgentSummary(BaseModel):
+    """**按代理**分列的待办计数（`GET /api/v1/todos/summary` 的 `by_agent` 段）。
+
+    * `agent` 是归属代理的**显示名**（注册表 `ks_agent` 的 `name`）；
+      **查不到注册表的（owner 为空 / 代理已删）归 `"-"` 桶**（前端显示「未标注」
+      —— 不假装它属于某个代理，与 `daily_by_agent` 的 `-` 桶同一口径）；
+    * `open` / `done` / `obsolete` / `total` 是这代理名下的计数
+      （一条 `GROUP BY owner, status` 聚合出来的，只读）；
+    * `ratio` 是**完成率百分比**（`(done + obsolete) / total * 100`，保留两位）——
+      与全局那个完成率**同一把尺子**（口径见 `utils/todo.js::completionPercent`）。
+    """
+
+    agent: str = Field(..., description="归属代理显示名；查不到注册表的 = '-'（未标注桶）")
+    agent_id: str = Field("-", description="归属代理 id（owner 那一列）；未标注桶 = '-'")
+    open: int = 0
+    done: int = 0
+    obsolete: int = 0
+    total: int = 0
+    ratio: float = Field(0, description="完成率百分比（(done+obsolete)/total*100，保留两位）")
+
+
+class TodoSummary(BaseModel):
+    """待办计数（`GET /api/v1/todos/summary`）。
+
+    🔴 `overdue` = **开放且已过期**的条数（销掉的不算 —— 过期是活儿没干完）。
+    `by_agent` 是**新增的一段**（按代理分列），老字段一字不改。
+    """
+
+    open: int = 0
+    done: int = 0
+    obsolete: int = 0
+    total: int = 0
+    overdue: int = 0
+    by_agent: List[TodoAgentSummary] = Field(
+        default_factory=list, description="按代理分列的待办计数（`by_agent` 段）")
 
 
 # --------------------------------------------------------------------------

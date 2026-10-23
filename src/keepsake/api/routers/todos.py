@@ -25,7 +25,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -44,6 +44,7 @@ from keepsake.govern.todo import (
 
 from .. import audit
 from ..deps import get_storage, require_session
+from ..schemas import TodoAgentSummary, TodoSummary
 from .agents import _backup, _registry
 from .ops import _need_flag, _need_text, _reject, write_guard
 
@@ -135,6 +136,52 @@ def _todo_item(row: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- 只读
 
+#: **未标注桶**：owner 为空 / 代理已从注册表删掉的那些待办归这一桶
+#: （与 `stats.daily_by_agent` 的 `-` 桶同一口径：不假装它属于某个代理）。
+UNATTRIBUTED_BUCKET = "-"
+
+
+def _by_agent(rows: List[Dict[str, Any]], registry: Any) -> List[TodoAgentSummary]:
+    """按代理分列的待办计数（`by_agent` 段）。
+
+    🔴 **归属名只认注册表**（`ks_agent`）：`owner` 那一列存的是 agent_id，
+    显示名（`name`）由注册表说了算 —— 待办行自己不带名字，另存一份必然漂。
+
+    🔴 **查不到注册表的合并进「未标注」桶 `-`**（owner 为空 / 代理已删）：
+    宁可说「不知道是谁的」，也不把活摊到一个不在册的代理名下。
+
+    排序：完成率降序 → 条数降序 → 名字（稳定，前端不必再排一遍）。
+    """
+    names: Dict[str, str] = {}
+    for row in registry.list_agents() or []:
+        aid = str(row.get("agent_id") or "")
+        if aid:
+            names[aid] = str(row.get("name") or aid)
+
+    merged: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        aid = str(r.get("owner") or "")
+        key = aid if aid in names else UNATTRIBUTED_BUCKET
+        acc = merged.setdefault(key, {"open": 0, "done": 0, "obsolete": 0, "total": 0})
+        for f in ("open", "done", "obsolete", "total"):
+            acc[f] += int(r.get(f) or 0)
+
+    out: List[TodoAgentSummary] = []
+    for key, acc in merged.items():
+        total = int(acc["total"] or 0)
+        closed = int(acc["done"] or 0) + int(acc["obsolete"] or 0)
+        out.append(TodoAgentSummary(
+            agent=names.get(key, UNATTRIBUTED_BUCKET),
+            agent_id=key,
+            open=int(acc["open"] or 0),
+            done=int(acc["done"] or 0),
+            obsolete=int(acc["obsolete"] or 0),
+            total=total,
+            ratio=round(closed * 10000 / total) / 100 if total > 0 else 0.0,
+        ))
+    out.sort(key=lambda r: (-r.ratio, -r.total, r.agent))
+    return out
+
 @router.get("/api/v1/todos", dependencies=[Depends(require_session)])
 def list_todos(
     page: int = Query(1, ge=1, description="页码（从 1 起）"),
@@ -162,16 +209,25 @@ def list_todos(
             "page": page, "page_size": page_size}
 
 
-@router.get("/api/v1/todos/summary", dependencies=[Depends(require_session)])
+@router.get("/api/v1/todos/summary", response_model=TodoSummary,
+            dependencies=[Depends(require_session)])
 def todo_summary(owner: str = Query("", description="按归属代理筛（空 = 全部）"),
-                 storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """待办计数：`{open, done, obsolete, total, overdue}`。
+                 storage: Any = Depends(get_storage)) -> TodoSummary:
+    """待办计数：`{open, done, obsolete, total, overdue}` **+ `by_agent` 段**。
 
     🔴 `overdue` = **开放且已过期**的条数（销掉的不算 —— 过期是活儿没干完）。
     看板那枚「待办」小节与待办页顶部的计数条**共用这一份**（前端不自己数）。
+
+    🆕 `by_agent`：**按代理**分列的同一份计数（看板「完成率按代理看」用）。
+    口径：一条 `GROUP BY owner, status`（只读聚合，**不动写路径**）；
+    **归属名来自注册表**（`ks_agent`）—— `owner` 是 agent_id，**查不到注册表的
+    归「未标注」桶 `-`**（不假装它属于某个代理，与 `stats.daily_by_agent` 的
+    `-` 桶同一口径）。
     """
     store = _store(storage)
-    return store.summary(owner=owner)
+    base = store.summary(owner=owner)
+    by_agent = _by_agent(store.summary_by_owner(owner=owner), _registry(storage))
+    return TodoSummary(**base, by_agent=by_agent)
 
 
 @router.get("/api/v1/todos/obsolete-suggestions", dependencies=[Depends(require_session)])

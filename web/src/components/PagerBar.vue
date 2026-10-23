@@ -14,7 +14,7 @@
       <label class="size">
         每页
         <select class="num" :value="pageSize" @change="onSize($event.target.value)">
-          <option v-for="s in SIZES" :key="s" :value="s">{{ s }}</option>
+          <option v-for="s in sizes" :key="s" :value="s">{{ s }}</option>
         </select>
       </label>
     </div>
@@ -47,14 +47,18 @@
 import { computed, ref, watch } from 'vue'
 import { pageWindow } from '../utils/format'
 
-const SIZES = [20, 50, 100]
-
 const props = defineProps({
   total: { type: Number, default: 0 },
   page: { type: Number, default: 1 },
   pageSize: { type: Number, default: 20 },
   /** 全库浏览：存储层没有 count 原语，总条数未知，措辞改成「至少 N 条」 */
   unknown: { type: Boolean, default: false },
+  /**
+   * 每页条数的可选档（默认 20/50/100）。
+   * 🔴 页面默认 10 条/页时传 `[10, 20, 50]` —— 否则下拉里没有当前值，
+   *    控件会显示空白（值不在选项里）。
+   */
+  sizes: { type: Array, default: () => [20, 50, 100] },
 })
 
 const emit = defineEmits(['update:page', 'update:pageSize'])

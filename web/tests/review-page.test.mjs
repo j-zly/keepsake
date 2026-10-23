@@ -27,11 +27,14 @@ const STATS = read('views/StatsView.vue')
 
 /** 维护页搬走之后不该再出现的任何痕迹（状态 / 函数 / 组件 / 区块标题 / 样式）。
  *  注意「退居建议」四个字本身还留在班车设置弹框的说明里（讲的是自动降级规则，
- *  不是审核队列），所以只钉代码标识符与「常驻候选」这个区块标题。 */
+ *  不是审核队列），所以只钉代码标识符与「常驻候选」这个区块标题。
+ *  ⚠️ `PagerBar` **不再钉**（2026-10-24 uipolish_r2）：维护页那张「退居提名」
+ *     只读表自己加了分页（每页 10 条）—— 那是**只读列表**的分页，不是审核队列
+ *     搬回来；审核动作（批准 / 驳回）仍然只在 /review 页。 */
 const LEFT_BEHIND = [
   'candDir', 'cands', 'candPage', 'candCount', 'candPagerTotal', 'candOpen',
   'loadCandidates', 'doCandidate', 'evidKeysOf', 'dropTag', 'splitTags',
-  'PagerBar', 'ItemCard', '常驻候选', '待审',
+  'ItemCard', '常驻候选', '待审',
 ]
 
 test('路由：/review 有页、有标题，且排在维护之前', () => {
