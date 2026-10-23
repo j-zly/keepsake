@@ -115,6 +115,7 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     TRGM_FALLBACK_SCORE,
     tag_match_sql,
     visibility_filter_sql,
+    UNATTRIBUTED_AGENT,
     # 语料维护的纯计算（与 SQLite 侧同一批函数对象，见 storage_shared 的说明）
     accumulate_co_occurrence,
     accumulate_word_freq,
@@ -211,6 +212,11 @@ _ATTENTION_TTL = {
     _TOPIC_SCOPE_DAILY: 86400 * 2,
     _TOPIC_SCOPE_WEEKLY: 86400 * 14,
 }
+
+#: 从 `tags` 文本里取**归属代理 id** 的正则（归属记在 `agent:<id>` 标签里 ——
+#: `ks_fragment` 没有独立的 agent 列，判据与 `govern/visibility.py::fragment_owner`
+#: 同一把尺子：逗号/竖线边界上的**完整** `agent:` 标签，只取第一个命中）。
+_AGENT_TAG_RE = r"(?:^|,|\|)\s*agent:([^,|]*)"
 
 # 碎片表列（与 Redis hash 字段一一对应；embed_bin 本批只留位不写）
 FRAGMENT_COLUMNS = (
@@ -3399,6 +3405,37 @@ class PgStorage(StorageBase):
             )
             rows = cur.fetchall()
         return [{"date": str(r[0]), "count": int(r[1] or 0)}
+                for r in rows if r and r[0]]
+
+    def daily_counts_by_agent(self, days: int = 7) -> List[Dict[str, Any]]:
+        """近 N 天的每日新增**按代理分列**（PG 侧**一条 SQL**：`GROUP BY` 日期, 归属）。
+
+        🔴 归属**不在独立列上**：`ks_fragment` 没有 `agent_id` 列 —— 归属记在
+        `tags` 的 `agent:<id>` 标签里（与 `govern/visibility.py::fragment_owner`
+        同一把尺子：逗号边界的**完整**标签）。这里用正则从 `tags` 里取**第一个**
+        `agent:` 标签（与 `fragment_owner` 的「第一个命中」口径一致）：
+
+            (?:^|,|\\|)\\s*agent:([^,|]*)
+
+        取不到（老库没打归属标签）⇒ 归 `"-"` 桶（`UNATTRIBUTED_AGENT`），
+        不假装它属于某个代理。
+
+        ⚠️ 口径必须与中性实现（`StorageBase.daily_counts_by_agent`）**逐行一致** ——
+        `tests/test_stats_daily_by_agent.py` 里有一条断言专门比对两边。
+        """
+        n = max(1, int(days))
+        since = (datetime.now(timezone.utc).date() - timedelta(days=n - 1)).isoformat()
+        with self._ro() as cur:
+            cur.execute(
+                "SELECT substr(created, 1, 10) AS d, "
+                "COALESCE(NULLIF(btrim((regexp_match(tags, %s))[1]), ''), %s) AS agent, "
+                "COUNT(*) AS n FROM ks_fragment "
+                "WHERE created <> '' AND substr(created, 1, 10) >= %s "
+                "GROUP BY d, agent ORDER BY d, agent",
+                (_AGENT_TAG_RE, UNATTRIBUTED_AGENT, since),
+            )
+            rows = cur.fetchall()
+        return [{"d": str(r[0]), "agent": str(r[1]), "n": int(r[2] or 0)}
                 for r in rows if r and r[0]]
 
     def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:

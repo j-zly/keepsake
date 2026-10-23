@@ -284,6 +284,23 @@ class DailyCount(BaseModel):
     count: int = Field(..., description="这一天新增的记忆条目数")
 
 
+class DailyAgentCount(BaseModel):
+    """一天的条目增量**按代理分列**（`GET /api/v1/stats?days=7` 的一段）。
+
+    * `d` 是 `YYYY-MM-DD`（UTC，与 `daily[].date` 同一把尺子）；
+    * `agent` 是**归属代理 id**（条目 `tags` 里的 `agent:<id>`）；
+      **没有归属的老行归 `"-"` 桶**（前端显示「未标注」—— 不假装它属于某个代理）；
+    * `n` 是这一天这个代理的新增条目数。
+
+    🔴 **只给「有写入」的格子**（不补 0）：补零/补日是**图表口径**，由前端按
+    `daily`（那一段补齐了每一天）铺横轴 —— 后端不重复发明一份横轴。
+    """
+
+    d: str = Field(..., description="YYYY-MM-DD（UTC）")
+    agent: str = Field(..., description="归属代理 id；无归属的老行 = '-'")
+    n: int = Field(..., description="这一天该代理新增的记忆条目数")
+
+
 class Overview(BaseModel):
     core: CoreStats
     retrieval: Dict[str, Any] = Field(
@@ -292,6 +309,9 @@ class Overview(BaseModel):
     daily: List[DailyCount] = Field(
         default_factory=list,
         description="近 N 天每日新增（?days=N 时给；缺省 = 空列表 = 不查这一段）")
+    daily_by_agent: List[DailyAgentCount] = Field(
+        default_factory=list,
+        description="近 N 天每日新增按代理分列（?days=N 时给；缺省 = 空列表 = 不查这一段）")
 
 
 # --------------------------------------------------------------------------

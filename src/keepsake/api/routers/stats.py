@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ..deps import get_storage, require_session
 from ..config import RETRIEVAL_SCAN_CAP, core_char_budget
-from ..schemas import CoreAgentUsage, DailyCount, Overview
+from ..schemas import CoreAgentUsage, DailyAgentCount, DailyCount, Overview
 from . import kb as kb_router
 from .core import CORE_TAG, core_stats
 
@@ -49,6 +49,24 @@ def _daily(storage: Any, days: int) -> List[DailyCount]:
     return out
 
 
+def _daily_by_agent(storage: Any, days: int) -> List[DailyAgentCount]:
+    """近 N 天的每日新增**按代理分列**（`daily_by_agent` 段）。
+
+    🔴 **不补零、不补日**：这一段只给「有写入」的格子（`{d, agent, n}`）——
+    横轴（连续 N 天）是**图表口径**，由 `daily` 那一段负责（它补齐了每一天），
+    前端拿 `daily` 铺横轴、拿这一段填格子。补零放两处就会漂。
+
+    🔴 **老字段不许动**：`daily` 段一字不改（老前端与既有测试都靠它），
+    按代理这一段是**新增**的 `daily_by_agent`。
+    """
+    if days <= 0:
+        return []
+    rows = storage.daily_counts_by_agent(days) or []
+    return [DailyAgentCount(d=str(r.get("d") or ""), agent=str(r.get("agent") or "-"),
+                             n=int(r.get("n") or 0))
+            for r in rows if r.get("d")]
+
+
 @router.get("/api/v1/stats", response_model=Overview, dependencies=[Depends(require_session)])
 def overview(days: int = Query(0, ge=0, le=DAILY_MAX_DAYS,
                                 description="近 N 天的每日新增（0 = 不查这一段）"),
@@ -57,6 +75,9 @@ def overview(days: int = Query(0, ge=0, le=DAILY_MAX_DAYS,
 
     `?days=N` 追加一段 `daily`（近 N 天每日新增条目数）—— 看板折线图用它。
     缺省 `days=0` ⇒ **不查这一段**（老调用方的开销一字不变）。
+
+    🆕 另加一段 `daily_by_agent`（近 N 天每日新增**按代理分列**）——
+    `daily` 一字不改（老前端与既有测试不许红），按代理是**新增**的一段。
     """
     core = core_stats(storage)
     _, keys = storage.scan_fragment_keys("", RETRIEVAL_SCAN_CAP)
@@ -66,6 +87,7 @@ def overview(days: int = Query(0, ge=0, le=DAILY_MAX_DAYS,
         retrieval=retrieval,
         kb=kb_router.probe(),
         daily=_daily(storage, days),
+        daily_by_agent=_daily_by_agent(storage, days),
     )
 
 

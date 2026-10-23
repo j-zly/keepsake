@@ -513,6 +513,11 @@ RESERVED_TAG_EXACT = frozenset({CORE_TAG, "core_candidate", SHARED_TAG})
 #: 前缀即保留的标签族（代理归属由存储层按 `_agent_id` 注入，不是调用方能填的）。
 RESERVED_TAG_PREFIX = "agent:"
 
+#: **无归属**条目的归属桶（`daily_counts_by_agent` 契约里的 `"-"`）。
+#: 🔴 老库里没打 `agent:` 标签的条目归这一桶（前端显示「未标注」）——
+#:    不假装它是某个代理写的，也不把它摊到别人头上。
+UNATTRIBUTED_AGENT = "-"
+
 #: **受控**元认知标签（2026-10 keepsake_reconcile_v2，Hy-Memory `models/memory.py:169-207`
 #: 的薄版）—— 提炼管线对自己产出的**自评**，声明它们不改变任何人的权限。
 #:

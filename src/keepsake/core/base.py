@@ -28,6 +28,11 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# 归属判据只有一处（与检索 / core 可见性同一把尺子）：
+# `govern` 只依赖标准库（不 import `core.*`）⇒ 这里反向引用不成环。
+from ..govern.visibility import fragment_owner
+from .shared import UNATTRIBUTED_AGENT
+
 logger = logging.getLogger("keepsake.storage_base")
 
 
@@ -289,6 +294,42 @@ class StorageBase(ABC):
             day = created[:10]
             counts[day] = counts.get(day, 0) + 1
         return [{"date": day, "count": counts[day]} for day in sorted(counts)]
+
+    def daily_counts_by_agent(self, days: int = 7) -> List[Dict[str, Any]]:
+        """近 N 天的**每日新增按代理分列**（`[{d, agent, n}]`）。
+
+        🔴 与 `daily_counts` **同一口径**（同一批行、同一 `created` 前 10 位判日、
+        `created` 为空的老行同样不计入），只是多切一个**归属**维度：
+
+        * 归属 = 条目 `tags` 里的 `agent:<id>` —— 判据用
+          `govern/visibility.py::fragment_owner`（逗号边界的完整标签，
+          `agent:win` 不命中 `agent:win-desktop`），与检索/core 可见性同一把尺子；
+        * **没有归属的老行归入 `"-"` 桶**（前端显示「未标注」）—— 不假装它是
+          某个代理写的，也不把它摊到别人头上。
+
+        `d` 是 `YYYY-MM-DD`；行序 = 日期升序、同日按代理升序（回包好对账）。
+        中性实现走 `scan_fragment_keys` + `get_fragments_batch`（Redis / SQLite
+        用这条）；PG 侧覆写成一条 `GROUP BY 日期, 归属` 的 SQL（`core/pg.py`）。
+        """
+        n = max(1, int(days))
+        since = (datetime.now(timezone.utc).date() - timedelta(days=n - 1)).isoformat()
+        cursor = ""
+        keys: List[str] = []
+        while True:
+            cursor, batch = self.scan_fragment_keys(cursor=cursor, limit=500)
+            keys.extend(batch)
+            if not cursor or not batch:
+                break
+        counts: Dict[Tuple[str, str], int] = {}
+        for doc in self.get_fragments_batch(keys).values():
+            created = str(doc.get("created") or "")
+            if len(created) < 10 or created[:10] < since:
+                continue
+            day = created[:10]
+            agent = fragment_owner(doc.get("tags", "")) or UNATTRIBUTED_AGENT
+            key = (day, agent)
+            counts[key] = counts.get(key, 0) + 1
+        return [{"d": d, "agent": a, "n": cnt} for (d, a), cnt in sorted(counts.items())]
 
     @abstractmethod
     def write_fragments_batch(self, rows: List[Dict[str, Any]]) -> int:

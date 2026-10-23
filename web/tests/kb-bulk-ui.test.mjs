@@ -86,8 +86,8 @@ test('批量结果报「成功 X · 失败 Y」并列前 10 条失败明细', ()
 test('批量动作走 ConfirmDialog 三层防手滑（expect = 选中条数）', () => {
   assert.match(KBR, /v-model="bulkOpen"/, '审核页缺批量 ConfirmDialog')
   assert.match(KBR, /:expect="bulkExpect"/, '审核页批量确认框没接 expect')
-  assert.match(KBR, /:tone="bulkKind === 'reject' \? 'danger' : 'primary'"/,
-    '语气按动作分（批准=primary，驳回=danger）')
+  assert.match(KBR, /:tone="bulkKind === 'approve' \? 'primary' : 'danger'"/,
+    '语气按动作分（批准=primary，驳回/删除=danger）')
   assert.match(KB, /v-model="bulkDeleting"/, '列表页缺批量删除 ConfirmDialog')
   assert.match(KB, /:expect="bulkDeleteExpect"/, '列表页批量删除确认框没接 expect')
   // 删除后果必须点名「物理删除 / 逐篇备份 / 不可撤销」

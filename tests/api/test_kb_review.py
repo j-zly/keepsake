@@ -12,7 +12,9 @@
      且**不删正文**（可再审）；
   4. 站内手建 ⇒ 直接 effective（有切片、检索得到）—— **零回归**；
   5. 被拒的代理（pending/revoked/坏凭据）⇒ 403，且库里一篇都没多；
-  6. 待审/已驳回的文档不许从改/删端点绕过审核动作（409）；
+  6. 待审/已驳回的文档不许从**改**端点绕过审核动作（409）；**删**分两档 ——
+     审核面板（primary）可以真删（=「这条我不收」，2026-10 kb_del_stats_r2），
+     非 primary 仍旧 409；
   7. 老库未迁移 status 列 ⇒ 读路径一律当全 effective（降级不炸），写审核路径人话 500；
   8. 提交查重（同标题/近重复）只记 `review_meta.dup_of` 提示，**不拒收**；
      批准/驳回各留一行审计。
@@ -432,19 +434,33 @@ def test_审核端点不接受代理身份(kb, sub_agent):
 
 
 @PG_ONLY
-def test_待审文档不许从改删端点绕过审核(kb, sub_agent):
-    """🔴 改/删只对已生效的开放：绕过去就等于在审核队列底下偷改或偷删。"""
+def test_待审文档的改删闸门_改仍不许_删审核面板可以(kb, sub_agent):
+    """🔴 闸门分两档（2026-10 kb_del_stats_r2，审核页补了「删除 / 批量删除」）：
+
+    * **改**只对已生效的开放 —— 绕过去就等于在审核队列底下偷改；
+    * **删**：审核面板（primary = 站内会话）**可以**真删待审行
+      （它从未切过块、从未进过检索 ⇒ 删掉 = 「这条我不收」，不是偷偷放行）；
+      **非 primary（子代理凭据）仍旧 409** —— c24a014 的老纪律对代理面不动。
+    """
     r = kb.client.post(CREATE, json={"confirm": True, "title": "子代理笔记",
                                      "content": "正文"}, headers=SUB_AUTH)
     doc_id = r.json()["id"]
     u = kb.client.post(f"/api/v1/kb/documents/{doc_id}/update",
                        json={"confirm": True, "content": "偷改"}, headers=AUTH)
     assert u.status_code == 409 and u.json()["detail"]["error"] == "kb_doc_not_effective"
-    d = kb.client.post(f"/api/v1/kb/documents/{doc_id}/delete",
-                       json={"confirm": "子代理笔记"}, headers=AUTH)
-    assert d.status_code == 409 and d.json()["detail"]["error"] == "kb_doc_not_effective"
+    # 非 primary 走批量删 ⇒ 那一条进 failed（带着 409 的原因码），文档还在
+    b = kb.client.post("/api/v1/kb/documents/bulk-delete",
+                       json={"ids": [doc_id], "confirm": "1"}, headers=SUB_AUTH)
+    assert b.status_code == 200, b.text
+    assert b.json()["succeeded"] == 0
+    assert b.json()["failed"] == [{"id": str(doc_id), "reason": "kb_doc_not_effective"}]
     assert doc_row(kb, doc_id) == [("pending",)]
     assert rmeta(kb, doc_id)["body"] == "正文"
+    # primary（站内会话）真删 ⇒ 成（审核页行操作的「删除」走的就是这条路）
+    d = kb.client.post(f"/api/v1/kb/documents/{doc_id}/delete",
+                       json={"confirm": "子代理笔记"}, headers=AUTH)
+    assert d.status_code == 200, d.text
+    assert doc_row(kb, doc_id) == []
 
 
 @PG_ONLY

@@ -83,6 +83,75 @@
       </div>
     </div>
 
+    <!-- 近 7 天增量 · **按代理**：内联 SVG 堆叠柱（每个代理一条色带）。
+         🔴 横轴 = `daily` 段（后端补齐了每一天），色带 = `daily_by_agent` 段
+         （只给有写入的格子）—— 横轴只补一次（后端补一次、前端再补一次必漂）。
+         序列 = 7 天总量降序前 6 + 「其他」桶；数字全部来自接口，零写死。 -->
+    <div class="panel pad">
+      <div class="chart-title">近 7 天记忆增量 · 按代理</div>
+      <svg
+        v-if="agentChart.segs.length"
+        class="stack-chart"
+        :viewBox="agentChart.viewBox"
+        role="img"
+        :aria-label="agentChartAria"
+      >
+        <!-- 网格线：0 / 中值 / 满值（值标在左侧） -->
+        <g class="grid">
+          <line
+            v-for="g in agentChart.grid"
+            :key="`g${g.v}`"
+            :x1="agentChart.padL"
+            :x2="agentChart.right"
+            :y1="g.y"
+            :y2="g.y"
+          />
+        </g>
+        <!-- 堆叠柱：一格 = 一天 × 一个代理 -->
+        <g class="bars">
+          <rect
+            v-for="seg in agentChart.segs"
+            :key="seg.key"
+            :x="seg.x"
+            :y="seg.y"
+            :width="seg.w"
+            :height="seg.h"
+            :fill="seg.color"
+          />
+        </g>
+        <!-- 坐标文字 -->
+        <g class="axis">
+          <text
+            v-for="g in agentChart.grid"
+            :key="`t${g.v}`"
+            :x="agentChart.padL - 6"
+            :y="g.y + 3"
+            text-anchor="end"
+          >{{ g.v }}</text>
+          <text
+            v-for="x in agentChart.xLabels"
+            :key="`x${x.text}`"
+            :x="x.x"
+            :y="x.y"
+            text-anchor="middle"
+          >{{ x.text }}</text>
+        </g>
+      </svg>
+      <div v-else class="empty">
+        <b>近 7 天没有可分列的增量</b>
+        <span>这段时间没有新增的记忆条目（接口没给到任何按代理的格子）。</span>
+      </div>
+      <!-- 图例：色点 + 名字 + 7 天总量（数字来自接口） -->
+      <ul v-if="agentChart.series.length" class="legend">
+        <li v-for="s in agentChart.series" :key="s.key" :title="s.title">
+          <span class="dot" :style="{ background: s.color }"></span>
+          <span class="lg-label">{{ s.label }}</span>
+          <span class="lg-num num">{{ s.total }}</span>
+        </li>
+      </ul>
+      <p class="src">{{ dailyByAgentHint }}</p>
+    </div>
+
     <!-- 待办小节：开放 N / 逾期 M，点进去就是待办页。 -->
     <h3 class="section-title">待办</h3>
     <div class="stat-grid">
@@ -288,6 +357,7 @@ import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, isOnline, loadAgentRows, ONLINE_HINT } from '../utils/agents'
 import { chartPalette, usageColor } from '../utils/chart-theme.js'
+import { bucketByAgent, OTHER_KEY, stackLayout, topSeries } from '../utils/daily-by-agent'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -489,6 +559,74 @@ const dailyPoints = computed(() => (data.value?.daily || []).map((d) => ({
 const dailyHint = computed(() => {
   const sum = dailyPoints.value.reduce((acc, p) => acc + p.count, 0)
   return `近 7 天新增 ${sum} 条（每天一格，没写入的那天是 0）`
+})
+
+/* ---------------------------------------------------------------- 近 7 天 · 按代理
+ * `daily_by_agent`（`GET /api/v1/stats?days=7` 新增的一段）= 每日增量**按代理分列**
+ * 的格子（`{d, agent, n}`，**只给有写入的格子**）。横轴用 `daily` 段（后端补齐了
+ * 每一天），色带用这一段 —— 横轴是图表口径，只补一次（后端补一次、前端补一次必漂）。
+ * 数值全部来自接口 —— 前端零写死。
+ *
+ * 🔴 图表是**内联 SVG**（不是 ECharts）：SVG 里的 `var(--*)` 直接吃 CSS 变量，
+ *    切主题不用重画（canvas 那套得订阅主题变化再重画一次，见 components/SparkLine.vue）。
+ * 🔴 色板只用 tokens.css 的既有令牌（DESIGN.md：组件里不许散落硬编码色值）。 */
+const DAILY_TOP_N = 6
+
+/** 序列色板：**只用 tokens.css 里的既有令牌**。
+ *  令牌表里没有「分类色板」这一档，凑不出七种不撞色的彩色 ⇒ 四色 + 两灰：
+ *  四个状态色各给一个序列，剩下的用两档中性灰。
+ *  灰的那两档天然适合放最小的序列与「其他」桶（归并项不该抢眼）。 */
+const SERIES_COLORS = [
+  'var(--accent)',    // 蓝：7 天总量最大的那个代理
+  'var(--ok)',        // 绿
+  'var(--warn)',      // 琥珀
+  'var(--danger)',    // 红
+  'var(--accent-5)',  // 浅蓝（accent 的浅一档）
+  'var(--text-dim)',  // 深灰：第 6 个序列
+]
+/** 「其他」桶固定用一档中性灰 —— 它是**归并项**，不该抢眼。 */
+const OTHER_COLOR = 'var(--text-faint)'
+
+/** 横轴：后端补齐的连续 N 天（`daily` 段）。 */
+const dailyDays = computed(() => (data.value?.daily || []).map((d) => d.date))
+
+/** 归属标签的显示名：注册表备注名 → 代理 id → 「未标注」（无归属的老条目）。 */
+function agentLabel(agent) {
+  if (!agent || agent === '-') return '未标注'
+  return agentNames.value[agent] || agent
+}
+
+/** 序列 = 7 天总量降序前 6 + 「其他」桶（其余代理合并进去）。
+ *  分组 / 排序 / 归并 / 摆位置都在 `utils/daily-by-agent.js`（纯函数，可单测）。 */
+const agentSeries = computed(() =>
+  topSeries(bucketByAgent(data.value?.daily_by_agent || []), DAILY_TOP_N, agentLabel))
+
+/** 内联 SVG 的画布尺寸（viewBox 坐标系，与实际像素解耦 ⇒ 窄屏不横向滚动）。 */
+const CHART = { w: 720, h: 240, padL: 38, padR: 12, padT: 14, padB: 30 }
+
+/** 堆叠柱的几何：每一格（天 × 代理）一个矩形 + 网格线 + 坐标文字。
+ *  🔴 颜色**挂在序列上**（图例色点与柱子里的是同一份，不会两处各画一份）。 */
+const agentChart = computed(() => {
+  const series = agentSeries.value.map((s, i) => ({
+    ...s,
+    color: s.key === OTHER_KEY
+      ? OTHER_COLOR
+      : SERIES_COLORS[i % SERIES_COLORS.length],
+  }))
+  const out = stackLayout(dailyDays.value, series, { ...CHART, colorOf: (s) => s.color })
+  return { ...out, series }
+})
+
+const agentChartAria = computed(() =>
+  `近 7 天记忆增量按代理分列，共 ${agentChart.value.total} 条`)
+
+const dailyByAgentHint = computed(() => {
+  const c = agentChart.value
+  if (!c.series.length) return '接口没有给到任何按代理的增量格子（库里这 7 天没有新增条目）。'
+  const other = c.series.find((s) => s.key === OTHER_KEY)
+  return `近 7 天新增 ${c.total} 条，按代理分 ${c.series.length} 个序列`
+    + (other ? `（「其他」= ${other.restCount} 个代理合并，共 ${other.total} 条）` : '')
+    + '；没打归属标签的老条目归「未标注」一栏，不摊到别人头上。'
 })
 
 /** 总预算水位（%）—— tiering 给的 ratio（与「常驻预算水位」卡同一份数）。 */
@@ -764,6 +902,66 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 
 .src {
   margin-top: 12px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- 按代理堆叠柱
+ * 内联 SVG：viewBox 720×240 + `width:100%` ⇒ 窄屏不横向滚动；
+ * `max-width` 封顶（宽屏上别把一张图拉成 1500px 宽的稀疏柱阵）。
+ * 颜色全在 :fill 里给 var(--*)，CSS 变量直接生效 ⇒ 切主题不用重画。 */
+.stack-chart {
+  display: block;
+  width: 100%;
+  max-width: 760px;
+  height: auto;
+  overflow: visible;
+}
+/* 网格线：与 ECharts 那套同一个令牌（--chart-grid，不透明的一档） */
+.stack-chart .grid line {
+  stroke: var(--chart-grid);
+  stroke-width: 1;
+}
+/* 堆叠段之间留一道底色的缝：两段挨着才分得出谁是谁 */
+.stack-chart .bars rect {
+  stroke: var(--bg-elev);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+.stack-chart .axis text {
+  fill: var(--text-faint);
+  font-size: 10px;
+  font-family: var(--font);
+}
+/* 图例：色点 + 名字 + 7 天总量（数字来自接口） */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.legend .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+.legend .lg-label {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.legend .lg-num {
   color: var(--text-faint);
   font-size: 12px;
 }

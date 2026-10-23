@@ -703,6 +703,23 @@ def _need_effective(doc: Dict[str, Any], doc_id: str, action: str) -> str:
     return st
 
 
+def _need_deletable(doc: Dict[str, Any], doc_id: str, action: str,
+                    writer: Optional[Dict[str, Any]]) -> str:
+    """**真删**的状态闸门：待审 / 已驳回的行，**审核面板（primary）可以删**。
+
+    🔴 删一篇**还没生效**的东西不构成「绕过审核」（2026-10 kb_del_stats_r2：
+    审核页补了「删除 / 批量删除」）—— 它从未切过块、从未进过检索，删前照样逐篇
+    备份、审计照记；而「驳回」只是标记，删了才是「这条我不收」。
+
+    但**非 primary（子代理凭据）仍旧 409**：c24a014 的「待审行不许改/删绕过」
+    对代理面一个字不动（改写路径的 `_need_effective` 同理）。
+    """
+    st = str((doc or {}).get("status") or ingest.STATUS_EFFECTIVE)
+    if st != ingest.STATUS_EFFECTIVE and not _is_primary(writer):
+        _need_effective(doc, doc_id, action)
+    return st
+
+
 def _dup_of(cur: Any, schema: str, names: Dict[str, str], title: str,
             source_key: str) -> Dict[str, Any]:
     """代理提交前的**查重提示**（title 相同即记一笔，**不拒收**）。
@@ -1210,7 +1227,8 @@ def _delete_one(doc_id: int, action: str, writer: Optional[Dict[str, Any]],
                 confirm: Optional[str] = None) -> Dict[str, Any]:
     """**真删**一篇文档（chunks + documents，同一事务）—— 单条与批量**共用这一份**。
 
-    执行序固定：取行 → 写域闸门（`_writable_doc`：谁能动这篇）→ 待审/已驳回不许删
+    执行序固定：取行 → 写域闸门（`_writable_doc`：谁能动这篇）→ 待审/已驳回
+    **只有 primary 能删**（审核面板可以真删待审行；子代理那侧仍旧 409）
     → **备份全文与全部切片（失败则不删）** → 删 → 审计。
     备份文件是唯一的回退路径（正文只存在于切片里，删了就真没了）。
 
@@ -1226,9 +1244,9 @@ def _delete_one(doc_id: int, action: str, writer: Optional[Dict[str, Any]],
                 _reject(404, "kb_doc_missing", f"知识库文档不存在：{doc_id}",
                         action, str(doc_id))
             _writable_doc(doc, str(doc_id), action, writer)
-            # 🔴 待审/已驳回的不许从这里删：那是审核队列的条目，删了就绕过审核动作
-            # （驳回是**标记**不是删行，正文还在 review_meta 里，改主意还能再批）。
-            _need_effective(doc, str(doc_id), action)
+            # 待审/已驳回的行：**审核面板（primary）可以真删**，子代理那侧仍旧 409
+            # （判据与理由见 `_need_deletable`）。
+            _need_deletable(doc, str(doc_id), action, writer)
             if confirm is not None:
                 _need_text(confirm, str(doc["title"]), action, str(doc_id), "文档标题")
             snapshot = {"document": dict(doc),

@@ -14,6 +14,12 @@
   （确认串 = 选中条数；驳回整批一个理由且必填；逐条成败回包，单条失败不拖累其余）。
   审完立刻重拉队列，并喊一声让侧栏那枚「待审 N」徽标跟上。
 
+  🆕 **真删**（2026-10 kb_del_stats_r2）：行操作「删除」→ POST /kb/documents/{id}/delete
+  （确认串 = 手输**文档标题全文**），批量条「批量删除」→ POST /kb/documents/bulk-delete
+  （确认串 = 选中条数）。**待审与已驳回都给**这一条：这两类行本来就还没生效
+  （没切过块、没进过检索），删掉它 = 「这条我不收」，不是把它偷偷放行；
+  删前逐篇备份、审计照记。删完刷新列表与页头计数，并喊一声刷侧栏徽标。
+
   🔴 语义照旧，搬过来一个字没改：pending 文档此刻**一块切片都没有**，正文只能看
   review_meta 的预览（这正是「未审正文不进检索索引」的另一面：它连自己都搜不到）；
   批准 = 此刻才切块进检索；驳回 = 只标状态不删正文，随时可以再审。
@@ -67,6 +73,15 @@
           @click="openBulkReject()"
         >
           批量驳回
+        </el-button>
+        <!-- 批量真删：走既有 bulk-delete（确认串 = 选中条数），逐篇备份、
+             单条失败不拖累其余 —— 与「知识库」页的批量删除同一套尺子。 -->
+        <el-button
+          type="danger"
+          :disabled="!selCount || busyBulk"
+          @click="askBulkDelete()"
+        >
+          批量删除
         </el-button>
       </SelectionBar>
 
@@ -122,6 +137,16 @@
               @click="openReject(row)"
             >
               驳回
+            </button>
+            <!-- 真删：待审与已驳回**都**给这一条（这篇从没生效过，删掉 =
+                 「这条我不收」，不是把它偷偷放行）。走既有单条 delete 端点，
+                 确认串 = 手输文档标题全文（后端还要再校验一次）。 -->
+            <button
+              class="act-btn act-btn--danger"
+              :disabled="busyReview || busyDelete"
+              @click="askDelete(row)"
+            >
+              删除
             </button>
           </template>
         </ItemCard>
@@ -187,16 +212,28 @@
     />
 
     <!-- 勾选批量的二次确认：expect = 选中条数（与后端 confirm 同一口径）；
-         语气按动作分（批准=primary 蓝，驳回=danger 红）。 -->
+         语气按动作分（批准=primary 蓝，驳回/删除=danger 红）。 -->
     <ConfirmDialog
       v-model="bulkOpen"
       :title="bulkTitle"
       :consequences="bulkConsequences"
       :expect="bulkExpect"
       :confirm-text="bulkConfirmText"
-      :tone="bulkKind === 'reject' ? 'danger' : 'primary'"
+      :tone="bulkKind === 'approve' ? 'primary' : 'danger'"
       :busy="busyBulk"
       @confirm="doBulk"
+    />
+
+    <!-- 真删单条：确认串 = 文档标题全文（与「知识库」页的真删同一档防手滑）。 -->
+    <ConfirmDialog
+      v-model="deleteOpen"
+      :title="deleteTitle"
+      :consequences="deleteConsequences"
+      :expect="deleteExpect"
+      confirm-text="确认删除"
+      tone="danger"
+      :busy="busyDelete"
+      @confirm="doDelete"
     />
   </div>
 </template>
@@ -281,15 +318,20 @@ function clearSel() {
   sel.value = new Set()
 }
 
-/** 批量动作：'approve' | 'reject'（语气与文案按它分） */
+/** 批量动作：'approve' | 'reject' | 'delete'（语气与文案按它分） */
 const bulkKind = ref('')
 const bulkOpen = ref(false)
 const busyBulk = ref(false)
 /** 确认串 = 当前选中条数（与后端 confirm 同一口径，后端还会再校验一次） */
 const bulkExpect = computed(() => String(selCount.value))
-const bulkTitle = computed(() =>
-  bulkKind.value === 'reject' ? '批量驳回选中的待审文档？' : '批量批准选中的待审文档？')
-const bulkConfirmText = computed(() => (bulkKind.value === 'reject' ? '批量驳回' : '批量批准'))
+const bulkTitle = computed(() => ({
+  reject: '批量驳回选中的待审文档？',
+  delete: '批量删除选中的待审文档？',
+}[bulkKind.value] || '批量批准选中的待审文档？'))
+const bulkConfirmText = computed(() => ({
+  reject: '批量驳回',
+  delete: '批量删除',
+}[bulkKind.value] || '批量批准'))
 
 /** 后果文案：只列前 10 个 id，多的折成一句（弹框不是 id 清单打印器） */
 function _previewIds() {
@@ -305,6 +347,9 @@ const bulkConsequences = computed(() => {
   if (bulkKind.value === 'reject') {
     base.push(`整批用同一个理由驳回：${rejectReason.value.trim() || '（还没填）'}`)
     base.push('驳回只是标状态、正文不删（子代理随时能改好重提，你也能在队列里重新批准）。')
+  } else if (bulkKind.value === 'delete') {
+    base.push('物理删除，不可恢复：每篇连同它的全部切片一起移除，检索与切片浏览立刻不再返回它们。')
+    base.push('删前逐篇备份：每篇的文档行与全部切片正文落在 console_ops 备份目录的 document.<id>.before.json（写不进去那篇宁删不成，会单独报失败）。')
   } else {
     base.push('批准 = 此刻才按内容类型切块落 chunks，切完立刻进检索。')
   }
@@ -320,6 +365,13 @@ function askBulk(kind) {
     openBulkReject()
     return
   }
+  bulkOpen.value = true
+}
+
+/** 批量真删：直接进二次确认（确认串 = 选中条数，与后端 bulk-delete 同一口径）。 */
+function askBulkDelete() {
+  if (!selCount.value) return
+  bulkKind.value = 'delete'
   bulkOpen.value = true
 }
 
@@ -346,8 +398,11 @@ function reasonText(code) {
   return FAIL_REASON[code] || code || '未知原因'
 }
 
+/** 批量动作的中文名（提示语里要用） */
+const KIND_TEXT = { approve: '批准', reject: '驳回', delete: '删除' }
+
 /**
- * 批量实跑：走 bulk-approve / bulk-reject 两个端点（api 层纯透传）。
+ * 批量实跑：走 bulk-approve / bulk-reject / bulk-delete 三个端点（api 层纯透传）。
  * 确认串原样传给后端 —— 后端还会再校验一次选中数，前端不算权威。
  * 成功的清出勾选、失败的**留在勾选里**（用户下一步就该逐条处理它们）。
  */
@@ -359,7 +414,9 @@ async function doBulk(typed) {
   try {
     const r = kind === 'reject'
       ? await api.kbBulkReject({ ids, confirm: typed, reason: rejectReason.value.trim() })
-      : await api.kbBulkApprove({ ids, confirm: typed })
+      : (kind === 'delete'
+        ? await api.kbBulkDelete({ ids, confirm: typed })
+        : await api.kbBulkApprove({ ids, confirm: typed }))
     bulkOpen.value = false
     const bad = new Set((r.failed || []).map((f) => f.id))
     sel.value = new Set([...sel.value].filter((id) => bad.has(id)))
@@ -368,15 +425,62 @@ async function doBulk(typed) {
       const why = r.failed.slice(0, 10).map((f) => `${f.id}（${reasonText(f.reason)}）`).join('、')
       showError(`成功 ${r.succeeded} · 失败 ${r.failed.length}：${why}${r.failed.length > 10 ? '…' : ''}`)
     } else {
-      showToast(`批量${kind === 'reject' ? '驳回' : '批准'}完成：成功 ${r.succeeded} 篇`)
+      showToast(`批量${KIND_TEXT[kind] || '批准'}完成：成功 ${r.succeeded} 篇`)
     }
     rejectReason.value = ''
     await loadPending()
     notifyCounts()
   } catch (e) {
-    showError(`批量${kind === 'reject' ? '驳回' : '批准'}失败：${e.message}`)
+    showError(`批量${KIND_TEXT[kind] || '批准'}失败：${e.message}`)
   } finally {
     busyBulk.value = false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 真删单条（待审 / 已驳回都行）—— 走既有 POST /kb/documents/{id}/delete
+// ---------------------------------------------------------------------------
+// 🔴 确认串 = **手输文档标题全文**（与「知识库」页的真删同一档防手滑；
+//    后端还会拿标题再校验一次，前端不算权威）。
+const deleteRow = ref(null)
+const deleteOpen = ref(false)
+const busyDelete = ref(false)
+const deleteTitle = computed(() => '彻底删除这篇知识库文档？')
+const deleteExpect = computed(() => (deleteRow.value ? deleteRow.value.title : ''))
+const deleteConsequences = computed(() => {
+  const row = deleteRow.value
+  if (!row) return []
+  return [
+    `真删《${row.title || '（无标题）'}》：连同它的全部切片一起移除，检索与切片浏览立刻不再返回它，不可恢复。`,
+    '这篇还没生效过（待审 / 已驳回）—— 删掉它等于「这条我不收」，不是把它偷偷放进检索。',
+    '删前自动备份：文档行与全部切片正文落在 console_ops 备份目录的 document.<id>.before.json（写不成则整次删除中止，这是唯一的回退路径）。',
+    '请照抄上面的标题全文确认 —— 一个字都不能差。',
+  ]
+})
+
+function askDelete(row) {
+  deleteRow.value = row
+  deleteOpen.value = true
+}
+
+async function doDelete(typed) {
+  const row = deleteRow.value
+  if (!row) return
+  busyDelete.value = true
+  try {
+    await api.kbDeleteDocument(row.doc_id, typed)
+    deleteOpen.value = false
+    showToast(`已删除：${row.title || row.doc_id}`)
+    // 删掉的那篇从勾选里去掉（它已经不在队列里了）
+    const next = new Set(sel.value)
+    next.delete(row.doc_id)
+    sel.value = next
+    await loadPending()
+    notifyCounts()
+  } catch (e) {
+    showError(`删除失败：${e.message}`)
+  } finally {
+    busyDelete.value = false
   }
 }
 
