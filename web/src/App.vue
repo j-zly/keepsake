@@ -271,10 +271,13 @@ if (typeof window !== 'undefined') {
     loadReviewCounts()
     if (reviewTimer) clearInterval(reviewTimer)
     reviewTimer = setInterval(loadReviewCounts, REVIEW_POLL_MS)
+    // 审核页（单条/批量）审完喊一声 → 徽标立刻跟上，不等 60s 轮询那一轮
+    window.addEventListener('ks:review-counts', loadReviewCounts)
   })
   onUnmounted(() => {
     if (reviewTimer) clearInterval(reviewTimer)
     reviewTimer = null
+    window.removeEventListener('ks:review-counts', loadReviewCounts)
   })
 }
 // ===== /待审数 =====================================================

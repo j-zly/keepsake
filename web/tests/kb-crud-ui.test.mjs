@@ -1,7 +1,7 @@
 /**
  * 知识库 CRUD 前端接线护栏（keepsake_kb_crud_fe，纯静态扫描）：
  *   1) 四条写操作都接到 api/index.js 里真实存在的方法（名字对不上 ⇒ 前端一跑就白屏）；
- *   2) manual 域判定必须落在真实字段 source_type 上（skill 域归灌入器，UI 先挡一道）；
+ *   2) 可写域判定必须落在真实字段 source_type 上（灌入器域归灌入器，UI 先挡一道）；
  *   3) 危险操作走 ConfirmDialog 的 expect 手输口径，不许出现原生 alert/confirm；
  *   4) 导入先预演后实跑，坏行必须计数返回而不是静默丢；
  *   5) 导出走 fetch + Authorization 头拿 blob（裸链子带不了 token）。
@@ -50,16 +50,20 @@ test('api/index.js 新增透传方法：URL 不硬编码、confirm 语义显式�
   assert.match(apiMethod('kbImportDocuments'), /\(payload\) => http\.post\('\/api\/v1\/kb\/import', payload\)/)
 })
 
-test('manual 域判定落在真实字段 source_type 上：skill 域不渲染写按钮', () => {
-  assert.match(KB, /function isManual\(doc\)/, '缺 isManual 判定')
-  assert.match(KB, /doc\.source_type/, '判定必须读 source_type（后端 _manual_only 同名口径）')
-  assert.match(KB, /v-if="isManual\(doc\)" #actions/, '写操作按钮只给手动域渲染')
-  assert.match(KB, /v-if="!isManual\(doc\)"/, '非手动域要给只读徽标')
+test('可写域判定落在真实字段 source_type 上：灌入器域不渲染写按钮', () => {
+  assert.match(KB, /function canEdit\(doc\)/, '缺 canEdit 判定')
+  assert.match(KB, /doc\?\.source_type|doc\.source_type/, '判定必须读 source_type（后端 _writable_doc 同名口径）')
+  assert.match(KB, /v-if="canEdit\(doc\)" #actions/, '写操作按钮只给可写域渲染')
+  assert.match(KB, /v-if="!canEdit\(doc\)"/, '不可写域要给只读徽标')
+  // 🆕 代理域也开放（主脑 owns 这摊子）：可写域 = 手动域 + 代理域；
+  // 归属校验在后端那道闸上（_writable_doc：非 primary 只能动自己名下的）。
+  assert.match(KB, /st === 'manual' \|\| st === 'agent'/, '可写域必须是「手动域 + 代理域」两个精确值')
+  assert.ok(!/st === 'skill/.test(KB), '灌入器域（skill/skill_hk）仍然只读')
 })
 
-test('判据是严格的：字段缺席/未知一律按只读，缺省绝不放行成 manual', () => {
+test('判据是严格的：字段缺席/未知一律按只读，缺省绝不放行成可写', () => {
   // 曾经的 bug：列表接口没投 source_type，判据写成「!source_type || ===manual」⇒ skill 文档渲染出编辑/删除
-  assert.match(KB, /return doc\.source_type === 'manual'/, 'isManual 必须只认 manual 精确值')
+  assert.match(KB, /return st === 'manual' \|\| st === 'agent'/, 'canEdit 必须只认这两个精确值')
   assert.ok(
     !/return\s+!?doc\.source_type\s*\|\|/.test(KB),
     '不许「字段缺席即手动」的放行式判据（保守方向：缺席=只读）',

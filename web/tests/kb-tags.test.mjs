@@ -28,7 +28,9 @@ test('chip 行接线：数据来自 /kb/tags，两路列表请求都带 tag=', (
   assert.match(KB, /api\.kbTags\(\)/, '页面要真的调这个接口')
   assert.match(KB, /async function loadTags\(\)/)
   // chip 由后端返回的数据驱动渲染（不逐个手写 = 库里加个标就少一个入口）
-  assert.match(KB, /v-for="row in tagRows"/, 'chip 行必须遍历 tagRows 渲染')
+  assert.match(KB, /v-for="row in visibleTagRows"/, 'chip 行必须遍历 visibleTagRows 渲染')
+  assert.match(KB, /const visibleTagRows = computed\(\(\) => \(tagsOpen\.value \? tagRowsAll\.value\.slice\(0, tagLimit\.value\) : tagRows\.value\)\)/,
+    '折叠态显示后端给的 Top-N，展开态显示前端分好的那一段（不许在前端自己造标签集合）')
   // 浏览态与检索态两路都透传：漏一路 = 标签筛选只对一半场景生效
   assert.equal(
     (KB.match(/tag: activeTag\.value/g) || []).length,
@@ -54,12 +56,17 @@ test('chip 计数来自后端、前端零写死数字', () => {
   assert.match(KB, /tagRows\.value = Array\.isArray\(r\?\.items\) \? r\.items : \[\]/)
   assert.match(KB, /catch \(e\) \{\s*\n\s*tagRows\.value = \[\]/,
     '接口失败要清空（不拿上一个库的旧标签冒充现状）')
-  assert.match(KB, /<template v-if="tagRows\.length">[\s\S]{0,900}?<\/template>/,
+  assert.match(KB, /<template v-if="tagRows\.length">[\s\S]{0,1800}?<\/template>/,
     '标签为空时整行隐藏')
   // 🔴 写死判据：chip 行的计数不许来自任何本地常量
   assert.ok(!/const TAG_CHIPS\s*=/.test(KB), '标签集合只能来自后端，不许在前端定义')
-  assert.match(KB, /class="tab-n">\{\{ row\.count \}/,
+  assert.match(KB, /class="tab-n">×\{\{ row\.count \}/,
     'chip 上的数字必须直接是后端给的 row.count')
+  // 🆕 「+N 更多」的 N = 后端给的 total_distinct（前端不自己数）
+  assert.match(KB, /tagTotal\.value = Number\(r\?\.total_distinct\) \|\| tagRows\.value\.length/,
+    '真实去重数必须来自接口的 total_distinct')
+  assert.match(KB, /const tagMoreCount = computed\(\(\) => Math\.max\(0, tagTotal\.value - visibleTagRows\.value\.length\)\)/,
+    '「+N 更多」的 N 必须由接口给的数算出来')
 })
 
 test('卡片渲染 tags chip：复用现有 .tag，零新色', () => {

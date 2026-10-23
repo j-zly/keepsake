@@ -63,6 +63,11 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/import",
     "/api/v1/kb/documents/{id}/approve",
     "/api/v1/kb/documents/{id}/reject",
+    # 知识库勾选批量三条（kb_bulk_ops）：批量批准 / 批量驳回 / 批量真删
+    # （逐条复用单条端点的那份实现，confirm = 选中条数）
+    "/api/v1/kb/documents/bulk-approve",
+    "/api/v1/kb/documents/bulk-reject",
+    "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
     "/api/v1/crons/{job_id}/pause",

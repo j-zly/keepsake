@@ -9,6 +9,11 @@
   数据源一字未改：仍是 GET /kb/pending（列表 + count + pending_count）与
   POST /kb/documents/{id}/approve|reject。计数全部来自接口，前端零写死数字。
 
+  🆕 **勾选批量**（与记忆条目页同一口径）：跨页保留的选中集合（Set）+ 共用的
+  SelectionBar 组件 → POST /kb/documents/bulk-approve | bulk-reject
+  （确认串 = 选中条数；驳回整批一个理由且必填；逐条成败回包，单条失败不拖累其余）。
+  审完立刻重拉队列，并喊一声让侧栏那枚「待审 N」徽标跟上。
+
   🔴 语义照旧，搬过来一个字没改：pending 文档此刻**一块切片都没有**，正文只能看
   review_meta 的预览（这正是「未审正文不进检索索引」的另一面：它连自己都搜不到）；
   批准 = 此刻才切块进检索；驳回 = 只标状态不删正文，随时可以再审。
@@ -43,6 +48,28 @@
 
       <div v-if="pendError" class="banner banner--danger">{{ pendError }}</div>
 
+      <!-- 勾选批量：跨页保留的选中集合 + 批量批准 / 批量驳回（与记忆条目页同一口径，
+           同一个 SelectionBar 组件）。勾了 20 篇再翻页，勾选**不清空** ——
+           批量动作最怕「以为只审了本页」。 -->
+      <SelectionBar
+        v-if="pendRows.length"
+        :count="selCount"
+        :page-count="pendRows.length"
+        :page-selected="pageSelected"
+        @select-all="selectAll"
+        @clear="clearSel"
+      >
+        <el-button :disabled="!selCount || busyBulk" @click="askBulk('approve')">批量批准</el-button>
+        <el-button
+          type="danger"
+          plain
+          :disabled="!selCount || busyBulk"
+          @click="openBulkReject()"
+        >
+          批量驳回
+        </el-button>
+      </SelectionBar>
+
       <div v-if="pendLoading && !pendRows.length" class="panel pad">
         <el-skeleton :rows="2" animated />
       </div>
@@ -55,6 +82,17 @@
         <ItemCard v-for="row in pendRows" :key="row.doc_id" chip-tone="accent">
           <template #tag>{{ row.status === 'rejected' ? '已驳回' : '待审' }}</template>
           <template v-if="row.submitted_at" #time>{{ toLocal(row.submitted_at) }}</template>
+
+          <!-- 勾选框：跨页累积（批量批准/批量驳回用） -->
+          <div class="pick-row">
+            <el-checkbox
+              class="pick"
+              :model-value="isOn(row.doc_id)"
+              title="勾选这篇（可跨页累积）"
+              @change="toggle(row.doc_id)"
+              @click.stop
+            />
+          </div>
 
           <p class="card-title" :title="row.title">{{ row.title || '（无标题）' }}</p>
           <p class="card-body" :title="row.preview">{{ row.preview || '（没有提交正文）' }}</p>
@@ -99,15 +137,16 @@
     </section>
 
     <!-- 驳回理由：必填（后端同样 400 reason_required）。驳回不删正文，理由是日后
-         重新审核的唯一线索 —— 所以这里不给「跳过」，只能取消。 -->
+         重新审核的唯一线索 —— 所以这里不给「跳过」，只能取消。
+         单条与批量共用这一个弹框（批量 = 整批一个理由）。 -->
     <el-dialog
       v-model="rejectAsk"
-      title="驳回这篇待审文档？"
+      :title="rejectBulk ? '批量驳回选中的待审文档？' : '驳回这篇待审文档？'"
       width="520px"
       align-center
       :close-on-click-modal="false"
-      :close-on-press-escape="!busyReview"
-      :show-close="!busyReview"
+      :close-on-press-escape="!busyReview && !busyBulk"
+      :show-close="!busyReview && !busyBulk"
       append-to-body
     >
       <el-form label-position="top">
@@ -122,10 +161,10 @@
       </el-form>
       <p class="tip">
         驳回只是把它标成「已驳回」，正文不删（子代理随时能改好重提，你也能在队列里重新批准）。
-        理由会记进该文档的审核台账。
+        理由会记进该文档的审核台账<template v-if="rejectBulk">；批量驳回时这一条理由覆盖整批</template>。
       </p>
       <template #footer>
-        <el-button :disabled="busyReview" @click="rejectAsk = false">取消</el-button>
+        <el-button :disabled="busyReview || busyBulk" @click="rejectAsk = false">取消</el-button>
         <el-button
           type="danger"
           :disabled="!rejectReason.trim()"
@@ -146,6 +185,19 @@
       :busy="busyReview"
       @confirm="doReview"
     />
+
+    <!-- 勾选批量的二次确认：expect = 选中条数（与后端 confirm 同一口径）；
+         语气按动作分（批准=primary 蓝，驳回=danger 红）。 -->
+    <ConfirmDialog
+      v-model="bulkOpen"
+      :title="bulkTitle"
+      :consequences="bulkConsequences"
+      :expect="bulkExpect"
+      :confirm-text="bulkConfirmText"
+      :tone="bulkKind === 'reject' ? 'danger' : 'primary'"
+      :busy="busyBulk"
+      @confirm="doBulk"
+    />
   </div>
 </template>
 
@@ -154,6 +206,7 @@ import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
+import SelectionBar from '../components/SelectionBar.vue'
 import { api } from '../api'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -199,6 +252,141 @@ function tagsOf(row) {
   return Array.isArray(row?.tags) ? row.tags : []
 }
 
+// ---------------------------------------------------------------------------
+// 勾选批量（批准 / 驳回）—— 与记忆条目页同一口径：Set 存 id、翻页不清空
+// ---------------------------------------------------------------------------
+// 🔴 选中集合存 id 的 Set，**翻页不清空**：批量动作最怕「以为只审了本页」，
+// 而翻页清空会让人在第 3 页以为「已选 0 条」而漏掉前两页的勾选。
+// 每次改动都整体换一个新 Set（ref 追的是引用），省掉 Vue 集合代理的坑。
+const sel = ref(new Set())
+const selIds = computed(() => [...sel.value])
+const selCount = computed(() => sel.value.size)
+const pageSelected = computed(() => pendRows.value.filter((r) => sel.value.has(r.doc_id)).length)
+
+function isOn(id) {
+  return sel.value.has(id)
+}
+function toggle(id) {
+  const next = new Set(sel.value)
+  next.has(id) ? next.delete(id) : next.add(id)
+  sel.value = next
+}
+/** 「全选本页」只动当前页：跨页累积靠逐页勾选，全选的口径不许含糊 */
+function selectAll(on) {
+  const next = new Set(sel.value)
+  pendRows.value.forEach((r) => (on ? next.add(r.doc_id) : next.delete(r.doc_id)))
+  sel.value = next
+}
+function clearSel() {
+  sel.value = new Set()
+}
+
+/** 批量动作：'approve' | 'reject'（语气与文案按它分） */
+const bulkKind = ref('')
+const bulkOpen = ref(false)
+const busyBulk = ref(false)
+/** 确认串 = 当前选中条数（与后端 confirm 同一口径，后端还会再校验一次） */
+const bulkExpect = computed(() => String(selCount.value))
+const bulkTitle = computed(() =>
+  bulkKind.value === 'reject' ? '批量驳回选中的待审文档？' : '批量批准选中的待审文档？')
+const bulkConfirmText = computed(() => (bulkKind.value === 'reject' ? '批量驳回' : '批量批准'))
+
+/** 后果文案：只列前 10 个 id，多的折成一句（弹框不是 id 清单打印器） */
+function _previewIds() {
+  const ids = selIds.value
+  return ids.slice(0, 10).join('、') + (ids.length > 10 ? `（共 ${ids.length} 篇，其余略）` : '')
+}
+
+const bulkConsequences = computed(() => {
+  const n = selCount.value
+  if (!n) return []
+  const base = [`本次操作 ${n} 篇：${_previewIds()}`,
+    `请照抄「${n}」确认 —— 这个数就是当前勾选条数，写进去一篇都不会多。`]
+  if (bulkKind.value === 'reject') {
+    base.push(`整批用同一个理由驳回：${rejectReason.value.trim() || '（还没填）'}`)
+    base.push('驳回只是标状态、正文不删（子代理随时能改好重提，你也能在队列里重新批准）。')
+  } else {
+    base.push('批准 = 此刻才按内容类型切块落 chunks，切完立刻进检索。')
+  }
+  base.push('单条失败（已生效 / 不在队列 / 不存在）只跳过那一条，其余照常执行 —— 结果会报「成功 X · 失败 Y」。')
+  base.push('写操作会落审计日志（逐条各一行 + 批次汇总一行）。')
+  return base
+})
+
+function askBulk(kind) {
+  if (!selCount.value) return
+  bulkKind.value = kind
+  if (kind === 'reject') {
+    openBulkReject()
+    return
+  }
+  bulkOpen.value = true
+}
+
+/** 批量驳回第一步：先填理由（必填），填完才进二次确认 */
+function openBulkReject() {
+  if (!selCount.value) return
+  rejectBulk.value = true
+  rejectReason.value = ''
+  rejectAsk.value = true
+}
+
+/** 后端回的原因码 → 人话（后端给的是码，界面要说人话） */
+const FAIL_REASON = {
+  kb_not_owner: '不是你的文档',
+  kb_doc_immutable: '只读域（灌入器维护）',
+  kb_doc_missing: '文档不存在',
+  kb_doc_not_pending: '不在待审队列',
+  kb_doc_not_effective: '还在审核队列',
+  kb_doc_id_invalid: 'id 不是整数',
+  kb_review_no_body: '没有可入库的正文',
+  kb_not_found: '不存在',
+}
+function reasonText(code) {
+  return FAIL_REASON[code] || code || '未知原因'
+}
+
+/**
+ * 批量实跑：走 bulk-approve / bulk-reject 两个端点（api 层纯透传）。
+ * 确认串原样传给后端 —— 后端还会再校验一次选中数，前端不算权威。
+ * 成功的清出勾选、失败的**留在勾选里**（用户下一步就该逐条处理它们）。
+ */
+async function doBulk(typed) {
+  const ids = selIds.value
+  const kind = bulkKind.value
+  if (!ids.length) return
+  busyBulk.value = true
+  try {
+    const r = kind === 'reject'
+      ? await api.kbBulkReject({ ids, confirm: typed, reason: rejectReason.value.trim() })
+      : await api.kbBulkApprove({ ids, confirm: typed })
+    bulkOpen.value = false
+    const bad = new Set((r.failed || []).map((f) => f.id))
+    sel.value = new Set([...sel.value].filter((id) => bad.has(id)))
+    if (r.failed?.length) {
+      // 失败明细列前 10 条（id + 原因），多了折成一句
+      const why = r.failed.slice(0, 10).map((f) => `${f.id}（${reasonText(f.reason)}）`).join('、')
+      showError(`成功 ${r.succeeded} · 失败 ${r.failed.length}：${why}${r.failed.length > 10 ? '…' : ''}`)
+    } else {
+      showToast(`批量${kind === 'reject' ? '驳回' : '批准'}完成：成功 ${r.succeeded} 篇`)
+    }
+    rejectReason.value = ''
+    await loadPending()
+    notifyCounts()
+  } catch (e) {
+    showError(`批量${kind === 'reject' ? '驳回' : '批准'}失败：${e.message}`)
+  } finally {
+    busyBulk.value = false
+  }
+}
+
+/** 审完立刻刷侧栏那枚「待审 N」徽标（不等 App.vue 的 60s 轮询那一轮） */
+function notifyCounts() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('ks:review-counts'))
+  }
+}
+
 /** 批准/驳回共用一个确认框实例（与记忆候选审核同款） */
 const reviewOpen = ref(false)
 const reviewKind = ref('')
@@ -207,6 +395,8 @@ const busyReview = ref(false)
 /** 驳回理由：先在弹框里填（必填），再走 ConfirmDialog 二次确认 */
 const rejectAsk = ref(false)
 const rejectReason = ref('')
+/** 这个理由弹框是**批量**用的（整批一个理由）还是单条用的 */
+const rejectBulk = ref(false)
 
 const reviewTitle = computed(() =>
   reviewKind.value === 'reject'
@@ -272,6 +462,7 @@ function askApprove(row) {
 function openReject(row) {
   reviewRow.value = row
   reviewKind.value = 'reject'
+  rejectBulk.value = false
   rejectReason.value = ''
   rejectAsk.value = true
 }
@@ -279,12 +470,18 @@ function openReject(row) {
 function askRejectConfirm() {
   if (!rejectReason.value.trim()) return
   rejectAsk.value = false
+  // 批量走批量那个确认框（expect = 选中条数），单条走单条那个
+  if (rejectBulk.value) {
+    bulkKind.value = 'reject'
+    bulkOpen.value = true
+    return
+  }
   reviewOpen.value = true
 }
 
 /**
- * 批准 = 此刻才切块进检索；驳回 = 只标状态、正文留着。审完只重拉本页队列 ——
- * 侧栏徽标有自己的 60s 轮询兜底（「知识库 › 审核」那个数），最坏滞后一轮。
+ * 批准 = 此刻才切块进检索；驳回 = 只标状态、正文留着。审完重拉本页队列，
+ * 并喊一声让侧栏那枚「待审 N」徽标立刻跟上（不等 60s 轮询那一轮）。
  */
 async function doReview() {
   const row = reviewRow.value
@@ -301,7 +498,12 @@ async function doReview() {
     }
     reviewOpen.value = false
     rejectReason.value = ''
+    // 审完的那篇从勾选里去掉（它已经不在队列里了）
+    const next = new Set(sel.value)
+    next.delete(row.doc_id)
+    sel.value = next
     await loadPending()
+    notifyCounts()
   } catch (e) {
     showError(`${reject ? '驳回' : '批准'}失败：${e.message}`)
   } finally {
@@ -340,5 +542,12 @@ async function doReview() {
 .tag--link {
   border-color: var(--accent);
   color: var(--accent);
+}
+/* 卡上的勾选行：与记忆条目页同一份配方（勾选框在正文上方一行，不挤标题） */
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 </style>

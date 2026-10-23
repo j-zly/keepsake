@@ -8,7 +8,7 @@
  *      驳回走的是「先填理由 → 再确认」两步；
  *   3) **驳回理由必填**：不给理由就点不下去（后端同样 400 reason_required）；
  *   4) **卡上信息**：状态、正文预览、同名重复警示都在（审的人得看得见才判得了）；
- *   5) **站内手建不受影响**：文档卡的编辑/删除按钮仍只由 isManual 决定 ——
+ *   5) **站内手建不受影响**：文档卡的编辑/删除按钮仍只由来源域（canEdit）决定 ——
  *      给手建加审核是明令禁止的回归。
  *
  * 队列本身已从 KbView 搬到独立页 KbReviewView（分页与批准/驳回都在那边），所以这里
@@ -88,8 +88,9 @@ test('待审文档：状态、正文预览、同名重复警示都在卡上', ()
 })
 
 test('站内手建路径零变化：审核只管待审队列，不许渗进文档卡的写按钮', () => {
-  // 文档卡的写按钮判据仍然只有 isManual（没有多一个「要不要审」分支）
-  assert.match(KB, /<template v-if="isManual\(doc\)" #actions>[\s\S]{0,220}openEdit\(doc\)[\s\S]{0,120}askDelete\(doc\)/,
+  // 文档卡的写按钮判据仍然只有来源域（canEdit：手动域 + 代理域），
+  // 没有多一个「要不要审」分支
+  assert.match(KB, /<template v-if="canEdit\(doc\)" #actions>[\s\S]{0,220}openEdit\(doc\)[\s\S]{0,120}askDelete\(doc\)/,
     '文档卡的编辑/删除按钮判据被改了')
-  assert.doesNotMatch(KB, /function isManual\(doc\) \{[\s\S]{0,200}pending/, 'isManual 里混进了审核判据')
+  assert.doesNotMatch(KB, /function canEdit\(doc\) \{[\s\S]{0,200}pending/, 'canEdit 里混进了审核判据')
 })

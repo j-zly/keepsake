@@ -96,10 +96,14 @@ export const api = {
   // 分类 Tab 上的计数：content_type -> 文档数。**后端给，前端不写死数字**
   // （老库未迁移该列时后端给 {}，页面按「无计数」渲染，不编）。
   kbTypeCounts: () => http.get('/api/v1/kb/type-counts').then((r) => r.data),
-  // 自由标签筛选 chip 行：{items:[{tag,count}]}，按计数倒序。**计数同样来自后端**
-  // （与 Tab 计数同纪律：写死就等于库一变数字就错）；老库未迁移 tags 列时后端给
-  // 空列表，页面整行隐藏，不编 chip。
+  // 自由标签筛选 chip 行：{items:[{tag,count}], total_distinct}，按计数倒序。
+  // **计数同样来自后端**（与 Tab 计数同纪律：写死就等于库一变数字就错）；
+  // 老库未迁移 tags 列时后端给空列表，页面整行隐藏，不编 chip。
+  // 🔴 后端已剔除机器标签（local-kb-id-* / entry-*）并只回 Top-N，
+  // total_distinct = 过滤后的真实去重数（页面据此显示「+N 更多」）。
   kbTags: () => http.get('/api/v1/kb/tags').then((r) => r.data),
+  // 「更多」展开：一次性取回**全部**过滤后的标签（分页在前端切）。
+  kbTagsAll: () => http.get('/api/v1/kb/tags', { params: { all: 1 } }).then((r) => r.data),
   kbDocumentChunks: (docId, params) =>
     http.get(`/api/v1/kb/documents/${encodeURIComponent(docId)}/chunks`, { params }).then((r) => r.data),
   // 总览：?days=N 追加一段 daily（近 N 天每日新增）—— 看板折线图用它。
@@ -220,6 +224,18 @@ export const api = {
     http.post(`/api/v1/kb/documents/${encodeURIComponent(id)}/delete`, { confirm }).then((r) => r.data),
   // 导入：{items, dry_run} 先预演，实跑再补 confirm=<would_add 数>。原样透传。
   kbImportDocuments: (payload) => http.post('/api/v1/kb/import', payload).then((r) => r.data),
+  // ---- 知识库勾选批量（与记忆条目页的 ops/bulk 同一口径）----------------
+  // {ids:[...], confirm:<选中条数>}：确认串 = 选中数（后端还会再校验一次，
+  // 前端不算权威）。逐条成败由后端返回 {succeeded, failed:[{id,reason}], total}，
+  // 前端只负责报「成功 X · 失败 Y」+ 刷新（单条失败不拖累其余条目）。
+  kbBulkApprove: (payload) =>
+    http.post('/api/v1/kb/documents/bulk-approve', payload).then((r) => r.data),
+  // 批量驳回：多一个 reason（**必填**，整批一个理由）。
+  kbBulkReject: (payload) =>
+    http.post('/api/v1/kb/documents/bulk-reject', payload).then((r) => r.data),
+  // 批量真删：逐篇备份快照（后端做），确认串同样 = 选中条数。
+  kbBulkDelete: (payload) =>
+    http.post('/api/v1/kb/documents/bulk-delete', payload).then((r) => r.data),
 
   // ---- 待办（2026-10 ks_todo 一等公民）--------------------------------
   // 列表：服务端分页 + 按 owner / status 筛（scope 快捷档 open/done/all）。

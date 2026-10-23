@@ -132,11 +132,16 @@ class KbTagCounts(BaseModel):
     """全部自由标签及计数（**后端给，前端不写死数字**）。
 
     按计数倒序、同数按标签名排序（老库未迁移 tags 列时为空列表，前端整行隐藏）。
+
+    🆕 `total_distinct` = **过滤后**（机器标签已剔除）的真实去重标签数：
+    `items` 默认只回 Top-N（chip 行一屏放不下 140 个），这个数让前端能说清
+    「还有多少个没显示」（+N 更多），**不靠前端自己数**。
     """
 
     items: List[KbTagCount] = Field(default_factory=list,
                                     description="按计数倒序、同数按标签名排序；"
                                                 "老库未迁移 tags 列时为空列表")
+    total_distinct: int = Field(0, description="过滤后真实去重标签数（Top-N 之外的也在内）")
 
 
 class KbHit(BaseModel):

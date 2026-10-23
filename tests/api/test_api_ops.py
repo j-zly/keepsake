@@ -44,6 +44,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: 不是治理动作），ks_agent_budget 起再加 1 条 per-agent 注入预算端点
 #: （core_budget_chars —— 只改一个阈值，不是治理动作）。
 #: ks_todo 起再加 3 条待办端点（新增 / 改状态 / 真删）。
+#: kb_bulk_ops 起再加 3 条知识库勾选批量端点（批量批准 / 批量驳回 / 批量真删）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -70,6 +71,11 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/import",
     "/api/v1/kb/documents/{id}/approve",
     "/api/v1/kb/documents/{id}/reject",
+    # 知识库勾选批量三条（kb_bulk_ops）：批量批准 / 批量驳回 / 批量真删
+    # （逐条复用单条端点的那份实现，confirm = 选中条数）
+    "/api/v1/kb/documents/bulk-approve",
+    "/api/v1/kb/documents/bulk-reject",
+    "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
     "/api/v1/crons/{job_id}/pause",
@@ -507,13 +513,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_37条业务加4条认证():
+def test_写面白名单全量断点_43条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 44
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 40
+    assert len(ALLOWED_POST_PATHS) == 47
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 43
 
 
 def test_P1只读路由未被写面影响(client):

@@ -7,11 +7,14 @@
   口径全部来自接口，页面不另算：count / page / page_size 都是后端给的。
   防串用请求序号（utils/kb.js 的 isStale）：快速改词时旧响应只丢弃、不覆盖新结果。
 
-  批2 加了写操作：新增 / 编辑 / 真删 / 导入 / 导出，全部只对**手动域**文档开放
-  （skill 域归夜间灌入器，前端不渲染按钮，后端 _manual_only 409 兜底）。
-  手动域判定读列表接口真投影出来的 source_type，**严格判据**：字段缺席/未知一律
+  批2 加了写操作：新增 / 编辑 / 真删 / 导入 / 导出，可写域 = **手动域 + 代理域**
+  （skill 域归夜间灌入器，前端不渲染按钮，后端 409 兜底）。
+  可写域判定读列表接口真投影出来的 source_type，**严格判据**：字段缺席/未知一律
   按只读渲染（缺省放行会让 skill 文档看着也能改）。筛选区加了来源下拉，值原样
   透传后端 `source_type`（精确匹配，与导出端点同一套口径与校验）。
+  🆕 勾选批量真删：跨页保留的选中集合（Set）+ 共用的 SelectionBar 组件，
+  确认串 = 选中条数（与后端 confirm 同一口径），走 POST /kb/documents/bulk-delete
+  （逐篇备份 + 逐条成败回包，单条失败不拖累其余）。
 
   内容类型（content_type）：**分内容类型**的 Tab（全部/技能/手记/文章/链接），
   选中即 GET /kb/documents?content_type=；每个 Tab 的计数来自 /kb/type-counts
@@ -25,6 +28,10 @@
   点选即按该标筛、再点取消；库里一个标签都没有时**整行隐藏**（不编 chip）。
   新增/编辑弹框里逗号或回车成一个 chip，超 12 个 / 单项超 32 字**即时提示**。
   标签与内容类型、来源三者取 AND；后端 update 是整体替换（不给 tags 就不动）。
+  🆕 **标签区重做**：后端已剔除机器标签（local-kb-id-* / entry-*）并只回 Top-N，
+  页面上是「Top chip + 每 chip 带文档数（×N）+『+N 更多』」（N = 后端给的
+  total_distinct）；超过一行高度默认折叠（纯 CSS），展开时一次取回全部
+  过滤后的标签、分页在前端切。
 
   审核队列（批2）已**独立成页** /kb-review（KbReviewView）：子代理（非主代理）写进来的
   知识文档先进待审队列，在审核页里批准/驳回。分出去的理由：审核是逐条判的动作，队列
@@ -78,12 +85,16 @@
       </div>
       <!-- 标签 chip 行：数据来自 /kb/tags（后端给的真实计数，前端零写死）。
            点选 = 按该标筛，再点取消；库里没标签时整行隐藏（v-if，不编 chip）。
-           选中态复用 .tab--on 这套（零新色），与上方内容类型 Tab 同一份配方。 -->
+           选中态复用 .tab--on 这套（零新色），与上方内容类型 Tab 同一份配方。
+           🆕 **Top-N + 每 chip 带文档数**：后端已剔除机器标签并只回前 N 个
+           （库里实测 140+ 个标签平铺一屏没法用）；「+N 更多」的 N = 后端给的
+           total_distinct（前端不自己数）。展开时一次取回全部过滤后的，
+           分页在前端切；区域超过一行高度默认折叠（CSS 裁一刀，不做 JS 高度测量）。 -->
       <template v-if="tagRows.length">
         <div class="filter-title">标签</div>
-        <div class="tabs">
+        <div class="tabs tag-cloud" :class="{ 'tag-cloud--open': tagsOpen }">
           <button
-            v-for="row in tagRows"
+            v-for="row in visibleTagRows"
             :key="row.tag"
             class="tab"
             :class="{ 'tab--on': activeTag === row.tag }"
@@ -91,8 +102,21 @@
             @click="onTag(row.tag)"
           >
             {{ row.tag }}
-            <span class="tab-n">{{ row.count }}</span>
+            <span class="tab-n">×{{ row.count }}</span>
           </button>
+        </div>
+        <div v-if="tagMoreCount > 0 || tagsOpen" class="tag-more">
+          <button class="ghost-btn" @click="toggleTags">
+            {{ tagsOpen ? '收起标签' : `+${tagMoreCount} 更多` }}
+          </button>
+          <button
+            v-if="tagsOpen && tagRowsAll.length > visibleTagRows.length"
+            class="ghost-btn"
+            @click="tagLimit += TAG_PAGE"
+          >
+            再显示 {{ TAG_PAGE }} 个
+          </button>
+          <span class="tag-more-tip">共 {{ tagTotal }} 个标签（已剔除机器标签）</span>
         </div>
       </template>
       <div class="filter-title">检索</div>
@@ -176,12 +200,43 @@
     </div>
 
     <template v-else>
+      <!-- 勾选批量：跨页保留的选中集合 + 批量删除（与记忆条目页同一口径，
+           同一个 SelectionBar 组件）。勾了 20 篇再翻页，勾选**不清空**。 -->
+      <SelectionBar
+        v-if="docs.length"
+        :count="selCount"
+        :page-count="docs.length"
+        :page-selected="pageSelected"
+        @select-all="selectAll"
+        @clear="clearSel"
+      >
+        <el-button
+          type="danger"
+          plain
+          :disabled="!selCount || busyBulk"
+          @click="askBulkDelete"
+        >
+          批量删除
+        </el-button>
+      </SelectionBar>
+
       <!-- 第一路：文档列表（检索态下按标题过滤，原地更新 doc-grid） -->
       <div v-if="searching && docs.length" class="section-title">文档</div>
       <div v-if="docs.length" class="card-grid">
         <ItemCard v-for="doc in docs" :key="doc.doc_id" @lead="openDoc(doc)">
           <template #tag>切片 {{ doc.chunk_count }}</template>
           <template v-if="doc.updated_at" #time>{{ toLocal(doc.updated_at) }}</template>
+
+          <!-- 勾选框：跨页累积（批量删除用） -->
+          <div class="pick-row">
+            <el-checkbox
+              class="pick"
+              :model-value="isOn(doc.doc_id)"
+              title="勾选这篇（可跨页累积）"
+              @change="toggle(doc.doc_id)"
+              @click.stop
+            />
+          </div>
 
           <p class="card-title" :title="doc.title">{{ doc.title || '（无标题）' }}</p>
           <p class="card-body mono">{{ doc.doc_id }}</p>
@@ -198,12 +253,20 @@
             </span>
             <!-- 自由标签：复用现有 .tag 配方（零新色）。字段缺席（老库未迁移）= 没打标 -->
             <span v-for="t in tagsOf(doc)" :key="t" class="tag" :title="`标签：${t}`">{{ t }}</span>
-            <span v-if="!isManual(doc)" class="tag">{{ readonlyBadge(doc) }}</span>
+            <!-- 只读徽标只给灌入器域（手动域 + 代理域都可改可删） -->
+            <span v-if="!canEdit(doc)" class="tag">{{ readonlyBadge() }}</span>
+            <span
+              v-else-if="doc.source_type === 'agent'"
+              class="tag"
+              title="子代理写入的文档：控制台可改可删（别的代理名下的由归属闸管）"
+            >
+              代理写入
+            </span>
           </template>
 
           <template #lead>查看切片 →</template>
-          <!-- 只有手动域能改/删；skill 域不渲染按钮（后端 409 兜底，这里先挡一道） -->
-          <template v-if="isManual(doc)" #actions>
+          <!-- 手动域 + 代理域能改/删；灌入器域不渲染按钮（后端 409 兜底，这里先挡一道） -->
+          <template v-if="canEdit(doc)" #actions>
             <button class="act-btn" @click="openEdit(doc)">编辑</button>
             <button class="act-btn act-btn--danger" @click="askDelete(doc)">删除</button>
           </template>
@@ -510,6 +573,19 @@
       tone="primary"
       @confirm="doImportRun"
     />
+
+    <!-- 勾选批量真删确认：比单条更重（一次删 N 篇），所以后果里点名
+         「物理删除 / 逐篇备份 / 不可撤销」，确认串 = 当前勾选条数。 -->
+    <ConfirmDialog
+      v-model="bulkDeleting"
+      title="彻底删除选中的知识库文档？"
+      :consequences="bulkDeleteConsequences"
+      :expect="bulkDeleteExpect"
+      confirm-text="确认删除"
+      tone="danger"
+      :busy="busyBulk"
+      @confirm="doBulkDelete"
+    />
   </div>
 </template>
 
@@ -518,6 +594,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
+import SelectionBar from '../components/SelectionBar.vue'
 import StatCard from '../components/StatCard.vue'
 import http, { api, getToken } from '../api'
 import { copyText } from '../utils/clipboard'
@@ -548,8 +625,21 @@ const contentType = ref('')
  *  老库未迁移该列时后端给 {}，Tab 上就不显示数字，而不是显示一个编出来的 0。 */
 const typeCounts = ref({})
 /** 标签筛选：tagRows = /kb/tags 给的 [{tag,count}]（**计数绝不写死**；空列表 ⇒ chip 行整行隐藏）；
- *  activeTag = 当前选中的那一个（再点一次取消）。与 q / source_type / content_type 取 AND。 */
+ *  activeTag = 当前选中的那一个（再点一次取消）。与 q / source_type / content_type 取 AND。
+ *  🆕 `tagTotal` = 后端给的**过滤后真实去重数**（total_distinct，机器标签已剔除）：
+ *  「+N 更多」的 N 就是它 —— 前端不自己数（写死就等于库一变数字就错）。 */
 const tagRows = ref([])
+const tagTotal = ref(0)
+/** 展开「更多」后一次性取回的全部过滤后标签（分页在前端切） */
+const tagRowsAll = ref([])
+const tagsOpen = ref(false)
+/** 展开后一次显示多少个（前端分页；再点「再显示 N 个」往后翻） */
+const TAG_PAGE = 20
+const tagLimit = ref(TAG_PAGE)
+/** 折叠态显示 Top-N，展开态显示前 tagLimit 个 */
+const visibleTagRows = computed(() => (tagsOpen.value ? tagRowsAll.value.slice(0, tagLimit.value) : tagRows.value))
+/** 「+N 更多」里的 N = 真实去重数 - 当前已显示数（后端给的数，不在前端凑） */
+const tagMoreCount = computed(() => Math.max(0, tagTotal.value - visibleTagRows.value.length))
 const activeTag = ref('')
 /** 来源代理筛选：选中的 agent_id 列表（空 = 全部 = 现状不变）。
  *  ⚠️ **服务端过滤**：分页列表只在前端切当前页 =「看着筛了、其实漏了」——
@@ -664,7 +754,7 @@ const deleteConsequences = computed(() =>
     ? [
         `真删《${deleteDoc.value.title}》：连同它的全部切片一起移除，检索与切片浏览立刻不再返回它，不可恢复。`,
         '删前自动备份：文档行与全部切片正文落在 console_ops 备份目录的 document.<id>.before.json（写不成则整次删除中止，这是唯一的回退路径）。',
-        '只有手动文档能删：skill/skill_hk 由夜间灌入器维护，改动会被覆盖、被删的文档也会被清理扫掉，后端对它们直回 409。',
+        '手动域与代理域的文档都能删；skill/skill_hk 由夜间灌入器维护（改动会被覆盖、被删的文档也会被清理扫掉），后端对它们直回 409。',
         '请照抄上面的标题全文确认 —— 一个字都不能差。',
       ]
     : [],
@@ -711,25 +801,26 @@ async function loadKbPending() {
   }
 }
 /**
- * 只有手动域（source_type='manual'）的文档能改/删 —— skill/skill_hk 域归灌入器，
- * 后端 _manual_only 409 兜底。
+ * 能改/删的域：**手动域（manual）+ 代理域（agent）** —— skill/skill_hk 域归
+ * 夜间灌入器（改了当晚被覆盖、删了被死文档清理扫掉），后端 409 兜底。
  *
- * 🔴 **判据严格**：字段缺席/值未知一律算**非手动域**（只读徽标、不渲染写按钮）。
- * 反过来（缺省当手动）会在读接口没投出 source_type 时给 skill 文档渲染出
+ * 🔴 **判据严格**：字段缺席/值未知一律算**不可改**（只读徽标、不渲染写按钮）。
+ * 反过来（缺省放行）会在读接口没投出 source_type 时给 skill 文档渲染出
  * 「编辑/删除」，看着能改、点下去才被 409 挡回 —— 保守方向才是安全方向。
+ *
+ * 🆕 代理域开放给控制台（主脑 owns 这摊子）：归属校验在后端那道闸上
+ * （`_writable_doc`：非 primary 只能动自己名下的），前端不判归属。
  */
-function isManual(doc) {
-  return doc.source_type === 'manual'
+function canEdit(doc) {
+  const st = doc?.source_type
+  return st === 'manual' || st === 'agent'
 }
 
 /**
- * 只读徽标按来源域给不同的话：灌入器维护的与代理写入的不是一回事 ——
- * 代理写入的（source_type='agent'）归那个代理自己管（kb_remove），
- * 说成「灌入器维护」会把人引到错的方向。
+ * 只读徽标：只给灌入器域（手动域 + 代理域都可改可删，另有「代理写入」chip）。
+ * 灌入器维护的文档改了当晚就被覆盖、删了被死文档清理扫掉 —— 说清是谁的地盘。
  */
-function readonlyBadge(doc) {
-  const st = doc?.source_type || ''
-  if (st === 'agent') return '只读 · 代理写入'
+function readonlyBadge() {
   return '只读 · 灌入器维护'
 }
 
@@ -877,13 +968,35 @@ async function loadTypeCounts() {
 }
 
 /** 标签 chip 行：只有 /kb/tags 给了的标签才渲染（老库未迁移 ⇒ 空列表 ⇒ 整行隐藏）。
- *  出错时清空（不拿上一个库的旧标签冒充现状）。 */
+ *  出错时清空（不拿上一个库的旧标签冒充现状）。
+ *  🆕 后端已剔除机器标签（管线产物那几个前缀，口径在后端）并只回 Top-N；
+ *  `total_distinct` 是过滤后的真实去重数（「+N 更多」的 N 就是它）。 */
 async function loadTags() {
   try {
     const r = await api.kbTags()
     tagRows.value = Array.isArray(r?.items) ? r.items : []
+    tagTotal.value = Number(r?.total_distinct) || tagRows.value.length
   } catch (e) {
     tagRows.value = []
+    tagTotal.value = 0
+  }
+}
+
+/** 「更多」展开/收起：展开时**一次**取回全部过滤后的标签（分页在前端切，
+ *  不再一页页问后端 —— 后端那个 Top-N 只是给 chip 行首屏用的）。 */
+async function toggleTags() {
+  tagsOpen.value = !tagsOpen.value
+  if (!tagsOpen.value) {
+    tagLimit.value = TAG_PAGE
+    return
+  }
+  if (tagRowsAll.value.length) return
+  try {
+    const r = await api.kbTagsAll()
+    tagRowsAll.value = Array.isArray(r?.items) ? r.items : []
+  } catch (e) {
+    tagRowsAll.value = []
+    showError(`加载全部标签失败：${e.message}`)
   }
 }
 
@@ -1069,6 +1182,104 @@ async function doDelete(typed) {
     showError(`删除失败：${e.message}`)
   } finally {
     busyDelete.value = false
+  }
+}
+
+// ---- 勾选批量真删（与记忆条目页同一口径：Set 存 id、翻页不清空）----
+// 🔴 选中集合存 id 的 Set，**翻页不清空**：批量动作最怕「以为只删了本页」，
+// 而翻页清空会让人在第 3 页以为「已选 0 条」而漏掉前两页的勾选。
+// 每次改动都整体换一个新 Set（ref 追的是引用），省掉 Vue 集合代理的坑。
+const sel = ref(new Set())
+const selIds = computed(() => [...sel.value])
+const selCount = computed(() => sel.value.size)
+const pageSelected = computed(() => docs.value.filter((d) => sel.value.has(d.doc_id)).length)
+
+function isOn(id) {
+  return sel.value.has(id)
+}
+function toggle(id) {
+  const next = new Set(sel.value)
+  next.has(id) ? next.delete(id) : next.add(id)
+  sel.value = next
+}
+/** 「全选本页」只动当前页：跨页累积靠逐页勾选，全选的口径不许含糊 */
+function selectAll(on) {
+  const next = new Set(sel.value)
+  docs.value.forEach((d) => (on ? next.add(d.doc_id) : next.delete(d.doc_id)))
+  sel.value = next
+}
+function clearSel() {
+  sel.value = new Set()
+}
+
+const bulkDeleting = ref(false)
+const busyBulk = ref(false)
+/** 确认串 = 当前勾选条数（与后端 confirm 同一口径，后端还会再校验一次） */
+const bulkDeleteExpect = computed(() => String(selCount.value))
+
+/** 后果文案：只列前 10 个 id，多的折成一句（弹框不是 id 清单打印器） */
+function _previewIds() {
+  const ids = selIds.value
+  return ids.slice(0, 10).join('、') + (ids.length > 10 ? `（共 ${ids.length} 篇，其余略）` : '')
+}
+
+const bulkDeleteConsequences = computed(() => {
+  const n = selCount.value
+  if (!n) return []
+  return [
+    `本次删除 ${n} 篇：${_previewIds()}`,
+    `请照抄「${n}」确认 —— 这个数就是当前勾选条数，写进去一篇都不会多。`,
+    '物理删除，不可恢复：每篇连同它的全部切片一起移除，检索与切片浏览立刻不再返回它们。',
+    '删前逐篇备份：每篇的文档行与全部切片正文落在 console_ops 备份目录的 document.<id>.before.json（写不进去那篇宁删不成，会单独报失败）。',
+    '单条失败（不存在 / 只读域 / 不是你的）只跳过那一条，其余照常执行 —— 结果会报「成功 X · 失败 Y」。',
+    '写操作会落审计日志（逐条各一行 + 批次汇总一行）。',
+  ]
+})
+
+function askBulkDelete() {
+  if (!selCount.value) return
+  bulkDeleting.value = true
+}
+
+/** 后端回的原因码 → 人话（后端给的是码，界面要说人话） */
+const FAIL_REASON = {
+  kb_not_owner: '不是你的文档',
+  kb_doc_immutable: '只读域（灌入器维护）',
+  kb_doc_missing: '文档不存在',
+  kb_doc_not_effective: '还在审核队列',
+  kb_doc_id_invalid: 'id 不是整数',
+  backup_failed: '备份写不进',
+}
+function reasonText(code) {
+  return FAIL_REASON[code] || code || '未知原因'
+}
+
+/**
+ * 批量实跑：`POST /api/v1/kb/documents/bulk-delete`（api 层纯透传）。
+ * 确认串原样传给后端 —— 后端还会再校验一次选中数，前端不算权威。
+ * 成功的清出勾选、失败的**留在勾选里**（用户下一步就该逐条处理它们）。
+ */
+async function doBulkDelete(typed) {
+  const ids = selIds.value
+  if (!ids.length) return
+  busyBulk.value = true
+  try {
+    const r = await api.kbBulkDelete({ ids, confirm: typed })
+    bulkDeleting.value = false
+    const bad = new Set((r.failed || []).map((f) => f.id))
+    sel.value = new Set([...sel.value].filter((id) => bad.has(id)))
+    if (r.failed?.length) {
+      // 失败明细列前 10 条（id + 原因），多了折成一句
+      const why = r.failed.slice(0, 10).map((f) => `${f.id}（${reasonText(f.reason)}）`).join('、')
+      showError(`成功 ${r.succeeded} · 失败 ${r.failed.length}：${why}${r.failed.length > 10 ? '…' : ''}`)
+    } else {
+      showToast(`批量删除完成：成功 ${r.succeeded} 篇`)
+    }
+    refresh()
+  } catch (e) {
+    showError(`批量删除失败：${e.message}`)
+  } finally {
+    busyBulk.value = false
   }
 }
 
@@ -1349,5 +1560,34 @@ onMounted(() => {
   color: var(--text-dim);
   font-size: 14px;
   line-height: 1.7;
+}
+/* ---- 标签 chip 行（Top-N + 折叠/展开）----
+   折叠态：超过一行高度就裁一刀（**纯 CSS**，不做 JS 高度测量 —— 高度测量
+   会在字体加载/换行时抖两下，用户看着像坏了）；展开态：放开高度。 */
+.tag-cloud {
+  max-height: 32px;      /* 一行 chip 的高度（chip 高 ~28px） */
+  overflow: hidden;
+}
+.tag-cloud--open {
+  max-height: none;
+  overflow: visible;
+}
+/* 「+N 更多 / 收起 / 再显示 N 个」那一行 */
+.tag-more {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -8px 0 16px;
+}
+.tag-more-tip {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+/* 卡上的勾选行：与记忆条目页同一份配方（勾选框在标题上方一行） */
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 </style>

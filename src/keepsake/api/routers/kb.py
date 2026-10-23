@@ -1,8 +1,10 @@
-"""知识库接口：三表计数 + 全文检索（只读）+ 手动文档 CRUD/导入/导出（写）。
+"""知识库接口：三表计数 + 全文检索（只读）+ 文档 CRUD/导入/导出 + 勾选批量（写）。
 
 **唯一允许直接连 PG 的地方**（任务书例外条款）：连接串只从 `KEEPSAKE_PG_DSN`
 环境变量读，代码里不出现任何连接串/口令。读端点只跑 `SELECT`；写端点只碰
-`source_type='manual'` 的文档（skill/skill_hk 是灌入器的地盘，见文末说明）。
+`source_type` ∈ {manual, agent} 的文档（skill/skill_hk 是灌入器的地盘，见文末
+说明）—— 代理域的归属闸见 `_writable_doc`（primary 全量 / 非 primary 只动
+自己名下的）。
 
 🔴 **连接 / 探列 / 写事务这一层在 `keepsake.kb.service`**（本模块 import 它）：
 那一层是 **FastAPI-free** 的 —— 代理面的知识库工具（MCP 的 `kb_store` /
@@ -62,7 +64,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi import Path          # 文档切片的路径参数（P9 新增；单独一行，不动上一行的 import)
@@ -79,7 +81,7 @@ from ..deps import get_storage, require_session
 from ..schemas import KbHit, KbSearchResult, KbSummary, KbTagCount, KbTagCounts, KbTypeCounts
 from ..schemas import KbChunkList, KbDocument, KbDocumentList
 from ..schemas import KbPendingItem, KbPendingList
-from .ops import _need_flag, _need_text, _reject, write_guard
+from .ops import _err_code, _need_flag, _need_text, _reject, write_guard
 
 # ---- 数据层（连接 / 探列 / 写事务）搬到 `keepsake.kb.service` ---------------
 # 那一层是 **FastAPI-free** 的：MCP 工具面（代理的知识库四工具 kb_store /
@@ -134,6 +136,30 @@ AGENT_DENIED_NOTE = (
     "代理 {agent_id} 未批准/已吊销（或凭据无效），知识库写入一律拒绝 —— "
     "请到控制台代理治理页批准该代理并领取 ksk_ 凭据后重试"
 )
+
+# --------------------------------------------------------------------------
+# 勾选批量（审核 / 删除）与标签 chip 行的护栏
+# --------------------------------------------------------------------------
+
+#: 批量写一次最多处理多少篇。**超了报 400，不截断**（被截断的批量写 =
+#: 用户以为都做了、实际没做）。200 是「防误选全库」的交互上限：知识库文档
+#: 动辄上千篇，误选全库 = 真删几百篇。
+BULK_MAX_DOCS = 200
+
+#: 标签 chip 行只回前 N 个（库里实测 140+ 个标签，一屏平铺没法用）。
+#: 真实去重数走 `total_distinct`（前端据此显示「+N 更多」）—— **数字在后端，
+#: 前端不写死**（写死就等于库一变数字就错）。
+TAGS_TOP_N = 20
+
+#: 🔴 **机器标签的唯一口径位**：这些前缀是管线产物（子代理同步 / 蒸馏），
+#: 不是人打的筛选维度 —— 一律不出现在 `/kb/tags` 的 chip 行里。
+#: **后续加前缀只改这个 tuple**（别处再写一份必然漂：两份口径各筛各的，
+#: 迟早出现「界面上有、后端查不到」的标签）。
+MACHINE_TAG_PREFIXES = ("local-kb-id-", "entry-")
+
+#: 代理写入域的 source_type（与 `keepsake.kb.service.AGENT_WRITABLE_SOURCE_TYPES`
+#: 里的那个同值；这里写一份字面量是因为本模块只按域判「谁能改/删」）。
+AGENT_SOURCE_TYPE = "agent"
 
 
 @router.get("/api/v1/kb/summary", response_model=KbSummary,
@@ -218,8 +244,8 @@ def kb_type_counts() -> KbTypeCounts:
 
 @router.get("/api/v1/kb/tags", response_model=KbTagCounts,
             dependencies=[Depends(require_session)])
-def kb_tags() -> KbTagCounts:
-    """全部标签 + 各有多少篇文档挂着（界面筛选 chip 行的唯一来源，只读）。
+def kb_tags(all: bool = False) -> KbTagCounts:
+    """标签 + 各有多少篇文档挂着（界面筛选 chip 行的唯一来源，只读）。
 
     🔴 **计数绝不写死在前端**（与 `/kb/type-counts` 同款纪律）：写死就等于库一变
     数字就错，而且没人会发现。老库未迁移 tags 列 ⇒ 返回空列表（前端整行隐藏，
@@ -229,13 +255,26 @@ def kb_tags() -> KbTagCounts:
     真要把 skill 排除掉得在这里加 WHERE，那是另一件事（用户能看见 chip 行里
     出现「只有 1 篇」的标签时，至少知道那篇是什么）。
     计数用 `COUNT(DISTINCT d.id)`：同一篇里同一个标签重复出现（存量脏数据）也只算一篇。
+
+    🆕 **机器标签一律剔除**（`MACHINE_TAG_PREFIXES` 是唯一口径位）：库里实测有
+    `local-kb-id-1..67`、`entry-fact/entry-note/…` 这类管线产物（子代理同步与
+    蒸馏带进来的），平铺出来一屏 140+ 个 chip，根本没法用 —— 那些不是人打的
+    筛选维度。**前缀口径只有这一处**，别处再写一份必然漂。
+
+    🆕 **只回 Top-N**（`TAGS_TOP_N`），真实去重数走 `total_distinct`：前端据此
+    显示「+N 更多」，展开时用 `?all=1` 一次性取回全部（分页在前端切）。
+
+    🔴 `all` 用**裸默认值**（不是 `Query(...)`）：有护栏测试是**直接调这个函数**
+    （不经过 FastAPI）来钉过滤与截断，`Query` 对象在这里是「恒真」的 ⇒ 默认那档
+    会被当成 `all=1`，Top-20 直接失效。参数名 `all` 遮住了内置函数（本函数里
+    不用它）。
     """
     schema = _ident(config.pg_schema())
     tabs = _table_columns(schema, (config.KB_TABLE_DOCUMENTS,))
     d_tags = next((_ident(c) for c in _CAND_TAGS
                    if c in tabs[config.KB_TABLE_DOCUMENTS]), None)
     if not d_tags:
-        return KbTagCounts(items=[])
+        return KbTagCounts(items=[], total_distinct=0)
     d_id = _pick(tabs[config.KB_TABLE_DOCUMENTS], _CAND_ID,
                  config.KB_TABLE_DOCUMENTS, "主键")
     with _connect() as conn:
@@ -245,8 +284,11 @@ def kb_tags() -> KbTagCounts:
                         f"unnest(d.{d_tags}) AS t "
                         f"GROUP BY t ORDER BY n DESC, t ASC")
             rows = cur.fetchall()
-    return KbTagCounts(items=[KbTagCount(tag=str(r["tag"] or ""), count=int(r["n"] or 0))
-                              for r in rows if str(r["tag"] or "").strip()])
+    items = [KbTagCount(tag=str(r["tag"] or ""), count=int(r["n"] or 0))
+             for r in rows
+             if str(r["tag"] or "").strip() and not _is_machine_tag(str(r["tag"]))]
+    return KbTagCounts(items=items if all else items[:TAGS_TOP_N],
+                       total_distinct=len(items))
 
 
 @router.get("/api/v1/kb/documents", response_model=KbDocumentList,
@@ -475,7 +517,7 @@ def kb_document_chunks(
 
 
 # --------------------------------------------------------------------------
-# 写端点（手动文档域：source_type='manual'）
+# 写端点（可写域：source_type ∈ {manual, agent}；灌入器域 skill/skill_hk 只读）
 # --------------------------------------------------------------------------
 
 class KbCreateBody(BaseModel):
@@ -774,6 +816,16 @@ def _tags_out(raw: Any) -> List[str]:
         return []
 
 
+def _is_machine_tag(tag: Any) -> bool:
+    """这个标签是不是**机器标签**（管线产物，不是人打的筛选维度）。
+
+    🔴 判据只有一处：`MACHINE_TAG_PREFIXES`（模块级 tuple）—— 别处再写一份
+    必然漂（两份口径各筛各的，迟早出现「界面上有、后端查不到」的标签）。
+    """
+    t = str(tag or "").strip()
+    return any(t.startswith(p) for p in MACHINE_TAG_PREFIXES)
+
+
 def _need_tags(names: Dict[str, str], action: str, target: str) -> str:
     """写 tags 前必须确认这根列在（老库未迁移 ⇒ 人话 500 带迁移 SQL，不裸崩）。"""
     if not names.get("tags"):
@@ -842,23 +894,76 @@ def _is_unique_violation(exc: BaseException) -> bool:
     return any(t.__name__ == "UniqueViolation" for t in type(exc).__mro__)
 
 
-def _manual_only(doc: Dict[str, Any], doc_id: str, action: str) -> None:
-    """只有手动域能改/删 —— skill/skill_hk 是灌入器的地盘。
+#: 站内会话的写者身份（= 主脑本人 ⇒ primary）：控制台的写端点都按它判归属。
+#: 与 `writer_identity` 对站内会话返回的字段同形（一份口径，不另发明）。
+_CONSOLE_WRITER = {"kind": "console", "agent_id": "", "role": ROLE_PRIMARY,
+                   "status": ingest.STATUS_EFFECTIVE}
 
-    改了当晚那轮会被**覆盖**（重新灌入）或因技能消失被**清理**掉：
-    控制台看着「改成功了」，第二天就没了。所以直接 409 并说明原因，
-    别给一个会被静默回滚的假成功。
 
-    🆕 **代理域（source_type='agent'）的文档也不许从控制台改/删**：那是代理自己
-    名下的内容（归属写在 `documents.agent_id`），归它自己管（`kb_remove`）——
-    控制台的手建域只管手建的。
+def _is_primary(writer: Optional[Dict[str, Any]]) -> bool:
+    """这个调用方是不是 **primary**（站内会话 = 主脑本人；主代理凭据也是）。
+
+    判据只有一处（`writer_identity` 写出来的 kind/role）：站内会话没有代理身份，
+    它就是主脑；带凭据的看 role（`primary` 可信、`sub` 受限）。
     """
-    if str(doc.get("source_type") or "") != ingest.MANUAL_SOURCE_TYPE:
+    w = writer or {}
+    if str(w.get("kind") or "") == "console":
+        return True
+    return str(w.get("role") or "") == ROLE_PRIMARY
+
+
+def _writable_doc(doc: Dict[str, Any], doc_id: str, action: str,
+                  writer: Optional[Dict[str, Any]]) -> None:
+    """**写域闸门**（改 / 删共用）：这个调用方能不能动这篇。
+
+    * `manual`（站内手建）⇒ 人人可改（老口径，不动）；
+    * `agent`（代理写入）⇒ **primary 全量**、**非 primary 只能动自己名下**的
+      （归属写在 `documents.agent_id`）—— 与记忆侧
+      `govern.visibility.can_remove_fragment` **同一把尺子**：看得见 ≠ 能改；
+      非 primary 动别人名下 ⇒ 403 `kb_not_owner`（不回显任何正文）；
+    * `skill` / `skill_hk`（夜间灌入器）⇒ **只读 409**：改了当晚会被覆盖、
+      删了会被死文档清理扫掉 —— 控制台看着「改成功了」，第二天就没了。
+
+    🆕 代理域**从控制台可改可删**（主脑owns这摊子）：归属校验保持，
+    闸门不放松 —— 非 primary 仍然只能动自己名下的。
+    """
+    st = str(doc.get("source_type") or "")
+    if st in ingest.INGEST_SOURCE_TYPES:
         _reject(409, "kb_doc_immutable",
-                f"只有手动文档（source_type={ingest.MANUAL_SOURCE_TYPE}）能改/删："
-                f"{doc_id} 来自 {doc.get('source_type') or '未知来源'}，"
-                "由夜间灌入器维护（改动会被覆盖或被死文档清理扫掉）",
+                f"{doc_id} 来自 {st}，由夜间灌入器维护（改动会被覆盖或被死文档清理扫掉）",
                 action, doc_id)
+    if st == ingest.MANUAL_SOURCE_TYPE:
+        return
+    if st == AGENT_SOURCE_TYPE:
+        if _is_primary(writer):
+            return
+        owner = str(doc.get("agent_id") or "").strip()
+        caller = str((writer or {}).get("agent_id") or "").strip()
+        if owner and owner == caller:
+            return
+        _reject(403, "kb_not_owner",
+                f"这篇知识库文档不是你的 —— 只能改/删自己名下的文档：{doc_id}",
+                action, doc_id)
+    # 未知来源域（老数据 / 别的写入方）：保守当只读（缺省放行 = 给假成功）
+    _reject(409, "kb_doc_immutable",
+            f"未知来源域（source_type={st or '空'}）只读，不许改/删：{doc_id}",
+            action, doc_id)
+
+
+def _doc_key(doc: Dict[str, Any], title: str, basis: str) -> str:
+    """改正文后的新 `source_key`：**按来源域各自的键空间**算。
+
+    * 手动域 = `manual:<sha256(标题+正文)[:12]>`（内容级幂等的老判据）；
+    * 代理域 = `agent:<归属 id>:<摘要>`（`ingest.agent_source_key` 的纪律：键里
+      必须带归属 —— 两个代理存同一篇内容不许撞成同一行）。
+
+    🔴 别拿手动域的键去写代理域的文档：那样这篇就掉出了代理面的幂等键空间，
+    代理重交同一篇会另起一行（重复文档）。
+    """
+    st = str(doc.get("source_type") or "")
+    if st == ingest.MANUAL_SOURCE_TYPE:
+        return ingest.manual_source_key(title, basis)
+    return ingest.agent_source_key(st, title, basis, str(doc.get("agent_id") or ""))
 
 
 def _not_ingester_doc(doc: Dict[str, Any], doc_id: str, action: str) -> None:
@@ -976,6 +1081,12 @@ def kb_update_document(id: str, body: KbUpdateBody,
                        writer: Dict[str, Any] = Depends(writer_identity)) -> Dict[str, Any]:
     """改手动文档的标题 / 正文（两者至少给一个）。
 
+    🆕 **代理域（`source_type='agent'`）的文档从控制台可改**（主脑 owns 这摊子）：
+    写域闸门 `_writable_doc` 判「谁能动这篇」—— primary（站内会话 / 主代理）
+    全量可改，**非 primary 只能改自己名下**的（归属在 `documents.agent_id`，
+    与记忆侧 `govern.visibility.can_remove_fragment` 同一把尺子）；
+    灌入器域（skill/skill_hk）仍然 409（改动当晚就被覆盖）。
+
     🔴 **改正文必须重切 chunks 且同事务**（DELETE 旧 + INSERT 新）：只改
     `documents` 行的话检索会继续召回旧片段 —— 页面显示新正文、检索命中旧正文，
     且不报错，正是最坏的那种坏。
@@ -1022,7 +1133,7 @@ def kb_update_document(id: str, body: KbUpdateBody,
                 doc = ingest.load_document(cur, schema, doc_id, names=names)
                 if doc is None:
                     _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
-                _manual_only(doc, str(id), action)
+                _writable_doc(doc, str(id), action, writer)
                 _need_effective(doc, str(id), action)
                 ctype = str(doc.get("content_type") or ingest.DEFAULT_CONTENT_TYPE)
                 _check_type_unchanged(body.content_type, ctype, action, str(id))
@@ -1055,7 +1166,7 @@ def kb_update_document(id: str, body: KbUpdateBody,
                     content = summary if is_link else (
                         body.content.strip() if body.content is not None else "")
                     basis = _doc_basis(title, content, ctype, url)
-                    key = ingest.manual_source_key(title, basis)
+                    key = _doc_key(doc, title, basis)
                     # 子代理改了正文 ⇒ 这一行重新进待审（status 写 pending），且**不重切**：
                     # 旧块留着但被检索的 status 谓词挡住，批准时才 replace_chunks。
                     if re_review:
@@ -1095,40 +1206,60 @@ def kb_update_document(id: str, body: KbUpdateBody,
             "review": ingest.STATUS_PENDING if re_review else ingest.STATUS_EFFECTIVE}
 
 
-@router.post("/api/v1/kb/documents/{id}/delete",
-             dependencies=[Depends(require_session), Depends(write_guard)])
-def kb_delete_document(id: str, body: KbDeleteBody) -> Dict[str, Any]:
-    """**真删**一篇手动文档（chunks + documents，同一事务）。
+def _delete_one(doc_id: int, action: str, writer: Optional[Dict[str, Any]],
+                confirm: Optional[str] = None) -> Dict[str, Any]:
+    """**真删**一篇文档（chunks + documents，同一事务）—— 单条与批量**共用这一份**。
 
-    与记忆真删同档防手滑：必须手输**文档标题全文**。执行序固定：
-    取行 → 校验来源类型 → **备份全文与全部切片（失败则不删）** → 删 → 审计。
+    执行序固定：取行 → 写域闸门（`_writable_doc`：谁能动这篇）→ 待审/已驳回不许删
+    → **备份全文与全部切片（失败则不删）** → 删 → 审计。
     备份文件是唯一的回退路径（正文只存在于切片里，删了就真没了）。
+
+    `confirm` 给了就按「手输**文档标题全文**」校验（单条端点）；批量端点传
+    `None` —— 那一批的确认串是**选中条数**（一次确认覆盖整批）。
     """
-    action = "kb.document.delete"
-    doc_id = _doc_id(id, action)
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     with _write_conn() as conn:
         with conn.cursor() as cur:
             doc = ingest.load_document(cur, schema, doc_id, names=names)
             if doc is None:
-                _reject(404, "kb_doc_missing", f"知识库文档不存在：{id}", action, str(id))
-            _manual_only(doc, str(id), action)
+                _reject(404, "kb_doc_missing", f"知识库文档不存在：{doc_id}",
+                        action, str(doc_id))
+            _writable_doc(doc, str(doc_id), action, writer)
             # 🔴 待审/已驳回的不许从这里删：那是审核队列的条目，删了就绕过审核动作
             # （驳回是**标记**不是删行，正文还在 review_meta 里，改主意还能再批）。
-            _need_effective(doc, str(id), action)
-            _need_text(body.confirm, str(doc["title"]), action, str(id), "文档标题")
+            _need_effective(doc, str(doc_id), action)
+            if confirm is not None:
+                _need_text(confirm, str(doc["title"]), action, str(doc_id), "文档标题")
             snapshot = {"document": dict(doc),
                         "chunks": ingest.document_chunks(cur, schema, doc_id, names=names)}
             backup = audit.backup_document(doc_id, snapshot)
             deleted = ingest.delete_document(cur, schema, doc_id, names=names)
             if deleted != 1:                   # pragma: no cover —— 取到行又删不掉＝并发
                 _reject(500, "kb_delete_failed",
-                        f"删除了 {deleted} 篇（应为 1），文档可能已被并发删掉：{id}",
-                        action, str(id))
-    audit.record(action, str(id), ok=True, reason=f"deleted=1; backup={backup}")
-    return {"ok": True, "action": action, "id": str(id), "deleted": True,
+                        f"删除了 {deleted} 篇（应为 1），文档可能已被并发删掉：{doc_id}",
+                        action, str(doc_id))
+    audit.record(action, str(doc_id), ok=True, reason=f"deleted=1; backup={backup}")
+    return {"ok": True, "action": action, "id": str(doc_id), "deleted": True,
             "source_key": str(doc["source_key"]), "backup": backup}
+
+
+@router.post("/api/v1/kb/documents/{id}/delete",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def kb_delete_document(id: str, body: KbDeleteBody) -> Dict[str, Any]:
+    """**真删**一篇文档（chunks + documents，同一事务）。
+
+    与记忆真删同档防手滑：必须手输**文档标题全文**。执行序固定：
+    取行 → 校验来源类型 → **备份全文与全部切片（失败则不删）** → 删 → 审计。
+    备份文件是唯一的回退路径（正文只存在于切片里，删了就真没了）。
+
+    🆕 代理域（`source_type='agent'`）的文档**从控制台可删**（主脑 owns 这摊子）；
+    灌入器域（skill/skill_hk）仍然 409（改动会被覆盖 / 会被死文档清理扫掉）。
+    """
+    action = "kb.document.delete"
+    doc_id = _doc_id(id, action)
+    # 站内会话 = 主脑本人（primary）：全量可删（写域闸门 `_writable_doc` 同一把尺子）。
+    return _delete_one(doc_id, action, _CONSOLE_WRITER, confirm=body.confirm)
 
 
 # --------------------------------------------------------------------------
@@ -1264,6 +1395,18 @@ def kb_approve_document(id: str, body: KbApproveBody,
     _need_flag(body.confirm, action, str(id), '批准知识库文档必须显式传 {"confirm": true}')
     doc_id = _doc_id(id, action)
     who = str(session.get("username") or "console")
+    return _approve_one(doc_id, action, who)
+
+
+def _approve_one(id: int, action: str, who: str) -> Dict[str, Any]:
+    """**批准**一篇待审文档 —— 单条与批量**共用这一份**（口径只有一份）。
+
+    同事务内 改 effective + 按类型切块落 chunks + 记批准痕迹。
+    🔴 **切块就发生在这一刻**（pending 阶段一行 chunks 都没有）：审核动作之前
+    未审正文不进检索索引，批准之后才按 `content_type` 走 `chunk_document` 落库。
+    正文取 `review_meta.body`（提交时存的那份原文），link 的 URL/摘要从 `meta` 取回。
+    """
+    doc_id = id
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     _need_status(names, action, str(id))
@@ -1326,6 +1469,17 @@ def kb_reject_document(id: str, body: KbRejectBody,
                 "日后重新审核时这句是唯一的线索", action, str(id))
     doc_id = _doc_id(id, action)
     who = str(session.get("username") or "console")
+    return _reject_one(doc_id, action, who, reason)
+
+
+def _reject_one(id: int, action: str, who: str, reason: str) -> Dict[str, Any]:
+    """**驳回**一篇待审文档 —— 单条与批量**共用这一份**（口径只有一份）。
+
+    `status='rejected'` + 记理由。**不删正文**。
+    🔴 标记而不是删行：正文还在 `review_meta.body` 里，审核的人改主意就能再批
+    （子代理的提交被一次误驳回整个丢掉，才是真丢数据）。
+    """
+    doc_id = id
     schema = _ident(config.pg_schema())
     names = _write_names(schema)
     _need_status(names, action, str(id))
@@ -1350,6 +1504,141 @@ def kb_reject_document(id: str, body: KbRejectBody,
                 reason=f"reason={reason[:80]}; by={who}; was={st}")
     return {"ok": True, "action": action, "id": str(id), "status": ingest.STATUS_REJECTED,
             "title": str(doc.get("title") or ""), "reason": reason}
+
+
+# --------------------------------------------------------------------------
+# 勾选批量：批准 / 驳回 / 真删（口径与 `routers/ops.py` 的 ops/bulk 同款）
+# --------------------------------------------------------------------------
+
+class KbBulkBody(BaseModel):
+    """`{"ids": ["12","34"], "confirm": "2"}` —— 勾选批量。
+
+    🔴 `confirm` = **ids 去重后的条数**（字符串形态，与 `ops/bulk` 同一口径）：
+    勾了 37 条却手输 38 个都不放行 ⇒「我要动的这一批」与「我点确认的那一批」
+    必须是同一个数。缺失或不等 ⇒ 400（不静默跑）。
+
+    🔴 `ids` 里的 id 逐条处理：坏 id（不是整数）、不存在的、没权限的，
+    各自在 `failed` 里带原因码，**不拖累其余条目**。
+    """
+
+    ids: List[Union[str, int]] = Field(default_factory=list,
+                                        description="文档 id 列表（去重后逐条处理；字符串或整数都行）")
+    confirm: Union[str, int] = Field("", description="确认串 = ids 去重后的条数")
+
+
+class KbBulkRejectBody(KbBulkBody):
+    """批量驳回：**reason 必填**（与单条同款 —— 驳回不删正文，理由是日后
+    重新审核时唯一的线索）。一条理由覆盖整批。"""
+
+    reason: str = Field("", description="统一的驳回理由（必填）")
+
+
+def _bulk_ids(raw: Any, action: str) -> List[str]:
+    """勾选的文档 id 去重 + 上限护栏（保序：与勾选顺序一致，回包好对账）。"""
+    ids: List[str] = []
+    seen = set()
+    for x in raw or []:
+        s = str(x).strip()
+        if s and s not in seen:
+            seen.add(s)
+            ids.append(s)
+    if not ids:
+        _reject(400, "bulk_no_ids", "ids 不能为空（请先勾选文档）", action, "batch")
+    if len(ids) > BULK_MAX_DOCS:
+        _reject(400, "bulk_too_large",
+                f"一次最多 {BULK_MAX_DOCS} 篇，本次 {len(ids)} 篇：请分批操作（超限不截断）",
+                action, "batch")
+    return ids
+
+
+def _bulk_one(action: str, ids: List[str], one: Callable[[str], Any]) -> Dict[str, Any]:
+    """逐条跑单条逻辑：**单条失败不拖累其他条**（各自记原因码）。
+
+    失败原因取单条端点抛出的**错误码**（`kb_not_owner` / `kb_doc_immutable` /
+    `kb_doc_not_pending` / `kb_doc_missing` …）—— 前端据此把「为什么没成」
+    说给人听（不把 500 堆栈甩到界面上）。
+    审计另记一条批次汇总（逐条的那几行由单条端点自己记）。
+    """
+    failed: List[Dict[str, str]] = []
+    succeeded = 0
+    for doc_id in ids:
+        try:
+            one(doc_id)
+            succeeded += 1
+        except HTTPException as e:        # 单条端点的拒绝（校验 / 闸门 / 不存在）
+            failed.append({"id": doc_id, "reason": _err_code(e)})
+        except OSError:                   # 备份落盘失败 —— 那条宁删不成
+            failed.append({"id": doc_id, "reason": "backup_failed"})
+    audit.record(action, f"batch:{len(ids)}", ok=bool(succeeded) or not failed,
+                 reason=f"requested={len(ids)}; succeeded={succeeded}; "
+                        f"failed={len(failed)}")
+    return {"ok": True, "action": action, "succeeded": succeeded,
+            "failed": failed, "total": len(ids)}
+
+
+@router.post("/api/v1/kb/documents/bulk-approve",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def kb_bulk_approve(body: KbBulkBody,
+                    session: Dict[str, Any] = Depends(require_session)) -> Dict[str, Any]:
+    """**批量批准**勾选的待审文档（逐条复用单条批准的那份实现）。
+
+    确认串 = **去重后的选中篇数**（与 `ops/bulk` 同一防手滑口径）。
+    **单条失败不拖累其他条**：已生效 / 不在队列 / 不存在，各自在 `failed` 里
+    带原因码，其余照常批准（批准 = 此刻才切块进检索）。
+    """
+    action = "kb.bulk.approve"
+    ids = _bulk_ids(body.ids, action)
+    _need_text(str(body.confirm or "").strip(), str(len(ids)), action, "batch",
+               f"本次勾选的 {len(ids)} 篇")
+    who = str(session.get("username") or "console")
+    return _bulk_one(action, ids,
+                     lambda did: _approve_one(_doc_id(did, action),
+                                              "kb.document.approve", who))
+
+
+@router.post("/api/v1/kb/documents/bulk-reject",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def kb_bulk_reject(body: KbBulkRejectBody,
+                   session: Dict[str, Any] = Depends(require_session)) -> Dict[str, Any]:
+    """**批量驳回**勾选的待审文档：整批**一个理由**，逐条复用单条驳回的实现。
+
+    🔴 reason 必填（与单条同款）：驳回不删正文，理由是日后重新审核时唯一的线索。
+    """
+    action = "kb.bulk.reject"
+    ids = _bulk_ids(body.ids, action)
+    _need_text(str(body.confirm or "").strip(), str(len(ids)), action, "batch",
+               f"本次勾选的 {len(ids)} 篇")
+    reason = (body.reason or "").strip()
+    if not reason:
+        _reject(400, "reason_required",
+                "驳回必须写理由（review_meta.reject_reason）—— 驳回不删正文，"
+                "日后重新审核时这句是唯一的线索", action, "batch")
+    who = str(session.get("username") or "console")
+    return _bulk_one(action, ids,
+                     lambda did: _reject_one(_doc_id(did, action),
+                                             "kb.document.reject", who, reason))
+
+
+@router.post("/api/v1/kb/documents/bulk-delete",
+             dependencies=[Depends(writer_identity), Depends(write_guard)])
+def kb_bulk_delete(body: KbBulkBody,
+                   writer: Dict[str, Any] = Depends(writer_identity)) -> Dict[str, Any]:
+    """**批量真删**勾选的文档：逐篇备份快照 + 逐条复用单条真删的实现。
+
+    确认串 = **去重后的选中篇数**（整批一次确认；单条那套「手输标题全文」在批量
+    里没有意义 —— 备份仍是**逐篇**的，写不进去那篇宁删不成）。
+
+    🔴 **归属闸不放松**：primary（站内会话 / 主代理凭据）全量可删；
+    **非 primary 只能删自己名下**的（归属写在 `documents.agent_id`）——
+    删别人名下 ⇒ 那一条进 `failed`（原因码 `kb_not_owner`），其余照常删。
+    """
+    action = "kb.bulk.delete"
+    ids = _bulk_ids(body.ids, action)
+    _need_text(str(body.confirm or "").strip(), str(len(ids)), action, "batch",
+               f"本次勾选的 {len(ids)} 篇")
+    return _bulk_one(action, ids,
+                     lambda did: _delete_one(_doc_id(did, action),
+                                             "kb.document.delete", writer, confirm=None))
 
 
 def _export_lines(schema: str, names: Dict[str, str], source_type: str,

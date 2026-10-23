@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是四十条业务写端点加四条auth_POST():
+def test_写面仍是四十三条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -695,6 +695,8 @@ def test_写面仍是四十条业务写端点加四条auth_POST():
     被连上来」）+ 消息中心手动/批量触发提醒（`POST /api/v1/messages/nudge`，
     推一帧事件、**不改数据**）。
     🆕 待办再加三条（37 → 40）：新增 / 改状态 / 真删（2026-10 ks_todo 一等公民）。
+    🆕 知识库勾选批量再加三条（40 → 43）：批量批准 / 批量驳回 / 批量真删
+    （kb_bulk_ops —— 逐条复用单条端点的那份实现，confirm = 选中条数）。
     """
     app = create_app()
     write = {r.path for r in flat_routes(app)
@@ -711,6 +713,9 @@ def test_写面仍是四十条业务写端点加四条auth_POST():
         "/api/v1/kb/documents", "/api/v1/kb/documents/{id}/update",
         "/api/v1/kb/documents/{id}/delete", "/api/v1/kb/import",
         "/api/v1/kb/documents/{id}/approve", "/api/v1/kb/documents/{id}/reject",
+        # 知识库勾选批量三条（kb_bulk_ops）：批量批准 / 批量驳回 / 批量真删
+        "/api/v1/kb/documents/bulk-approve", "/api/v1/kb/documents/bulk-reject",
+        "/api/v1/kb/documents/bulk-delete",
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
         "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
         "/api/v1/crons/{job_id}/edit",
