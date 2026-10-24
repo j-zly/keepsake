@@ -13,7 +13,7 @@
   ⑥ **未批准**的凭据四工具全拒（fail-closed，与记忆工具同一道闸）。
 
 **用真 PG**（知识库是 PG 专有，documents/chunks 无 SQLite 对应物）：连
-8.140.192.91/keepsake_test，每个用例建一个独立 schema（表结构与生产同款 DDL，
+KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test，每个用例建一个独立 schema（表结构与生产同款 DDL，
 **含 `agent_id` 归属列**），用完 `DROP SCHEMA ... CASCADE`；读不到凭据就 skip ——
 与 `tests/api/test_kb_crud.py` 同一套接法。代理注册表走**临时 SQLite**
 （不连 Redis / 生产库）。
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -43,7 +44,7 @@ OTHER = "worker-other"
 WORD = "回滚手册"
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 
@@ -59,7 +60,7 @@ DSN = _read_dsn()
 _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 
 PG_ONLY = pytest.mark.skipif(not _pg_ready,
-                             reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+                             reason="无测试库凭据，跳过 PG 真库")
 
 #: 与生产同款的 documents/chunks DDL（**含 `agent_id text NULL`** —— 归属列）。
 #: `agent_id` 是可空的：历史行全无主（NULL），加了列也不改存量语义。
@@ -101,7 +102,7 @@ def _build(tmp_path, monkeypatch):
 def kb(tmp_path, monkeypatch) -> Iterator[SimpleNamespace]:
     """隔离 schema 的真库 + 装配好的 MCP server；用完 DROP SCHEMA CASCADE。"""
     if not _pg_ready:
-        pytest.skip("无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+        pytest.skip("无测试库凭据，跳过 PG 真库")
     schema = f"ks_kbtool_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(DSN, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
         for stmt in DDL:

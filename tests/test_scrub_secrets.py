@@ -166,8 +166,8 @@ class TestCategory5HighEntropy:
 
     def test_ipv4_address_does_not_mask(self):
         """任务书硬要求：URL 域名 / IP 主机部分零误伤"""
-        out, n = scrub_secrets("154.219.96.202")
-        assert out == "154.219.96.202"
+        out, n = scrub_secrets("203.0.113.7")
+        assert out == "203.0.113.7"
         assert n == 0
 
     def test_jwt_style_token_masks(self):

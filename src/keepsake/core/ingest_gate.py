@@ -225,7 +225,7 @@ def _is_high_entropy_secret(s: str) -> bool:
     """判断一个 high-entropy run 是否更像 secret（保守策略）。
 
     排除：
-      - 纯 [0-9.]（如 "154.219.96.202" 等 IPv4）
+      - 纯 [0-9.]（如 "203.0.113.7" 等 IPv4）
       - IPv4 显式格式（4 段，每段 1-3 位数字）
 
     接受（任一条件满足即视为 secret）：

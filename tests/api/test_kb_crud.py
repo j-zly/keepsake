@@ -1,7 +1,7 @@
 """知识库写端点测试（增 / 改 / 真删 / 导入 / 导出）。
 
 **用真 PG**：KB 是 PG 专有（documents/chunks 无 SQLite 对应物），所以真库用例连
-`~/.keepsake_pg_test.env` 里的 8.140.192.91/keepsake_test，每个用例建一个独立
+`~/.keepsake_pg_test.env` 里的 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test，每个用例建一个独立
 schema（表结构与生产同款 DDL），用完 `DROP SCHEMA ... CASCADE`；读不到凭据就
 skip —— 与 `tests/test_list_by_tag_archived.py` 同一套接法。纯函数用例
 （`split_chunks` / 单点断言）不碰库，任何环境都跑。
@@ -45,7 +45,7 @@ IMPORT = "/api/v1/kb/import"
 EXPORT = "/api/v1/kb/export"
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 #: 与生产 `keepsake` 库同款 DDL（含 (source_type, source_key) 唯一约束 ——
@@ -112,7 +112,7 @@ DSN = _read_dsn()
 _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 
 PG_ONLY = pytest.mark.skipif(not _pg_ready,
-                             reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+                             reason="无测试库凭据，跳过 PG 真库")
 
 
 # ---------------------------------------------------------------- 纯函数（不碰库）
@@ -170,7 +170,7 @@ def legacy_kb(monkeypatch, tmp_path) -> Iterator[SimpleNamespace]:
 
 def _kb_with(monkeypatch, tmp_path, ddl) -> Iterator[SimpleNamespace]:
     if not _pg_ready:
-        pytest.skip("无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+        pytest.skip("无测试库凭据，跳过 PG 真库")
     schema = f"ks_kb_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(DSN, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
         for stmt in ddl:

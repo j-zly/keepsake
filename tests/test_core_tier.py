@@ -184,14 +184,14 @@ def test_replace_by_substring_old_text_replaces_not_duplicates():
 def test_previous_content_wins_over_old_text():
     """镜像带过来的旧条目全文优先于 old_text：old_text 碰巧是另一条的子串也不许删错。"""
     st = FakeStorage([
-        {"key": "memory:frag:target", "content": "甲条目：主脑 IP 39.96.44.98 且端口 8091",
+        {"key": "memory:frag:target", "content": "甲条目：主脑 IP 203.0.113.7 且端口 8091",
          "tags": "core,memory", "updated_at": ""},
         {"key": "memory:frag:decoy", "content": "乙条目：端口 8091 也出现过",
          "tags": "core,memory", "updated_at": ""},
     ])
     _provider(st).on_memory_write("replace", "memory", "新条目",
                                   {"old_text": "端口 8091",
-                                   "previous_content": "甲条目：主脑 IP 39.96.44.98 且端口 8091"})
+                                   "previous_content": "甲条目：主脑 IP 203.0.113.7 且端口 8091"})
     assert st.deleted == ["memory:frag:target"], "必须按全文命中目标，而不是命中子串诱饵"
     assert [c["text"] for c in st.store_calls] == ["新条目"]
 

@@ -26,12 +26,13 @@
 
 SQLite 用例全 hermetic（tmp_path 临时库）；Redis 用假 client（不连真 Redis，
 与 `test_list_by_tag_archived.py` 同一套接法）；PG 连
-`~/.keepsake_pg_test.env` 里的 8.140.192.91/keepsake_test（隔离 schema），
+`~/.keepsake_pg_test.env` 里的 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test（隔离 schema），
 读不到凭据就 skip —— 与 `test_list_by_tag_archived.py` 同一套接法。
 """
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -47,7 +48,7 @@ from keepsake.storage import RedisStorage
 from keepsake.storage_sqlite import SqliteStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 CORPUS = ["回测策略命中率提升明显", "风控规则收紧审批流程", "量化组合再平衡节奏"]
@@ -498,7 +499,7 @@ def test_redis_不可达返回0(monkeypatch):
 @pytest.fixture()
 def pgs():
     if not _pg_ready:
-        pytest.skip("无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+        pytest.skip("无测试库凭据，跳过 PG 真库")
     from keepsake.storage_pg import PgStorage
 
     schema = f"ks_hits_{uuid.uuid4().hex[:12]}"

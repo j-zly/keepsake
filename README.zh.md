@@ -1,6 +1,6 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
-> 最后校准: 2026-10-19（对齐 HEAD 11e0ef0：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP + Hy-Memory 借鉴线三批（契约v2 演化链四列 / 调和协议五裁决 / 检索层批3）全部上线，班车 3000/5000 准入改制生效）
+> 最后校准: 2026-10-24（对齐 HEAD 582a35d：检索结果 LLM 筛选 + 控制台 AI 设置页 + 按代理注入预算 + 代理可用知识库 + 待办看板 + 推送唤醒与通知出口 + PG 连接池按 conninfo 共享 + 统一 HTTP 栈，均已上线）
 
 碎片化记忆系统 — 每次对话自动检索相关记忆注入上下文。
 
@@ -54,6 +54,14 @@
 | 🖥️ **控制台记忆条目 CRUD** | 新增 / 真删（confirm=key 末 8 位，删前备份）/ JSONL·CSV 导出 / 导入（dry-run 预演+手输实跑）；常驻层列表带 `?q=` 搜索 |
 | 📚 **知识库 CRUD 与灌入器** | 记忆库旁的 documents/chunks 文档库：manual 域归控制台、skill 域归夜间灌入器，切块判据单点收在 `keepsake.kb.ingest`。见「知识库（documents / chunks）与灌入器」节 |
 | 🧰 **记忆维护独立页** | 合并/遗忘 dry-run 与实跑 + 常驻候选审核区，从看板摘出为控制台独立页 |
+| 🧮 **检索结果 LLM 筛选** | `memory_search` / `kb_search` 支持 `screen` 参数：检索结果先按相关性筛选再注入上下文，噪音查询只回真正答得上问题的那几条。配置集中在控制台 AI 设置页 |
+| 🖥️ **控制台 AI 设置页** | 一页五节集中配置：LLM / embedder / 筛选 / 查询扩展 / 班车复核；凭据真值永不下发，接口只回「是否已设置」与存放路径 |
+| 📏 **按代理注入预算** | 每个代理可单独设常驻层字符预算；留空（NULL）回退全局预算 |
+| 📚 **代理可用的知识库** | `kb_store` / `kb_search` / `kb_get` / `kb_remove` 四工具，文档归属与可见性和记忆同尺 |
+| ✅ **待办看板** | `todo_add` / `todo_done` / `todo_list` 三工具 + 控制台看板，待办与相关记忆放在一起管 |
+| 🔔 **推送唤醒与通知出口** | SSE 帧旁路 HMAC 签名 webhook 唤醒宿主会话，`notify_url` 推到聊天渠道；出口故障一律 fail-open，不阻塞对话 |
+| 🔌 **PG 连接池按 conninfo 共享** | 同一条连接串共用一个连接池，长驻会话不再泄漏连接 |
+| 🌐 **统一 HTTP 栈** | httpx + tenacity 单点出口，embedder 与 LLM 通道共用同一套超时与重试口径 |
 
 ## 设计哲学：为 LLM 优化的干净记忆
 
@@ -87,14 +95,67 @@
 ## 安装
 
 ```bash
-pip install keepsake
+# 核心安装 —— Redis 后端 + BM25 全文检索，不需要嵌入 API
+pip install keepsake-memory
+
+# 用 PostgreSQL 后端（代替 Redis）
+pip install 'keepsake-memory[postgres]'
+
+# 通用 MCP 服务（keepsake.mcp_server）
+pip install 'keepsake-memory[mcp]'
 ```
 
 或者从 GitHub 直装：
 
 ```bash
-pip install git+https://github.com/j-zly/keepsake.git
+pip install 'git+https://github.com/j-zly/keepsake.git'
 ```
+
+### 快速开始
+
+四步，照抄即可。
+
+**1. 安装**
+
+```bash
+pip install keepsake-memory                # Redis 后端
+pip install 'keepsake-memory[postgres]'    # 或 PostgreSQL 后端
+```
+
+**2. 配置** —— 建 `~/.config/keepsake/config.json`（也可以只导出环境变量，环境变量优先）：
+
+```bash
+mkdir -p ~/.config/keepsake
+cat > ~/.config/keepsake/config.json <<'JSON'
+{
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379
+}
+JSON
+```
+
+纯环境变量写法：
+
+```bash
+export KEEPSAKE_REDIS_HOST=127.0.0.1
+export KEEPSAKE_REDIS_PORT=6379
+```
+
+**3. 让 Hermes 指过来** —— 在 `~/.hermes/config.yaml` 里：
+
+```yaml
+memory:
+  provider: keepsake
+```
+
+**4. 重启网关**
+
+```bash
+# CLI 模式：重开会话即可
+# Gateway 模式：重启进程
+```
+
+不配 `embedder` 节就一直是 BM25-only 模式：不需要嵌入 API、不需要 LLM、不需要向量索引。
 
 ## 配置
 

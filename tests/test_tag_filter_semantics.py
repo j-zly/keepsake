@@ -10,12 +10,13 @@
   2. 分隔符按**真实形态（逗号）**处理，且逗号两侧空格容错（`c, d` 里的 `d` 能查到）
   3. 多 tag_filter 是**并集**（OR），不是「拼成一个相邻子串」
 
-PG 用例只连 `~/.keepsake_pg_test.env` 里的 8.140.192.91/keepsake_test（隔离 schema），
+PG 用例只连 `~/.keepsake_pg_test.env` 里的 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test（隔离 schema），
 读不到凭据就 skip；SQLite 用例全 hermetic（tmp_path 临时库）。
 """
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from pathlib import Path
@@ -25,7 +26,7 @@ import pytest
 from keepsake.storage_sqlite import SqliteStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 QUERY = "部署 回滚 流程"
@@ -185,7 +186,7 @@ def test_sqlite_agent_isolation_clause_matches_own_tag(lite_seeded):
 # 三、PG 真库 + 与 SQLite 的 key 集合一致性（无凭据则 skip）
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _pg_ready, reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+@pytest.mark.skipif(not _pg_ready, reason="无测试库凭据，跳过 PG 真库")
 def test_pg_matches_sqlite_on_same_corpus(lite_seeded):
     from keepsake.storage_pg import PgStorage
 

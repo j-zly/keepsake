@@ -6,7 +6,7 @@
 🔴 凭据纪律（抄 `tests/test_storage_pg.py`）：
   * DSN 只从 `~/.keepsake_pg_test.env`（KEEPSAKE_PG_DSN）读；
   * 读不到 / 没装 psycopg ⇒ **skip，不 fail**；
-  * 只连 8.140.192.91 / keepsake_test，否则 skip（防手滑连到生产）；
+  * 只连 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example） / keepsake_test，否则 skip（防手滑连到生产）；
   * 凭据绝不进代码、日志、断言输出。
 
 测试结束删除本次写入的全部行（不留残渣）。
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import List
@@ -25,7 +26,7 @@ from keepsake.splitter import extract_entities
 from keepsake.storage_pg import PgStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg（pip install 'psycopg[binary]'）")

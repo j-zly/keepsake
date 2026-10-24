@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List
@@ -411,7 +412,7 @@ def test_三后端判据同源(monkeypatch):
 # --------------------------------------------------------------------------
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 

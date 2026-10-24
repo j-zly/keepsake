@@ -18,6 +18,7 @@ Redis / PG / 网络 / 生产库，也不碰主脑的真实 config。
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from pathlib import Path
@@ -382,7 +383,7 @@ def test_redis后端同一份语义():
 # ---------------------------------------------------------------------------
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 
@@ -396,7 +397,7 @@ def _read_dsn() -> str:
 DSN = _read_dsn()
 _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 _pg_skip = pytest.mark.skipif(not _pg_ready,
-                              reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+                              reason="无测试库凭据，跳过 PG 真库")
 
 
 @pytest.fixture()

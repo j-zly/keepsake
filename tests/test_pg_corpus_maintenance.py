@@ -14,7 +14,7 @@ PG 侧这两个方法此前是 `NotImplementedError` 留桩，是**三后端等�
 
 ## 隔离与凭据
 
-* DSN 只从 `~/.keepsake_pg_test.env` 读；host/dbname 必须是 8.140.192.91 /
+* DSN 只从 `~/.keepsake_pg_test.env` 读；host/dbname 必须是 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example） /
   keepsake_test，否则整模块 skip（防手滑连生产）。
 * 每个用例在**独立 schema**（`ks_syn_*`）里建表，跑完 `DROP SCHEMA ... CASCADE`
   并复查残留 = 0 —— 与 `test_pg_legacy_maintenance.py` 同一套办法，
@@ -24,6 +24,7 @@ PG 侧这两个方法此前是 `NotImplementedError` 留桩，是**三后端等�
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -35,7 +36,7 @@ from keepsake.storage_pg import PgStorage
 from keepsake.storage_sqlite import SqliteStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg（pip install 'keepsake-memory[postgres]'）")

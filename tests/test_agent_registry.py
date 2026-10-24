@@ -9,7 +9,8 @@
 5. 迁移器：`agent:` 项进 exclude、`core_candidate` 忽略、二次跑不重复；
 6. 本机 bootstrap 行 = approved + primary + `meta.bootstrap=local`；
 7. Redis 假 client（`keepsake:agent:<id>` hash 形态）语义与 SQL 后端同款；
-8. PG 真库（8.140.192.91 / keepsake_test，跑完清干净；没凭据就 skip）；
+8. PG 真库（host 取 KEEPSAKE_PG_TEST_HOST、缺省 postgres.test.example，库名 keepsake_test；
+   跑完清干净；没凭据就 skip）；
 9. 凭据纪律：库里只有 sha256，明文不进存储、不进日志。
 
 全程 hermetic：SQLite 用 `tmp_path` 临时库、Redis 用内存假 client、PG 用隔离测试库，
@@ -550,7 +551,7 @@ def test_redis_不可达时报错而不是静默放行():
 # --------------------------------------------------------------------------
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 

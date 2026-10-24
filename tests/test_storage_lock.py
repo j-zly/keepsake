@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import threading
 import time
@@ -57,7 +58,7 @@ from keepsake import storage_pg
 from keepsake.storage_pg import PgStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 ROUNDS = 20

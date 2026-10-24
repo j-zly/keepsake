@@ -14,13 +14,14 @@
      显式空串 = 不排除；`search()` / `prefetch()` 两个出口同一份实现
 
 SQLite 用例全 hermetic（tmp_path 临时库，BM25-only 模式）；
-PG 用例连 `~/.keepsake_pg_test.env` 里的 8.140.192.91/keepsake_test（隔离 schema），
+PG 用例连 `~/.keepsake_pg_test.env` 里的 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test（隔离 schema），
 读不到凭据就 skip —— 与 tests/test_tag_filter_semantics.py 同一套接法。
 Redis 用例需要真实 RediSearch，无基建 ⇒ skip（口径由 G2 静态闸覆盖）。
 """
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from pathlib import Path
@@ -133,7 +134,7 @@ def test_primary_branch_unchanged_by_core_opening(lite_seeded):
 
 # PG 真库：同一份语料同一套断言（无凭据则 skip）
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 
@@ -147,7 +148,7 @@ def _read_dsn() -> str:
 DSN = _read_dsn()
 _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 _pg_skip = pytest.mark.skipif(not _pg_ready,
-                              reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+                              reason="无测试库凭据，跳过 PG 真库")
 
 
 @pytest.fixture()

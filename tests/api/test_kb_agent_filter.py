@@ -30,7 +30,7 @@ from keepsake.api.deps import get_storage
 from keepsake.api.routers import kb as kb_router
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 TOKEN = "kbagent-test-token-not-a-real-secret"
@@ -83,7 +83,7 @@ DSN = _read_dsn()
 _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 
 PG_ONLY = pytest.mark.skipif(not _pg_ready,
-                             reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+                             reason="无测试库凭据，跳过 PG 真库")
 
 
 @pytest.fixture()
@@ -99,7 +99,7 @@ def legacy_kb(monkeypatch, tmp_path) -> Iterator[SimpleNamespace]:
 
 def _kb_with(monkeypatch, tmp_path, ddl) -> Iterator[SimpleNamespace]:
     if not _pg_ready:
-        pytest.skip("无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+        pytest.skip("无测试库凭据，跳过 PG 真库")
     schema = f"ks_kbagent_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(DSN, autocommit=True, connect_timeout=30) as conn, conn.cursor() as cur:
         for stmt in ddl:

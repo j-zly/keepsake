@@ -5,7 +5,7 @@
   * 读不到 / 没装 psycopg → **skip，不 fail**（这台机器没库时也要能跑全套）
   * 凭据绝不进代码、日志、断言输出（报错只打印异常类型，不打印 DSN）
 
-🔴 只连这一个测试库：host 必须是 8.140.192.91 / dbname 必须是 keepsake_test，
+🔴 只连这一个测试库：host 必须是 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example） / dbname 必须是 keepsake_test，
    否则 skip（防手滑连到生产）。
 
 测试结束删除本次写入的全部行（不留残渣）。
@@ -27,7 +27,7 @@ from keepsake.splitter import extract_entities, extract_keywords
 from keepsake.storage_pg import PgStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 # 本次运行写入的所有记忆条目 key（teardown 按 key 清；整表不 TRUNCATE —— 那是别人的库）

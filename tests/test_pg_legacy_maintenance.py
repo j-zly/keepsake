@@ -2,7 +2,7 @@
 
 ## 为什么必须有这个文件
 
-`keepsake_test`（8.140.192.91）里 `ks_fragment` **已经有**
+`keepsake_test`（host 取 KEEPSAKE_PG_TEST_HOST，缺省 postgres.test.example）里 `ks_fragment` **已经有**
 `level / consumed_by / consumed_at` 三列 —— 上一单在它上面跑过 `ensure_index`，
 ALTER 已落库。所以既有 PG 真库用例**测不出**生产 180 的故障：
 
@@ -46,7 +46,7 @@ from keepsake.forgetter import Forgetter
 from keepsake.storage_pg import MAINTENANCE_COLUMNS, PgStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST = "8.140.192.91"
+ALLOWED_HOST = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example")
 ALLOWED_DBNAME = "keepsake_test"
 
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg（pip install 'keepsake-memory[postgres]'）")

@@ -14,13 +14,14 @@
   3. 真删 = 备份先行 + 确认串手输，删完库与备份文件对得上；
   4. 导出/导入的计数口径（超限 400 不截断、重复 skip、dry-run 零写入）。
 
-PG 用例连 `~/.keepsake_pg_test.env` 里的 8.140.192.91/keepsake_test（隔离 schema，
+PG 用例连 `~/.keepsake_pg_test.env` 里的 KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test（隔离 schema，
 用完 DROP），读不到凭据就 skip —— 与 `tests/test_list_by_tag_archived.py` 同一套接法。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -54,7 +55,7 @@ SEED: List[Dict[str, Any]] = [
 ]
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 
 
 def _read_dsn() -> str:
@@ -283,7 +284,7 @@ def test_改正文同时改标签_标签仍在召回面(client, storage):
     assert key in hits(storage, "改稿", tag="demo,改稿"), "改标签后标签仍在召回面"
 
 
-@pytest.mark.skipif(not _pg_ready, reason="无 8.140.192.91/keepsake_test 凭据，跳过 PG 真库")
+@pytest.mark.skipif(not _pg_ready, reason="无测试库凭据，跳过 PG 真库")
 def test_pg_改正文后content_tsv同步():
     """PG 侧同款判据 —— 这是 PG 历史上真实存在的 bug：
     `update_fragment_fields` 只 UPDATE 列、不重算 `content_tsv`，

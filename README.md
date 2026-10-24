@@ -1,6 +1,6 @@
 # Keepsake — Memory Plugin for Hermes Agent
 
-> 最后校准: 2026-10-19（对齐 HEAD 11e0ef0：契约v2演化链四列+调和协议五裁决+检索层批3（意图惰性过期+链头判重）+班车 3000/5000 准入均已上线；借鉴线三批收官：多代理治理四闸 + 记忆/知识库 CRUD + 通用 MCP）
+> Last calibrated: 2026-10-24 (aligned with HEAD 582a35d — LLM screening of search results, the console AI settings page, per-agent injection budgets, the agent-facing knowledge base, the todo board, push wake & notify outlets, a shared PG connection pool and a unified HTTP stack are all live).
 
 The Keepsake system automatically retrieves relevant memories and injects them into the conversation context for each dialogue.
 
@@ -50,6 +50,14 @@ User: "How did we set up that React project structure last time?"
 - **Console Memory CRUD** — create, delete (confirm the last 8 characters of the key, backed up first), JSONL/CSV export and dry-run import from the console; the resident-layer list takes `?q=` free-text search
 - **Knowledge Base CRUD and Ingestor** — document/chunk storage beside the memory store, with a manual domain owned by the console and a `skill` domain owned by the nightly ingestor; chunking is single-sourced in `keepsake.kb.ingest`. See [Knowledge Base (documents / chunks) and the Ingestor](#knowledge-base-documents--chunks-and-the-ingestor)
 - **Standalone Memory Maintenance Page** — merge / forget dry-run and real run plus the resident-layer candidate review queue, split out of the dashboard into its own console page
+- **LLM Screening of Search Results** — `memory_search` / `kb_search` take a `screen` flag: an LLM drops the irrelevant hits before they are injected, so a noisy query returns only what actually answers it. Configured from the console's AI settings page
+- **Console AI Settings Page** — one page, five sections (LLM / embedder / screening / query expansion / tiering review); credential values are never sent to the browser, the API only reports whether a key is set and which file holds it
+- **Per-Agent Injection Budget** — every agent can carry its own resident-layer character budget; leaving it unset falls back to the global budget
+- **Knowledge Base for Agents** — four tools (`kb_store` / `kb_search` / `kb_get` / `kb_remove`) give agents a document store whose ownership and visibility rules match the memory store's
+- **Todo Board** — three tools (`todo_add` / `todo_done` / `todo_list`) plus a console board, so outstanding work is tracked next to the memories it depends on
+- **Push Wake & Notify Outlets** — beside the private-message SSE stream, an HMAC-signed webhook wakes the host session and a notify URL pushes to a chat channel; both fail open, so a broken outlet never blocks a turn
+- **Shared PG Connection Pool** — one pool per connection string, so a long-lived session no longer leaks connections
+- **Unified HTTP Stack** — a single httpx + tenacity path serves the embedder and LLM channels, so timeouts and retries behave identically everywhere
 
 ## Design Philosophy: Clean Memory for LLMs
 
@@ -83,14 +91,67 @@ By default (BM25-only mode) Keepsake needs no vector database, no embedding API 
 ## Installation
 
 ```bash
-pip install keepsake
+# Core install — Redis backend, BM25 full-text search, no embedding API needed
+pip install keepsake-memory
+
+# PostgreSQL backend instead of Redis
+pip install 'keepsake-memory[postgres]'
+
+# Generic MCP server (keepsake.mcp_server)
+pip install 'keepsake-memory[mcp]'
 ```
 
 Or install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/j-zly/keepsake.git
+pip install 'git+https://github.com/j-zly/keepsake.git'
 ```
+
+### Quickstart
+
+Four steps, copy-paste ready.
+
+**1. Install**
+
+```bash
+pip install keepsake-memory                # Redis backend
+pip install 'keepsake-memory[postgres]'    # or the PostgreSQL backend
+```
+
+**2. Configure** — create `~/.config/keepsake/config.json` (or export environment variables instead; environment variables win):
+
+```bash
+mkdir -p ~/.config/keepsake
+cat > ~/.config/keepsake/config.json <<'JSON'
+{
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379
+}
+JSON
+```
+
+Environment-only alternative:
+
+```bash
+export KEEPSAKE_REDIS_HOST=127.0.0.1
+export KEEPSAKE_REDIS_PORT=6379
+```
+
+**3. Point Hermes at it** — in `~/.hermes/config.yaml`:
+
+```yaml
+memory:
+  provider: keepsake
+```
+
+**4. Restart the gateway**
+
+```bash
+# CLI mode: a new session is enough
+# Gateway mode: restart the process
+```
+
+Without an `embedder` section the provider stays in BM25-only mode — no embedding API, no LLM, no vector index required.
 
 ## Configuration
 
@@ -292,7 +353,7 @@ export KEEPSAKE_REDIS_HOST=127.0.0.1
 export KEEPSAKE_REDIS_PORT=6379
 export KEEPSAKE_TOP_K=5
 export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
-export OPENAI_API_KEY=sk-xxx        # embedder API key
+export OPENAI_API_KEY=***           # embedder API key
 ```
 
 ### 6. Workflow Lock
@@ -686,7 +747,7 @@ Mask format: keep the matching prefix (label + separator), replace the value wit
 
 Conservative filtering of the high-entropy fallback (Category 5) avoids false positives on:
 
-- **IPv4 addresses** — `154.219.96.202` → no mask
+- **IPv4 addresses** — `203.0.113.7` → no mask
 - **URL host / paths** — `https://api.example.com/v1/users`, `/var/log/keepsake/server.log` → no mask
 - **Plain English** — `thequickbrownfoxjumpsoverthelazydog` → no mask
 - **Chinese text** — `我的密码本很厚` (no separator) → no mask

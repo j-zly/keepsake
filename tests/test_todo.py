@@ -10,11 +10,12 @@
 6. **老数据兼容**：缺字段的行不炸，缺省值回落。
 
 全程 hermetic：SQLite 用 `tmp_path` 临时库、Redis 用内存假 client、
-PG 只连白名单里的测试库（`8.140.192.91/keepsake_test`）且用例自带清理。
+PG 只连白名单里的测试库（`KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test`）且用例自带清理。
 """
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -438,7 +439,7 @@ def test_老行缺字段不炸(lite):
 # --------------------------------------------------------------------------
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
-ALLOWED_HOST, ALLOWED_DBNAME = "8.140.192.91", "keepsake_test"
+ALLOWED_HOST, ALLOWED_DBNAME = os.environ.get("KEEPSAKE_PG_TEST_HOST", "postgres.test.example"), "keepsake_test"
 psycopg = pytest.importorskip("psycopg", reason="未装 psycopg")
 
 
