@@ -40,7 +40,7 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
     def tool_error(msg):
         return f"[tool_error] {msg}"
 
-from ...core.embedder import create_embedder
+from ...core.embedder import create_embedder, resolve_embedder_api_key
 from ...core.redis import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
 from ...core.ops.forgetter import Forgetter
 # 治理收口（2026-10 ks_agent_registry）：身份 / 角色 / 上下文的判定源。
@@ -1109,7 +1109,9 @@ class KeepsakeProvider(MemoryProvider):
         if embed_provider and embed_provider not in ("", "default", "none"):
             embedder = create_embedder(
                 provider=embed_cfg.get("provider", ""),
-                api_key=embed_cfg.get("api_key", ""),
+                # 凭据：内联 api_key 优先，其次 api_key_file（控制台「AI 配置」页
+                # 写的就是文件型；口径见 core.embedder.resolve_embedder_api_key）
+                api_key=resolve_embedder_api_key(embed_cfg),
                 base_url=embed_cfg.get("base_url", ""),
                 model=embed_cfg.get("model", ""),
             )

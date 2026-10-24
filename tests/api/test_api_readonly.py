@@ -72,6 +72,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/settings/tiering",
     # 检索筛选配置一条（screening_ui）：写 config.json 的 screening 一节
     "/api/v1/settings/screening",
+    # AI 配置页两条（ai_settings_page）：写 config.json 的一节 + 连通检测
+    # （probe 是读性质：不写库、不改 config，但仍要会话）
+    "/api/v1/settings/ai/{section_id}",
+    "/api/v1/settings/ai/{section_id}/probe",
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",

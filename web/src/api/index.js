@@ -258,6 +258,22 @@ export const api = {
     http.request({ method: 'delete', url: `/api/v1/todos/${encodeURIComponent(id)}`,
       data: { confirm } }).then((r) => r.data),
 
+  // ---- AI 配置页（五节集中配置 + 连通检测）--------------------------
+  // 五节快照：{sections:[{id,label,note,enabled,fields:[{key,type,value,min,max,
+  // secret,placeholder}]}]}。🔴 **secret 字段只回「有没有」**（值永不下发），
+  // 数值与输入框上下限也由后端给（前端零写死）。
+  aiSettings: () => http.get('/api/v1/settings/ai').then((r) => r.data),
+  // 保存一节：fields 是该节字段 map，confirm 恒为 true（后端要显式二次确认）；
+  // 🔴 凭据字段留空就别传（传空串 = 不改）。
+  setAiSettings: (sectionId, fields) =>
+    http
+      .put(`/api/v1/settings/ai/${encodeURIComponent(sectionId)}`, { confirm: true, ...fields })
+      .then((r) => r.data),
+  // 连通检测（读性质：不写库、不改 config）：成功 ok=true + 各节细节，
+  // 失败 ok=false + HTTP 状态 + 原因摘要（后端已抹掉凭据）。
+  probeAiSettings: (sectionId) =>
+    http.post(`/api/v1/settings/ai/${encodeURIComponent(sectionId)}/probe`, {}).then((r) => r.data),
+
   // ---- 知识库审核队列（批2）：子代理提交的知识文档先审后用 ----
   // 待审面板（pending + rejected 一起给，pending_count 是全量 pending 数）：
   // 🔴 **计数绝不写死在前端**（与 type-counts / tags 同纪律），老库未迁移 status 列

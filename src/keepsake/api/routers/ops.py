@@ -30,14 +30,18 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from keepsake.core.http import get_client
 from keepsake.core.shared import fragment_key_for, sanitize_reserved_tags
 
 from .. import audit, config
@@ -1151,6 +1155,644 @@ def set_screening(body: ScreeningBody) -> Dict[str, Any]:
     return {"ok": True, "action": action, "screening": section,
             "key_present": key_present, "path": str(config.keepsake_config_file()),
             "backup": backup}
+
+
+# --------------------------------------------------------------------------
+# AI 配置页（settings/ai）：五节快照 + 保存 + 连通检测
+#
+# 口径（2026-10-24 用户拍板）：**所有需要 AI 的地方都在这一页配**；
+# 唯一配置源仍是 config.json（本端点写它），改完靠既有 mtime 机制热生效 ——
+# **不许引入环境变量兜底 / 默认付费模型**（2026-09 退役的老坑，别复活）。
+#
+# 🔴 **凭据真值永不下发**：GET 只回「有没有 + 路径」；新凭据由 PUT 写进
+# 0600 的密钥文件（config.json 里只留路径）。内联旧值**不自动删** ——
+# 迁移是人的决定：页面给一行提示，人填了新值再保存，那次保存才把旧明文摘掉。
+# --------------------------------------------------------------------------
+
+#: 五节（顺序 = 页面上的卡片顺序）。
+AI_SECTIONS: Tuple[str, ...] = ("llm", "embedder", "screening",
+                                "query_expansion", "tiering_review")
+
+#: **可写**的三节（各有自己的 AI 配置）。
+AI_EDITABLE_SECTIONS: Tuple[str, ...] = ("llm", "embedder", "screening")
+
+#: 复用 llm 节、**没有自己的 AI 配置**的两节 —— 对它们写 ⇒ 400，指引到 llm 节。
+AI_REUSE_SECTIONS: Dict[str, str] = {
+    "query_expansion": "查询扩展",
+    "tiering_review": "分级班车复核",
+}
+
+#: 密钥文件目录（env 可改：测试指临时目录；默认 ~/.config/keepsake/ai_keys）。
+AI_KEYS_DIR_ENV = "KEEPSAKE_AI_KEYS_DIR"
+DEFAULT_AI_KEYS_DIR = "~/.config/keepsake/ai_keys"
+
+#: 密钥文件 0600（只有属主可读写）；目录 0700。
+AI_KEY_FILE_MODE = 0o600
+AI_KEY_DIR_MODE = 0o700
+
+#: probe 的超时硬顶（秒）：各节用自己的 timeout，但**不许超过**这个值。
+PROBE_TIMEOUT_CAP_S = 60
+
+#: llm 探测的最小请求体（max_tokens 给足 512：思考型模型给小 token 会腰斩）。
+PROBE_MAX_TOKENS = 512
+
+#: screening 真函数返回的 `skipped:<原因>` → 人话（探测失败时直接回这句）。
+_SCREENING_SKIP_REASON: Dict[str, str] = {
+    "skipped:disabled": "筛选总开关关着（探测的是通道，不看这个开关）",
+    "skipped:no_key": "没有可用凭据（key 文件找不到或为空）",
+    "skipped:unconfigured": "筛选节没配全（接口地址 / 模型缺一不可）",
+    "skipped:timeout": "请求超时",
+    "skipped:rate_limited": "被限流（429）",
+    "skipped:http_error": "连接失败（网络 / 接口不可达）",
+    "skipped:bad_json": "模型回的不是合法 JSON",
+    "skipped:bad_answer": "模型回的编号越界 / 重复 / 空（整份作废）",
+    "skipped:error": "请求异常",
+}
+
+
+# --------------------------------------------------------------------------
+# 凭据：读 / 写（**真值只进密钥文件，不进 config.json、不进响应**）
+# --------------------------------------------------------------------------
+
+def _ai_keys_dir() -> Path:
+    """密钥文件目录（env 可改；默认 ~/.config/keepsake/ai_keys）。"""
+    raw = (os.environ.get(AI_KEYS_DIR_ENV) or "").strip()
+    return Path(raw or DEFAULT_AI_KEYS_DIR).expanduser()
+
+
+def _write_ai_key(section_id: str, secret: str) -> Path:
+    """把凭据写进 0600 的密钥文件（**绝不写进 config.json**）。
+
+    先写临时文件再改名 ⇒ 半截文件不会留下；目录 0700、文件 0600。
+    """
+    d = _ai_keys_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, AI_KEY_DIR_MODE)
+    except OSError:
+        pass            # 目录是别人建的、改不动权限 —— 不该让这次写失败
+    path = d / f"{section_id}.key"
+    tmp = d / f".{section_id}.key.tmp"
+    tmp.write_text(secret.strip() + "\n", encoding="utf-8")
+    os.chmod(tmp, AI_KEY_FILE_MODE)
+    tmp.replace(path)
+    os.chmod(path, AI_KEY_FILE_MODE)
+    return path
+
+
+def _read_key_file(path: Any) -> str:
+    """读密钥文件内容（读不到 ⇒ 空串）。**只给探测用，绝不进响应体。**"""
+    try:
+        return Path(str(path or "")).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _key_file_present(path: Any) -> bool:
+    """密钥文件在不在（**只看文件在不在，绝不读内容**）。"""
+    try:
+        return Path(str(path or "")).expanduser().is_file()
+    except OSError:
+        return False
+
+
+def _llm_secret(llm_cfg: Dict[str, Any]) -> str:
+    """llm 节的凭据：内联 `api_key` 优先，其次 `key_file` 指向的文件。
+
+    优先级与运行时 `resolve_llm_channel` **同款**，但**没有环境变量兜底** ——
+    探测要如实反映 config.json 里写了什么，不能靠 env 里恰好有的 key 蒙对。
+    """
+    key = str(llm_cfg.get("api_key") or "").strip()
+    return key or _read_key_file(llm_cfg.get("key_file"))
+
+
+def _embedder_secret(emb_cfg: Dict[str, Any]) -> str:
+    """embedder 节的凭据：内联 `api_key` 优先，其次 `api_key_file` 指向的文件。
+
+    与运行时 `core.embedder.resolve_embedder_api_key` **同一份口径**。
+    """
+    key = str(emb_cfg.get("api_key") or "").strip()
+    return key or _read_key_file(emb_cfg.get("api_key_file"))
+
+
+def _scrub(text: Any, *secrets: str) -> str:
+    """把凭据真值从要外发的文本里抹掉（错误摘要 / 审计理由都过这一道）。"""
+    out = str(text or "")
+    for s in secrets:
+        if s and len(s) >= 6:
+            out = out.replace(s, "***")
+    return out
+
+
+def _ai_bool(value: Any) -> bool:
+    """布尔解析：只认真布尔与 `true/false` 字符串（数字不认 —— 1 到底开还是关不猜）。
+
+    与 `core.screening._parse_bool` 同款口径。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+    return False
+
+
+def _ai_field(key: str, ftype: str, value: Any, placeholder: str = "",
+              secret: bool = False, **extra: Any) -> Dict[str, Any]:
+    """一个字段的描述（前端照它渲染；**数字零写死**：min/max 也由后端给）。"""
+    out: Dict[str, Any] = {"key": key, "type": ftype, "value": value,
+                           "secret": bool(secret), "placeholder": placeholder}
+    out.update(extra)
+    return out
+
+
+def _ai_reject_unknown(fields: Dict[str, Any], allowed: set,
+                       action: str, target: str) -> None:
+    """未知字段 ⇒ 400（机器输入：字段名打错就该当场红，不许静默忽略）。"""
+    unknown = sorted(set(fields) - set(allowed))
+    if unknown:
+        _reject(400, "ai_unknown_field",
+                f"不认识的字段：{'、'.join(unknown)}（这一节只认 "
+                f"{'、'.join(sorted(allowed))}）", action, target)
+
+
+# --------------------------------------------------------------------------
+# 五节快照（GET）
+# --------------------------------------------------------------------------
+
+def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """llm 节（提炼 / 合并 / 查询扩展 / 班车复核共用这一条通道）。"""
+    cfg = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    base_url = str(cfg.get("base_url") or "").strip()
+    model = str(cfg.get("model") or "").strip()
+    key_file = str(cfg.get("key_file") or "").strip()
+    inline = bool(str(cfg.get("api_key") or "").strip())
+    note = ""
+    if inline:
+        note = ("config.json 里的 llm.api_key 是明文内联：运行时优先用它，"
+                "key_file 只在内联为空时生效（填一次新凭据保存即迁到密钥文件）。")
+    return {
+        "id": "llm",
+        "label": "记忆提炼/合并",
+        "note": note,
+        "enabled": bool(base_url and model and _llm_secret(cfg)),
+        "enabled_editable": False,
+        "editable": True,
+        "fields": [
+            _ai_field("base_url", "text", base_url, "如 https://api.minimax.cn/v1"),
+            _ai_field("model", "text", model, "如 MiniMax-M3.1-Flash"),
+            _ai_field("key_file", "secret_path",
+                      {"set": _key_file_present(key_file), "path": key_file},
+                      "凭据文件路径（留空 = 不改）", secret=True),
+            _ai_field("api_key", "secret_value", {"set": bool(_llm_secret(cfg))},
+                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+        ],
+    }
+
+
+def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """embedder 节（向量检索；provider 留空 = 只用 BM25）。"""
+    cfg = raw.get("embedder") if isinstance(raw.get("embedder"), dict) else {}
+    provider = str(cfg.get("provider") or "").strip()
+    base_url = str(cfg.get("base_url") or "").strip()
+    model = str(cfg.get("model") or "").strip()
+    key_file = str(cfg.get("api_key_file") or "").strip()
+    inline = bool(str(cfg.get("api_key") or "").strip())
+    migrate = ""
+    if inline:
+        migrate = ("embedder.api_key 目前是明文内联：在下面填一次新凭据并保存，"
+                   "它会写进 600 权限的密钥文件、config 里只留 api_key_file；"
+                   "旧明文不会自动删（删不删由你这次保存决定）。")
+    return {
+        "id": "embedder",
+        "label": "向量检索",
+        "note": "provider 留空 = 只用 BM25（没有向量，语义召回失效）。",
+        "migrate_hint": migrate,
+        "enabled": bool(provider.lower() not in ("", "default", "none")
+                        and model and _embedder_secret(cfg)),
+        "enabled_editable": False,
+        "editable": True,
+        "fields": [
+            _ai_field("provider", "text", provider, "openai / dashscope / 自定义兼容端点"),
+            _ai_field("base_url", "text", base_url, "如 https://api.openai.com/v1"),
+            _ai_field("model", "text", model, "如 text-embedding-3-small"),
+            _ai_field("api_key_file", "secret_path",
+                      {"set": _key_file_present(key_file), "path": key_file},
+                      "凭据文件路径（留空 = 不改）", secret=True),
+            _ai_field("api_key", "secret_value", {"set": bool(_embedder_secret(cfg))},
+                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+        ],
+    }
+
+
+def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """screening 节（检索结果筛选）—— 字段口径与 `settings/screening` **同源**。"""
+    p = _screening_payload(raw)
+    return {
+        "id": "screening",
+        "label": "检索结果筛选",
+        "note": "关着 = 检索照常返回（不筛）；开着每次检索后多一次 LLM 调用。",
+        "enabled": bool(p["enabled"]),
+        "enabled_editable": True,
+        "editable": True,
+        "fields": [
+            _ai_field("default_on", "bool", bool(p["default_on"])),
+            _ai_field("model", "text", p["model"], "如 MiniMax-M3.1-Flash"),
+            _ai_field("base_url", "text", p["base_url"], "如 https://api.minimax.cn/v1"),
+            _ai_field("api_key_file", "secret_path",
+                      {"set": bool(p["key_present"]), "path": p["api_key_file"]},
+                      "凭据文件路径（留空 = 不改）", secret=True),
+            _ai_field("api_key", "secret_value", {"set": bool(p["key_present"])},
+                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+            _ai_field("max_pick", "number", int(p["max_pick"]), "",
+                      min=SCREENING_BOUNDS["max_pick"][0],
+                      max=SCREENING_BOUNDS["max_pick"][1]),
+            _ai_field("timeout_s", "number", int(p["timeout_s"]), "",
+                      min=SCREENING_BOUNDS["timeout_s"][0],
+                      max=SCREENING_BOUNDS["timeout_s"][1]),
+            _ai_field("max_tokens", "number", int(p["max_tokens"]), "",
+                      min=SCREENING_BOUNDS["max_tokens"][0],
+                      max=SCREENING_BOUNDS["max_tokens"][1]),
+        ],
+    }
+
+
+def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
+                      llm_ok: bool) -> Dict[str, Any]:
+    """两节「只读说明卡」：没有自己的 AI 配置，全部复用 llm 节。"""
+    if section_id == "query_expansion":
+        ret = raw.get("retrieval") if isinstance(raw.get("retrieval"), dict) else {}
+        qe = ret.get("query_expansion") if isinstance(ret.get("query_expansion"), dict) else {}
+        on = bool(qe.get("enabled", True))
+        label = "查询扩展"
+        note = ("复用 llm 节（同一接口、同一模型、同一凭据）；"
+                "调用开关在 config.json 的 retrieval.query_expansion.enabled（缺省开）。")
+    else:
+        from keepsake.core import tiering as tiering_mod
+        on = bool(tiering_mod.resolve_tiering(raw).get("enabled"))
+        label = "分级班车复核"
+        note = "复用 llm 节 + 班车开关（tiering.enabled）：班车关着时没有复核。"
+    return {
+        "id": section_id,
+        "label": label,
+        "note": note,
+        "enabled": bool(llm_ok and on),
+        "enabled_editable": False,
+        "editable": False,
+        "fields": [],
+    }
+
+
+@router.get("/api/v1/settings/ai", dependencies=[Depends(require_session)])
+def get_ai_settings() -> Dict[str, Any]:
+    """AI 配置页的**五节快照**（只读端点：不挂 write_guard，绝不碰 config.json）。
+
+    🔴 **凭据真值永不下发**：secret 字段只回 `{"set": true/false}`（路径型另带
+    `path`）—— 页面显示「已设置 / 未设置」徽标，不回显 key 内容。
+
+    🔴 只读端点**绝不因为配置坏了就 500**：config 读不出来时按缺省回
+    （页面照常显示「没配」）。
+    """
+    raw = _read_config_quiet()
+    llm = _ai_llm_section(raw)
+    sections = [
+        llm,
+        _ai_embedder_section(raw),
+        _ai_screening_section(raw),
+        _ai_reuse_section("query_expansion", raw, bool(llm["enabled"])),
+        _ai_reuse_section("tiering_review", raw, bool(llm["enabled"])),
+    ]
+    return {"sections": sections,
+            "path": str(config.keepsake_config_file()),
+            "backup_dir": str(audit.backup_dir()),
+            "keys_dir": str(_ai_keys_dir())}
+
+
+# --------------------------------------------------------------------------
+# 保存（PUT）：只动指定节，其余逐字节不变
+# --------------------------------------------------------------------------
+
+@router.put("/api/v1/settings/ai/{section_id}",
+            dependencies=[Depends(require_session), Depends(write_guard)])
+def set_ai_settings(section_id: str,
+                    body: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+    """保存 AI 配置（写 config.json 的**一节**）。
+
+    🔴 **只动这一节**：读整份 → 只改这一节 → 原样回写（顶层键序不变，
+    已存在的键不换位）—— config.json 里还有存储后端、班车站等配置，
+    「改 AI」顺手重排/丢键就能让 provider 读不到 DSN。
+    写前把原 config 整份备份进审计备份目录（`audit.backup_json`），
+    写不成功 ⇒ 一条都不写；必须打 `write_guard`（改的是**进程外**的文件）。
+
+    🔴 **凭据不落 config.json**：新凭据写进 0600 的密钥文件
+    （`~/.config/keepsake/ai_keys/<节>.key`），config 里只留路径。
+    内联的旧明文**只在这次明确给了新凭据时**才摘掉（迁移是人的决定，
+    页面先给一行提示让人自己决定）。
+
+    越界 / 空串 ⇒ 400 带人话（控制台提交是机器输入，半截值绝不许落盘）。
+
+    `query_expansion` / `tiering_review` 两节**没有独立配置** ⇒ 400，
+    指引去改 llm 节。
+    """
+    action, target = f"settings.ai.{section_id}", section_id
+    if section_id in AI_REUSE_SECTIONS:
+        _reject(400, "ai_section_not_editable",
+                f"{AI_REUSE_SECTIONS[section_id]}没有独立配置（复用 llm 节）：请改 llm 节",
+                action, target)
+    if section_id not in AI_EDITABLE_SECTIONS:
+        _reject(400, "ai_section_unknown", f"没有这一节：{section_id}", action, target)
+    if (body or {}).get("confirm") is not True:
+        _reject(400, "confirm_required",
+                "保存 AI 配置必须带 confirm=true（这是一次配置写操作）", action, target)
+
+    fields = {k: v for k, v in (body or {}).items() if k != "confirm"}
+    raw = _read_config_or_reject(action, target)
+    old = raw.get(section_id)
+    section = dict(old) if isinstance(old, dict) else {}
+    notes: List[str] = []
+    key_file: str = ""      # 本次写入的密钥文件路径（没写凭据 ⇒ 空串）
+
+    if section_id == "llm":
+        _ai_reject_unknown(fields, {"base_url", "model", "key_file", "api_key"},
+                           action, target)
+        if "base_url" in fields:
+            v = str(fields["base_url"] or "").strip()
+            if not v:
+                _reject(400, "ai_invalid", "接口地址不能为空（llm 通道靠它发请求）",
+                        action, target)
+            if not v.startswith(("http://", "https://")):
+                _reject(400, "ai_invalid",
+                        f"接口地址要以 http:// 或 https:// 开头：{v[:60]}", action, target)
+            section["base_url"] = v.rstrip("/")
+        if "model" in fields:
+            v = str(fields["model"] or "").strip()
+            if not v:
+                _reject(400, "ai_invalid", "模型名不能为空", action, target)
+            section["model"] = v
+        if "key_file" in fields:
+            v = str(fields["key_file"] or "").strip()
+            if v:
+                section["key_file"] = v
+        if "api_key" in fields:
+            v = str(fields["api_key"] or "").strip()
+            if v:
+                path = _write_ai_key("llm", v)
+                key_file = str(path)
+                section["key_file"] = key_file
+                if section.pop("api_key", None):
+                    notes.append("旧的内联明文已从 config.json 移除（凭据改走密钥文件）")
+                notes.append(f"新凭据已写入 {path}（600 权限）")
+
+    elif section_id == "embedder":
+        _ai_reject_unknown(fields, {"provider", "base_url", "model",
+                                    "api_key_file", "api_key"}, action, target)
+        if "provider" in fields:
+            section["provider"] = str(fields["provider"] or "").strip()
+        if "base_url" in fields:
+            section["base_url"] = str(fields["base_url"] or "").strip().rstrip("/")
+        if "model" in fields:
+            section["model"] = str(fields["model"] or "").strip()
+        if "api_key_file" in fields:
+            v = str(fields["api_key_file"] or "").strip()
+            if v:
+                section["api_key_file"] = v
+        if "api_key" in fields:
+            v = str(fields["api_key"] or "").strip()
+            if v:
+                path = _write_ai_key("embedder", v)
+                key_file = str(path)
+                section["api_key_file"] = key_file
+                if section.pop("api_key", None):
+                    notes.append("旧的内联明文已从 config.json 移除（凭据改走密钥文件）")
+                notes.append(f"新凭据已写入 {path}（600 权限）")
+
+    else:   # screening
+        _ai_reject_unknown(fields, {"enabled", "default_on", "model", "base_url",
+                                    "api_key_file", "api_key",
+                                    "max_pick", "timeout_s", "max_tokens"},
+                           action, target)
+        if "enabled" in fields:
+            section["enabled"] = _ai_bool(fields["enabled"])
+        if "default_on" in fields:
+            section["default_on"] = _ai_bool(fields["default_on"])
+        if "model" in fields:
+            v = str(fields["model"] or "").strip()
+            if not v:
+                _reject(400, "screening_invalid", "模型名不能为空（筛选靠它发请求）",
+                        action, target)
+            section["model"] = v
+        if "base_url" in fields:
+            v = str(fields["base_url"] or "").strip()
+            if not v:
+                _reject(400, "screening_invalid",
+                        "接口地址不能为空（要带 /v1 这样的完整前缀）", action, target)
+            section["base_url"] = v.rstrip("/")
+        if "api_key_file" in fields:
+            v = str(fields["api_key_file"] or "").strip()
+            if v:
+                section["api_key_file"] = v
+        if "api_key" in fields:
+            v = str(fields["api_key"] or "").strip()
+            if v:
+                path = _write_ai_key("screening", v)
+                key_file = str(path)
+                section["api_key_file"] = key_file
+                notes.append(f"新凭据已写入 {path}（600 权限）")
+        for name, (lo, hi) in SCREENING_BOUNDS.items():
+            if name not in fields:
+                continue
+            try:
+                value = int(fields[name])
+            except (TypeError, ValueError):
+                _reject(400, "screening_out_of_range", f"{name} 必须是整数", action, target)
+            if not (lo <= value <= hi):
+                _reject(400, "screening_out_of_range",
+                        f"{name} 必须在 {lo}~{hi} 之间，本次 {value}", action, target)
+            section[name] = value
+
+    new = dict(raw)                       # 顶层保序
+    new[section_id] = section             # 只动这一节
+    backup = audit.backup_json(f"config.ai.{audit.stamp()}.json", raw)
+    _write_config_or_reject(new, action, target)
+
+    from keepsake.core import screening as screening_mod
+    from keepsake.core.ops import consolidator as consolidator_mod
+
+    screening_mod.invalidate_cfg_cache()      # 同尺寸改值时指纹可能不变 ⇒ 主动失效
+    consolidator_mod.invalidate_channel_cache()
+
+    # 🔴 审计只记**字段名**，绝不记值（值里可能有凭据）。
+    audit.record(action, target, ok=True,
+                 reason=f"fields={sorted(fields)}; backup={backup}; "
+                        f"path={config.keepsake_config_file()}")
+    return {"ok": True, "action": action, "section": section_id, "notes": notes,
+            "key_file": key_file, "backup": backup,
+            "path": str(config.keepsake_config_file())}
+
+
+# --------------------------------------------------------------------------
+# 连通检测（POST）：各节定制，**读性质**（不写库、不改 config），但计入审计
+# --------------------------------------------------------------------------
+
+def _probe_body_summary(resp: Any, limit: int = 200) -> str:
+    """错误体摘要（截 200 字；**调用方负责再抹一遍凭据**）。"""
+    try:
+        text = resp.text or ""
+    except Exception:       # noqa: BLE001 —— 摘要失败不许掀翻探测
+        text = ""
+    return text[:limit]
+
+
+def _probe_llm(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """llm 连通检测：真发一条最小 chat completion（prompt=ping）。
+
+    🔴 `max_tokens` 给足 512：思考型模型给小 token 会「想不完就腰斩」。
+    """
+    from keepsake.core.ops.consolidator import LLM_TIMEOUT, resolve_llm_channel
+
+    cfg = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    channel = resolve_llm_channel(raw)
+    base_url = str(channel.get("base_url") or "").rstrip("/")
+    model = str(channel.get("model") or "").strip()
+    key = _llm_secret(cfg)
+    if not base_url or not model or not key:
+        return {"ok": False, "section": "llm", "error": "not_configured",
+                "message": "llm 节没配全（接口地址 / 模型 / 凭据缺一不可）"}
+    body = {"model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": PROBE_MAX_TOKENS, "temperature": 0}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    timeout = min(float(LLM_TIMEOUT), float(PROBE_TIMEOUT_CAP_S))
+    started = time.monotonic()
+    try:
+        resp = get_client(base_url, timeout).post(f"{base_url}/chat/completions",
+                                                  json=body, headers=headers)
+    except httpx.TimeoutException:
+        return {"ok": False, "section": "llm", "error": "timeout",
+                "message": f"请求超时（{timeout:.0f}s 上限）"}
+    except Exception as e:      # noqa: BLE001 —— 探测不许抛穿
+        return {"ok": False, "section": "llm", "error": "http_error",
+                "message": _scrub(f"{type(e).__name__}: {e}", key)[:200]}
+    latency = int((time.monotonic() - started) * 1000)
+    if resp.status_code >= 400:
+        return {"ok": False, "section": "llm", "status": int(resp.status_code),
+                "error": f"http_{resp.status_code}", "latency_ms": latency,
+                "message": _scrub(_probe_body_summary(resp), key)[:200]}
+    try:
+        choice = resp.json()["choices"][0]
+        finish = str(choice.get("finish_reason") or "")
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {"ok": False, "section": "llm", "status": int(resp.status_code),
+                "error": "bad_response", "latency_ms": latency,
+                "message": "响应不是合法的 chat completion（choices 为空或不是 JSON）"}
+    return {"ok": True, "section": "llm", "latency_ms": latency,
+            "finish_reason": finish, "model": model}
+
+
+def _probe_embedder(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """embedder 连通检测：真发一条 embed（输入「检测」），报告维度与延迟。"""
+    from keepsake.core.embedder import EMBED_TIMEOUT_S, resolve_dimension
+
+    cfg = raw.get("embedder") if isinstance(raw.get("embedder"), dict) else {}
+    base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+    model = str(cfg.get("model") or "").strip()
+    key = _embedder_secret(cfg)
+    if not base_url or not model or not key:
+        return {"ok": False, "section": "embedder", "error": "not_configured",
+                "message": "embedder 节没配全（接口地址 / 模型 / 凭据缺一不可）"}
+    body = {"model": model, "input": "检测"}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    timeout = min(float(EMBED_TIMEOUT_S), float(PROBE_TIMEOUT_CAP_S))
+    started = time.monotonic()
+    try:
+        resp = get_client(base_url, timeout).post(f"{base_url}/embeddings",
+                                                  json=body, headers=headers)
+    except httpx.TimeoutException:
+        return {"ok": False, "section": "embedder", "error": "timeout",
+                "message": f"请求超时（{timeout:.0f}s 上限）"}
+    except Exception as e:      # noqa: BLE001 —— 探测不许抛穿
+        return {"ok": False, "section": "embedder", "error": "http_error",
+                "message": _scrub(f"{type(e).__name__}: {e}", key)[:200]}
+    latency = int((time.monotonic() - started) * 1000)
+    if resp.status_code >= 400:
+        # 400 / 20015 这类错误体**原样转述**（截 200 字，凭据已抹掉）
+        return {"ok": False, "section": "embedder", "status": int(resp.status_code),
+                "error": f"http_{resp.status_code}", "latency_ms": latency,
+                "message": _scrub(_probe_body_summary(resp), key)[:200]}
+    try:
+        dim = len(resp.json()["data"][0]["embedding"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {"ok": False, "section": "embedder", "status": int(resp.status_code),
+                "error": "bad_response", "latency_ms": latency,
+                "message": "响应不是合法的 embeddings 结果（data[0].embedding 缺失）"}
+    return {"ok": True, "section": "embedder", "latency_ms": latency,
+            "dimension": dim, "registered_dimension": resolve_dimension(model),
+            "model": model}
+
+
+def _probe_screening(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """screening 连通检测：**走 core/screening.py 的真函数**发一个小样本选择请求。
+
+    探的是**通道**（模型 / 接口 / 凭据能不能用），不是那个总开关 ——
+    所以这里临时把 enabled 按 true 传给真函数（**不改 config.json**）。
+    """
+    from keepsake.core import screening as screening_mod
+
+    cfg = screening_mod.resolve_screening(raw)
+    probe_cfg = dict(cfg)
+    probe_cfg["enabled"] = True
+    probe_cfg["timeout_s"] = min(int(cfg["timeout_s"]), PROBE_TIMEOUT_CAP_S)
+    candidates = [
+        {"content": "Keepsake 是跑在本机的记忆库，记忆只留在本地。"},
+        {"content": "北京今天的天气是晴。"},
+    ]
+    started = time.monotonic()
+    picked, status = screening_mod.pick_relevant("Keepsake 是什么？", candidates, probe_cfg)
+    latency = int((time.monotonic() - started) * 1000)
+    if status != "ok":
+        return {"ok": False, "section": "screening", "error": status,
+                "latency_ms": latency,
+                "message": _SCREENING_SKIP_REASON.get(status, "筛选请求没成功")}
+    return {"ok": True, "section": "screening", "latency_ms": latency,
+            "picked": list(picked), "of": len(candidates), "status": status}
+
+
+@router.post("/api/v1/settings/ai/{section_id}/probe",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def probe_ai_settings(section_id: str) -> Dict[str, Any]:
+    """连通检测（**读性质**：不写库、不改 config；但计入审计）。
+
+    🔴 **永不抛穿**：任何失败都结构化回包（`ok=false` + 原因 + 耗时），
+    页面上只显示一行状态，不弹栈。成功时带各自的细节：
+    llm → finish_reason；embedder → 向量维度；screening → 挑中的编号。
+    """
+    action, target = f"settings.ai.probe.{section_id}", section_id
+    if section_id in AI_REUSE_SECTIONS:
+        _reject(400, "ai_section_not_editable",
+                f"{AI_REUSE_SECTIONS[section_id]}没有独立配置（复用 llm 节）："
+                f"检测请用 llm 节", action, target)
+    if section_id not in AI_EDITABLE_SECTIONS:
+        _reject(400, "ai_section_unknown", f"没有这一节：{section_id}", action, target)
+
+    raw = _read_config_quiet()
+    try:
+        if section_id == "llm":
+            result = _probe_llm(raw)
+        elif section_id == "embedder":
+            result = _probe_embedder(raw)
+        else:
+            result = _probe_screening(raw)
+    except Exception as e:      # noqa: BLE001 —— 探测不许抛穿
+        result = {"ok": False, "section": section_id, "error": "probe_error",
+                  "message": _scrub(f"{type(e).__name__}: {e}")[:200]}
+    # 🔴 审计只记结果与耗时，不记响应体（里面可能有上游回显的凭据）。
+    audit.record(action, target, ok=bool(result.get("ok")),
+                 reason=f"ok={bool(result.get('ok'))}; error={result.get('error', '')}; "
+                        f"latency_ms={result.get('latency_ms', '')}")
+    return result
 
 
 # --------------------------------------------------------------------------

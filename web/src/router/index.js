@@ -3,6 +3,7 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 import { api, getToken } from '../api'
 import AgentsReviewView from '../views/AgentsReviewView.vue'
 import AgentsView from '../views/AgentsView.vue'
+import AiSettingsView from '../views/AiSettingsView.vue'
 import CoreView from '../views/CoreView.vue'
 import FragmentsView from '../views/FragmentsView.vue'
 import KbReviewView from '../views/KbReviewView.vue'
@@ -40,6 +41,9 @@ const routes = [
   // 待办（2026-10 ks_todo 一等公民）：独立成页 —— 待办有状态机与到期日，
   // 挤在别页里既看不清也翻不动；侧栏位置在「审核」之前（业务页在前、审核收尾）。
   { path: '/todos', name: 'todos', component: TodosView, meta: { title: '待办' } },
+  // AI 配置（2026-10 ai_settings_page）：所有模型调用点的集中配置页
+  // （llm / embedder / screening 可写，query_expansion / tiering_review 只读说明）
+  { path: '/ai-settings', name: 'ai-settings', component: AiSettingsView, meta: { title: 'AI 配置' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]
 

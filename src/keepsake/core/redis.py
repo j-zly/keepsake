@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import redis
 from redis.commands.search.query import Query
 
-from .embedder import Embedder, create_embedder
+from .embedder import Embedder, create_embedder, resolve_embedder_api_key
 from .base import StorageBase, fire_hits
 # 2026-10 ks_pg_b2：检索后处理与排序权重抽到 storage_shared —— Redis / PG 共用同一份。
 # 下面这几个名字从 storage_shared 转出，是给既有调用方（cleanup_hot_topics 等）的转出口。
@@ -254,7 +254,9 @@ def _build_embedder(cfg: Dict[str, Any], path: Any) -> Optional[Embedder]:
     try:
         return create_embedder(
             provider=emb_cfg.get("provider", "openai"),
-            api_key=emb_cfg.get("api_key", ""),
+            # 凭据：内联 api_key 优先，其次 api_key_file（控制台「AI 配置」页
+            # 写的就是文件型；口径见 core.embedder.resolve_embedder_api_key）
+            api_key=resolve_embedder_api_key(emb_cfg),
             base_url=emb_cfg.get("base_url", ""),
             model=emb_cfg.get("model", ""),
         )

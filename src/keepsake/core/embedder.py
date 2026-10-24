@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional
 
 from .http import get_client, retrying
@@ -225,6 +226,34 @@ _EMBEDDER_PROVIDERS: dict[str, type[Embedder]] = {
     "openai": OpenAIEmbedder,
     "dashscope": OpenAIEmbedder,  # DashScope 也走 /v1/embeddings
 }
+
+
+def resolve_embedder_api_key(cfg: Optional[dict]) -> str:
+    """embedder 段的凭据：内联 `api_key` 优先，其次 `api_key_file` 指向的文件。
+
+    与 LLM 通道**同款口径**（`core.ops.consolidator.resolve_llm_channel`：
+    `api_key` 直填 > `key_file` 读取），差别只在于**没有环境变量兜底** ——
+    凭据来源只有 config.json 里写的那两处。
+
+    🔴 存在的理由：控制台「AI 配置」页把新凭据写进 600 权限的密钥文件、
+    config 里只留 `api_key_file` 路径（明文不落 config.json）。没有这个解析，
+    迁完 key 的向量路会**静默退化成 BM25**（`api_key` 取空 → 无 key → 不写向量），
+    配置看着对、行为已经变了。
+
+    读不到文件 ⇒ 空串（上层按「没凭据」降级，绝不抛）。
+    """
+    if not isinstance(cfg, dict):
+        return ""
+    key = str(cfg.get("api_key") or "").strip()
+    if key:
+        return key
+    path = str(cfg.get("api_key_file") or "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def create_embedder(

@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是四十三条业务写端点加四条auth_POST():
+def test_写面仍是四十五条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -697,6 +697,9 @@ def test_写面仍是四十三条业务写端点加四条auth_POST():
     🆕 待办再加三条（37 → 40）：新增 / 改状态 / 真删（2026-10 ks_todo 一等公民）。
     🆕 知识库勾选批量再加三条（40 → 43）：批量批准 / 批量驳回 / 批量真删
     （kb_bulk_ops —— 逐条复用单条端点的那份实现，confirm = 选中条数）。
+    🆕 AI 配置页再加两条（43 → 45）：写 config.json 的一节（PUT settings/ai）
+    + 连通检测（POST settings/ai/{节}/probe，**读性质**：不写库、不改 config，
+    但要会话、也要留审计）。
     """
     app = create_app()
     write = {r.path for r in flat_routes(app)
@@ -719,6 +722,9 @@ def test_写面仍是四十三条业务写端点加四条auth_POST():
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
         # 检索筛选配置（screening_ui）
         "/api/v1/settings/screening",
+        # AI 配置页：写一节 + 连通检测（probe 是读性质，但要会话）
+        "/api/v1/settings/ai/{section_id}",
+        "/api/v1/settings/ai/{section_id}/probe",
         "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
         "/api/v1/crons/{job_id}/edit",
         "/api/v1/agents", "/api/v1/agents/{agent_id}/approve",
