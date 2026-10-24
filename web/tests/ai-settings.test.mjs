@@ -10,7 +10,9 @@
  *   3) **每卡一个保存 + 一个检测**：保存走既有重确认件（ConfirmDialog），
  *      检测即时调 probe，结果落在卡内状态行（绿点 = 通 / 红字 = 失败摘要）；
  *   4) **数字零写死**：输入框上下限照抄后端给的 min/max，前端不另抄一份；
- *   5) **不引新依赖 / 不用原生弹框**：提示走 utils/dialog。
+ *   5) **不引新依赖 / 不用原生弹框**：提示走 utils/dialog；
+ *   6) **视觉层级**（2026-10-24 重做）：只读卡降饱和且没有保存按钮、
+ *      数值三件一行三列、probe 成功/失败两态各有样式类、凭据状态条默认收起。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -24,6 +26,9 @@ const VIEW = read('views/AiSettingsView.vue')
 const API = read('api/index.js')
 const ROUTER = read('router/index.js')
 const APP = read('App.vue')
+
+/** 视图自己的 <style scoped> 段（视觉层断言只看这一段）。 */
+const STYLE = VIEW.slice(VIEW.indexOf('<style scoped>'))
 
 // ---------------------------------------------------------------------------
 // 接线：路由 + 侧栏 + api 方法
@@ -127,4 +132,50 @@ test('提示走 utils/dialog（禁原生 alert / confirm）', () => {
   assert.match(VIEW, /from '\.\.\/utils\/dialog'/)
   assert.doesNotMatch(VIEW, /\balert\(/)
   assert.doesNotMatch(VIEW, /window\.confirm\(/)
+})
+
+// ---------------------------------------------------------------------------
+// 视觉层级（2026-10-24 重做，纯样式层）：结构断言跟着新类名走
+// ---------------------------------------------------------------------------
+
+test('只读卡：降饱和 + 卡头挂「跟随 llm 节」，且没有保存按钮', () => {
+  // 只读卡走降饱和样式（灰底灰边）
+  assert.match(VIEW, /'ai-card--ro': !card\.editable/)
+  assert.match(STYLE, /\.ai-card--ro\s*\{[^}]*var\(--panel\)/)
+  // 卡头右上角明说「跟随 llm 节」
+  assert.match(VIEW, /class="chip ai-chip-follow">跟随 llm 节/)
+  // 编辑入口整块挂在 editable 上 —— 只读卡连保存/检测都不渲染
+  assert.match(VIEW, /<div v-if="card\.editable" class="ops">/)
+  assert.equal((VIEW.match(/@click="askSave\(card\)"/g) || []).length, 1)
+  assert.equal((VIEW.match(/@click="probe\(card\)"/g) || []).length, 1)
+  // 并且明说「这里不编辑」
+  assert.match(VIEW, /这里不编辑/)
+})
+
+test('数值三件收进一行三列的小网格', () => {
+  assert.match(VIEW, /class="ai-nums"/)
+  // 数值字段按 type 单独切出来（后端给 min/max，前端零写死）
+  assert.match(VIEW, /card\.fields\.filter\(\(x\) => x\.type === 'number'\)/)
+  assert.match(STYLE, /\.ai-nums\s*\{[^}]*grid-template-columns:\s*repeat\(3,/)
+})
+
+test('probe 成功/失败两态各有样式类，空状态不占位', () => {
+  // 两条路径各挂一个类
+  assert.match(VIEW, /'ai-status--ok': card\.status\.tone === 'ok'/)
+  assert.match(VIEW, /'ai-status--err': card\.status\.tone === 'err'/)
+  // 绿边浅底 / 红边浅底
+  assert.match(STYLE, /\.ai-status--ok\s*\{[^}]*var\(--ok\)/)
+  assert.match(STYLE, /\.ai-status--err\s*\{[^}]*var\(--danger\)/)
+  // 空 = 不渲染（没状态就不占位）
+  assert.match(VIEW, /v-if="card\.editable && card\.status\.text"/)
+})
+
+test('凭据字段是整行状态条，输入框默认收起（原生 details，无新增 JS 状态）', () => {
+  // 状态条：左路径 + 右「已设置 / 未设置」chip
+  assert.match(VIEW, /<details v-else-if="f\.type === 'secret_path'" class="ai-secret">/)
+  assert.match(VIEW, /<summary class="ai-secret-bar">/)
+  // 默认收起 = 没有 open 属性
+  assert.doesNotMatch(VIEW, /<details[^>]*\bopen\b/)
+  // 没有为了展开新增 ref / 状态变量
+  assert.doesNotMatch(VIEW, /openMap|expanded|toggleOpen/)
 })
