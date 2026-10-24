@@ -110,17 +110,18 @@ test('侧栏「消息中心」在代理登记之后、代理审核之前；路�
 // 私信开关（代理登记页那半边）：切换走 dm 端点，失败回滚
 // ---------------------------------------------------------------------------
 
-test('私信开关：走 dm 端点（带 confirm），失败回滚 UI + 报红条', () => {
+test('私信开关：走 dm 端点（带 confirm），失败报红条', () => {
   assert.match(API, /setAgentDm: \(agentId, enabled\) =>\s*\n?\s*http\.post\(`\/api\/v1\/agents\/\$\{encodeURIComponent\(agentId\)\}\/dm`, \{ enabled, confirm: true \}\)/,
     '接口层带 confirm（后端要显式二次确认）')
-  assert.match(AGENTS, /api\.setAgentDm\(id, !!val\)/, '切换走 setAgentDm')
-  assert.match(AGENTS, /delete next\[id\]/, '失败回滚：丢掉这次的乐观值')
-  assert.match(AGENTS, /error\.value = `私信开关切换失败/, '失败要报红条')
-  assert.match(AGENTS, /function dmOn\(a\)/, '开关状态读 dm_enabled（乐观值优先）')
-  // 🔴 开关在 primary 的分流链**外面** —— 关了自己也收不到私信，合法
-  const actions = AGENTS.slice(AGENTS.indexOf('<template #actions>'), AGENTS.indexOf('<!-- 四个动作共用'))
-  const elseAt = actions.indexOf('<template v-else>')
-  assert.ok(elseAt !== -1, '缺少 v-else 分支')
-  assert.ok(actions.indexOf('toggleDm(a, $event)') > elseAt, '私信开关在 primary 分流链之外（primary 行也给）')
-  assert.doesNotMatch(actions.slice(0, elseAt), /toggleDm/, '分流点之前不许有私信开关')
+  // 2026-10-24 UI 重做：私信开关收进**编辑弹框**（卡面只做只读 chip）
+  assert.match(AGENTS, /api\.setAgentDm\(targetId, wantDm\)/, '保存走 setAgentDm')
+  assert.match(AGENTS, /'私信开关'/, '失败红条要说得清是哪一项没改成')
+  assert.match(AGENTS, /showError\(`\$\{label\}保存失败：\$\{e\.message\}`\)/, '失败要报红条')
+  assert.match(AGENTS, /function dmOn\(a\)/, '开关状态读 dm_enabled')
+  assert.match(AGENTS, /私信\{\{ dmOn\(a\) \? '开' : '关' \}\}/, '卡面上是只读 chip')
+  // 🔴 开关在编辑弹框里，**不按角色锁死** —— 关了自己也收不到私信，合法
+  assert.match(AGENTS, /<el-switch v-model="editDm" \/>/, '私信开关不按角色锁死')
+  const actions = AGENTS.slice(AGENTS.indexOf('<div class="ac-foot">'), AGENTS.indexOf('</article>'))
+  assert.ok(actions.length > 0, '找不到卡片操作区')
+  assert.doesNotMatch(actions, /el-switch/, '卡面不许挂开关件')
 })

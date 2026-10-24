@@ -70,6 +70,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
+    # 检索筛选配置一条（screening_ui）：写 config.json 的 screening 一节
+    "/api/v1/settings/screening",
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",

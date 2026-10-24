@@ -40,11 +40,10 @@ test('页面：编辑弹框里有「私信实时推送」开关', () => {
 
 test('开关只在一个编辑入口里（一张卡一个编辑入口）', () => {
   // 弹框外的卡片操作区不许再出现推送开关
-  const actions = VIEW.slice(VIEW.indexOf('<template #actions>'), VIEW.indexOf('<!-- 四个动作共用'))
+  const actions = VIEW.slice(VIEW.indexOf('<div class="ac-foot">'), VIEW.indexOf('</article>'))
   assert.ok(actions.length > 0, '找不到卡片操作区')
   assert.doesNotMatch(actions, /editPush|setAgentPush/, '推送开关只在编辑弹框里')
   // 编辑弹框只有一个
-  assert.equal((VIEW.match(/<el-dialog/g) || []).length, (VIEW.match(/<el-dialog/g) || []).length)
   assert.match(VIEW, /title="编辑代理"/, '编辑弹框还在')
 })
 

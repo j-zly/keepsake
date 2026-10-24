@@ -7,11 +7,17 @@
  * 一次性凭据的显示实现抽成共用组件 components/CredentialDialog.vue
  * （两页同一份，不许复制第二份 —— 见下面「凭据展示」那条）。
  *
+ * 2026-10-24 UI 重做（用户点名「太丑」）：一代理一张卡，**卡面只留一个直接
+ * 动作（批准 / 吊销）+ 一支铅笔（唯一编辑入口）**；角色 / 开关 / 凭据 / 删除
+ * 全收进编辑弹框（分三组：角色 / 开关 / 凭据）。下列断言随之重指向新结构 ——
+ * **判据没变**（primary 行不给治理动作、确认闸一字不弱、凭据只活一次），
+ * 变的只是「这些动作现在长在哪儿」。
+ *
  * 这页的静默失败模式特别多，逐条钉死：
  *   1) **凭据纪律**：approve 的明文只许活在一次性弹框的前端内存态 ——
  *      不许出现任何持久面写入（本页连浏览器的持久存储 API 都不许碰），
  *      关掉弹框就抹掉，页面不许把明文拼进 URL。
- *   2) **三道确认闸**：approve / exclude 要 `confirm: true`，revoke 要手输
+ *   2) **三道确认闸**：approve 要 `confirm: true`，revoke 要手输
  *      agent_id 前 8 位，改角色要手输完整 agent_id —— 与后端口径逐字一致。
  *      少一闸就是「点一下真改数据」。
  *   3) **待审醒目**：pending > 0 时顶部必须有 banner，且它的读写正被拒，
@@ -79,77 +85,77 @@ test('五条 API 齐全，且 confirm 口径与后端逐字一致', () => {
 
 test('三道确认闸接在 ConfirmDialog 上，串由用户手输', () => {
   assert.match(VIEW, /import ConfirmDialog from '\.\.\/components\/ConfirmDialog\.vue'/)
-  assert.match(VIEW, /<ConfirmDialog[\s\S]*?@confirm="doAction"/, '四个动作都要先过确认框')
+  assert.match(VIEW, /<ConfirmDialog[\s\S]*?@confirm="doAction"/, '危险动作都要先过确认框')
   // 吊销 = agent_id 前 8 位（与 ops 归档「key 末 8 位」同一道闸）
   assert.match(VIEW, /\(dlgRow\.value\?\.agent_id \|\| ''\)\.slice\(0, 8\)/, '吊销确认串取前 8 位')
   assert.match(VIEW, /if \(dlgKind\.value === 'revoke'\) return revokePrefix\.value/, '吊销走 8 位串')
   // 改角色 = 完整 agent_id
   assert.match(VIEW, /if \(dlgKind\.value === 'role'\) return dlgRow\.value\?\.agent_id \|\| ''/, '改角色走全串')
-  // approve / exclude 不手输，后端要的是 confirm: true —— 手输串留空即可
+  // approve 不手输，后端要的是 confirm: true —— 手输串留空即可
   assert.match(VIEW, /@confirm="doAction"/, '确认回调统一收手输串')
   const body = VIEW.slice(VIEW.indexOf('async function doAction'))
-  // 🔴 窗口从 900 放宽到 1400：doAction 多了「停凭据 / 删除」两条分支，函数变长了。
-  //    判据是「这四个调用都在 doAction 里、各自带对参数」，不是「函数有多长」——
-  //    窗口卡死 900 只会逼着人把分支往回塞，那才是真的把代码写歪。
   assert.match(body.slice(0, 1400), /api\.approveAgent\(row\.agent_id\)/, '批准走 approveAgent')
   assert.match(body.slice(0, 1400), /api\.revokeAgent\(row\.agent_id, typed\)/, '吊销把用户手输的串原样发出去')
   assert.match(body.slice(0, 1400), /api\.setAgentRole\(row\.agent_id, 'primary', typed\)/, '设主代理发 role=primary')
-  assert.match(body.slice(0, 1400), /api\.setAgentExclude\(row\.agent_id, !row\.exclude_from_primary\)/, '上下文开关是 toggle')
+  // 🔴 上下文开关 2026-10-24 起是**编辑弹框里的开关件**（不再走确认框）：
+  //    它是「只挡它之后写的东西」的投递偏好，不是危险动作 —— 走确认框反而挡路。
+  const editBody = VIEW.slice(VIEW.indexOf('async function doEdit'))
+  assert.match(editBody, /api\.setAgentExclude\(targetId, !wantContext\)/, '上下文开关走 setAgentExclude')
 })
 
 test('主代理行不给「设为主代理」按钮', () => {
+  // 2026-10-24 UI 重做：设主代理收进**编辑弹框**（卡面只留一个直接动作 + 一支铅笔）。
+  // 判据不变：已经是主代理的那行**不许**出现这个入口（防把自己降了没人批）。
   assert.match(
     VIEW,
-    /<button v-if="a\.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask\('role', a\)">\s*\n?\s*设为主代理/,
+    /<el-button v-if="!editPrimary" :disabled="busy" @click="askFromEdit\('role'\)">\s*\n?\s*设为主代理/,
     '已经是主代理的行必须没有这个按钮（防把自己降了没人批）',
   )
+  assert.match(VIEW, /<span v-else class="tip">它已经是主代理了。<\/span>/, '要跟用户说清为什么没有这个钮')
 })
 
 // ---------------------------------------------------------------------------
-// 自锁洞：primary 行必须**一个动作按钮都不给**
+// 自锁洞：primary 行必须**一个治理动作都不给**
 // ---------------------------------------------------------------------------
 
-/** 取 `<template #actions>` 那一段（到下一个 `<template #` 或 `</ItemCard>` 为止）。 */
+/** 取卡片操作区那一段（`<div class="ac-foot">` 到它的闭合 `</div>`）。 */
 function actionsBlock() {
-  const start = VIEW.indexOf('<template #actions>')
+  const start = VIEW.indexOf('<div class="ac-foot">')
+  assert.ok(start !== -1, '找不到卡片操作区')
   const rest = VIEW.slice(start)
-  const end = Math.min(
-    ...['<template #tags>', '</ItemCard>', '<!-- 四个动作共用']
-      .map((m) => {
-        const i = rest.indexOf(m)
-        return i === -1 ? Infinity : i
-      }),
-  )
-  return rest.slice(0, end)
+  const end = rest.indexOf('</article>')
+  return rest.slice(0, end === -1 ? rest.length : end)
 }
 
-test('primary 行只留一句话：吊销 / 排除 / 设主 / 批准一个都不给', () => {
+test('primary 行只留一句话：吊销 / 批准一个都不给', () => {
   const actions = actionsBlock()
-  // 外层按 role 分流：primary 走说明，**其余全部包在 v-else 里**
+  // 外层按 role 分流：primary 走说明，其余走「批准 / 吊销」
   assert.match(actions, /<span v-if="a\.role === 'primary'" class="act-note">/, 'primary 行要有那句说明')
   assert.match(actions, /主代理 · 不可吊销 \/ 不可排除/, '要说清为什么没有按钮（人话，不是空白）')
-  // 🔴 逐个点名 primary 分支（分流点之前）：一个动作调用都不许有
-  const primaryBranch = actions.slice(0, actions.indexOf('<template v-else>'))
+  // 🔴 逐个点名 primary 分支（分流点之前）：一个治理动作都不许有
+  const primaryBranch = actions.slice(0, actions.indexOf('v-else-if="a.status === \'approved\'"'))
   assert.doesNotMatch(primaryBranch, /ask\('revoke'/, 'primary 行不许出现吊销入口')
-  assert.doesNotMatch(primaryBranch, /ask\('exclude'/, 'primary 行不许出现上下文排除入口')
-  assert.doesNotMatch(primaryBranch, /ask\('role'/, 'primary 行不许出现改角色入口')
   assert.doesNotMatch(primaryBranch, /ask\('approve'/, 'primary 行不许出现批准入口')
-  assert.doesNotMatch(primaryBranch, /act-btn/, 'primary 行不许有任何按钮样式残留')
+  assert.doesNotMatch(primaryBranch, /ask\('role'/, 'primary 行不许出现改角色入口')
+  assert.doesNotMatch(primaryBranch, /ask\('exclude'/, 'primary 行不许出现上下文排除入口')
+  assert.doesNotMatch(primaryBranch, /act-btn/, 'primary 行不许有任何动作按钮样式残留')
 })
 
-test('四个动作都收在 primary 的 v-else 分支里', () => {
+test('卡面只留「一个直接动作 + 一支铅笔」（2026-10-24 UI 重做）', () => {
   const actions = actionsBlock()
-  const elseAt = actions.indexOf('<template v-else>')
-  assert.ok(elseAt !== -1, '缺少 v-else 分支')
-  // 非 primary 分支里四个动作齐全（改口径时不能顺手删掉一个）
-  for (const kind of ['approve', 'role', 'exclude', 'revoke']) {
-    assert.ok(
-      actions.indexOf(`ask('${kind}', a)`, elseAt) !== -1,
-      `${kind} 动作应当存在于非 primary 分支`,
-    )
+  // 直接动作：已批准 = 吊销（危险红字），其余 = 批准 / 重新批准
+  assert.match(actions, /v-else-if="a\.status === 'approved'"[\s\S]*?ask\('revoke', a\)/, '已批准行的直接动作是吊销')
+  assert.match(actions, /v-else class="act-btn"[\s\S]*?ask\('approve', a\)/, '其余行的直接动作是批准')
+  // 编辑入口：每卡**唯一**一支铅笔
+  const editBtns = actions.match(/class="ac-edit"/g) || []
+  assert.equal(editBtns.length, 1, '一张卡只许有一支铅笔（一个编辑入口）')
+  assert.match(actions, /@click="openEdit\(a\)"/, '铅笔走 openEdit')
+  // 🔴 反钉：卡面上不许再并排挂治理动作（设主 / 排除 / 停凭据 / 换发 / 删除）
+  for (const kind of ['role', 'exclude', 'clearcred', 'rotate', 'delete']) {
+    assert.doesNotMatch(actions, new RegExp(`ask\\('${kind}'`), `卡面不许出现 ${kind} 入口（收进编辑弹框）`)
   }
-  // 分流点之前不得有任何动作调用
-  assert.doesNotMatch(actions.slice(0, elseAt), /ask\('/, '分流点之前不许有动作调用')
+  // 开关类在卡面上只做**只读** chip（拨开关的地方在编辑弹框里）
+  assert.doesNotMatch(actions, /el-switch/, '卡面不许挂开关件（只读 chip 即可）')
 })
 
 // ---------------------------------------------------------------------------
@@ -183,34 +189,24 @@ function templateBranchEnd(block, openMarker) {
   return -1
 }
 
-/** 「重新生成凭据」按钮那一段（从 <button 标签到它的 @click）。 */
+/** 「重新生成凭据」按钮那一段（2026-10-24 起在**编辑弹框**的危险区里）。 */
 function rotateButton() {
-  const at = VIEW.indexOf("ask('rotate', a)")
+  const at = VIEW.indexOf("askFromEdit('rotate')")
   assert.ok(at !== -1, '没有「重新生成凭据」入口')
-  const start = VIEW.lastIndexOf('<button', at)
+  const start = VIEW.lastIndexOf('<el-button', at)
   assert.ok(start !== -1, '入口不是按钮')
-  return VIEW.slice(start, at + "ask('rotate', a)".length)
+  return VIEW.slice(start, at + "askFromEdit('rotate')".length)
 }
 
-test('已批准行有「重新生成凭据」按钮；待审 / 已吊销的行没有', () => {
-  const actions = actionsBlock()
-  assert.match(actions, /重新生成凭据/, '操作区要有「重新生成凭据」入口')
-  assert.match(actions, /@click="ask\('rotate', a\)"/, '入口走统一的确认框（kind=rotate）')
+test('「重新生成凭据」在编辑弹框的危险区里；只对已批准行开', () => {
   const btn = rotateButton()
   // 门只开在已批准行上：待审行（去审核页）与已吊销行（走「重新批准」）都拿不到这个钮
-  assert.match(btn, /v-if="a\.status === 'approved'"/, '只有已批准行才给换发钮')
+  assert.match(btn, /v-if="editRow\?\.status === 'approved'"/, '只有已批准行才给换发钮')
   assert.doesNotMatch(VIEW, /a\.status === 'pending'/, '本页压根不渲染待审行，遑论给待审行换发')
-  // 非危险色那一档：吊销那种红底留给真会毁掉东西的动作
-  assert.match(btn, /class="act-btn"/, '走 act-btn 样式')
-  assert.doesNotMatch(btn, /act-btn--danger/, '不占危险色那一档')
-  // 🔴 换发对主代理无副作用：按钮在 primary / 非 primary 的分流链**外面**（主代理行也要有）。
-  //    旧断言 `> elseAt` 是恒真的（v-else **内部**的元素同样在 elseAt 之后，零检出能力），
-  //    改钉到 v-else 分支**闭合之后** —— 把换发钮挪回分支里必须让本测试转红（judge 2026-10-20）。
-  const vElseEnd = templateBranchEnd(actions, '<template v-else>')
-  assert.ok(vElseEnd !== -1, '找不到 v-else 分支的闭合')
-  assert.ok(actions.indexOf("ask('rotate', a)") > vElseEnd, '换发钮必须落在 v-else 分支之外（主代理行才看得见）')
-  // 同一条链外面还站着「编辑」入口（改备注名对主代理照样要能改）——顺手用同一个闭合钉死
-  assert.ok(actions.indexOf('openEdit(a)') > vElseEnd, '编辑钮同样必须落在 v-else 分支之外')
+  // 危险区里它**不是** danger 那一档（吊销 / 删除那种红底留给真会毁掉东西的动作）
+  assert.doesNotMatch(btn, /type="danger"/, '换发不占危险色那一档')
+  // 🔴 换发对主代理无副作用：主代理行也要能换（主脑走本机 bootstrap，不吃这把凭据）
+  assert.match(VIEW, /<el-button\s+v-if="editRow\?\.status === 'approved'"/, '主代理行照样给换发入口')
 })
 
 test('换发走手输闸：照抄 agent_id 前 8 位才让提交', () => {
@@ -298,7 +294,7 @@ test('两组分组：已批准在上、已吊销在下（待审不在本页）',
   assert.match(VIEW, /const revokedRows = computed\(\(\) => agents\.value\.filter\(\(a\) => a\.status === 'revoked'\)\)/, '已吊销那一摞（保留展示，可重新批准）')
   assert.match(VIEW, /title: '已批准'/, '分组标题')
   assert.match(VIEW, /title: '已吊销'/, '分组标题')
-  assert.match(VIEW, /<ItemCard v-for="a in grp\.rows"/, '卡片循环走的是筛过的两摞')
+  assert.match(VIEW, /<article v-for="a in grp\.rows"/, '卡片循环走的是筛过的两摞')
   // 已吊销的行仍能「重新批准」（这是既有行为，别在拆页时丢了）
   assert.match(VIEW, /a\.status === 'revoked' \? '重新批准' : '批准'/, '已吊销的行走重新批准')
 })
@@ -353,10 +349,10 @@ function doEditBody() {
   return VIEW.slice(start, end)
 }
 
-test('卡片操作区有「编辑」入口，行内不再有第二支铅笔', () => {
+test('卡片操作区有「编辑」入口（唯一一支铅笔），行内不再有第二支', () => {
   const actions = actionsBlock()
-  assert.match(actions, /class="act-btn"[^>]*@click="openEdit\(a\)"/, '操作区要有「编辑」入口')
-  assert.match(actions, />编辑</, '按钮上写「编辑」')
+  assert.match(actions, /class="ac-edit"[\s\S]*?@click="openEdit\(a\)"/, '操作区要有「编辑」入口')
+  assert.match(actions, /title="编辑：角色 \/ 开关 \/ 凭据"/, '铅笔钮要说清编辑的是什么')
   // 反钉：旧的两个行内铅笔（改 id / 改名）都不许留 —— 一张卡一个编辑入口
   assert.doesNotMatch(VIEW, /id-edit/, 'id 旁的铅笔钮已并入「编辑」')
   assert.doesNotMatch(VIEW, /name-edit/, '备注名旁的铅笔钮已并入「编辑」')
@@ -418,51 +414,40 @@ test('primary 行：ID 输入框 disabled（能改备注名，不能改 ID）', 
 //   停凭据 = 只废那把钥匙（代理照旧在册、状态不动）
 //   删除   = 整行抹掉（删前备份，可人工复原）
 
-/** 「停凭据」按钮那一段（从 <button 标签到它的 @click）。 */
+/** 「停凭据」按钮那一段（2026-10-24 起在**编辑弹框**的危险区里）。 */
 function clearCredButton() {
-  const at = VIEW.indexOf("ask('clearcred', a)")
+  const at = VIEW.indexOf("askFromEdit('clearcred')")
   assert.ok(at !== -1, '没有「停凭据」入口')
-  const start = VIEW.lastIndexOf('<button', at)
+  const start = VIEW.lastIndexOf('<el-button', at)
   assert.ok(start !== -1, '入口不是按钮')
-  return VIEW.slice(start, at + "ask('clearcred', a)".length)
+  return VIEW.slice(start, at + "askFromEdit('clearcred')".length)
 }
 
 /** 「删除」按钮那一段。 */
 function deleteButton() {
-  const at = VIEW.indexOf("ask('delete', a)")
+  const at = VIEW.indexOf("askFromEdit('delete')")
   assert.ok(at !== -1, '没有「删除」入口')
-  const start = VIEW.lastIndexOf('<button', at)
+  const start = VIEW.lastIndexOf('<el-button', at)
   assert.ok(start !== -1, '入口不是按钮')
-  return VIEW.slice(start, at + "ask('delete', a)".length)
+  return VIEW.slice(start, at + "askFromEdit('delete')".length)
 }
 
-/** 已批准那一块（`<template v-if="a.status === 'approved'">` 到底）。 */
-function approvedBlock() {
-  const actions = actionsBlock()
-  const open = actions.indexOf(`<template v-if="a.status === 'approved'">`)
-  assert.ok(open !== -1, '找不到已批准分支')
-  const end = templateBranchEnd(actions, `<template v-if="a.status === 'approved'">`)
-  assert.ok(end > open, '找不到已批准分支的闭合')
-  return actions.slice(open, end)
-}
-
-test('停凭据：只有「有凭据提示」的行才渲染这个钮', () => {
+test('停凭据：只有「已批准且有凭据提示」的行才渲染这个钮', () => {
   const btn = clearCredButton()
-  assert.match(btn, /v-if="a\.credential_hint"/, '门开在 credential_hint 非空的行上（没凭据没得停）')
-  assert.match(btn, /class="act-btn"/, '走普通 act-btn 样式')
-  // 它挂在「已批准」分支里：没批准的行压根没有凭据可停
-  assert.ok(approvedBlock().includes("ask('clearcred', a)"), '停凭据钮要在已批准分支内')
-  // 反钉：别把它写成「所有行都有」
-  assert.doesNotMatch(btn, /v-if="a\.status === 'approved'"/,
-    '停凭据的门是凭据提示，不是光看状态')
+  assert.match(btn, /v-if="editRow\?\.status === 'approved' && editRow\?\.credential_hint"/,
+    '门开在「已批准 + 有凭据提示」上（没凭据没得停）')
+  // 它在**编辑弹框**里（不在卡面）：卡面只留一个直接动作 + 一支铅笔
+  assert.ok(VIEW.indexOf("askFromEdit('clearcred')") > VIEW.indexOf('title="编辑代理"'),
+    '停凭据钮在编辑弹框里')
 })
 
 test('删除钮只给已吊销的行：approved 的行绝不给删除钮', () => {
   const btn = deleteButton()
-  assert.match(btn, /v-if="a\.status === 'revoked'"/, '删除钮只挂在已吊销行上')
-  assert.match(btn, /class="act-btn act-btn--danger"/, '删除是危险色那一档')
+  assert.match(btn, /v-if="editRow\?\.status === 'revoked'"/, '删除钮只挂在已吊销行上')
+  assert.match(btn, /type="danger"/, '删除是危险色那一档')
   // 🔴 反钉：approved 的行（在跑的活代理）绝不能出现删除入口 —— 先吊销再删，两步隔离
-  assert.doesNotMatch(approvedBlock(), /ask\('delete'/, 'approved 的行不许有删除入口')
+  assert.doesNotMatch(VIEW.slice(VIEW.indexOf('title="编辑代理"')), /v-if="editRow\?\.status === 'approved'[\s\S]{0,200}删除/,
+    'approved 的行不许有删除入口')
 })
 
 test('两道新手输闸：停凭据 = 前 8 位，删除 = 完整 agent_id', () => {

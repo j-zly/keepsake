@@ -78,6 +78,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
+    # 检索筛选配置一条（screening_ui）：写 config.json 的 screening 一节
+    "/api/v1/settings/screening",
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",
@@ -518,8 +520,8 @@ def test_写面白名单全量断点_43条业务加4条认证():
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 47
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 43
+    assert len(ALLOWED_POST_PATHS) == 48
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 44
 
 
 def test_P1只读路由未被写面影响(client):

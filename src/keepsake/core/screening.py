@@ -5,7 +5,8 @@
 影子回测（34 条真实探针、双臂对比）结论：M3.1-Flash 做「检索后、进上下文前」的
 候选筛选**零错杀**、注入字符 **-66%**，但单次 ~10s ⇒ **只允许挂在显式检索调用上**，
 严禁进任何自动 / 预取热路径。本模块**只**被 `mcp_server.tools` 的
-`memory_search` / `kb_search` 在**显式 `screen=true`** 时调用；
+`memory_search` / `kb_search` 在**显式 `screen=true`**（或调用方未传 screen 且
+`screening.default_on=true`，见 `screen_default_on`）时调用；
 常驻注入路径（prefetch / provider）**一条口子都不留**。
 常驻层**不参与**筛选（prompt cache 前缀纪律 —— 常驻块在每次请求里逐字不变）。
 
@@ -57,6 +58,10 @@ logger = logging.getLogger("keepsake.core.screening")
 #: **已经显式开了**的情况下才会被用到（关着的时候连 key 文件都不碰）。
 DEFAULTS: Dict[str, Any] = {
     "enabled": False,
+    # 🆕 default_on（2026-10 ks_screening_default_on）：**调用方没显式传 screen 时**
+    # 按 screen=true 处理。显式传 false 仍然照关（调用方意志优先）。
+    # 总开关 `enabled=false` 时本项**无效**（见 `screen_default_on`）。
+    "default_on": False,
     "model": "MiniMax-M3.1-Flash",
     "base_url": "https://api.minimax.cn/v1",
     "api_key_file": "/root/.config/keepsake/screen_key",
@@ -143,6 +148,7 @@ def resolve_screening(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
             raw = node
     return {
         "enabled": _parse_bool(raw.get("enabled"), DEFAULTS["enabled"]),
+        "default_on": _parse_bool(raw.get("default_on"), DEFAULTS["default_on"]),
         "model": _parse_str(raw.get("model"), "model", DEFAULTS["model"]),
         "base_url": _parse_str(raw.get("base_url"), "base_url",
                                DEFAULTS["base_url"]).rstrip("/"),
@@ -167,6 +173,22 @@ def screen_enabled(cfg: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(cfg, dict):
         return False
     return _parse_bool(cfg.get("enabled"), False)
+
+
+def screen_default_on(cfg: Optional[Dict[str, Any]]) -> bool:
+    """调用方**没显式传 screen** 时，要不要按 screen=true 处理。
+
+    语义（2026-10 ks_screening_default_on 拍板）：
+    * `default_on=true` ⇒ MCP 的 memory_search / kb_search 在调用方未传 screen
+      时按「筛」处理；
+    * 显式传 `screen=false` 仍照关 —— **调用方意志优先**（这一层在调用方）；
+    * `enabled=false` ⇒ 本项**无效**（总开关关着 ⇒ 一律不筛）。
+
+    判据只有一条：**总开关开着**且 `default_on` 为真。
+    """
+    if not screen_enabled(cfg):
+        return False
+    return _parse_bool(cfg.get("default_on"), False)
 
 
 # --------------------------------------------------------------------------

@@ -407,15 +407,22 @@ def test_配置文件缺失_按关死处理(monkeypatch, tmp_path):
 # MCP 协议面：schema 里有 screen（默认 false）+ 端到端跑通
 # ---------------------------------------------------------------------------
 
-def test_两个工具的schema都带screen且默认关闭():
+def test_两个工具的schema都带screen且缺省是哨兵None():
+    """🔴 哨兵语义：`screen` 的缺省值是 **None**（= 调用方没传），不是 false。
+
+    「没传」与「显式传了 false」必须分得开：前者看 `screening.default_on`，
+    后者一律照关（调用方意志优先）—— 两者压成一个 false 就没法实现 default_on。
+    schema 上体现为 `anyOf: [boolean, null]` + `default: null`。
+    """
     from keepsake.mcp_server.server import build_server
 
     server = build_server(_FakeProvider([]))
     schemas = {t.name: t.inputSchema for t in server.list_tools()}
     for name in ("memory_search", "kb_search"):
         prop = schemas[name]["properties"]["screen"]
-        assert prop["type"] == "boolean"
-        assert prop["default"] is False
+        assert prop["default"] is None, "缺省必须是哨兵 None（不是 false）"
+        types = [t.get("type") for t in prop.get("anyOf", [])]
+        assert "boolean" in types and "null" in types, prop
 
 
 def test_MCP端到端_screen参数一路传到工具(monkeypatch, tmp_path):

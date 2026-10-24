@@ -77,7 +77,7 @@ test('① 审核页只出现 pending：已批准 / 已吊销的行一律不在�
 test('② 登记页不出现 pending：只渲染已批准 + 已吊销两摞', () => {
   assert.match(VIEW, /const approvedRows = computed\(\(\) => agents\.value\.filter\(\(a\) => a\.status === 'approved'\)\)/)
   assert.match(VIEW, /const revokedRows = computed\(\(\) => agents\.value\.filter\(\(a\) => a\.status === 'revoked'\)\)/)
-  assert.match(VIEW, /<ItemCard v-for="a in grp\.rows"/, '卡片循环走的是两摞筛过的行')
+  assert.match(VIEW, /<article v-for="a in grp\.rows"/, '卡片循环走的是两摞筛过的行')
   assert.doesNotMatch(VIEW, /a\.status === 'pending'/, '登记页不渲染 pending 行')
   // 真跑一遍两个谓词：pending 一个都不许留下
   const keepApproved = predicateOf(VIEW.match(/const approvedRows[\s\S]*?\)\)/)[0])

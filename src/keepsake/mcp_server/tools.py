@@ -236,12 +236,29 @@ def _unread_dm(box: Any, agent_id: str) -> int:
 # --------------------------------------------------------------------------
 # 检索结果 LLM 筛选（2026-10 recall_screening）
 #
-# 🔴 **只挂在显式检索调用上**：`memory_search(screen=True)` / `kb_search(screen=True)`。
+# 🔴 **只挂在检索调用上**：`memory_search(screen=True)` / `kb_search(screen=True)`。
 # 常驻注入路径（prefetch / provider）**一律不接** —— 筛选一次 ~10s，
 # 挂在自动路径上会把每轮注入都拖慢；常驻层也不参与筛选（prompt cache 前缀纪律）。
-# 🔴 **默认 false ⇒ 对现有所有调用方零行为变化**（本单第一红线）。
+# 🔴 **默认不筛 ⇒ 对现有所有调用方零行为变化**（本单第一红线）。
+#    （2026-10 ks_screening_default_on 起：`screen` 的缺省值是**哨兵 None**
+#    ——「调用方没传」与「调用方显式传了 false」必须分得开：
+#    没传 ⇒ 看 `screening.default_on`；显式传了 ⇒ 照传，调用方意志优先。）
 # 🔴 **fail-open**：筛选坏了就把原始结果照返，检索本体绝不受影响。
 # --------------------------------------------------------------------------
+
+def _screen_flag(screen: Optional[bool]) -> bool:
+    """`screen` 参数的哨兵解析：**None = 调用方没传** ⇒ 看 `screening.default_on`。
+
+    * `screen=True/False`（显式传了）⇒ **照传**（调用方意志优先）；
+    * `screen=None` ⇒ `screening.default_on` 且总开关开着 ⇒ True，否则 False。
+
+    🔴 总开关（`screening.enabled`）关着时一律 False —— `default_on` 只是
+    「没传时怎么办」的偏好，不是绕过总开关的后门。
+    """
+    if screen is not None:
+        return bool(screen)
+    return screening.screen_default_on(screening.load_cfg())
+
 
 def _screen_rows(query: str, rows: List[Dict[str, Any]], *,
                  text_of: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -348,7 +365,7 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
 
 def memory_search(provider: Any, query: str, limit: int = 10,
                  caller_agent_id: str = "", caller_role: str = "",
-                 box: Any = None, screen: bool = False) -> Dict[str, Any]:
+                 box: Any = None, screen: Optional[bool] = None) -> Dict[str, Any]:
     """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。
 
     `caller_agent_id` / `caller_role`（2026-10 ks_share_memory）：调用方身份
@@ -359,8 +376,10 @@ def memory_search(provider: Any, query: str, limit: int = 10,
     零定时器、零额外请求。计数走既有连接池（`box` 与注册表同一个 storage），
     读失败 ⇒ 0（fail-open，**绝不影响检索本体返回**）。
 
-    🔴 `screen`（2026-10 recall_screening）：**默认 false ⇒ 行为逐字不变**。
-    显式 `screen=true` 时才走 LLM 候选筛选（见 `_screen_rows`）：
+    🔴 `screen`（2026-10 recall_screening）：**哨兵 None = 调用方没传** ——
+    没传时看 `screening.default_on`（默认 false ⇒ 行为与接入前逐字不变）；
+    显式传 `screen=true/false` 一律**照传**（调用方意志优先）。
+    走 LLM 候选筛选时（见 `_screen_rows`）：
     筛成功按选中编号保序过滤并回 `"screened": {"picked": N, "of": M}`，
     筛失败（关着 / 无 key / 429 / 超时 / 坏 JSON）⇒ 原结果照返 +
     `"screened": {"skipped": "<原因>"}`（fail-open，绝不影响检索本体）。
@@ -388,7 +407,7 @@ def memory_search(provider: Any, query: str, limit: int = 10,
         "unread_dm": _unread_dm(box, caller_agent_id),
         "results": results,
     }
-    if screen:
+    if _screen_flag(screen):
         results, meta = _screen_rows(query.strip(), results,
                                       text_of=lambda r: str(r.get("content") or ""))
         out["results"] = results
@@ -1059,13 +1078,15 @@ def kb_store(title: str, content: str, tags: str = "", source_type: str = "agent
 
 def kb_search(query: str, limit: int = 10, *, caller_agent_id: str = "",
               caller_role: str = "", registry: Any = None,
-              screen: bool = False) -> Dict[str, Any]:
+              screen: Optional[bool] = None) -> Dict[str, Any]:
     """检索知识库。返回 `id` / `title` / 摘要（**不含全文** —— 要全文用 `kb_get`）。
 
     🔴 可见范围 = **自己名下 + 已共享代理名下 + 无主老文档**（primary 全量）。
 
-    🔴 `screen`（2026-10 recall_screening）：**默认 false ⇒ 行为逐字不变**；
-    显式 `screen=true` 时走 LLM 候选筛选，语义与 `memory_search` 完全一致
+    🔴 `screen`（2026-10 recall_screening）：**哨兵 None = 调用方没传** ——
+    没传时看 `screening.default_on`（默认 false ⇒ 行为与接入前逐字不变）；
+    显式传 `screen=true/false` 一律**照传**（调用方意志优先）。
+    走 LLM 候选筛选时语义与 `memory_search` 完全一致
     （筛成功保序过滤 + `"screened": {"picked": N, "of": M}`；
     筛失败 ⇒ 原结果照返 + `"screened": {"skipped": "<原因>"}`）。
     候选正文取知识库检索条目里的**摘要文本**（`snippet` —— 知识库路由没有全文字段）。
@@ -1085,7 +1106,7 @@ def kb_search(query: str, limit: int = 10, *, caller_agent_id: str = "",
         "count": len(results),
         "results": results,
     }
-    if screen:
+    if _screen_flag(screen):
         results, meta = _screen_rows(
             str(query or "").strip(), results,
             text_of=lambda r: str(r.get("snippet") or r.get("title") or ""))
@@ -1202,9 +1223,11 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         name="memory_search",
         description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）；"
                     "unread_dm = 本代理的未读私信条数（0 = 没有）。"
-                    "screen=true 时先经 LLM 候选筛选（默认关；开启后结果里带 screened 说明）。",
+                    "screen=true 时先经 LLM 候选筛选（默认不筛；开启后结果里带 screened 说明）。"
+                    "不传 screen 时按服务端的 default_on 偏好走；显式传 false 一律不筛。",
     )
-    def _search(query: str, limit: int = 10, screen: bool = False) -> Dict[str, Any]:
+    def _search(query: str, limit: int = 10,
+                screen: Optional[bool] = None) -> Dict[str, Any]:
         ident = _authorize("memory_search")
         return memory_search(provider, query, limit,
                              caller_agent_id=str(ident.get("agent_id") or ""),
@@ -1295,9 +1318,11 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         name="kb_search",
         description="检索知识库，返回 id / title / 摘要（不含全文；要全文用 kb_get）。"
                     "只看得到自己名下 + 已共享代理名下 + 无主的老文档。"
-                    "screen=true 时先经 LLM 候选筛选（默认关；开启后结果里带 screened 说明）。",
+                    "screen=true 时先经 LLM 候选筛选（默认不筛；开启后结果里带 screened 说明）。"
+                    "不传 screen 时按服务端的 default_on 偏好走；显式传 false 一律不筛。",
     )
-    def _kb_search(query: str, limit: int = 10, screen: bool = False) -> Dict[str, Any]:
+    def _kb_search(query: str, limit: int = 10,
+                   screen: Optional[bool] = None) -> Dict[str, Any]:
         ident = _authorize("kb_search")
         return kb_search(query, limit,
                          caller_agent_id=str(ident.get("agent_id") or ""),

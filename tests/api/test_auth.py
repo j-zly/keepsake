@@ -717,6 +717,8 @@ def test_写面仍是四十三条业务写端点加四条auth_POST():
         "/api/v1/kb/documents/bulk-approve", "/api/v1/kb/documents/bulk-reject",
         "/api/v1/kb/documents/bulk-delete",
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
+        # 检索筛选配置（screening_ui）
+        "/api/v1/settings/screening",
         "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
         "/api/v1/crons/{job_id}/edit",
         "/api/v1/agents", "/api/v1/agents/{agent_id}/approve",
@@ -755,6 +757,7 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/ops/merge", "/api/v1/ops/forget", "/api/v1/auth/logout",
                  "/api/v1/auth/me",
                  "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
+                 "/api/v1/settings/screening",
                  "/api/v1/tiering/status", "/api/v1/import/template",
                  "/api/v1/ops/bulk", "/api/v1/ops/bulk-export",
                  "/api/v1/auth/change_password",

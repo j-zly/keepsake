@@ -126,12 +126,24 @@
           <span class="group-title">{{ grp.title }}</span>
           <span class="group-count num">{{ grp.rows.length }} 个</span>
         </div>
-        <div class="card-grid">
-          <ItemCard v-for="a in grp.rows" :key="a.agent_id" :chip-tone="chipTone(a)">
-            <template #tag>{{ STATUS_TEXT[a.status] || a.status }}</template>
-            <template #time>{{ toLocal(a.first_seen_at) }}</template>
+        <!--
+          一代理一张卡（2026-10 UI 重做，用户点名「太丑」）：
+          头部 = 名字 + 角色徽标 + 状态徽标；中部 = 读数（最后活动 / 读写计数 / 凭据）
+          + 状态 chip（私信 / 共享 / 上下文 —— **只读**，不在卡面上拨开关）；
+          卡面**只留一个直接动作**（待审/已吊销 = 批准，已批准 = 吊销）+ **一个编辑入口**（铅笔）。
+          其余动作（设主 / 上下文 / 私信 / 共享 / 预算 / 凭据 / 删除）全收进编辑弹框。
+        -->
+        <div class="card-grid agent-grid">
+          <article v-for="a in grp.rows" :key="a.agent_id" class="card agent-card">
+            <div class="ac-head">
+              <span class="ac-name" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
+              <span class="chip" :class="a.role === 'primary' ? 'chip--accent' : ''">
+                {{ a.role === 'primary' ? '主代理' : '子代理' }}
+              </span>
+              <span class="chip" :class="statusTone(a)">{{ STATUS_TEXT[a.status] || a.status }}</span>
+            </div>
 
-            <div class="cell-key">
+            <div class="ac-id">
               <span class="k" :title="a.agent_id">{{ a.agent_id }}</span>
               <button class="copy-btn" title="复制 agent_id" @click="doCopy(a.agent_id)">
                 <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
@@ -140,15 +152,6 @@
                   <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
                 </svg>
               </button>
-              <!--
-                行内只留复制钮（复制 id 仍是最常用的操作）；改 id 与改备注名
-                一起收进卡片操作区的「编辑」弹框 —— 一张卡一个编辑入口。
-              -->
-            </div>
-
-            <div class="aname">
-              <span class="aname-txt" :title="a.name || a.agent_id">{{ a.name || a.agent_id }}</span>
-              <span class="chip">{{ a.role === 'primary' ? '主代理' : '子代理' }}</span>
             </div>
 
             <div class="kv">
@@ -166,132 +169,55 @@
               </div>
             </div>
 
-            <template #tags>
-              <span v-if="a.exclude_from_primary" class="tag">不进主脑上下文</span>
+            <!-- 状态 chip：**只读**（拨开关的地方在编辑弹框里，卡面不再挂控件） -->
+            <div class="card-tags">
+              <span class="tag">私信{{ dmOn(a) ? '开' : '关' }}</span>
+              <span class="tag">共享{{ shareOn(a) ? '开' : '关' }}</span>
+              <span class="tag">{{ a.exclude_from_primary ? '不进主脑上下文' : '进主脑上下文' }}</span>
               <!-- 配了自己的注入预算才亮（没配 = 沿用全局默认，不必标） -->
               <span v-if="a.core_budget_chars" class="tag">注入预算 {{ a.core_budget_chars }} 字符</span>
-            </template>
+            </div>
 
-            <template #actions>
+            <div class="ac-foot">
               <!--
-                🔴 主代理行**只留一句话**，四个动作一个都不给（approve/revoke/role/exclude）：
+                🔴 主代理行**只留一句话**，治理动作一个都不给（吊销 / 批准 / 设主 / 排除）：
                 吊销它 = 写闸 fail-closed 把主脑降成 sub，常驻写入全降级、候选链瘫痪；
                 排除它更没有意义（过滤是给别人的看的，它自己每轮就在上下文里）。
                 换主的唯一安全路径是「先把另一个设为主代理」，那次会自动把它降级。
                 后端同口径 409（`_need_not_primary`）—— 这里只是不让人看见那个钮。
               -->
               <span v-if="a.role === 'primary'" class="act-note">主代理 · 不可吊销 / 不可排除</span>
-              <template v-else>
-                <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
-                <button
-                  v-if="a.status !== 'approved'"
-                  class="act-btn"
-                  :disabled="busy"
-                  @click="ask('approve', a)"
-                >
-                  {{ a.status === 'revoked' ? '重新批准' : '批准' }}
-                </button>
-                <template v-if="a.status === 'approved'">
-                  <!-- 内层这道 v-if 是本地护栏：外层已经按 role 分流，这里再钉一次 -->
-                  <button v-if="a.role !== 'primary'" class="act-btn" :disabled="busy" @click="ask('role', a)">
-                    设为主代理
-                  </button>
-                  <button class="act-btn" :disabled="busy" @click="ask('exclude', a)">
-                    {{ a.exclude_from_primary ? '加入主脑上下文' : '移出主脑上下文' }}
-                  </button>
-                  <button class="act-btn act-btn--danger" :disabled="busy" @click="ask('revoke', a)">吊销</button>
-                  <!--
-                    停凭据：**只废那把钥匙**（凭据哈希与提示清掉；状态 / 角色 / 备注一个都不动）——
-                    与「吊销」的分界就在状态上：吊销 = 停权限并留一条吊销记录，
-                    停凭据 = 代理照旧在册、只是再也连不上（凭据泄露时先止血用这个）。
-                    🔴 门只开在「有凭据提示」的行上（credential_hint 非空）：没凭据的行没有可停的东西。
-                  -->
-                  <button
-                    v-if="a.credential_hint"
-                    class="act-btn"
-                    :disabled="busy"
-                    @click="ask('clearcred', a)"
-                  >
-                    停凭据
-                  </button>
-                </template>
-                <!--
-                  删除：**整行抹掉**（删前会备份一份，可人工复原）。
-                  🔴 只给**已吊销**的行 —— approved 的行不给这个钮：先吊销（停权限）
-                  再删，两步隔离「心误删活代理」（那个正在跑的）。
-                -->
-                <button
-                  v-if="a.status === 'revoked'"
-                  class="act-btn act-btn--danger"
-                  :disabled="busy"
-                  @click="ask('delete', a)"
-                >
-                  删除
-                </button>
-              </template>
+              <!-- pending / revoked 都走批准；已吊销的走这条等于重新签发一条新凭据 -->
+              <button
+                v-else-if="a.status === 'approved'"
+                class="act-btn act-btn--danger"
+                :disabled="busy"
+                @click="ask('revoke', a)"
+              >
+                吊销
+              </button>
+              <button v-else class="act-btn" :disabled="busy" @click="ask('approve', a)">
+                {{ a.status === 'revoked' ? '重新批准' : '批准' }}
+              </button>
               <!--
-                编辑：一张卡**一个**编辑入口（代理 ID + 备注名同框）。
-                放在分流链**外面** —— primary 行不给的是「危险治理动作」，
-                改备注名它照样要能改（后端同口径：primary 只锁 id）。
-              -->
-              <button class="act-btn" :disabled="busy" @click="openEdit(a)">编辑</button>
-
-              <!--
-                重新生成凭据：**换发**（approve + 显式 reissue=true —— 旧的那条立即作废，
-                新的一条顶上来；不带 reissue 的重复批准会被后端 409 挡掉）。
-                放在 primary / 非 primary 的分流链**外面** —— 换发对主代理无副作用
-                （主脑走本机 bootstrap，不吃这把凭据），泄露场景下主代理同样得能换。
-                门只开在「已批准」行上：待审的去审核页，已吊销的走「重新批准」。
-                🔴 不是危险色那一档：吊销 / 排除 / 改角色会毁掉东西，这里只是**换一把钥匙**
-                （代理照旧能读写），所以走普通 act-btn。
+                编辑：一张卡**一个**编辑入口（铅笔钮）。放在分流链**外面** ——
+                primary 行不给的是「危险治理动作」，改备注名它照样要能改
+                （后端同口径：primary 只锁 id）。
               -->
               <button
-                v-if="a.status === 'approved'"
-                class="act-btn"
+                class="ac-edit"
                 :disabled="busy"
-                @click="ask('rotate', a)"
+                title="编辑：角色 / 开关 / 凭据"
+                @click="openEdit(a)"
               >
-                重新生成凭据
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M11.2 2.4a1.4 1.4 0 0 1 2 2l-7.3 7.3-2.7.7.7-2.7z" />
+                  <path d="M9.6 4l2.4 2.4" />
+                </svg>
               </button>
-
-              <!--
-                私信开关（dm_enabled）：关掉之后，别人往它信箱里投的消息一律拒投
-                （投递闸门在后端，与 MCP 的 message_send 同一条规矩）。
-                🔴 放在 primary 的分流链**外面** —— 关了自己也收不到私信，合法
-                （用户明确要过）；它是**投递偏好**，不是治理动作（不碰状态 / 角色 / 凭据）。
-                失败回滚：乐观值丢掉即回到服务器口径，并报红条（不许留下「以为改成了」）。
-              -->
-              <span class="dm-toggle">
-                <span class="dm-label">私信</span>
-                <el-switch
-                  :model-value="dmOn(a)"
-                  size="small"
-                  :loading="dmBusy === a.agent_id"
-                  :title="dmOn(a) ? '已开启：接收私信' : '已关闭：别人投不进来'"
-                  @change="toggleDm(a, $event)"
-                />
-              </span>
-
-              <!--
-                记忆共享开关（share_memory）：打开之后，这个代理名下的记忆进入
-                **别的已批准代理**的检索可见范围（关着就只有它自己 + 主脑看得见）。
-                🔴 与私信开关**同一档**：只改**读可见性**，不是治理动作
-                （不碰状态 / 角色 / 凭据 / 记忆归属）—— 所以同样放在 primary
-                的分流链**外面**（主代理也可以共享自己的记忆，合法）。
-                失败回滚：乐观值丢掉即回到服务器口径，并报红条。
-              -->
-              <span class="dm-toggle">
-                <span class="dm-label">共享记忆</span>
-                <el-switch
-                  :model-value="shareOn(a)"
-                  size="small"
-                  :loading="shareBusy === a.agent_id"
-                  :title="shareOn(a) ? '已共享：别的代理能检索到它的记忆' : '未共享：只有它自己和主脑看得见'"
-                  @change="toggleShare(a, $event)"
-                />
-              </span>
-            </template>
-          </ItemCard>
+            </div>
+          </article>
         </div>
       </template>
     </template>
@@ -375,16 +301,17 @@
     </el-dialog>
 
     <!--
-      编辑代理：**代理 ID + 备注名 + 注入预算同框**（一张卡一个编辑入口，两个铅笔合并到这儿）。
+      编辑代理：**一个编辑入口** → 弹框里分三组（角色 / 开关 / 凭据）+ 基本信息。
+      🔴 卡面上不再并排五六个小按钮：角色、开关、凭据、删除全收进这里，
+      一张卡只留「一个直接动作 + 一支铅笔」。
       🔴 改 ID 是换主键（凭据与权限不变，历史记忆的归属跟着一起搬）；
-      改备注名只动人看的标签（状态 / 角色 / 已发的凭据一律不碰）；
-      改注入预算只改这一个代理的注入阈值（留空 = 沿用全局默认）。
+      改备注名只动人看的标签（状态 / 角色 / 已发的凭据一律不碰）。
       primary 行的 ID 输入框锁死 —— 主脑的引导配置绑在这个 id 上（后端同口径 400）。
     -->
     <el-dialog
       v-model="editOpen"
       title="编辑代理"
-      width="460px"
+      width="560px"
       align-center
       :close-on-click-modal="false"
       :close-on-press-escape="!busy"
@@ -392,6 +319,7 @@
       append-to-body
     >
       <el-form label-position="top">
+        <div class="eg-title">基本信息</div>
         <el-form-item label="代理 ID">
           <el-input
             v-model="editId"
@@ -412,6 +340,39 @@
             @keyup.enter.prevent="doEdit"
           />
         </el-form-item>
+
+        <!-- 组一：角色（设主 / 上下文） -->
+        <div class="eg-title">角色</div>
+        <el-form-item label="进入主脑上下文（关掉 = 它之后写的东西不进主脑每轮注入）">
+          <el-switch v-model="editContext" :disabled="editPrimary" />
+          <p class="tip">主代理恒在主脑上下文里，这一项对它锁死（后端同口径 400）。</p>
+        </el-form-item>
+        <el-form-item label="设为主代理（全库唯一；当前主代理会自动降为子代理）">
+          <el-button v-if="!editPrimary" :disabled="busy" @click="askFromEdit('role')">
+            设为主代理
+          </el-button>
+          <span v-else class="tip">它已经是主代理了。</span>
+          <p class="tip">
+            改前会备份整份注册表（含被降级的那一行），可人工复原；
+            确认框要手输完整 agent_id（改的是全库唯一的主脑，不是单个开关）。
+          </p>
+        </el-form-item>
+
+        <!-- 组二：开关（私信 / 共享记忆 / 实时推送 / 注入预算） -->
+        <div class="eg-title">开关</div>
+        <el-form-item label="私信（关掉 = 别人投不进来）">
+          <el-switch v-model="editDm" />
+        </el-form-item>
+        <el-form-item label="共享记忆（打开 = 别的代理能检索到它的记忆）">
+          <el-switch v-model="editShare" />
+        </el-form-item>
+        <el-form-item label="私信实时推送（SSE 长连接）">
+          <el-switch v-model="editPush" />
+          <p class="tip">
+            开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
+            有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
+          </p>
+        </el-form-item>
         <!--
           注入预算（per-agent）：留空 = 沿用全局默认。
           🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个编辑入口。
@@ -429,22 +390,41 @@
             @keyup.enter.prevent="doEdit"
           />
         </el-form-item>
-        <!--
-          私信实时推送（SSE 快车道）：开着 = 这个代理可以挂一条 SSE 长连接，
-          别人给它投私信时服务端顺这条流推一帧**元数据**（未读数 / 最近发件人）。
-          🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个入口。
-          🔴 与私信开关 / 共享开关**同一档**：只改投递偏好，不碰状态 / 角色 / 凭据。
-        -->
-        <el-form-item label="私信实时推送（SSE 长连接）">
-          <el-switch
-            v-model="editPush"
-            :title="editPush ? '已开启：允许挂 SSE 长连接收私信提醒' : '已关闭：别人连不上它的提醒通道'"
-          />
-          <p class="tip">
-            开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
-            有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
-          </p>
-        </el-form-item>
+
+        <!-- 组三：凭据（危险区）—— 换发 / 停凭据 / 删除 -->
+        <div class="eg-title eg-title--danger">凭据（危险区）</div>
+        <div class="eg-danger">
+          <el-button
+            v-if="editRow?.status === 'approved'"
+            :disabled="busy"
+            @click="askFromEdit('rotate')"
+          >
+            重新生成凭据
+          </el-button>
+          <el-button
+            v-if="editRow?.status === 'approved' && editRow?.credential_hint"
+            :disabled="busy"
+            @click="askFromEdit('clearcred')"
+          >
+            停凭据
+          </el-button>
+          <el-button
+            v-if="editRow?.status === 'revoked'"
+            type="danger"
+            :disabled="busy"
+            @click="askFromEdit('delete')"
+          >
+            删除这个代理
+          </el-button>
+          <span v-if="editRow?.status !== 'approved' && !editRow?.credential_hint" class="tip">
+            这个代理现在没有凭据（已吊销 / 待审的行不签发凭据 —— 批准时才会发）。
+          </span>
+        </div>
+        <p class="tip">
+          重新生成凭据 = 换发：旧的那条立即作废，新的一条**只出现一次**（关掉弹框就拿不到了）。
+          停凭据 = 只废那把钥匙（代理照旧在册，状态 / 角色都不动）。
+          删除 = 整行抹掉（删前会备份一份，可人工复原）—— 只给已吊销的行。
+        </p>
       </el-form>
       <p class="tip">
         改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
@@ -453,9 +433,7 @@
         <br />
         改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
         <br />
-        改注入预算：只改这个代理自己的注入阈值（留空 = 沿用全局默认），改完立刻生效。
-        <br />
-        私信实时推送：只改「能不能被连上来」，状态 / 角色 / 凭据一个都不动。
+        开关与注入预算：只改这个代理自己的设置，状态 / 角色 / 凭据一个都不动，改完立刻生效。
       </p>
       <template #footer>
         <el-button :disabled="busy" @click="editOpen = false">取消</el-button>
@@ -476,7 +454,6 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import CredentialDialog from '../components/CredentialDialog.vue'
-import ItemCard from '../components/ItemCard.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import http, { api } from '../api'
@@ -493,14 +470,7 @@ const loading = ref(true)
 const error = ref('')
 const busy = ref(false)
 
-/** 私信开关的乐观值（agent_id → 开/关）：只活到下一次成功刷新；失败即丢掉（回滚）。 */
-const dmState = ref({})
-/** 正在提交的那一行（同一时刻只允许一个，避免连点连发）。 */
-const dmBusy = ref('')
-/** 记忆共享开关的乐观值（agent_id → 开/关）：与私信开关同款（乐观 + 失败回滚）。 */
-const shareState = ref({})
-/** 正在提交共享开关的那一行。 */
-const shareBusy = ref('')
+/** 私信 / 共享记忆的**只读**状态（卡面上只做 chip 展示，拨开关在编辑弹框里）。 */
 
 // 搜索 + 服务端分页（口径照抄 CoreView：回车查、清空回全量、seq 防串）
 const q = ref('')
@@ -524,9 +494,9 @@ const groups = computed(() =>
 /** 有搜索词在生效吗：空态分支与「清除筛选」按钮都看它。 */
 const dirty = computed(() => !!(q.value || '').trim())
 
-/** approved 走蓝底、revoked 中性灰（pending 红底那一摞在审核页）。 */
-function chipTone(a) {
-  if (a.status === 'approved') return 'accent'
+/** 状态徽标的底色：approved 蓝底、revoked 中性灰（pending 的行不在本页渲染）。 */
+function statusTone(a) {
+  if (a.status === 'approved') return 'chip--accent'
   return ''
 }
 
@@ -555,9 +525,6 @@ async function load(silent = false) {
     data.value = list
     error.value = ''
     lastErr = ''
-    // 服务器口径为准：没有正在提交的行时，乐观值一律丢掉（页面回到真实状态）
-    if (!dmBusy.value) dmState.value = {}
-    if (!shareBusy.value) shareState.value = {}
   } catch (e) {
     if (isStale(seq, reqSeq)) return
     // 保留旧数据不清屏：一次抖动不该把正在审的列表抽走
@@ -613,77 +580,17 @@ async function doCopy(text) {
 }
 
 // ---------------------------------------------------------------------------
-// 私信开关（dm_enabled）：投递偏好，不是治理动作
+// 私信 / 共享记忆 / 上下文：**只读**状态（卡面上是 chip，拨开关在编辑弹框里）
 // ---------------------------------------------------------------------------
 
-/** 当前开关状态：乐观值优先；没有乐观值就看服务器给的（缺字段按**开** —— 老数据兼容）。 */
+/** 私信开关状态（缺字段按**开** —— 老数据兼容）。 */
 function dmOn(a) {
-  const s = dmState.value
-  if (a.agent_id in s) return s[a.agent_id]
   return a.dm_enabled !== false
 }
 
-// ---------------------------------------------------------------------------
-// 记忆共享开关（share_memory）：只改读可见性，不是治理动作
-// ---------------------------------------------------------------------------
-
-/** 当前共享状态：乐观值优先；没有乐观值就看服务器给的（缺字段按**关** —— 老数据兼容）。 */
+/** 共享记忆状态（缺字段按**关** —— 共享是放宽权限的开关，缺省必须最严）。 */
 function shareOn(a) {
-  const s = shareState.value
-  if (a.agent_id in s) return s[a.agent_id]
   return a.share_memory === true
-}
-
-/**
- * 切换记忆共享开关：乐观更新 → 打端点 → 失败回滚（丢掉乐观值）+ 红条。
- *
- * 🔴 失败**必须**回滚：不回滚的话，界面显示「已共享」而服务端根本没改 ——
- * 那正是这套治理要拔掉的「以为改成了」。
- */
-async function toggleShare(a, val) {
-  const id = a.agent_id
-  shareState.value = { ...shareState.value, [id]: !!val }
-  shareBusy.value = id
-  try {
-    await api.setAgentShare(id, !!val)
-    showToast(`${id}：记忆已${val ? '共享' : '收回'}`)
-    // 状态以服务器为准（本地改了很快就和注册表对不上）
-    await load(true)
-  } catch (e) {
-    const next = { ...shareState.value }
-    delete next[id]
-    shareState.value = next
-    error.value = `记忆共享开关切换失败：${e.message}`
-    showError(error.value)
-  } finally {
-    shareBusy.value = ''
-  }
-}
-
-/**
- * 切换私信开关：乐观更新 → 打端点 → 失败回滚（丢掉乐观值）+ 红条。
- *
- * 🔴 失败**必须**回滚：不回滚的话，界面显示「已关」而服务端根本没改 ——
- * 那正是这套治理要拔掉的「以为改成了」。
- */
-async function toggleDm(a, val) {
-  const id = a.agent_id
-  dmState.value = { ...dmState.value, [id]: !!val }
-  dmBusy.value = id
-  try {
-    await api.setAgentDm(id, !!val)
-    showToast(`${id}：私信已${val ? '开启' : '关闭'}`)
-    // 状态以服务器为准（本地改了很快就和注册表对不上）
-    await load(true)
-  } catch (e) {
-    const next = { ...dmState.value }
-    delete next[id]
-    dmState.value = next
-    error.value = `私信开关切换失败：${e.message}`
-    showError(error.value)
-  } finally {
-    dmBusy.value = ''
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +666,7 @@ async function doRegister() {
 }
 
 // ---------------------------------------------------------------------------
-// 编辑：代理 ID + 备注名 + 注入预算**同框**（一张卡一个编辑入口）
+// 编辑：**一个编辑入口** → 弹框里分三组（角色 / 开关 / 凭据）+ 基本信息
 // ---------------------------------------------------------------------------
 
 const editOpen = ref(false)
@@ -770,6 +677,12 @@ const editName = ref('')
 const editBudget = ref('')
 /** 私信实时推送开关（布尔）：缺省**关**（往外放行的开关，缺省必须最严）。 */
 const editPush = ref(false)
+/** 私信开关（布尔）：只改投递偏好，不碰状态 / 角色 / 凭据。 */
+const editDm = ref(true)
+/** 记忆共享开关（布尔）：只改读可见性，缺省**关**（放宽权限的开关，缺省最严）。 */
+const editShare = ref(false)
+/** 进入主脑上下文（布尔）：`exclude_from_primary` 的**反面**（开关语义用正面词）。 */
+const editContext = ref(true)
 /** 主代理不能改 id（后端同口径 400）：输入框直接锁死，备注名照改。 */
 const editPrimary = computed(() => editRow.value?.role === 'primary')
 
@@ -779,8 +692,23 @@ function openEdit(row) {
   editName.value = row?.name || ''
   editBudget.value = row?.core_budget_chars == null ? '' : String(row.core_budget_chars)
   editPush.value = row?.push_enabled === true
+  editDm.value = row?.dm_enabled !== false
+  editShare.value = row?.share_memory === true
+  editContext.value = !row?.exclude_from_primary
   editOpen.value = true
   loadGlobalBudget()      // placeholder 里的「当前全局」顺手刷一次（fire-and-forget）
+}
+
+/**
+ * 编辑弹框里的危险动作（设主 / 换发凭据 / 停凭据 / 删除）：
+ * 先关编辑框，再弹**既有**的确认框 —— 两层弹框不叠着（后一层的遮罩会把前一层
+ * 变成「点不动的背景」）。
+ */
+function askFromEdit(kind) {
+  const row = editRow.value
+  if (!row) return
+  editOpen.value = false
+  ask(kind, row)
 }
 
 /**
@@ -844,8 +772,17 @@ async function doEdit() {
   // 私信实时推送：与其它几项同一档（只改投递偏好，不碰状态 / 角色 / 凭据）
   const wantPush = !!editPush.value
   const pushChanged = wantPush !== (row.push_enabled === true)
+  // 主脑上下文：开关用正面词（editContext = 进不进主脑上下文），端点收反面
+  const wantContext = !!editContext.value
+  const contextChanged = !editPrimary.value && wantContext !== !row.exclude_from_primary
+  // 私信 / 共享记忆：与推送同一档（只改投递偏好 / 读可见性）
+  const wantDm = !!editDm.value
+  const dmChanged = wantDm !== (row.dm_enabled !== false)
+  const wantShare = !!editShare.value
+  const shareChanged = wantShare !== (row.share_memory === true)
   // 什么都没改：关窗，一个请求都不发
-  if (!idChanged && !nameChanged && !budgetChanged && !pushChanged) {
+  if (!idChanged && !nameChanged && !budgetChanged && !pushChanged
+      && !contextChanged && !dmChanged && !shareChanged) {
     editOpen.value = false
     return
   }
@@ -938,6 +875,52 @@ async function doEdit() {
       done.push(wantPush ? '已开启私信实时推送' : '已关闭私信实时推送')
       if (r.note) notes.push(r.note)
     }
+    /**
+     * 打一个「只改这一个开关」的端点；失败 ⇒ 说清「改了一半」并**中止**。
+     * （id 已经改过时更要说明：前面那步已生效，别让人以为全没生效。）
+     */
+    const applySwitch = async (label, fn, okText) => {
+      try {
+        const r = await fn()
+        done.push(okText)
+        if (r?.note) notes.push(r.note)
+        return true
+      } catch (e) {
+        if (idChanged) {
+          editOpen.value = false
+          showToast(`已更新：${done.join('，')}；但${label}没改：${e.message}`, 'warning')
+          load(true)
+        } else {
+          showError(`${label}保存失败：${e.message}`)
+        }
+        return false
+      }
+    }
+    if (contextChanged) {
+      // 端点收的是**反面**（exclude=true = 移出主脑上下文）
+      const ok = await applySwitch(
+        '主脑上下文开关',
+        () => api.setAgentExclude(targetId, !wantContext),
+        wantContext ? '已进入主脑上下文' : '已移出主脑上下文',
+      )
+      if (!ok) return
+    }
+    if (dmChanged) {
+      const ok = await applySwitch(
+        '私信开关',
+        () => api.setAgentDm(targetId, wantDm),
+        wantDm ? '私信已开启' : '私信已关闭',
+      )
+      if (!ok) return
+    }
+    if (shareChanged) {
+      const ok = await applySwitch(
+        '记忆共享开关',
+        () => api.setAgentShare(targetId, wantShare),
+        wantShare ? '记忆已共享' : '记忆已收回',
+      )
+      if (!ok) return
+    }
     editOpen.value = false
     showToast(`已更新：${done.join('，')}${notes.length ? ` · ${notes.join(' ')}` : ''}`)
     // 状态 / 角色 / 计数都由后端说了算，本地改了很快就和注册表对不上
@@ -962,8 +945,7 @@ const dlgTitle = computed(() => {
   if (dlgKind.value === 'revoke') return `吊销 ${id}？`
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
   if (dlgKind.value === 'clearcred') return `停掉 ${id} 的凭据？`
-  if (dlgKind.value === 'delete') return `删除 ${id}？`
-  return `${dlgRow.value?.exclude_from_primary ? '加入' : '移出'}主脑上下文？`
+  return `删除 ${id}？`
 })
 
 const dlgConfirmText = computed(() => {
@@ -1044,17 +1026,7 @@ const dlgConsequences = computed(() => {
       '删前会备份这一行（备份目录里那份 JSON 就是原行），可人工复原。',
     ]
   }
-  return row.exclude_from_primary
-    ? [
-        '这个代理之后写入的条目重新进入主脑上下文（每轮注入与检索都能看见）。',
-        '已在库里的条目不受影响 —— 这个开关只挡它之后写的东西。',
-        '随时可以再关回去。',
-      ]
-    : [
-        '这个代理之后写入的条目不进主脑上下文（每轮注入看不到、检索也过滤掉）。',
-        '已在库里的条目不受影响 —— 这个开关只挡它之后写的东西。',
-        '随时可以在这里改回来。',
-      ]
+  return []
 })
 
 function ask(kind, row) {
@@ -1092,9 +1064,6 @@ async function doAction(typed) {
           ? `已设为主代理：${row.agent_id}（原主 ${r.demoted.join('、')} 已降为子代理）`
           : `已设为主代理：${row.agent_id}`,
       )
-    } else if (kind === 'exclude') {
-      await api.setAgentExclude(row.agent_id, !row.exclude_from_primary)
-      showToast(`${row.exclude_from_primary ? '已加入' : '已移出'}主脑上下文：${row.agent_id}`)
     } else if (kind === 'clearcred') {
       // 🔴 停凭据 = 只废那把钥匙：confirm 是 true（后端那侧才敢承诺状态不动）
       const r = await http
@@ -1130,21 +1099,6 @@ async function doAction(typed) {
   margin-top: 12px;
 }
 /* 第二行：名字（可截断）+ 角色徽标，名字太长时徽标不许被挤掉 */
-.aname {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  min-width: 0;
-  margin-top: -4px;
-}
-.aname-txt {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-dim);
-  font-size: 14px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .kv .row .v.mono {
   font-family: var(--mono);
   font-size: 12px;
@@ -1177,16 +1131,112 @@ async function doAction(typed) {
   font-size: 12px;
   line-height: 1.7;
 }
-/* 私信开关：文字 + 开关并排（投递偏好，不是危险动作 —— 不用危险色那一档） */
-.dm-toggle {
-  display: inline-flex;
-  gap: 6px;
+
+/* ---------------------------------------------------------------- 代理卡
+   一代理一张卡（2026-10 UI 重做）：头部（名字 + 角色 + 状态）→ 读数 → 状态 chip
+   → 卡底（一个直接动作 + 一支铅笔）。零新色，全走 tokens。 */
+.agent-grid {
+  /* 宽屏两列：代理卡信息比普通卡多，列太窄会挤成竖排字。
+     列数仍自适应（窄屏自动收成一列），不写死列数。 */
+  grid-template-columns: repeat(auto-fill, minmax(620px, 1fr));
+}
+@media (max-width: 1200px) {
+  .agent-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.agent-card {
+  gap: 10px;
+}
+/* 头部：名字 + 角色徽标 + 状态徽标（名字长时先截断，徽标不许被挤掉） */
+.ac-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   align-items: center;
-  flex: none;
-  font-size: 12px;
+  min-width: 0;
+}
+.ac-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.dm-label {
+/* agent_id 一行（可复制） */
+.ac-id {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.ac-id .k {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 卡底：直接动作在左，铅笔（唯一编辑入口）在右 */
+.ac-foot {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 4px;
+  border-top: 1px solid var(--line-3);
+}
+.ac-foot .act-btn {
+  white-space: nowrap;
+}
+/* 铅笔钮：小粒控件（同 .copy-btn 那一档），hover 才上蓝 */
+.ac-edit {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
   color: var(--text-dim);
+  cursor: pointer;
+}
+.ac-edit:hover {
+  border-color: var(--text-ghost);
+  color: var(--accent);
+}
+.ac-edit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 编辑弹框里的分组小标题（角色 / 开关 / 凭据） */
+.eg-title {
+  margin: 16px 0 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+.eg-title:first-child {
+  margin-top: 0;
+}
+.eg-title--danger {
+  color: var(--danger);
+}
+/* 凭据危险区：与上面几组隔开，别和普通开关混成一堆 */
+.eg-danger {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-inset);
+  background: var(--panel);
 }
 </style>
