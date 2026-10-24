@@ -270,7 +270,14 @@ def create_embedder(
         base_url: API 端点
         model: 模型名
     """
-    provider = provider or os.environ.get("KEEPSAKE_EMBEDDER", "openai").lower()
+    # provider：**只认显式来源**（调用方实参 / config.json 的 embedder.provider）。
+    # 2026-10 embedder_provider_hygiene：这里原来还兜底读环境变量
+    # KEEPSAKE_EMBEDDER —— 那是**影子开关**（页面上看不见、却能改行为），
+    # 与「唯一配置源 = config 文件」冲突，已退役。
+    # 无配置 = 显式走 OpenAI 兼容实现（协议缺省，不是影子开关）；
+    # dashscope 分支保留（显式传 provider="dashscope" 仍可构造），
+    # 只是不再能被环境变量悄悄启用。
+    provider = (provider or "openai").strip().lower()
     api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
     base_url = base_url or os.environ.get("KEEPSAKE_EMBEDDER_URL", _DEFAULT_OPENAI_URL)
     model = model or os.environ.get("KEEPSAKE_EMBEDDER_MODEL", _DEFAULT_OPENAI_MODEL)

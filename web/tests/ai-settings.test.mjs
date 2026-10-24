@@ -135,6 +135,41 @@ test('提示走 utils/dialog（禁原生 alert / confirm）', () => {
 })
 
 // ---------------------------------------------------------------------------
+// embedder provider：只读展示项 + 三卡字段顺序统一
+// （2026-10-24 embedder_provider_hygiene）
+// ---------------------------------------------------------------------------
+
+test('embedder 的 provider 是只读展示项：有只读文本、没有输入框', () => {
+  // 模板有 readonly 分支：一行静态文本（不是输入框）
+  assert.match(VIEW, /v-else-if="f\.readonly" class="ai-readonly"/)
+  assert.match(VIEW, /\{\{ f\.display \|\| f\.value \}\}/)
+  // 只读项不进 draft ⇒ 保存时不会被回写（页面不再改 provider）
+  assert.match(VIEW, /if \(f\.readonly\) continue/)
+  // 🔴 不许给 provider 留输入框（llm / screening 两卡都没有这个字段）
+  assert.doesNotMatch(VIEW, /v-model="card\.draft\.provider"/)
+  assert.doesNotMatch(VIEW, /card\.draft\[f\.key\][\s\S]{0,80}provider/)
+})
+
+test('三卡字段顺序统一：接口地址 → 模型 → 凭据（状态条）→ 其它', () => {
+  // 顺序表在前端一处（展示排序，纯模板层，不动数据流）
+  const m = VIEW.match(/const FIELD_ORDER = \[([^\]]+)\]/)
+  assert.ok(m, '要有 FIELD_ORDER 顺序表')
+  const order = m[1]
+    .split(',')
+    .map((x) => x.trim().replace(/['"]/g, ''))
+    .filter(Boolean)
+  assert.ok(order.indexOf('base_url') < order.indexOf('model'), '接口地址先于模型')
+  assert.ok(order.indexOf('model') < order.indexOf('api_key_file'), '模型先于凭据')
+  assert.ok(order.indexOf('api_key_file') < order.indexOf('api_key'), '凭据路径先于凭据值')
+  // 数值参数不在顺序表里（它们走下方数字网格，永远最后）
+  assert.equal(order.includes('max_pick'), false)
+  assert.equal(order.includes('timeout_s'), false)
+  // 排序真的用上了
+  assert.match(VIEW, /function orderFields\(fields\)/)
+  assert.match(VIEW, /fields: orderFields\(s\.fields\)/)
+})
+
+// ---------------------------------------------------------------------------
 // 视觉层级（2026-10-24 重做，纯样式层）：结构断言跟着新类名走
 // ---------------------------------------------------------------------------
 

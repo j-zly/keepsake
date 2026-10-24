@@ -1182,6 +1182,13 @@ AI_REUSE_SECTIONS: Dict[str, str] = {
     "tiering_review": "分级班车复核",
 }
 
+#: 同族说明文案（**只在后端写一次**，前端零硬编码）：
+#: llm / screening 两节走的是同一条 OpenAI 兼容 chat 通道。
+AI_CHAT_FAMILY_NOTE = "OpenAI 兼容 chat 接口。"
+
+#: embedder 卡里 provider 这个**只读展示项**的文案（协议说明；provider 本身可配置）。
+AI_EMBEDDER_PROVIDER_DISPLAY = "OpenAI 兼容协议"
+
 #: 密钥文件目录（env 可改：测试指临时目录；默认 ~/.config/keepsake/ai_keys）。
 AI_KEYS_DIR_ENV = "KEEPSAKE_AI_KEYS_DIR"
 DEFAULT_AI_KEYS_DIR = "~/.config/keepsake/ai_keys"
@@ -1330,10 +1337,10 @@ def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     model = str(cfg.get("model") or "").strip()
     key_file = str(cfg.get("key_file") or "").strip()
     inline = bool(str(cfg.get("api_key") or "").strip())
-    note = ""
+    note = AI_CHAT_FAMILY_NOTE
     if inline:
-        note = ("config.json 里的 llm.api_key 是明文内联：运行时优先用它，"
-                "key_file 只在内联为空时生效（填一次新凭据保存即迁到密钥文件）。")
+        note += ("config.json 里的 llm.api_key 是明文内联：运行时优先用它，"
+                 "key_file 只在内联为空时生效（填一次新凭据保存即迁到密钥文件）。")
     return {
         "id": "llm",
         "label": "记忆提炼/合并",
@@ -1342,6 +1349,7 @@ def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
         "enabled_editable": False,
         "editable": True,
         "fields": [
+            # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）
             _ai_field("base_url", "text", base_url, "如 https://api.minimax.cn/v1"),
             _ai_field("model", "text", model, "如 MiniMax-M3.1-Flash"),
             _ai_field("key_file", "secret_path",
@@ -1369,14 +1377,16 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": "embedder",
         "label": "向量检索",
-        "note": "provider 留空 = 只用 BM25（没有向量，语义召回失效）。",
+        "note": ("provider 留空 = 只用 BM25（没有向量，语义召回失效）；"
+                 "provider 是只读展示项（要改请改 config.json）。"),
         "migrate_hint": migrate,
         "enabled": bool(provider.lower() not in ("", "default", "none")
                         and model and _embedder_secret(cfg)),
         "enabled_editable": False,
         "editable": True,
+        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）：
+        #   接口地址 / 模型 / 凭据（状态条）→ provider（只读展示项，最后）
         "fields": [
-            _ai_field("provider", "text", provider, "openai / dashscope / 自定义兼容端点"),
             _ai_field("base_url", "text", base_url, "如 https://api.openai.com/v1"),
             _ai_field("model", "text", model, "如 text-embedding-3-small"),
             _ai_field("api_key_file", "secret_path",
@@ -1384,6 +1394,12 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
                       "凭据文件路径（留空 = 不改）", secret=True),
             _ai_field("api_key", "secret_value", {"set": bool(_embedder_secret(cfg))},
                       "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+            # provider：**只读展示项**（2026-10 embedder_provider_hygiene）——
+            # 页面不再给「可选值输入框」（llm / screening 两卡都没这个字段，
+            # 口径统一）；显示文案由后端给，前端零硬编码。
+            # 🔴 PUT 侧**仍接受 provider 写入**（逃生门留着，不做删除式阉割）。
+            _ai_field("provider", "text", provider, "", readonly=True,
+                      display=AI_EMBEDDER_PROVIDER_DISPLAY),
         ],
     }
 
@@ -1394,19 +1410,22 @@ def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": "screening",
         "label": "检索结果筛选",
-        "note": "关着 = 检索照常返回（不筛）；开着每次检索后多一次 LLM 调用。",
+        "note": ("关着 = 检索照常返回（不筛）；开着每次检索后多一次 LLM 调用。"
+                 " 同族（与「记忆提炼/合并」同一接口）：" + AI_CHAT_FAMILY_NOTE),
         "enabled": bool(p["enabled"]),
         "enabled_editable": True,
         "editable": True,
+        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）：
+        #   接口地址 / 模型 / 凭据（状态条）→ 独有开关 → 数值参数（最后）
         "fields": [
-            _ai_field("default_on", "bool", bool(p["default_on"])),
-            _ai_field("model", "text", p["model"], "如 MiniMax-M3.1-Flash"),
             _ai_field("base_url", "text", p["base_url"], "如 https://api.minimax.cn/v1"),
+            _ai_field("model", "text", p["model"], "如 MiniMax-M3.1-Flash"),
             _ai_field("api_key_file", "secret_path",
                       {"set": bool(p["key_present"]), "path": p["api_key_file"]},
                       "凭据文件路径（留空 = 不改）", secret=True),
             _ai_field("api_key", "secret_value", {"set": bool(p["key_present"])},
                       "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+            _ai_field("default_on", "bool", bool(p["default_on"])),
             _ai_field("max_pick", "number", int(p["max_pick"]), "",
                       min=SCREENING_BOUNDS["max_pick"][0],
                       max=SCREENING_BOUNDS["max_pick"][1]),

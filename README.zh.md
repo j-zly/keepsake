@@ -231,7 +231,7 @@ pip install git+https://github.com/j-zly/keepsake.git
 | `KEEPSAKE_TAG_FILTER` | `tag_filter` | 标签过滤（逗号分隔） |
 | `KEEPSAKE_AGENT_ID` | `agent_id` | 身份标签，用于记忆隔离 |
 | `KEEPSAKE_IS_PRIMARY` | `is_primary` | `true` = 看得见全部条目；`false` = 只看带自己标签的 |
-| `KEEPSAKE_EMBEDDER` | `embedder.provider` | 嵌入模型提供商（`openai`、`dashscope`） |
+| `KEEPSAKE_EMBEDDER` | — | **已退役**：嵌入协议只认配置文件（`embedder.provider`），这个环境变量不再切换协议 |
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | 嵌入 API 端点 |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | 嵌入模型名称 |
 | `OPENAI_API_KEY` | `embedder.api_key` | 嵌入 API 密钥 |
@@ -281,7 +281,6 @@ memory:
 export KEEPSAKE_REDIS_HOST=127.0.0.1
 export KEEPSAKE_REDIS_PORT=6379
 export KEEPSAKE_TOP_K=5
-export KEEPSAKE_EMBEDDER=dashscope
 export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
 export OPENAI_API_KEY=***        # embedder API key
 ```
@@ -358,7 +357,7 @@ yeah
 | `feedback_positive_boost` | — | `1.3` | 正反馈加分权重 |
 | `feedback_negative_penalty` | — | `0.5` | 负反馈降权系数 |
 | `hot_topic_boost` | — | `1.2` | 热门话题加权乘数 |
-| `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
+| `embedder.provider` | — | `openai` | `openai` / `dashscope`（只认配置文件 —— 没有环境变量覆盖） |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API 密钥 |
 | `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1/embeddings` | API 端点 |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | 嵌入模型名 |

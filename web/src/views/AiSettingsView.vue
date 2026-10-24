@@ -16,8 +16,13 @@
   一行用途副标）、卡内 label-in 字段栅格、数值三件一行三列、凭据做成整行
   状态条（默认收起，点开才出输入框）、保存=主按钮 / 检测=描边次按钮、
   probe 结果=绿/红状态块（失败可展开看全）。
-  **零数据流改动**：接口调用、事件处理函数体、提交载荷一字未动 ——
+  **零数据流改动（那次重做）**：接口调用、事件处理函数体、提交载荷一字未动 ——
   展开/收起走原生 <details>，没有新增任何 JS 状态。
+
+  2026-10-24 embedder_provider_hygiene：embedder 卡的 provider 改成**只读展示项**
+  （后端标 readonly + 给展示文本；前端零硬编码、**没有输入框**、不进提交载荷）；
+  三卡字段顺序统一为：接口地址 → 模型 → 凭据（状态条）→ 其它
+  （screening 独有数值参数走下方数字网格，永远最后）。
 -->
 <template>
   <div class="ai-page">
@@ -121,6 +126,8 @@
                 />
               </div>
             </details>
+            <!-- 只读展示项（后端标了 readonly）：静态文本，**没有输入框** -->
+            <span v-else-if="f.readonly" class="ai-readonly">{{ f.display || f.value }}</span>
             <!-- 普通文本 -->
             <el-input
               v-else
@@ -220,6 +227,7 @@ function buildCards(sections) {
         draft[f.key] = (f.value && f.value.path) || ''
         continue
       }
+      if (f.readonly) continue      // 只读展示项：不进 draft（保存时不回写它）
       draft[f.key] = f.value
     }
     if (s.enabled_editable) draft.enabled = !!s.enabled
@@ -231,7 +239,7 @@ function buildCards(sections) {
       enabled: !!s.enabled,
       enabled_editable: !!s.enabled_editable,
       editable: !!s.editable,
-      fields: s.fields || [],
+      fields: orderFields(s.fields),
       draft,
       secret,
       saving: false,
@@ -239,6 +247,22 @@ function buildCards(sections) {
       status: { tone: '', text: '' },
     }
   })
+}
+
+/**
+ * 字段展示顺序（**三卡统一口径**，2026-10 embedder_provider_hygiene）：
+ *   接口地址 → 模型 → 凭据（状态条）→ 其它（数值参数另走下方数字网格，永远最后）。
+ * 后端 GET 也按同一顺序给；这里再兜一层，纯展示排序，**不动数据流**。
+ */
+const FIELD_ORDER = ['base_url', 'model', 'key_file', 'api_key_file', 'api_key',
+  'default_on', 'provider']
+
+function orderFields(fields) {
+  const rank = (k) => {
+    const i = FIELD_ORDER.indexOf(k)
+    return i < 0 ? FIELD_ORDER.length : i   // 没登记过的字段排最后（相对次序不变）
+  }
+  return [...(fields || [])].sort((a, b) => rank(a.key) - rank(b.key))
 }
 
 async function load() {
@@ -260,7 +284,7 @@ async function load() {
 const LABELS = {
   base_url: '接口地址',
   model: '模型',
-  provider: '服务商（openai / dashscope / 自定义）',
+  provider: '协议（只读展示）',
   key_file: '凭据文件路径',
   api_key_file: '凭据文件路径',
   api_key: '凭据',
@@ -481,6 +505,13 @@ onMounted(load)
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.5;
+}
+/* 只读展示项：静态文本（比输入框退一档 —— 它不可编辑） */
+.ai-readonly {
+  display: block;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
 }
 /* 数字控件占满小格，但不超过一格该有的宽度 */
 .ai-nums :deep(.el-input-number) {

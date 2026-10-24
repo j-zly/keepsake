@@ -854,8 +854,9 @@ class KeepsakeProvider(MemoryProvider):
     注入上下文。仅 memory(action='add') 操作时存储完整内容。
 
     配置优先级（高→低）:
-      1. 环境变量 (KEEPSAKE_REDIS_HOST, KEEPSAKE_EMBEDDER 等)
+      1. 环境变量 (KEEPSAKE_REDIS_HOST, KEEPSAKE_EMBEDDER_MODEL 等)
       2. JSON 配置文件 (~/.config/keepsake/config.json)
+         （嵌入协议 provider 只认配置文件：KEEPSAKE_EMBEDDER 影子开关已退役）
       3. config.yaml memory.keepsake 节（由 Hermes 传入）
       4. 硬编码默认值
     """

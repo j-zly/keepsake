@@ -242,7 +242,7 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
 | `KEEPSAKE_TAG_FILTER` | `tag_filter` | Tag filtering (comma-separated) |
 | `KEEPSAKE_AGENT_ID` | `agent_id` | Agent identity tag for isolation |
 | `KEEPSAKE_IS_PRIMARY` | `is_primary` | `true` = sees all entries; `false` = only tagged ones |
-| `KEEPSAKE_EMBEDDER` | `embedder.provider` | Embedding provider (`openai`, `dashscope`) |
+| `KEEPSAKE_EMBEDDER` | — | **Retired**: the provider is config-file only (`embedder.provider`); this env var no longer switches the protocol |
 | `KEEPSAKE_EMBEDDER_URL` | `embedder.base_url` | Embedding API endpoint |
 | `KEEPSAKE_EMBEDDER_MODEL` | `embedder.model` | Embedding model name |
 | `OPENAI_API_KEY` | `embedder.api_key` | Embedding API key |
@@ -291,7 +291,6 @@ Also supports environment variable configuration (highest precedence):
 export KEEPSAKE_REDIS_HOST=127.0.0.1
 export KEEPSAKE_REDIS_PORT=6379
 export KEEPSAKE_TOP_K=5
-export KEEPSAKE_EMBEDDER=dashscope
 export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
 export OPENAI_API_KEY=sk-xxx        # embedder API key
 ```
@@ -370,7 +369,7 @@ Then reference it in config.json:
 | `feedback_positive_boost` | — | `1.3` | Positive feedback bonus weight |
 | `feedback_negative_penalty` | — | `0.5` | Negative feedback penalty coefficient |
 | `hot_topic_boost` | — | `1.2` | Hot topic weighting multiplier |
-| `embedder.provider` | `KEEPSAKE_EMBEDDER` | `openai` | `openai` / `dashscope` |
+| `embedder.provider` | — | `openai` | `openai` / `dashscope` (config file only — no env override) |
 | `embedder.api_key` | `OPENAI_API_KEY` | — | Embedding API key |
 | `embedder.base_url` | `KEEPSAKE_EMBEDDER_URL` | `https://api.openai.com/v1/embeddings` | API endpoint |
 | `embedder.model` | `KEEPSAKE_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model name |
