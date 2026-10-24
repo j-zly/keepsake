@@ -64,6 +64,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ..api import audit
+from ..core import screening
 from ..govern.messaging import CONTENT_MAX as MESSAGE_CONTENT_MAX, Messaging
 # 待办（2026-10 ks_todo）：存储层 + 口径单点（到期判定、可见性都在那边）。
 from ..govern.todo import (
@@ -233,6 +234,45 @@ def _unread_dm(box: Any, agent_id: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# 检索结果 LLM 筛选（2026-10 recall_screening）
+#
+# 🔴 **只挂在显式检索调用上**：`memory_search(screen=True)` / `kb_search(screen=True)`。
+# 常驻注入路径（prefetch / provider）**一律不接** —— 筛选一次 ~10s，
+# 挂在自动路径上会把每轮注入都拖慢；常驻层也不参与筛选（prompt cache 前缀纪律）。
+# 🔴 **默认 false ⇒ 对现有所有调用方零行为变化**（本单第一红线）。
+# 🔴 **fail-open**：筛选坏了就把原始结果照返，检索本体绝不受影响。
+# --------------------------------------------------------------------------
+
+def _screen_rows(query: str, rows: List[Dict[str, Any]], *,
+                 text_of: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """对工具结果做 LLM 候选筛选 → `(新列表, screened 元数据)`。
+
+    * 关着（`screening.enabled=false`）⇒ 原列表 + `{"skipped": "disabled"}`；
+    * 结果数 ≤ `max_pick` ⇒ 没必要筛 ⇒ 原列表 + `{"skipped": "not_needed"}`；
+    * 筛成功 ⇒ 按选中编号**保序**过滤 + `{"picked": N, "of": M}`；
+    * 筛失败（无 key / 429 / 超时 / 坏 JSON / 越界 id）⇒ 原列表照返 +
+      `{"skipped": "<原因>"}`（原因可辨识，便于排查）。
+    """
+    cfg = screening.load_cfg()
+    if not screening.screen_enabled(cfg):
+        return rows, {"skipped": "disabled"}
+    try:
+        max_pick = int(cfg.get("max_pick") or 0)
+    except (TypeError, ValueError):
+        max_pick = int(screening.DEFAULTS["max_pick"])
+    if len(rows) <= max_pick:
+        return rows, {"skipped": "not_needed"}
+    candidates = [{"content": text_of(r)} for r in rows]
+    ids, note = screening.pick_relevant(query, candidates, cfg)
+    if not ids:
+        reason = note.split(":", 1)[-1] if note.startswith("skipped:") else note
+        return rows, {"skipped": reason}
+    keep = set(ids)
+    picked = [r for i, r in enumerate(rows, 1) if i in keep]
+    return picked, {"picked": len(picked), "of": len(rows)}
+
+
+# --------------------------------------------------------------------------
 # 8 个 tool 的实现（纯函数，provider 显式传参 —— 不靠闭包，方便单测直接调）
 # --------------------------------------------------------------------------
 
@@ -308,7 +348,7 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
 
 def memory_search(provider: Any, query: str, limit: int = 10,
                  caller_agent_id: str = "", caller_role: str = "",
-                 box: Any = None) -> Dict[str, Any]:
+                 box: Any = None, screen: bool = False) -> Dict[str, Any]:
     """按查询检索记忆条目。**后端异常直接往上抛**（契约：检索层绝不静默返回空）。
 
     `caller_agent_id` / `caller_role`（2026-10 ks_share_memory）：调用方身份
@@ -318,6 +358,12 @@ def memory_search(provider: Any, query: str, limit: int = 10,
     私信是拉取式的，接收方无感知；把提醒寄生在每轮必然发生的检索上，
     零定时器、零额外请求。计数走既有连接池（`box` 与注册表同一个 storage），
     读失败 ⇒ 0（fail-open，**绝不影响检索本体返回**）。
+
+    🔴 `screen`（2026-10 recall_screening）：**默认 false ⇒ 行为逐字不变**。
+    显式 `screen=true` 时才走 LLM 候选筛选（见 `_screen_rows`）：
+    筛成功按选中编号保序过滤并回 `"screened": {"picked": N, "of": M}`，
+    筛失败（关着 / 无 key / 429 / 超时 / 坏 JSON）⇒ 原结果照返 +
+    `"screened": {"skipped": "<原因>"}`（fail-open，绝不影响检索本体）。
     """
     if not query or not query.strip():
         raise ToolError("query 不能为空")
@@ -327,20 +373,28 @@ def memory_search(provider: Any, query: str, limit: int = 10,
     if box is None:
         # 没显式给信箱句柄 ⇒ 问 provider 要它自己那份（宿主 provider 懒创建）。
         box = getattr(provider, _PROVIDER_BOX_ATTR, None)
-    return {
+    results = [
+        {
+            "key": _hit_key(h),
+            "tags": str(h.get("tags", "")),
+            "score": float(h.get("_combined_score", 0.0) or 0.0),
+            "content": _preview(h.get("content"), SEARCH_PREVIEW_CHARS),
+        }
+        for h in hits
+    ]
+    out: Dict[str, Any] = {
         "query": query.strip(),
         "count": len(hits),
         "unread_dm": _unread_dm(box, caller_agent_id),
-        "results": [
-            {
-                "key": _hit_key(h),
-                "tags": str(h.get("tags", "")),
-                "score": float(h.get("_combined_score", 0.0) or 0.0),
-                "content": _preview(h.get("content"), SEARCH_PREVIEW_CHARS),
-            }
-            for h in hits
-        ],
+        "results": results,
     }
+    if screen:
+        results, meta = _screen_rows(query.strip(), results,
+                                      text_of=lambda r: str(r.get("content") or ""))
+        out["results"] = results
+        out["count"] = len(results)
+        out["screened"] = meta
+    return out
 
 
 def memory_get(provider: Any, key: str, caller_agent_id: str = "",
@@ -1004,25 +1058,41 @@ def kb_store(title: str, content: str, tags: str = "", source_type: str = "agent
 
 
 def kb_search(query: str, limit: int = 10, *, caller_agent_id: str = "",
-              caller_role: str = "", registry: Any = None) -> Dict[str, Any]:
+              caller_role: str = "", registry: Any = None,
+              screen: bool = False) -> Dict[str, Any]:
     """检索知识库。返回 `id` / `title` / 摘要（**不含全文** —— 要全文用 `kb_get`）。
 
     🔴 可见范围 = **自己名下 + 已共享代理名下 + 无主老文档**（primary 全量）。
+
+    🔴 `screen`（2026-10 recall_screening）：**默认 false ⇒ 行为逐字不变**；
+    显式 `screen=true` 时走 LLM 候选筛选，语义与 `memory_search` 完全一致
+    （筛成功保序过滤 + `"screened": {"picked": N, "of": M}`；
+    筛失败 ⇒ 原结果照返 + `"screened": {"skipped": "<原因>"}`）。
+    候选正文取知识库检索条目里的**摘要文本**（`snippet` —— 知识库路由没有全文字段）。
     """
     _kb_registry(registry)
     is_primary = _is_primary_caller(caller_agent_id, caller_role)
     scope = kb_service.visible_scope(caller_agent_id, registry, is_primary=is_primary)
     out = _kb_call(kb_service.search_documents, query=query,
                     limit=max(1, min(int(limit), 100)), agent_scope=scope)
-    return {
+    results = [
+        {"id": r["doc_id"], "title": r["title"], "snippet": r["snippet"],
+         "chunk_id": r["chunk_id"]}
+        for r in out["items"]
+    ]
+    res: Dict[str, Any] = {
         "query": str(query or "").strip(),
-        "count": len(out["items"]),
-        "results": [
-            {"id": r["doc_id"], "title": r["title"], "snippet": r["snippet"],
-             "chunk_id": r["chunk_id"]}
-            for r in out["items"]
-        ],
+        "count": len(results),
+        "results": results,
     }
+    if screen:
+        results, meta = _screen_rows(
+            str(query or "").strip(), results,
+            text_of=lambda r: str(r.get("snippet") or r.get("title") or ""))
+        res["results"] = results
+        res["count"] = len(results)
+        res["screened"] = meta
+    return res
 
 
 def kb_get(id: str, *, caller_agent_id: str = "", caller_role: str = "",
@@ -1131,14 +1201,15 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     @server.tool(
         name="memory_search",
         description="按查询检索记忆条目，返回 key / tags / score / 正文预览（截断 300 字）；"
-                    "unread_dm = 本代理的未读私信条数（0 = 没有）。",
+                    "unread_dm = 本代理的未读私信条数（0 = 没有）。"
+                    "screen=true 时先经 LLM 候选筛选（默认关；开启后结果里带 screened 说明）。",
     )
-    def _search(query: str, limit: int = 10) -> Dict[str, Any]:
+    def _search(query: str, limit: int = 10, screen: bool = False) -> Dict[str, Any]:
         ident = _authorize("memory_search")
         return memory_search(provider, query, limit,
                              caller_agent_id=str(ident.get("agent_id") or ""),
                              caller_role=str(ident.get("role") or ""),
-                             box=box)
+                             box=box, screen=screen)
 
     @server.tool(
         name="memory_get",
@@ -1223,14 +1294,15 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     @server.tool(
         name="kb_search",
         description="检索知识库，返回 id / title / 摘要（不含全文；要全文用 kb_get）。"
-                    "只看得到自己名下 + 已共享代理名下 + 无主的老文档。",
+                    "只看得到自己名下 + 已共享代理名下 + 无主的老文档。"
+                    "screen=true 时先经 LLM 候选筛选（默认关；开启后结果里带 screened 说明）。",
     )
-    def _kb_search(query: str, limit: int = 10) -> Dict[str, Any]:
+    def _kb_search(query: str, limit: int = 10, screen: bool = False) -> Dict[str, Any]:
         ident = _authorize("kb_search")
         return kb_search(query, limit,
                          caller_agent_id=str(ident.get("agent_id") or ""),
                          caller_role=str(ident.get("role") or ""),
-                         registry=registry)
+                         registry=registry, screen=screen)
 
     @server.tool(
         name="kb_get",
