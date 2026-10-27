@@ -1,17 +1,16 @@
 /**
- * 检索筛选配置面（记忆维护页底部）+ 代理治理页卡片重做（2026-10-24）。
+ * 检索筛选配置面（**唯一编辑入口在「AI 配置」页**）+ 代理治理页卡片重做。
  *
  * 两块，都是「结构断言」：盯住**接线**与**收敛**，盯不住的地方一旦回退成
  * 「一排小按钮 / 两个保存键」，本单的红线就漏了。
  *
- * A. 检索筛选卡（settings/screening）：
- *   1) 一张卡**一个保存按钮**（不许双保存键 —— 两个保存口 = 用户不知道自己
- *      改的是哪个）；
- *   2) 数字**全部来自 GET**（连输入框的上下限都是后端给的 bounds）—— 前端
- *      零写死；
- *   3) `key_present` 徽标**当场可见**（填错路径 ⇒ 筛选一路 fail-open 成
- *      「静默不筛」，不看徽标就发现不了）；
- *   4) 保存前走既有重确认件，后果逐条列明（改哪一节 / 备份去哪 / 怎么生效）。
+ * A. 检索筛选（2026-10 ks_maint_ui_dedup 断言反转）：
+ *   1) **记忆维护页的旧筛选卡彻底摘净**（草稿 / 表单 / 保存入口 / 直连端点
+ *      一个都不许留 —— 两个编辑入口 = 用户不知道自己改的是哪一份配置）；
+ *   2) 维护页只留**一行迁移指引** + 指向 /ai-settings 的链接；
+ *   3) 「AI 配置」页是 screening 的**唯一编辑面**：通用 settings/ai 端点，
+ *      数字与上下限照抄后端 bounds、凭据只显「已设置 / 未设置」、保存走既有
+ *      重确认件（后果逐条列明）。
  *
  * B. 代理卡（AgentsView）：
  *   1) 卡面动作**收敛**：一个直接动作（批准 / 吊销）+ 唯一一支铅笔；
@@ -20,7 +19,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
@@ -28,15 +27,11 @@ const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
 
 const MAINT = read('views/MaintenanceView.vue')
 const AGENTS = read('views/AgentsView.vue')
+const AISET = read('views/AiSettingsView.vue')
+const API = read('api/index.js')
 
-/** 检索筛选卡那一段（从标题到分级班车设置弹框之前）。 */
-function screeningCard() {
-  const start = MAINT.indexOf('<h3 class="section-title">检索筛选</h3>')
-  assert.ok(start !== -1, '记忆维护页底部没有「检索筛选」卡')
-  const rest = MAINT.slice(start)
-  const end = rest.indexOf('<!-- 分级班车设置')
-  return rest.slice(0, end === -1 ? rest.length : end)
-}
+/** src/views 下所有 .vue —— 用于「全站只有一个 screening 编辑入口」的扫描。 */
+const VIEWS = readdirSync(`${SRC}/views`).filter((n) => n.endsWith('.vue'))
 
 /** 代理卡的操作区（卡底那一段）。 */
 function agentCardFoot() {
@@ -57,70 +52,68 @@ function editDialog() {
 }
 
 // ---------------------------------------------------------------------------
-// A. 检索筛选卡
+// A. 检索筛选：唯一编辑入口在「AI 配置」页
 // ---------------------------------------------------------------------------
 
-test('检索筛选卡在记忆维护页底部，且只有**一个**保存按钮', () => {
-  const card = screeningCard()
-  const saves = card.match(/@click="askSaveScreening"/g) || []
-  assert.equal(saves.length, 1, '一张卡一个保存入口（不许双保存键）')
-  assert.match(card, /<el-button type="primary" :loading="scBusy" @click="askSaveScreening">保存<\/el-button>/,
-    '保存按钮文案是「保存」')
-  // 打开的是既有重确认件，不是裸 confirm
-  assert.match(card, /<ConfirmDialog/, '保存前弹既有重确认件')
-  assert.match(card, /@confirm="saveScreening"/, '确认后走 saveScreening')
+test('记忆维护页的旧筛选卡彻底摘净（零残留）', () => {
+  for (const sym of ['scDraft', 'scMeta', 'scBusy', 'scConfirmOpen', 'scMin', 'scMax',
+    'sc-card', 'sc-head', 'sc-title', 'sc-grid', 'settings/screening',
+    'askSaveScreening', 'saveScreening', 'loadScreening', 'scConsequences']) {
+    assert.ok(!MAINT.includes(sym), `记忆维护页里还留着「${sym}」—— 旧筛选卡没摘净`)
+  }
+  // 旧卡的标题行 / 表单 / 保存按钮一个都不许在
+  assert.doesNotMatch(MAINT, /检索结果 LLM 筛选/, '旧卡标题不许还在')
+  assert.doesNotMatch(MAINT, /class="section-title">检索筛选/, '旧卡的小节标题不许还在')
+  assert.doesNotMatch(MAINT, /v-model="scDraft\./, '旧卡的表单控件不许还在')
+  // 「检索筛选」这个词全页只许出现一次（就是那句迁移指引，不许再有第二处配置面）
+  assert.equal(MAINT.split('检索筛选').length - 1, 1, '「检索筛选」只许出现在迁移指引里')
+})
+
+test('维护页留了迁移指引：灰字 + 指向 /ai-settings 的链接', () => {
+  const note = MAINT.match(/<p class="src migrate-note">[\s\S]*?<\/p>/)
+  assert.ok(note, '要有迁移指引段落')
+  assert.match(note[0], /检索筛选的配置已统一到「AI 配置」页/, '要有迁移指引文案')
+  assert.ok((MAINT.match(/to="\/ai-settings"/g) || []).length >= 1, '要有指向 /ai-settings 的链接')
+  // 链接沿用既有链接样式类（不新造颜色）
+  assert.match(note[0], /<router-link class="card-link" to="\/ai-settings">/, '链接走既有 .card-link')
+})
+
+test('「AI 配置」页是 screening 的唯一编辑面（通用 settings/ai 端点）', () => {
+  // 端点：GET 快照 + PUT 保存（section_id 传 screening）
+  assert.match(API, /aiSettings: \(\) => http\.get\('\/api\/v1\/settings\/ai'\)/)
+  assert.match(API, /setAiSettings: \(sectionId, fields\) =>/)
+  assert.match(API, /\/api\/v1\/settings\/ai\/\$\{encodeURIComponent\(sectionId\)\}/, '保存按 section_id 写')
+  // 页面按后端给的 sections 逐节成卡 —— screening 是其中一节，必然在这一页
+  assert.match(AISET, /v-for="card in cards"/)
+  assert.match(AISET, /cards\.value = buildCards\(data\.sections\)/)
+  assert.match(AISET, /api\.setAiSettings\(card\.id, payload\)/, '保存按卡片节 id 写')
+  // 🔴 全站再不许有第二个 screening 编辑入口（直连旧端点的地方一个都不许剩）
+  const offenders = VIEWS.filter((n) => read(`views/${n}`).includes('settings/screening'))
+  assert.deepEqual(offenders, [], 'screening 的编辑入口必须唯一')
+})
+
+test('AI 配置页的筛选纪律没丢：上下限照抄后端 / 凭据只显状态 / 保存走重确认件', () => {
+  // 数字零写死：上下限照抄 GET 给的 min/max
+  assert.match(AISET, /:min="f\.min"/)
+  assert.match(AISET, /:max="f\.max"/)
+  assert.doesNotMatch(AISET, /:min="\d|:max="\d/, '前端不许自己写死上下限')
+  // 凭据真值永不回显：只显「已设置 / 未设置」
+  assert.match(AISET, /'已设置' : '未设置'/)
+  assert.doesNotMatch(AISET, /f\.value\.key|f\.value\.api_key/, '凭据真值不许回显')
+  // 保存走既有重确认件，后果逐条列明
+  assert.match(AISET, /<ConfirmDialog/)
+  assert.match(AISET, /只改 config\.json 的 \$\{c\.id\} 一节/, '要说清只动哪一节')
+  assert.match(AISET, /写前会把原 config 整份备份到/, '要说清备份落在哪')
   // 禁遮罩关闭是 ConfirmDialog 组件自己的纪律（复用它就自带）
   assert.match(read('components/ConfirmDialog.vue'), /:close-on-click-modal="false"/,
     '确认弹框禁遮罩关闭')
 })
 
-test('后果说明逐条列明：改哪一节 / 备份去哪 / MCP 怎么生效', () => {
-  assert.match(MAINT, /只改 config\.json 的 screening 一节/, '要说清只动哪一节')
-  assert.match(MAINT, /写前会把原 config 整份备份到/, '要说清备份落在哪')
-  assert.match(MAINT, /MCP 服务热生效：下一轮检索就用新值，不需重启任何进程/, '要说清怎么生效')
-  // 保存请求带 confirm: true（后端要显式二次确认）
-  assert.match(MAINT, /put\('\/api\/v1\/settings\/screening', \{ confirm: true, \.\.\.scDraft\.value \}\)/,
-    'PUT 必须带 confirm: true')
-})
-
-test('数字全部来自 GET：前端零写死（连上下限都跟后端 bounds）', () => {
-  const card = screeningCard()
-  assert.match(card, /v-model="scDraft\.max_pick"/, '最多保留条数绑草稿')
-  assert.match(card, /v-model="scDraft\.timeout_s"/, '超时绑草稿')
-  assert.match(card, /v-model="scDraft\.max_tokens"/, 'token 上限绑草稿')
-  // 上下限来自后端 bounds（不写死 1 / 30 / 10 / 300 / 512 / 16384）
-  assert.match(card, /:min="scMin\('max_pick'\)"/, '上下限走后端给的 bounds')
-  assert.match(card, /:max="scMax\('max_tokens'\)"/, '上下限走后端给的 bounds')
-  assert.doesNotMatch(card, /max_pick="(\d+)"|timeout_s="(\d+)"|max_tokens="(\d+)"/,
-    '数字不许写死在模板上')
-  // 草稿初值来自 GET（loadScreening 覆盖）
-  assert.match(MAINT, /http\.get\('\/api\/v1\/settings\/screening'\)/, '读 GET')
-  assert.match(MAINT, /max_pick: Number\(r\.max_pick\) \|\| 0/, '草稿按 GET 填')
-})
-
-test('key_present 徽标当场可见（绿点=文件在 / 黄=路径没找到）', () => {
-  const card = screeningCard()
-  assert.match(card, /scMeta\.key_present/, '徽标读 key_present')
-  assert.match(card, /key 文件在/, '有文件时的文案')
-  assert.match(card, /key 文件没找到/, '没找到时的文案')
-  // 徽标用现成令牌（不新造颜色）
-  assert.match(card, /class="dot-ok"/, '绿点走全局 .dot-ok')
-  assert.match(card, /chip--warn/, '没找到走 chip--warn')
-  // 没配过这一节也要说清
-  assert.match(card, /config\.json 里还没有这一节/, '「没配过」与「配成默认值」要分得开')
-})
-
-test('两个开关都在卡上（总开关 / 默认开），且默认开的语义说清了', () => {
-  const card = screeningCard()
-  assert.match(card, /v-model="scDraft\.enabled"/, '总开关')
-  assert.match(card, /v-model="scDraft\.default_on"/, '默认开开关')
-  assert.match(card, /代理显式传 screen=false 依然不筛/, '要说清「显式传 false 仍然不筛」')
-  assert.match(card, /关着时一切行为与接入前逐字一致/, '要说清默认关死')
-})
-
-test('保存失败要报红条（不许留下「以为改成了」）', () => {
-  assert.match(MAINT, /保存检索筛选配置失败：\$\{e\.message\}/, '失败红条透出后端 message')
-  assert.doesNotMatch(MAINT, /(?<![A-Za-z0-9_.$])(alert|confirm)\s*\(/, '禁原生弹框')
+test('两个页面都没有裸 alert / confirm（禁原生弹框）', () => {
+  for (const [name, src] of [['MaintenanceView', MAINT], ['AiSettingsView', AISET]]) {
+    const bare = src.match(/(?<![A-Za-z0-9_.$])(alert|confirm|prompt)\s*\(/g) || []
+    assert.deepEqual(bare, [], `${name} 必须走 ConfirmDialog / utils/dialog`)
+  }
 })
 
 // ---------------------------------------------------------------------------

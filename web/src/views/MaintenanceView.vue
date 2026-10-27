@@ -108,131 +108,58 @@
     <div v-if="!obsoleteTodos.length" class="panel empty-mini">
       <span>没有建议废弃的待办 —— 没有过了 7 天还没销的开放待办。</span>
     </div>
-    <div v-else class="panel pad agent-split">
-      <div v-for="row in obsoleteTodos" :key="row.id" class="agent-line">
-        <span class="cell-key">
-          <span class="k">{{ row.title }}</span>
+    <div v-else class="panel obs-list">
+      <div v-for="row in obsoleteTodos" :key="row.id" class="obs-row">
+        <span class="obs-title" :title="row.title">{{ row.title }}</span>
+        <span class="obs-tags">
+          <span v-if="row.owner" class="tag tag--owner" :title="`归属代理：${row.owner}`">
+            {{ row.owner }}
+          </span>
+          <span class="chip chip--danger">已过期 {{ row.overdue_days }} 天</span>
+          <span class="num obs-due">到期 {{ row.due }}</span>
         </span>
-        <span v-if="row.owner" class="tag tag--owner" :title="`归属代理：${row.owner}`">
-          {{ row.owner }}
-        </span>
-        <span class="chip chip--danger">已过期 {{ row.overdue_days }} 天</span>
-        <span class="num agent-num">到期 {{ row.due }}</span>
       </div>
-      <p class="src">
+      <p class="src obs-foot">
         共 {{ obsoleteTodos.length }} 条；<b>这里只提名，不改状态</b> ——
         确认没人管了，去「待办」页标废弃或删除。
       </p>
     </div>
 
-    <!-- 页脚说明：降为 secondary 小字（12px 灰）—— 它是脚注，不该跟正文抢视觉；
-         安全要点在按钮文案（dry-run / 实跑）与确认弹框里都写着。 -->
-    <p class="src foot-note foot-note--lead">
-      dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
-    </p>
-    <div class="ops">
-      <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
-      <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
-      <span class="ops-gap"></span>
-      <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
-      <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
-      <span class="ops-gap"></span>
-      <el-button :disabled="!tStatus" @click="openTiering">
-        分级班车设置（{{ tStatus?.enabled ? '已开' : '默认关' }}）
-      </el-button>
+    <!-- 危险操作区：合并 / 遗忘 / 分级班车 —— 收进一张卡（脚注在上，按钮行在中，
+         结果块贴底）；安全要点在按钮文案（dry-run / 实跑）与确认弹框里都写着。 -->
+    <div class="panel ops-card">
+      <p class="src foot-note foot-note--lead">
+        dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
+      </p>
+      <div class="ops">
+        <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
+        <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
+        <span class="ops-gap"></span>
+        <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
+        <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
+        <span class="ops-gap"></span>
+        <el-button :disabled="!tStatus" @click="openTiering">
+          分级班车设置（{{ tStatus?.enabled ? '已开' : '默认关' }}）
+        </el-button>
+      </div>
+      <p class="src foot-note">
+        分级班车：每天一次 cron 跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
+        <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
+      </p>
+      <pre v-if="opResult" class="pre">{{ opResult }}</pre>
     </div>
-    <p class="src foot-note">
-      分级班车：每天一次 cron 跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
-      <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
-    </p>
-    <pre v-if="opResult" class="pre">{{ opResult }}</pre>
 
     <!--
-      检索筛选（screening）：检索结果**进上下文前**的最后一道筛子。
-      🔴 一张卡**一个编辑入口**：卡上只有一个「保存」按钮，保存前弹既有重确认件
-      （后果逐条列明：改的是哪一节、备份落在哪、MCP 怎么生效）。
-      🔴 数字**全部来自 GET**（连输入框的上下限都是后端给的 bounds）—— 前端零写死。
-      🔴 key 文件在不在**当场可见**（填错路径 ⇒ 筛选一路 fail-open 成「静默不筛」）。
+      screening 的配置面**已搬到「AI 配置」页**（2026-10 ks_maint_ui_dedup）。
+      🔴 一张卡**一个编辑入口**：这一页不再摆第二张筛选卡，只留一行迁移指引 ——
+      两个编辑入口意味着用户不知道自己改的是哪一份配置。
+      正源在 /ai-settings（AiSettingsView）：screening 是那一页的五节之一，
+      数字/上下限/凭据路径全走 settings/ai 端点，本页**零直连**。
     -->
-    <h3 class="section-title">检索筛选</h3>
-    <div class="panel pad sc-card">
-      <div class="sc-head">
-        <span class="sc-title">检索结果 LLM 筛选</span>
-        <span class="chip" :class="scDraft.enabled ? 'chip--accent' : ''">
-          {{ scDraft.enabled ? '已开' : '已关' }}
-        </span>
-        <span class="chip" :class="scMeta.key_present ? '' : 'chip--warn'">
-          <i v-if="scMeta.key_present" class="dot-ok"></i>
-          {{ scMeta.key_present ? 'key 文件在' : 'key 文件没找到' }}
-        </span>
-        <span v-if="!scMeta.configured" class="chip chip--warn">config.json 里还没有这一节</span>
-      </div>
-      <p class="src">
-        关着时一切行为与接入前逐字一致（连 config.json 都不必写）；
-        开着的筛选每次检索后多一次 LLM 调用（约 10 秒），结果数不超过「最多保留条数」时直接跳过筛选。
-        <b>默认开</b>只管「调用方没显式传 screen 时怎么办」—— 代理显式传 screen=false 依然不筛。
-      </p>
-      <el-form label-position="top" class="sc-form">
-        <div class="sc-grid">
-          <el-form-item label="总开关（关着 = 不筛）">
-            <el-switch v-model="scDraft.enabled" />
-          </el-form-item>
-          <el-form-item label="默认开（调用方没传 screen 时按筛处理）">
-            <el-switch v-model="scDraft.default_on" />
-          </el-form-item>
-        </div>
-        <el-form-item label="模型">
-          <el-input v-model="scDraft.model" placeholder="如 MiniMax-M3.1-Flash" autocomplete="off" spellcheck="false" />
-        </el-form-item>
-        <el-form-item label="接口地址">
-          <el-input v-model="scDraft.base_url" placeholder="如 https://api.minimax.cn/v1" autocomplete="off" spellcheck="false" />
-        </el-form-item>
-        <el-form-item label="key 文件路径（凭据只从这个文件读，不填内容）">
-          <el-input v-model="scDraft.api_key_file" placeholder="如 /root/.config/keepsake/screen_key" autocomplete="off" spellcheck="false" />
-        </el-form-item>
-        <div class="sc-grid">
-          <el-form-item label="最多保留条数（结果数不超过它就不筛）">
-            <el-input-number
-              v-model="scDraft.max_pick"
-              :min="scMin('max_pick')"
-              :max="scMax('max_pick')"
-              :step="1"
-            />
-          </el-form-item>
-          <el-form-item label="单次超时（秒）">
-            <el-input-number
-              v-model="scDraft.timeout_s"
-              :min="scMin('timeout_s')"
-              :max="scMax('timeout_s')"
-              :step="10"
-            />
-          </el-form-item>
-          <el-form-item label="单次最多 token">
-            <el-input-number
-              v-model="scDraft.max_tokens"
-              :min="scMin('max_tokens')"
-              :max="scMax('max_tokens')"
-              :step="512"
-            />
-          </el-form-item>
-        </div>
-      </el-form>
-      <div class="ops">
-        <el-button type="primary" :loading="scBusy" @click="askSaveScreening">保存</el-button>
-        <span class="src">配置写在 {{ scMeta.path || 'config.json' }} 的 screening 一节；写前整份备份到 {{ scMeta.backup_dir || '备份目录' }}。</span>
-      </div>
-    </div>
-
-    <!-- 保存前的重确认件：后果逐条列明（改哪一节 / 备份去哪 / 怎么生效） -->
-    <ConfirmDialog
-      v-model="scConfirmOpen"
-      title="保存检索筛选配置？"
-      :consequences="scConsequences"
-      confirm-text="确认保存"
-      tone="primary"
-      :busy="scBusy"
-      @confirm="saveScreening"
-    />
+    <p class="src migrate-note">
+      检索筛选的配置已统一到「AI 配置」页 ——
+      <router-link class="card-link" to="/ai-settings">去 AI 配置 ›</router-link>
+    </p>
 
     <!-- 分级班车设置：总开关 + 阈值。confirm 要手输当前生效的 enabled（防手滑） -->
     <el-dialog
@@ -297,7 +224,7 @@ import { computed, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
-import http, { api } from '../api'
+import { api } from '../api'
 import { agentUsageRows, loadAgentRows, NO_OWNER_LABEL, ownerOf, sharePercent } from '../utils/agents'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
@@ -575,101 +502,7 @@ onMounted(() => {
   loadAgentDimension()
   loadDemotes()
   loadObsoleteTodos()
-  loadScreening()
 })
-
-// ---------------------------------------------------------------------------
-// 检索筛选（screening）：配置面 —— 一个编辑入口、一张卡、一个保存按钮
-// ---------------------------------------------------------------------------
-
-/** 表单草稿（值全部来自 GET；**前端零写死**任何数字）。 */
-const scDraft = ref({
-  enabled: false,
-  default_on: false,
-  model: '',
-  base_url: '',
-  api_key_file: '',
-  max_pick: 0,
-  timeout_s: 0,
-  max_tokens: 0,
-})
-/** GET 带回来的元信息：configured / key_present / bounds / 路径。 */
-const scMeta = ref({ configured: false, key_present: false, bounds: {}, path: '', backup_dir: '' })
-const scBusy = ref(false)
-const scConfirmOpen = ref(false)
-
-/** 输入框的上下限：后端给的 bounds（缺了就不给 —— 不在前端另抄一份）。 */
-function scMin(name) {
-  const b = scMeta.value.bounds?.[name]
-  return Array.isArray(b) ? b[0] : undefined
-}
-function scMax(name) {
-  const b = scMeta.value.bounds?.[name]
-  return Array.isArray(b) ? b[1] : undefined
-}
-
-async function loadScreening() {
-  try {
-    // 🔴 走 http 直连（api/index.js 是只读文件，本单不碰它）
-    const r = await http.get('/api/v1/settings/screening').then((res) => res.data)
-    scDraft.value = {
-      enabled: !!r.enabled,
-      default_on: !!r.default_on,
-      model: r.model || '',
-      base_url: r.base_url || '',
-      api_key_file: r.api_key_file || '',
-      max_pick: Number(r.max_pick) || 0,
-      timeout_s: Number(r.timeout_s) || 0,
-      max_tokens: Number(r.max_tokens) || 0,
-    }
-    scMeta.value = {
-      configured: !!r.configured,
-      key_present: !!r.key_present,
-      bounds: r.bounds || {},
-      path: r.path || '',
-      backup_dir: r.backup_dir || '',
-    }
-  } catch (e) {
-    showError(`读取检索筛选配置失败：${e.message}`)
-  }
-}
-
-/** 保存前的后果说明（确认弹框逐条列出来，不是一句「确定吗」）。 */
-const scConsequences = computed(() => {
-  const out = [
-    '只改 config.json 的 screening 一节 —— 存储后端、LLM 通道等其余配置一字不动。',
-    `写前会把原 config 整份备份到 ${scMeta.value.backup_dir || '备份目录'}（可人工回退）。`,
-    'MCP 服务热生效：下一轮检索就用新值，不需重启任何进程。',
-    '总开关开着时，每次检索后多一次 LLM 调用（约 10 秒）；结果数不超过「最多保留条数」时直接跳过筛选。',
-  ]
-  if (!scMeta.value.key_present) {
-    out.push('🔴 key 文件当前找不到：筛选会一路 fail-open（结果原样返回，只是不筛）—— 请先把 key 放到那个路径。')
-  }
-  if (scDraft.value.default_on) {
-    out.push('「默认开」只管「调用方没显式传 screen 时怎么办」；代理显式传 screen=false 依然不筛。')
-  }
-  return out
-})
-
-function askSaveScreening() {
-  scConfirmOpen.value = true
-}
-
-async function saveScreening() {
-  scConfirmOpen.value = false
-  scBusy.value = true
-  try {
-    await http
-      .put('/api/v1/settings/screening', { confirm: true, ...scDraft.value })
-      .then((res) => res.data)
-    showToast('已保存检索筛选配置')
-    await loadScreening()
-  } catch (e) {
-    showError(`保存检索筛选配置失败：${e.message}`)
-  } finally {
-    scBusy.value = false
-  }
-}
 
 // ---------------------------------------------------------------------------
 // 分级班车设置（开关 + 阈值）
@@ -741,6 +574,11 @@ async function saveTiering() {
 </script>
 
 <style scoped>
+/* 操作区卡片：合并 / 遗忘 / 分级班车收进一张卡（脚注 → 按钮行 → 结果块）。 */
+.ops-card {
+  padding: 20px;
+  margin-bottom: 20px;
+}
 .ops {
   display: flex;
   flex-wrap: wrap;
@@ -755,6 +593,10 @@ async function saveTiering() {
 }
 .pre {
   margin-top: 20px;
+}
+/* 卡内的结果块贴着上一步（卡间距档 20px → 卡内区块 12px）。 */
+.ops-card .pre {
+  margin-top: 12px;
 }
 .src {
   margin-top: 10px;
@@ -779,20 +621,20 @@ async function saveTiering() {
 .agent-cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 16px;
+  gap: 20px;
   margin-bottom: 20px;
 }
 @media (max-width: 900px) {
   .agent-cards {
     grid-template-columns: minmax(0, 1fr);
-    gap: 12px;
+    gap: 16px;
   }
 }
 .agent-card {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 16px;
+  gap: 12px;
+  padding: 20px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
@@ -917,53 +759,63 @@ async function saveTiering() {
   }
 }
 
-/* 「建议废弃的待办」清单：一行一条。零新色 —— 归属 chip 走全局 .tag--owner，
-   数字走 .num，行分隔线走 --border-2。 */
-.agent-split {
+/* 「建议废弃的待办」清单：与退居提名表同一套卡语言 ——
+   行 12px 20px（8px 栅格的紧贴档）、行分隔线走 --line-3、说明行贴底。
+   零新色：归属 chip 走全局 .tag--owner，过期数走 .chip--danger。 */
+.obs-list {
+  padding: 0;
+  overflow: hidden;
   margin-bottom: 20px;
 }
-.agent-line {
+.obs-row {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 0;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line-3);
 }
-.agent-line + .agent-line {
-  border-top: 1px solid var(--border-2);
+.obs-row:first-child {
+  border-top: none;
 }
-.agent-num {
+.obs-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-dim);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
+  font-size: 14px;
 }
-
-/* ---------------------------------------------------------------- 检索筛选卡
-   一张卡一个编辑入口：标题行（名字 + 状态徽标）+ 表单 + 一个保存按钮。 */
-.sc-card {
-  margin-bottom: 20px;
-}
-.sc-head {
+.obs-tags {
   display: flex;
-  flex-wrap: wrap;
+  flex: none;
   gap: 8px;
   align-items: center;
-  margin-bottom: 8px;
 }
-.sc-title {
-  color: var(--text);
-  font-size: 16px;
-  font-weight: 600;
+.obs-due {
+  color: var(--text-faint);
+  font-size: 12px;
 }
-/* 表单里的两列/三列：窄屏折成一列（不写死列数）。 */
-.sc-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0 16px;
+.obs-foot {
+  margin: 0;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line-3);
 }
 @media (max-width: 600px) {
-  .sc-grid {
-    grid-template-columns: minmax(0, 1fr);
+  /* 窄屏：标题独占一行，标签行贴左换行（不许横向滚动）。 */
+  .obs-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
   }
+}
+
+/* 迁移指引：一句灰字 + 一个指向「AI 配置」页的链接
+   （链接沿用全局 .card-link，不新造颜色；只去掉 <a> 的默认下划线）。 */
+.migrate-note {
+  margin: 24px 0 0;
+}
+.migrate-note a {
+  text-decoration: none;
 }
 </style>
