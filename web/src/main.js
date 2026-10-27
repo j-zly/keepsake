@@ -80,6 +80,13 @@ const app = createApp(App)
 // 全局配置（语言包 / 命名空间 / zIndex）：等价于整包安装时的 locale 选项
 provideGlobalConfig({ locale: zhCn }, app, true)
 app.use(router)
+// 🔴 注册方式必须是 app.component(c.name, c)，**不能**是 app.use(c)：
+//    element-plus 的 radio 族（ElRadioGroup / ElRadioButton）的 install 是
+//    NOOP（withNoopInstall），app.use() 走完注册表里**一个组件都没有** ——
+//    模板里的 <el-radio-group> 会 "Failed to resolve component"，
+//    页面上的「晋升候选/退居建议」切换器退化成裸文字连排（生产事故）。
+//    所以这里逐个断言 name 非空、再按组件自己的名字注册；
+//    name 缺失就当场报错，不许静默跳过。
 for (const c of [
   ElButton,
   ElCheckbox,
@@ -99,6 +106,7 @@ for (const c of [
   ElSkeleton,
   ElSwitch,
 ]) {
-  app.use(c)
+  if (!c || !c.name) throw new Error(`element-plus 组件缺少 name，无法注册：${c}`)
+  app.component(c.name, c)
 }
 app.mount('#app')
