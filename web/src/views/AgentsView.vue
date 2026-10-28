@@ -311,7 +311,7 @@
     <el-dialog
       v-model="editOpen"
       title="编辑代理"
-      width="560px"
+      width="min(1040px, 94vw)"
       align-center
       :close-on-click-modal="false"
       :close-on-press-escape="!busy"
@@ -319,112 +319,118 @@
       append-to-body
     >
       <el-form label-position="top">
-        <div class="eg-title">基本信息</div>
-        <el-form-item label="代理 ID">
-          <el-input
-            v-model="editId"
-            :disabled="editPrimary"
-            placeholder="如 worker-2"
-            autocomplete="off"
-            spellcheck="false"
-            @keyup.enter.prevent="doEdit"
-          />
-          <p v-if="editPrimary" class="tip">主代理 ID 不可改（备注名照常可以改）。</p>
-        </el-form-item>
-        <el-form-item label="备注名（必填）">
-          <el-input
-            v-model="editName"
-            placeholder="给人看的名字"
-            autocomplete="off"
-            spellcheck="false"
-            @keyup.enter.prevent="doEdit"
-          />
-        </el-form-item>
+        <div class="eg-grid">
+          <div class="eg-col">
+            <div class="eg-title">基本信息</div>
+            <el-form-item label="代理 ID">
+              <el-input
+                v-model="editId"
+                :disabled="editPrimary"
+                placeholder="如 worker-2"
+                autocomplete="off"
+                spellcheck="false"
+                @keyup.enter.prevent="doEdit"
+              />
+              <p v-if="editPrimary" class="tip">主代理 ID 不可改（备注名照常可以改）。</p>
+            </el-form-item>
+            <el-form-item label="备注名（必填）">
+              <el-input
+                v-model="editName"
+                placeholder="给人看的名字"
+                autocomplete="off"
+                spellcheck="false"
+                @keyup.enter.prevent="doEdit"
+              />
+            </el-form-item>
 
-        <!-- 组一：角色（设主 / 上下文） -->
-        <div class="eg-title">角色</div>
-        <el-form-item label="进入主脑上下文（关掉 = 它之后写的东西不进主脑每轮注入）">
-          <el-switch v-model="editContext" :disabled="editPrimary" />
-          <p class="tip">主代理恒在主脑上下文里，这一项对它锁死（后端同口径 400）。</p>
-        </el-form-item>
-        <el-form-item label="设为主代理（全库唯一；当前主代理会自动降为子代理）">
-          <el-button v-if="!editPrimary" :disabled="busy" @click="askFromEdit('role')">
-            设为主代理
-          </el-button>
-          <span v-else class="tip">它已经是主代理了。</span>
-          <p class="tip">
-            改前会备份整份注册表（含被降级的那一行），可人工复原；
-            确认框要手输完整 agent_id（改的是全库唯一的主脑，不是单个开关）。
-          </p>
-        </el-form-item>
+            <!-- 组一：角色（设主 / 上下文） -->
+            <div class="eg-title">角色</div>
+            <el-form-item label="进入主脑上下文（关掉 = 它之后写的东西不进主脑每轮注入）">
+              <el-switch v-model="editContext" :disabled="editPrimary" />
+              <p class="tip">主代理恒在主脑上下文里，这一项对它锁死（后端同口径 400）。</p>
+            </el-form-item>
+            <el-form-item label="设为主代理（全库唯一；当前主代理会自动降为子代理）">
+              <el-button v-if="!editPrimary" :disabled="busy" @click="askFromEdit('role')">
+                设为主代理
+              </el-button>
+              <span v-else class="tip">它已经是主代理了。</span>
+              <p class="tip">
+                改前会备份整份注册表（含被降级的那一行），可人工复原；
+                确认框要手输完整 agent_id（改的是全库唯一的主脑，不是单个开关）。
+              </p>
+            </el-form-item>
+          </div>
 
-        <!-- 组二：开关（私信 / 共享记忆 / 实时推送 / 注入预算） -->
-        <div class="eg-title">开关</div>
-        <el-form-item label="私信（关掉 = 别人投不进来）">
-          <el-switch v-model="editDm" />
-        </el-form-item>
-        <el-form-item label="共享记忆（打开 = 别的代理能检索到它的记忆）">
-          <el-switch v-model="editShare" />
-        </el-form-item>
-        <el-form-item label="私信实时推送（SSE 长连接）">
-          <el-switch v-model="editPush" />
-          <p class="tip">
-            开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
-            有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
-          </p>
-        </el-form-item>
-        <!--
-          注入预算（per-agent）：留空 = 沿用全局默认。
-          🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个编辑入口。
-          这里的「当前」是**全局默认**值（控制台「全局默认注入预算」那张卡）。
-        -->
-        <el-form-item label="注入预算（字符，留空 = 沿用全局）">
-          <el-input
-            v-model="editBudget"
-            type="number"
-            min="1"
-            step="1000"
-            :placeholder="`留空 = 沿用全局（当前 ${globalBudget}）`"
-            autocomplete="off"
-            spellcheck="false"
-            @keyup.enter.prevent="doEdit"
-          />
-        </el-form-item>
+          <div class="eg-col">
+            <!-- 组二：开关（私信 / 共享记忆 / 实时推送 / 注入预算） -->
+            <div class="eg-title">开关</div>
+            <el-form-item label="私信（关掉 = 别人投不进来）">
+              <el-switch v-model="editDm" />
+            </el-form-item>
+            <el-form-item label="共享记忆（打开 = 别的代理能检索到它的记忆）">
+              <el-switch v-model="editShare" />
+            </el-form-item>
+            <el-form-item label="私信实时推送（SSE 长连接）">
+              <el-switch v-model="editPush" />
+              <p class="tip">
+                开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
+                有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
+              </p>
+            </el-form-item>
+            <!--
+              注入预算（per-agent）：留空 = 沿用全局默认。
+              🔴 走**同一个编辑弹框**（一张卡一个编辑入口）—— 不另开第二个编辑入口。
+              这里的「当前」是**全局默认**值（控制台「全局默认注入预算」那张卡）。
+            -->
+            <el-form-item label="注入预算（字符，留空 = 沿用全局）">
+              <el-input
+                v-model="editBudget"
+                type="number"
+                min="1"
+                step="1000"
+                :placeholder="`留空 = 沿用全局（当前 ${globalBudget}）`"
+                autocomplete="off"
+                spellcheck="false"
+                @keyup.enter.prevent="doEdit"
+              />
+            </el-form-item>
 
-        <!-- 组三：凭据（危险区）—— 换发 / 停凭据 / 删除 -->
-        <div class="eg-title eg-title--danger">凭据（危险区）</div>
-        <div class="eg-danger">
-          <el-button
-            v-if="editRow?.status === 'approved'"
-            :disabled="busy"
-            @click="askFromEdit('rotate')"
-          >
-            重新生成凭据
-          </el-button>
-          <el-button
-            v-if="editRow?.status === 'approved' && editRow?.credential_hint"
-            :disabled="busy"
-            @click="askFromEdit('clearcred')"
-          >
-            停凭据
-          </el-button>
-          <el-button
-            v-if="editRow?.status === 'revoked'"
-            type="danger"
-            :disabled="busy"
-            @click="askFromEdit('delete')"
-          >
-            删除这个代理
-          </el-button>
-          <span v-if="editRow?.status !== 'approved' && !editRow?.credential_hint" class="tip">
-            这个代理现在没有凭据（已吊销 / 待审的行不签发凭据 —— 批准时才会发）。
-          </span>
+            <!-- 组三：凭据（危险区）—— 换发 / 停凭据 / 删除 -->
+            <div class="eg-title eg-title--danger">凭据（危险区）</div>
+            <div class="eg-danger">
+              <el-button
+                v-if="editRow?.status === 'approved'"
+                :disabled="busy"
+                @click="askFromEdit('rotate')"
+              >
+                重新生成凭据
+              </el-button>
+              <el-button
+                v-if="editRow?.status === 'approved' && editRow?.credential_hint"
+                :disabled="busy"
+                @click="askFromEdit('clearcred')"
+              >
+                停凭据
+              </el-button>
+              <el-button
+                v-if="editRow?.status === 'revoked'"
+                type="danger"
+                :disabled="busy"
+                @click="askFromEdit('delete')"
+              >
+                删除这个代理
+              </el-button>
+              <span v-if="editRow?.status !== 'approved' && !editRow?.credential_hint" class="tip">
+                这个代理现在没有凭据（已吊销 / 待审的行不签发凭据 —— 批准时才会发）。
+              </span>
+            </div>
+            <p class="tip">
+              重新生成凭据 = 换发：旧的那条立即作废，新的一条**只出现一次**（关掉弹框就拿不到了）。
+              停凭据 = 只废那把钥匙（代理照旧在册，状态 / 角色都不动）。
+              删除 = 整行抹掉（删前会备份一份，可人工复原）—— 只给已吊销的行。
+            </p>
+          </div>
         </div>
-        <p class="tip">
-          重新生成凭据 = 换发：旧的那条立即作废，新的一条**只出现一次**（关掉弹框就拿不到了）。
-          停凭据 = 只废那把钥匙（代理照旧在册，状态 / 角色都不动）。
-          删除 = 整行抹掉（删前会备份一份，可人工复原）—— 只给已吊销的行。
-        </p>
       </el-form>
       <p class="tip">
         改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
@@ -1238,5 +1244,19 @@ async function doAction(typed) {
   border: 1px solid var(--border-2);
   border-radius: var(--r-inset);
   background: var(--panel);
+}
+/* 编辑代理弹框：宽体双栏（用户 10-28 拍板：太长 → 改宽，左=信息+角色，右=开关+凭据） */
+.eg-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 32px;
+}
+.eg-col {
+  min-width: 0;
+}
+@media (max-width: 880px) {
+  .eg-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>
