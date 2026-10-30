@@ -77,6 +77,9 @@ class FragmentItem(BaseModel):
     content: str = Field("", description="截断后的正文")
     updated_at: str = ""
     score: Optional[float] = None
+    rev: str = Field("1", description="**乐观并发版本号**（2026-10 ks_memory_rev_cas）："
+                                     "改写这条时要带它当 expected_rev；"
+                                     "老库未补列时兜成 '1'")
 
 
 class FragmentList(BaseModel):
@@ -102,6 +105,12 @@ class FragmentDetail(BaseModel):
     created_at: str = ""
     updated_at: str = ""
     score: Optional[float] = None
+    rev: str = Field("1", description="**乐观并发版本号**（2026-10 ks_memory_rev_cas）")
+    chain: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="**演化链**（最老 → 最新；2026-10 ks_memory_rev_cas）："
+                    "同一条记忆被改写过的各版本。改写 = 新条目 + 旧条目转链身，"
+                    "所以一条记忆的历史版本是**一条链**而不是一堆散条目。")
     raw: Dict[str, Any] = Field(default_factory=dict,
                                 description="存储层返回的其余字段（BLOB 字段已剔除）")
 

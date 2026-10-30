@@ -35,7 +35,7 @@ from keepsake.mcp_server.tools import ToolError
 #: 记忆工具那 8 个的契约**逐字不动**（仍逐个在集合里，见下面的 `<=` 断言）。
 EXPECTED_TOOLS = {
     "memory_capabilities", "memory_search", "memory_get", "memory_core_list",
-    "memory_add", "memory_remove", "memory_merge", "memory_forget",
+    "memory_add", "memory_update", "memory_remove", "memory_merge", "memory_forget",
     "message_send", "message_inbox", "message_recent",
     "kb_store", "kb_search", "kb_get", "kb_remove",
     "todo_add", "todo_list", "todo_done",

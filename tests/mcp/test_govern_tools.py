@@ -31,7 +31,7 @@ from keepsake.mcp_server.tools import (GOVERN_TOOLS, KB_TOOLS, MESSAGE_TOOLS,
 
 MEMORY_TOOLS = {
     "memory_capabilities", "memory_search", "memory_get", "memory_core_list",
-    "memory_add", "memory_remove", "memory_merge", "memory_forget",
+    "memory_add", "memory_update", "memory_remove", "memory_merge", "memory_forget",
 }
 
 
@@ -110,6 +110,8 @@ def test_治理面默认不挂_既有八工具契约不动(tmp_path, monkeypatch
     都能用，归属 / 可见性 / 删除与记忆同一把尺子）⇒ 默认装配下也在工具面里。
     🔴 2026-10 ks_todo：**待办那 3 个同样与治理面无关**（所有已批准代理都能用）⇒
     默认装配下也在工具面里（工具面 15 → 18）。
+    🔴 2026-10 ks_memory_rev_cas：**memory_update**（CAS 改写）同样与治理面无关
+    ⇒ 默认装配下也在工具面里（18 → 19）。
     """
     server = _build(tmp_path, monkeypatch, govern=False)
     try:

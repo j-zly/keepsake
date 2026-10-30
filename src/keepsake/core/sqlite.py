@@ -104,6 +104,9 @@ from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
 # 代理注册表 `ks_agent` 的 DDL 唯一定义处（本模块只 import，不重复实现语义）
 from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
+# 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
+# 标准库，不反向 import core ⇒ 不成环）。
+from ..govern.visibility import fragment_owner
 from .base import StorageBase, fire_hits
 from . import shared as storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
@@ -112,6 +115,9 @@ from .shared import (
     DENOISE_STOPWORDS,
     agent_tag,
     replace_agent_tag,
+    REV_COLUMN,
+    next_rev,
+    rev_of,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
     HOT_TOPIC_BOOST,
@@ -234,6 +240,9 @@ _COLUMN_DDL: Dict[str, str] = {c: "TEXT NOT NULL DEFAULT ''"
 #: 还是链身」变成靠猜，而猜错的后果是刚写的记忆检索不出来。老行 ALTER 补列时
 #: SQLite 会用 DEFAULT 回填 ⇒ 存量行一律 '1'，迁移后检索面一字不变。
 _COLUMN_DDL["is_latest"] = "TEXT NOT NULL DEFAULT '1'"
+#: rev（2026-10 ks_memory_rev_cas）：乐观并发版本号，默认 '1' —— 存量行 ALTER
+#: 补列时 SQLite 用 DEFAULT 回填 ⇒ 一律 '1' ⇒ 迁移后行为与迁移前逐字一致。
+_COLUMN_DDL[REV_COLUMN] = "TEXT NOT NULL DEFAULT '1'"
 _COLUMN_DDL.update(dict(_EXTRA_COLUMNS))
 #: 批量读回哪几列（对齐 PG `get_fragments_batch`：全列，含维护列）
 READ_COLUMNS: Tuple[str, ...] = ALL_COLUMNS
@@ -485,6 +494,9 @@ class SqliteStorage(StorageBase):
     等于**静默丢数据**，比抛错坏得多。逐条级错误（锁竞争、单条脏值）仍然
     fail-open + 汇总告警，与 PG/Redis 同口径。
     """
+
+    #: 本后端**支持** rev CAS（真实现：BEGIN IMMEDIATE + 同事务比对，见 `cas_update`）。
+    supports_rev_cas = True
 
     # ---- 检索后处理：与 Redis / PG **同一个函数对象**（三后端一份实现）----
     _rrf_fuse = rrf_fuse
@@ -1169,6 +1181,245 @@ class SqliteStorage(StorageBase):
                            old_key, new_key, e)
             return False
 
+    # ------------------------------------------------------------------
+    # 乐观并发（CAS）—— 2026-10 ks_memory_rev_cas
+    #
+    # 🔴 **与 PG 侧语义逐条同款**（同一条链、同一个冲突载荷形状），
+    #    差别只在**锁的实现**：PG 侧是 `SELECT ... FOR UPDATE`（行级排他锁），
+    #    SQLite 侧是 `BEGIN IMMEDIATE`（**开口就拿写锁**，不延迟升级 ——
+    #    延迟升级是 SQLite 最典型的 `database is locked` 死锁来源）。
+    #    两者都保证「同一时刻只有一个写者能改同一条」⇒ 没有窗口让两人都通过
+    #    版本比对 ⇒ **不会内容分叉**。
+    # ------------------------------------------------------------------
+
+    def cas_update(
+        self,
+        key: str,
+        fields: Dict[str, Any],
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 改写一条碎片（单事务：读版本 → 比对 → 建新行 → 封旧边）。
+
+        🔴 **为什么是「新建一行」而不是原地 UPDATE**：记忆条目的 key 是
+        **内容哈希** —— 改正文就意味着换 key（语义与 PG 侧逐条同款，理由见
+        `core/pg.py::cas_update` 的 docstring）。改写 = 新条目 + 旧条目转链身
+        （`is_latest='0'` + `superseded_by`），演化链完整可回溯。
+
+        返回 `(状态, 载荷)`，形状见 `StorageBase.cas_update`。
+        """
+        if not key:
+            return ("not_found", None)
+        content = str(fields.get("content") or "")
+        if not content.strip():
+            raise ValueError("storage_sqlite: cas_update 的 content 不能为空")
+        self._require_ready("cas_update")
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        try:
+            with self._write() as cur:
+                # BEGIN IMMEDIATE 已把写锁拿稳 ⇒ 这里读到的一定是**最新**那一版
+                cur.execute(
+                    "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                    "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                    "COALESCE(created, ''), COALESCE(category, ''), "
+                    "COALESCE(source, ''), COALESCE(fragment_type, ''), "
+                    "COALESCE(sentiment_score, ''), COALESCE(sentiment_label, ''), "
+                    "COALESCE(feedback_score, '0'), COALESCE(applicability, '') "
+                    "FROM ks_fragment WHERE key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return ("not_found", None)
+                head = self._resolve_chain_head(cur, row)
+                if head is None:
+                    return ("not_found", None)
+                if head["key"] != key:
+                    # 目标已经不是链头 ⇒ **有人先改了它** ⇒ 冲突
+                    return ("conflict", self._conflict_payload(head))
+                # 🔴 `expected_rev` 空 = **不做版本校验**（老调用方的兼容路径）。
+                #    并发场景下**必须**传，否则照样分叉。
+                want_rev = str(expected_rev or "").strip()
+                if want_rev and head["rev"] != want_rev:
+                    return ("conflict", self._conflict_payload(head))
+
+                # ---- 版本对上了：建新版本行 + 封旧边（同一个事务）----
+                new_key = self._free_fragment_key(cur, self._fragment_key_for(content))
+                new_rev = next_rev(head["rev"])
+                entities = extract_entities(content)
+                entities_str = ",".join(entities) if entities else ""
+                keywords = extract_keywords(content, max_keywords=5)
+                if fields.get("sentiment_score") is None or fields.get("sentiment_label") is None:
+                    intensity, label = analyze_emotion(content)
+                else:
+                    intensity = float(fields["sentiment_score"])
+                    label = str(fields["sentiment_label"])
+
+                new_tags = fields.get("tags")
+                new_tags = str(new_tags if new_tags is not None else row[3])
+                new_category = str(fields.get("category") or row[7] or "")
+                new_source = str(fields.get("source") or row[8] or "")
+                new_type = str(fields.get("fragment_type") or row[9] or "")
+                new_app = fields.get("applicability")
+                new_app = str(new_app if new_app is not None else (row[13] or ""))
+                reason = str(fields.get("supersede_reason") or "")
+                feedback = row[12] or "0"
+                tokens = self._fts_tokens(content, entities_str, new_tags)
+
+                cur.execute(
+                    """
+                    INSERT INTO ks_fragment (
+                        key, content, tags, category, source, created, updated, hash,
+                        sentiment_score, sentiment_label, feedback_score,
+                        entities, fragment_type, embed_bin, content_tsv, applicability,
+                        is_latest, supersedes, supersede_reason, rev
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (new_key, content, new_tags, new_category, new_source,
+                     now_iso, now_iso, _sha12(content),
+                     str(intensity), label, feedback,
+                     entities_str, new_type, self._text_to_blob(content), tokens, new_app,
+                     "1", append_supersedes("", key), reason, new_rev),
+                )
+                self._fts_write(cur, new_key, tokens)
+                # 封旧边：旧条转链身（语义与 `supersede_fragment` / pipeline UPDATE 同款）
+                cur.execute(
+                    "UPDATE ks_fragment SET superseded_by = ?, superseded_at = ?, "
+                    "is_latest = '0' WHERE key = ?",
+                    (new_key, now_iso, key),
+                )
+                self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
+                if entities:
+                    self._record_entity_cooc(cur, entities, now_ts=now.timestamp())
+                    cur.executemany(
+                        "INSERT INTO ks_entity_timeline (entity, frag_key, ts) "
+                        "VALUES (?,?,?) ON CONFLICT(entity, frag_key) DO UPDATE SET ts = excluded.ts",
+                        [(ent, new_key, now.timestamp()) for ent in entities],
+                    )
+                self._record_topics(cur, keywords, label, now_ts=now.timestamp())
+            return ("ok", {"new_key": new_key, "new_rev": new_rev, "old_key": key})
+        except (StorageNotReadyError, ValueError):
+            raise
+        except Exception as e:      # noqa: BLE001
+            # 🔴 **异常原样上抛**（与 PG 侧同款）：吞掉再返回个假的 conflict
+            #    =「静默降级」，调用方会以为「有人抢先改了」而重试 —— 真相是
+            #    数据库挂了。重试一万次也是同样结果，必须让人看见。
+            logger.warning("storage_sqlite: cas_update(%s) failed: %s: %s",
+                           key, type(e).__name__, e)
+            raise
+
+    def cas_remove(
+        self,
+        key: str,
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 删除一条碎片（版本对不上 ⇒ **不删**，回报冲突载荷）。"""
+        if not key:
+            return ("not_found", None)
+        self._require_ready("cas_remove")
+        try:
+            with self._write() as cur:
+                cur.execute(
+                    "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                    "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                    "COALESCE(created, '') FROM ks_fragment WHERE key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return ("not_found", None)
+                head = self._resolve_chain_head(cur, row)
+                if head is None:
+                    return ("not_found", None)
+                want_rev = str(expected_rev or "").strip()
+                if head["key"] != key or (want_rev and head["rev"] != want_rev):
+                    return ("conflict", self._conflict_payload(head))
+                cur.execute("DELETE FROM ks_fragment WHERE key = ?", (key,))
+                cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = ?", (key,))
+                self._fts_delete(cur, key)
+                return ("ok", None)
+        except StorageNotReadyError:
+            raise
+        except Exception as e:      # noqa: BLE001
+            # 🔴 同 `cas_update`：异常原样上抛，不吞成假的 conflict。
+            logger.warning("storage_sqlite: cas_remove(%s) failed: %s: %s",
+                           key, type(e).__name__, e)
+            raise
+
+    def _resolve_chain_head(self, cur: sqlite3.Cursor, row: tuple
+                            ) -> Optional[Dict[str, Any]]:
+        """给定目标行 ⇒ 它**当前的链头**（必要时沿 `superseded_by` 回溯）。
+
+        为什么要回溯：目标 key 可能**已经被人改过**（成了链身，superseded_by
+        指向新一版）。此时「目标行的 rev」还是旧值，光比 rev 会**误判成通过**
+        ⇒ 第二个写会从链身再分叉出一条新链（内容分叉回来了）。
+        所以判据是「**我是不是当前链头**」+「版本对不对」，两条都要成立。
+        """
+        if is_chain_head(row[4]) or not row[5]:
+            return {
+                "key": row[0], "rev": rev_of(row[1]), "content": row[2] or "",
+                "tags": row[3] or "", "updated_at": row[6] or "",
+            }
+        return self._follow_chain_head(cur, row[5])
+
+    def _follow_chain_head(self, cur: sqlite3.Cursor, key: str, max_hops: int = 20
+                           ) -> Optional[Dict[str, Any]]:
+        """沿 `superseded_by` 回溯到当前链头（返回链头那行的关键字段）。
+
+        `max_hops` 是防环保险（历史数据可能被人手工改过 ⇒ 不许无限转圈）。
+        """
+        current = key
+        for _ in range(max_hops):
+            cur.execute(
+                "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                "COALESCE(created, '') FROM ks_fragment WHERE key = ?",
+                (current,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if is_chain_head(row[4]) or not row[5]:
+                return {
+                    "key": row[0], "rev": rev_of(row[1]), "content": row[2] or "",
+                    "tags": row[3] or "", "updated_at": row[6] or "",
+                }
+            current = row[5]
+        return None
+
+    @staticmethod
+    def _conflict_payload(head: Dict[str, Any]) -> Dict[str, Any]:
+        """conflict 载荷：**当前链头**的最新内容 + 版本号 + 归属 + 时间。
+
+        🔴 载荷里给的是「链头」而不是「你提交的那一行」：输的一方必须拿到
+        **对方刚写进去的那一版**（否则它只能再读一遍才知道自己被覆盖了什么）。
+        """
+        return {
+            "current_key": head["key"],
+            "current_rev": head["rev"],
+            "current_content": head["content"],
+            "updated_owner": fragment_owner(head.get("tags", "")),
+            "updated_at": head.get("updated_at", ""),
+        }
+
+    def _free_fragment_key(self, cur: sqlite3.Cursor, base: str) -> str:
+        """找一个没被占用的 key（内容哈希 base；被占则加 `:<epoch>` 后缀）。
+
+        🔴 与 `store()` 的同内容去重路径**同一套规则**（base → base:`<epoch>`）。
+        """
+        cur.execute("SELECT 1 FROM ks_fragment WHERE key = ?", (base,))
+        if cur.fetchone() is None:
+            return base
+        stamp = int(time.time())
+        for n in range(0, 20):
+            candidate = f"{base}:{stamp}" if n == 0 else f"{base}:{stamp}:{n}"
+            cur.execute("SELECT 1 FROM ks_fragment WHERE key = ?", (candidate,))
+            if cur.fetchone() is None:
+                return candidate
+        raise RuntimeError(
+            f"storage_sqlite: 为内容哈希 {base} 找空闲 key 失败（20 次都撞车）"
+        )
+
     def correct_fragments(self, keys: List[str]) -> int:
         """打 corrected 标签 + feedback_score=-1，返回实际处理条数。"""
         keys = [k for k in keys if k]
@@ -1262,7 +1513,11 @@ class SqliteStorage(StorageBase):
         except Exception as e:      # noqa: BLE001
             logger.warning("storage_sqlite: get_fragment(%s) error: %s", key, e)
             return None
-        return self._row_to_fragment(row) if row else None
+        if not row:
+            return None
+        frag = self._row_to_fragment(row)
+        frag[REV_COLUMN] = rev_of(frag)      # 缺列环境容错 '1'
+        return frag
 
     def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量读；缺失的 key 不出现在结果里。
@@ -1285,7 +1540,9 @@ class SqliteStorage(StorageBase):
                 for chunk in _chunks(keys):
                     placeholders = ", ".join("?" for _ in chunk)
                     for row in cur.execute(sql.format(placeholders), chunk):
-                        out[row[0]] = self._row_to_fragment(row, cols)
+                        doc = self._row_to_fragment(row, cols)
+                        doc[REV_COLUMN] = rev_of(doc)   # 缺列环境容错 '1'
+                        out[row[0]] = doc
         except Exception as e:      # noqa: BLE001
             # 带上 key 数便于判断是单页问题还是全库问题（同 Redis 侧）。
             logger.warning("storage_sqlite: get_fragments_batch failed (%d keys, got %d): %s",
@@ -1315,7 +1572,7 @@ class SqliteStorage(StorageBase):
         clause, args = tag_match_sql("tags", [clean], "?")
         with self._lock:
             rows = self._db().execute(
-                "SELECT key, content, tags, updated, created FROM ks_fragment "
+                "SELECT key, content, tags, updated, created, rev FROM ks_fragment "
                 f"WHERE {clause} AND COALESCE(is_archived, '') != '1' "
                 "ORDER BY COALESCE(NULLIF(updated, ''), created) ASC, key ASC",
                 tuple(args),
@@ -1326,6 +1583,7 @@ class SqliteStorage(StorageBase):
                 "content": r[1] or "",
                 "tags": r[2] or "",
                 "updated_at": r[3] or r[4] or "",
+                REV_COLUMN: rev_of(r[5]),
             }
             for r in rows
         ]
@@ -1413,7 +1671,9 @@ class SqliteStorage(StorageBase):
         """
         if not key or not fields:
             return False
-        allowed = set(ALL_COLUMNS) - {"key"}
+        # rev **不在这条路径里**：版本号只由 `cas_update` 递增（它是并发语义，
+        # 不是普通字段）—— 局部更新顺手改 rev 会让 CAS 判据失真。
+        allowed = set(ALL_COLUMNS) - {"key", REV_COLUMN}
         cols = [c for c in fields if c in allowed]
         if not cols:
             return False
@@ -1987,7 +2247,7 @@ class SqliteStorage(StorageBase):
                     f"f.content_tsv, "
                     # 🔴 FTS5 的 bm25() 只用来给**窗口粗排**（对应 PG 侧的 ts_rank_cd），
                     #    最终分在 Python 侧按 PG 公式重算 —— 见方法 docstring。
-                    f"-bm25({FTS_TABLE}) AS bm25_pos "
+                    f"-bm25({FTS_TABLE}) AS bm25_pos, f.rev "
                     f"FROM {FTS_TABLE} JOIN ks_fragment f ON f.key = {FTS_TABLE}.frag_key "
                     f"WHERE {FTS_TABLE} MATCH ? AND {where_sql} "
                     f"ORDER BY bm25_pos DESC, f.key LIMIT ?",
@@ -2020,7 +2280,8 @@ class SqliteStorage(StorageBase):
         lower_terms = {t.lower() for t in terms}
         for row in rows:
             key, content, tags, category, source, created, sent, label, fb, \
-                entities, ftype, invalid_at, valid_until, applic, tsv, _window_score = row
+                entities, ftype, invalid_at, valid_until, applic, tsv, _window_score, \
+                rev = row
             # tf / doclen：词元口径与 PG 的 tsvector positions 逐字对齐
             # （content_tsv 落库时已按 unicode61 词元切分，见 `_tok_string`）
             words = [w.lower() for w in (tsv or "").split()]
@@ -2042,6 +2303,8 @@ class SqliteStorage(StorageBase):
                 if value is None or value == "":
                     continue          # 稀疏语义：空值不进 dict（同 PG/Redis）
                 frag[name] = value if isinstance(value, str) else str(value)
+            # rev 随检索结果一起回（**只是数据字段**，不进任何打分/排序公式）
+            frag[REV_COLUMN] = rev_of(rev)
             if frag.get("content"):
                 fragments.append(frag)
         if not fragments:
@@ -2087,7 +2350,7 @@ class SqliteStorage(StorageBase):
                     f"SELECT f.key, f.content, f.tags, f.category, f.source, f.created, "
                     f"f.sentiment_score, f.sentiment_label, f.feedback_score, "
                     f"f.entities, f.fragment_type, f.invalid_at, f.valid_until, "
-                    f"f.applicability, f.content_tsv, 0 AS bm25_pos "
+                    f"f.applicability, f.content_tsv, 0 AS bm25_pos, f.rev "
                     f"FROM ks_fragment f "
                     f"WHERE f.content LIKE ? ESCAPE '\\' AND {where_sql} "
                     f"ORDER BY f.key LIMIT ?",

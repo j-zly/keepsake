@@ -35,7 +35,26 @@
           <span class="k">更新</span>
           <span class="v mono" :title="detail.updated_at">{{ toLocal(detail.updated_at) }}</span>
         </div>
+        <!-- rev（2026-10 ks_memory_rev_cas）：乐观并发版本号。改写时要带它当
+             expected_rev；版本对不上会被拒绝并回最新内容。 -->
+        <div class="row">
+          <span class="k">版本</span>
+          <span class="v mono">v{{ detail.rev || '1' }}</span>
+        </div>
       </div>
+
+      <!-- 演化链（2026-10 ks_memory_rev_cas）：改写一条记忆 = 新条目 + 旧条目
+           转链身，所以「这条被改过几版」是一条链，不是一堆散条目。 -->
+      <template v-if="chain.length">
+        <h3 class="section-title">演化链（{{ chain.length }} 版）</h3>
+        <ol class="chain">
+          <li v-for="c in chain" :key="c.key" :class="{ 'chain--old': !c.is_latest }">
+            <span class="chain-ver mono">v{{ c.rev || '1' }}</span>
+            <span class="chain-text" :title="c.content">{{ c.content || '（空）' }}</span>
+            <span v-if="c.is_latest" class="chain-cur">当前</span>
+          </li>
+        </ol>
+      </template>
 
       <h3 class="section-title">编辑</h3>
       <el-form label-position="top">
@@ -64,7 +83,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showConfirm, showError, showToast } from '../utils/dialog'
@@ -80,6 +99,15 @@ const emit = defineEmits(['update:modelValue', 'saved'])
 const editContent = ref('')
 const editTags = ref('')
 const saving = ref(false)
+
+/**
+ * 演化链（2026-10 ks_memory_rev_cas）：后端已按「最老 → 最新」排好序。
+ * 这里只做**展示层**的排序兜底（后端没给 chain 就不显示这一段）。
+ */
+const chain = computed(() => {
+  const rows = Array.isArray(props.detail?.chain) ? props.detail.chain : []
+  return rows.map((r) => ({ ...r, is_latest: r.is_latest !== false }))
+})
 
 // 每次拿到新详情就把编辑框填上，避免上一条的残留内容
 watch(
@@ -134,5 +162,32 @@ async function save() {
 }
 .rawbox {
   margin-top: 20px;
+}
+/* 演化链：竖排版本序列（最老在上、当前在最下） */
+.chain {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.8;
+}
+.chain li {
+  margin: 2px 0;
+}
+.chain--old {
+  color: var(--text-faint);
+}
+.chain-ver {
+  margin-right: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.chain-text {
+  word-break: break-all;
+}
+.chain-cur {
+  margin-left: 6px;
+  color: var(--accent);
+  font-size: 12px;
 }
 </style>

@@ -74,6 +74,9 @@ INSTRUCTIONS = (
     "keepsake 记忆系统。检索用 memory_search，取全文用 memory_get 或 "
     "resource memory://fragment/{key}，常驻记忆在 resource memory://core。"
     "删除必须显式 confirm；merge/forget 默认 dry-run，只统计不写。"
+    "改写已有记忆用 memory_update：先 memory_get 拿它的 rev，改完带 expected_rev "
+    "提交；收到 error=conflict 说明别人先改了（返回里带对方最新内容），"
+    "请重新读、合并后再提交，不要硬写。"
 )
 
 #: 知识库工具面的用法说明（**什么时候用知识库，而不是记忆**）。
@@ -133,7 +136,7 @@ GOVERN_HINT = (
 #: 🆕 `kb_store` / `kb_remove` 也算写（知识库文档的增删）。
 #: 🆕 `todo_add` / `todo_done` 也算写（待办的增 / 状态变更；`todo_list` 是纯读）。
 GATE_WRITE_TOOLS = frozenset({
-    "memory_add", "memory_remove", "memory_merge", "memory_forget",
+    "memory_add", "memory_update", "memory_remove", "memory_merge", "memory_forget",
     "agent_approve", "agent_revoke", "agent_set_role", "agent_set_exclude",
     "agent_set_share",
     "message_send", "message_inbox", "message_recent",

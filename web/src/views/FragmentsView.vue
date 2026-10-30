@@ -149,6 +149,9 @@
         <p class="card-body" :title="row.content">{{ row.content }}</p>
 
         <template #tags>
+          <!-- rev 徽标（2026-10 ks_memory_rev_cas）：乐观并发版本号 ——
+               改写这条时要带它当 expected_rev；版本越高说明被改过几版 -->
+          <span class="tag tag--rev" :title="revTitle(row)">v{{ row.rev || '1' }}</span>
           <!-- 归属代理 chip：一眼看出这条记忆是谁的（无归属走灰色 chip） -->
           <span class="tag" :class="ownerOf(row.tags) ? 'tag--owner' : ''" :title="ownerTitle(row)">
             {{ ownerText(row) }}
@@ -605,6 +608,15 @@ function ownerText(row) {
 function ownerTitle(row) {
   const id = ownerOf(row?.tags)
   return id ? `归属代理：${id}` : '这条记忆没有归属代理'
+}
+
+/** rev 徽标的悬浮说明（版本号是并发改写的凭据，得说清它怎么用）。 */
+function revTitle(row) {
+  const rev = row?.rev || '1'
+  return (
+    `乐观并发版本号 v${rev}（改写这条时带它当 expected_rev；` +
+    '版本对不上会被拒绝并回最新内容）'
+  )
 }
 function onPage(p) {
   page.value = p

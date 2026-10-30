@@ -36,6 +36,23 @@ from .shared import UNATTRIBUTED_AGENT
 logger = logging.getLogger("keepsake.storage_base")
 
 
+class BackendUnsupportedError(RuntimeError):
+    """后端**明确不支持**某个能力（不是「暂时失败」，是「这个后端做不了」）。
+
+    🔴 为什么单独一个类，而不是随便抛个 RuntimeError：调用方要能区分
+       「后端挂了，稍后重试」与「这个后端根本不支持这个语义」。后者**重试一万次
+       也是同样结果**，必须立刻显式失败（降级成「不传 expected_rev 的老路径」
+       之类）而不是静默当成功。
+
+    🔴 **消息里必须带 `backend_unsupported` 字样**：那是本仓库对「显式降级」的
+       统一标记（控制台 / MCP 层按它区分「不支持」与「失败」）。改文案前先看
+       `mcp_server/tools.py` 与 `core/redis.py` 里的判据。
+    """
+
+    def __init__(self, message: str = "backend_unsupported: 该后端不支持此能力") -> None:
+        super().__init__(message)
+
+
 class StorageBase(ABC):
     """存储后端抽象基类。
 
@@ -49,6 +66,13 @@ class StorageBase(ABC):
       - 检索类方法若后端尚未实现，**必须抛 NotImplementedError**，
         绝不允许静默返回空列表（静默空 = 记忆搜不到且无告警，最危险的失败形态）
     """
+
+    #: 本后端**是否支持 rev CAS**（乐观并发，2026-10 ks_memory_rev_cas）。
+    #:
+    #: 🔴 **默认 False（不支持）**：新写的后端**不会**因为「继承了基类」就
+    #:    悄悄拿到一套假 CAS 语义 —— 假语义 = 并发照样分叉、但回执说成功。
+    #:    真正实现了 `cas_update` / `cas_remove` 的后端必须显式改成 True。
+    supports_rev_cas: bool = False
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -107,6 +131,65 @@ class StorageBase(ABC):
           * 有新条 ⇒ 记在**新条**的 `supersede_reason` 上，同时旧条转链身；
           * `new_key` 为 `__void__`（或空串）⇒ 没有新条，`reason` 记在**旧条**上。
         """
+
+    # ------------------------------------------------------------------
+    # 乐观并发（CAS）—— 2026-10 ks_memory_rev_cas
+    #
+    # 🔴 **rev 是数据字段，不是检索信号**：它不进任何排序 / 打分公式，
+    #    只用于「写之前确认我读到的还是不是最新版」。
+    #
+    #    共享记忆被多个代理读写时，没有这层并发控制就会出现「内容分叉」：
+    #    两个代理基于同一版各自改写 ⇒ key=内容哈希 ⇒ 各存一条 ⇒ 互相看不见
+    #    对方（谁都不知道对方改过）。
+    #
+    #    语义（HTTP ETag / If-Match、CouchDB _rev 的思路）：
+    #      读：返回值里带 `rev`；
+    #      写：声明 `expected_rev`，对不上 ⇒ **拒绝并回最新内容**（不覆盖）。
+    #
+    #    🔴 **刻意不是 `@abstractmethod`**（与 `daily_counts` 同款纪律）：
+    #       只有 PG / SQLite 支持真 CAS，Redis 明确不支持 ⇒ 默认实现直接抛
+    #       `BackendUnsupportedError`，**禁止静默降级成「无条件覆盖」**。
+    #       抽象方法会让漏实现的后端在**构造期**就炸（波及既有测试），
+    #       默认抛错则每个后端必须自己表态「支持」还是「不支持」。
+    # ------------------------------------------------------------------
+
+    def cas_update(
+        self,
+        key: str,
+        fields: Dict[str, Any],
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 改写一条碎片（**新建版本 + 封旧边**，不是原地 UPDATE）。
+
+        `fields` 是新版本的字段（至少含 `content`；其余字段缺省沿用旧条）。
+        返回 `(状态, 载荷)`：
+
+          * `("ok", {"new_key":…, "new_rev":…})` —— 改写成功；
+          * `("conflict", {"current_rev":…, "current_content":…,
+            "updated_owner":…, "updated_at":…})` —— 版本对不上，
+            **载荷里带当前最新内容**，调用方据此合并后重试；
+          * `("not_found", None)` —— key 不存在。
+
+        默认实现 = **不支持**（抛 `BackendUnsupportedError`）。支持的后端必须
+        在**同一个事务**里完成「读版本 → 比对 → 建新行 → 封旧边」。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+        )
+
+    def cas_remove(
+        self,
+        key: str,
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 删除一条碎片（`expected_rev` 对不上 ⇒ 不删，返回 conflict 载荷）。
+
+        返回形状与 `cas_update` 同款：`("ok", None)` / `("conflict", 载荷)` /
+        `("not_found", None)`。默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+        )
 
     @abstractmethod
     def correct_fragments(self, keys: List[str]) -> int:

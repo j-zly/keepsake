@@ -659,6 +659,14 @@ html.dark {
   border-color: var(--accent-3);
   color: var(--accent);
 }
+/* rev 徽标（2026-10 ks_memory_rev_cas）：乐观并发版本号。
+   复用 .tag 的描边 chip，只把字重/字色提上来 —— 版本号是「身份信息」不是标签，
+   得比普通标签醒目一点，但不该抢归属代理 chip 的位置。 */
+.tag--rev {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .chip {
   display: inline-block;
   padding: 1px 8px;

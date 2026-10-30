@@ -101,10 +101,11 @@ class _GoodFake:
     def add(self, text: str, *, tags: str = "", meta=None) -> str:
         return ""
 
-    def update(self, key: str, *, content=None, tags=None) -> bool:
-        return False
+    def update(self, key: str, text: str, expected_rev: str = "", *,
+               tags: str = "", meta=None) -> dict:
+        return {"error": "not_found"}
 
-    def remove(self, target: str) -> bool:
+    def remove(self, target: str, expected_rev: str = "") -> bool:
         return False
 
     def merge(self, *, dry_run: bool = True) -> dict:
@@ -184,12 +185,36 @@ def test_search_limit_is_respected(provider):
 
 
 def test_update_changes_content_and_tags(provider):
+    """CAS 改写（2026-10 ks_memory_rev_cas）：读带 rev → 写声明 expected_rev。
+
+    🔴 契约语义：改写**换 key**（key = 内容哈希）⇒ 旧条转链身、新条 rev+1；
+    版本对不上 ⇒ 返回**结构化 conflict**（带对方最新内容），不是抛异常。
+    """
     key = provider.add("原始内容 草稿")
-    assert provider.update(key, content="修订内容 定稿", tags="final") is True
-    got = provider.get(key)
+    rev = provider.get(key)["rev"]
+    out = provider.update(key, "修订内容 定稿", rev, tags="final")
+    assert out.get("ok") is True, out
+    new_key = out["key"]
+    assert new_key and new_key != key
+    assert out["rev"] == "2"
+
+    got = provider.get(new_key)
     assert got["content"] == "修订内容 定稿"
     assert "final" in got["tags"]
-    assert provider.update("memory:frag:不存在", content="x") is False
+    assert got["rev"] == "2"
+    # 旧条转链身（演化链完整可回溯）
+    old = provider.get(key)
+    assert old["is_latest"] == "0"
+    assert old["superseded_by"] == new_key
+
+    # 版本对不上 ⇒ conflict（**带对方最新内容**，代理据此合并重提）
+    conflict = provider.update(key, "再改一次", rev)
+    assert conflict.get("error") == "conflict", conflict
+    assert conflict["current_content"] == "修订内容 定稿"
+    assert conflict["current_rev"] == "2"
+
+    # key 不存在 ⇒ not_found（结构化，不是裸异常）
+    assert provider.update("memory:frag:不存在", "x", "1").get("error") == "not_found"
 
 
 def test_read_path_raises_when_uninitialized():
@@ -209,7 +234,8 @@ def test_write_path_is_fail_closed_when_uninitialized():
 
     p = KeepsakeProvider()
     assert p.add("随便写点") == ""
-    assert p.update("memory:frag:x", content="y") is False
+    # 未初始化 ⇒ 结构化失败（不是抛异常、也不是谎报成功）
+    assert p.update("memory:frag:x", "y").get("error") == "error"
     assert p.remove("memory:frag:x") is False
 
 

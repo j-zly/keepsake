@@ -41,6 +41,7 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
         return f"[tool_error] {msg}"
 
 from ...core.embedder import create_embedder, resolve_embedder_api_key
+from ...core.base import BackendUnsupportedError
 from ...core.redis import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
 from ...core.ops.forgetter import Forgetter
 # 治理收口（2026-10 ks_agent_registry）：身份 / 角色 / 上下文的判定源。
@@ -51,6 +52,7 @@ from ...govern.registry import ROLE_PRIMARY as REGISTRY_ROLE_PRIMARY
 from ...govern.messaging import Messaging
 # 记忆共享开关的可见性过滤器（2026-10 ks_share_memory）：**唯一**那份口径。
 from ...govern.visibility import (
+    can_remove_fragment,
     fragment_owner,
     truncate_core_fragments,
     visible_agent_ids,
@@ -2453,37 +2455,165 @@ class KeepsakeProvider(MemoryProvider):
     def update(
         self,
         key: str,
+        text: str,
+        expected_rev: str = "",
         *,
-        content: Optional[str] = None,
-        tags: Optional[str] = None,
-    ) -> bool:
-        """局部更新一条碎片。两个参数都为 None 时**什么都不做**并返回 False。"""
-        fields: Dict[str, Any] = {}
-        if content is not None:
-            fields["content"] = content
-        if tags is not None:
-            fields["tags"] = tags
-        if not fields:
-            return False
-        try:
-            ok = bool(self._require_storage().update_fragment_fields(key, fields))
-        except Exception as e:
-            logger.warning("keepsake: update(%s) 失败（fail-closed，返回 False）: %s", key, e)
-            return False
-        if ok:
-            self._touch("write")
-        return ok
+        tags: str = "",
+        meta: Optional[Dict[str, Any]] = None,
+        caller_agent_id: str = "",
+        caller_role: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """**乐观并发（CAS）改写**一条记忆（2026-10 ks_memory_rev_cas）。
 
-    def remove(self, target: str) -> bool:
-        """按 key 删除；key 不存在或后端失败返回 False。"""
+        🔴 **为什么不是「原地改」**：记忆条目的 key 是**内容哈希** —— 改正文
+        就意味着换 key（存储层的 `cas_update` 会建新条目 + 把旧条转链身，
+        演化链完整可回溯）。这里负责的是**这一层之下的治理**：
+
+          * **归属校验与 `add` 同尺**：非 owner 不能改别人的碎片；primary 全量。
+            判据复用 `govern.visibility.can_remove_fragment`（**唯一一份**「谁能动
+            这条」的尺子 —— 看得见 ≠ 能改）。
+          * **core 内容写入照旧走候选审核队列**：`core_direct` 在这条路径上
+            **恒为 False** ⇒ **不得因 update 开直通**（primary 写 core 也落候选，
+            与 `add` 同一套闸门）。
+          * **冲突时返回结构化结果**（`{"error": "conflict", …}`，**不抛裸异常**）：
+            代理要能读懂「谁改了什么、现在是什么样」并据此合并重提。
+
+        返回：
+          * 成功 `{"ok": True, "key": <新 key>, "rev": <新 rev>, "previous_key": …}`
+          * 冲突 `{"error": "conflict", "current_rev":…, "current_content":…,
+            "updated_by":…, "current_key":…}`
+          * 不存在 `{"error": "not_found"}`
+          * 不归我 `{"error": "not_owner"}`
+        """
+        meta = meta or {}
+        if not key:
+            return {"error": "not_found"}
+        if not (text or "").strip():
+            return {"error": "invalid", "message": "text 不能为空"}
         try:
-            ok = bool(self._require_storage().delete_fragments_batch([target]))
+            storage = self._require_storage()
+        except Exception as e:
+            logger.warning("keepsake: update(%s) 失败（fail-closed）: %s", key, e)
+            return {"error": "error", "message": str(e)}
+        # 🔴 **后端不支持 CAS ⇒ 立刻显式失败**（不先读一遍再报 not_found）：
+        #    那会把「这个后端做不了」说成「这条不存在」—— 调用方会一直往错的方向
+        #    重试。Redis 是只读兜底后端，生产 = PG / SQLite。
+        if not getattr(storage, "supports_rev_cas", False):
+            raise BackendUnsupportedError(
+                "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+            )
+
+        # ---- 归属校验（与 add 同尺：非 owner 不能改别人的碎片；primary 全量）----
+        row = storage.get_fragment(key)
+        if not row:
+            return {"error": "not_found"}
+        if not self._may_write_fragment(row, caller_agent_id, caller_role):
+            return {"error": "not_owner", "key": key}
+
+        # ---- 写闸：core 照旧落候选队列（**不开直通**）----
+        effective_tags = tags if tags else str(row.get("tags", "") or "")
+        try:
+            gated_tags, _nominated = self._apply_write_gate(
+                effective_tags, core_direct=False, caller_role=caller_role)
+        except Exception as e:      # noqa: BLE001 —— 闸门挂了就当没闸（fail-closed 写）
+            logger.warning("keepsake: update(%s) 写闸异常（按原标签写）: %s", key, e)
+            gated_tags = effective_tags
+
+        fields: Dict[str, Any] = {"content": text, "tags": gated_tags}
+        for name in ("category", "source", "fragment_type", "applicability"):
+            if meta.get(name) is not None:
+                fields[name] = meta[name]
+        try:
+            status, payload = storage.cas_update(key, fields, expected_rev)
+        except Exception as e:      # noqa: BLE001
+            # 🔴 `backend_unsupported`（Redis）**原样上抛**：那不是「失败」，
+            #    是「这个后端做不了」—— 调用方必须显式知道，不许被吞成假成功。
+            logger.warning("keepsake: update(%s) CAS 失败: %s: %s", key, type(e).__name__, e)
+            raise
+        if status == "ok":
+            self._touch("write")
+            return {
+                "ok": True,
+                "key": (payload or {}).get("new_key", ""),
+                "rev": (payload or {}).get("new_rev", ""),
+                "previous_key": key,
+            }
+        if status == "conflict":
+            payload = payload or {}
+            return {
+                "error": "conflict",
+                "current_key": payload.get("current_key", ""),
+                "current_rev": payload.get("current_rev", ""),
+                "current_content": payload.get("current_content", ""),
+                "updated_by": payload.get("updated_owner", ""),
+                "updated_at": payload.get("updated_at", ""),
+            }
+        return {"error": "not_found"}
+
+    def _may_write_fragment(self, row: Dict[str, Any], caller_agent_id: str,
+                            caller_role: Optional[str]) -> bool:
+        """这个调用方**能不能改**这条（归属尺子 = `can_remove_fragment`，唯一一份）。
+
+        🔴 为什么复用删除那把尺子：「看得见」≠「能改」。非 primary 只能改
+        **自己的**条目与**无归属的老条目**；别人的条目 —— **含已共享代理的** ——
+        一律不许（与 `memory_remove` 的归属闸逐条同款）。
+
+        `caller_agent_id` 空 ⇒ **本进程自己**（主脑直连存储）⇒ 归属方 = 本进程
+        身份 `self._agent_id`，primary 判定沿用 config 的 `self._is_primary`
+        （与读路径 `_visibility_scope` 逐条同款，既有行为不变）。
+        """
+        if not caller_agent_id:
+            caller = str(self._agent_id or "")
+            is_primary = bool(self._is_primary)
+        else:
+            caller = str(caller_agent_id)
+            is_primary = caller_role == REGISTRY_ROLE_PRIMARY
+        owner = fragment_owner(row.get("tags", ""))
+        return can_remove_fragment(owner, caller, is_primary=is_primary)
+
+    def remove(self, target: str, expected_rev: Optional[str] = None) -> Any:
+        """按 key 删除。
+
+        * `expected_rev` 为 None（**默认**）⇒ **现行为逐字不变**：返回 bool。
+        * `expected_rev` 给了 ⇒ **CAS 删除**：版本对不上返回**同款 conflict 结构**
+          （与 `update()` 同形：带 `current_rev` / `current_content` / `updated_by`），
+          且**行仍在**（不删）；删掉了返回 `{"ok": True, "removed": True, "key": …}`。
+        """
+        try:
+            storage = self._require_storage()
         except Exception as e:
             logger.warning("keepsake: remove(%s) 失败（fail-closed，返回 False）: %s", target, e)
             return False
-        if ok:
+        if not expected_rev:
+            # `expected_rev` 空 ⇒ **现行为逐字不变**（向后兼容已接入的老代理）
+            try:
+                ok = bool(storage.delete_fragments_batch([target]))
+            except Exception as e:
+                logger.warning("keepsake: remove(%s) 失败（fail-closed，返回 False）: %s",
+                               target, e)
+                return False
+            if ok:
+                self._touch("write")
+            return ok
+        try:
+            status, payload = storage.cas_remove(target, expected_rev)
+        except Exception as e:      # noqa: BLE001
+            logger.warning("keepsake: remove(%s) CAS 失败: %s: %s", target, type(e).__name__, e)
+            raise
+        if status == "ok":
             self._touch("write")
-        return ok
+            return {"ok": True, "removed": True, "key": target}
+        if status == "conflict":
+            payload = payload or {}
+            return {
+                "error": "conflict",
+                "current_key": payload.get("current_key", ""),
+                "current_rev": payload.get("current_rev", ""),
+                "current_content": payload.get("current_content", ""),
+                "updated_by": payload.get("updated_owner", ""),
+                "updated_at": payload.get("updated_at", ""),
+            }
+        return {"error": "not_found"}
 
     # ---- 维护层 ----
 

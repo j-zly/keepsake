@@ -24,7 +24,7 @@ import redis
 from redis.commands.search.query import Query
 
 from .embedder import Embedder, create_embedder, resolve_embedder_api_key
-from .base import StorageBase, fire_hits
+from .base import BackendUnsupportedError, StorageBase, fire_hits
 # 2026-10 ks_pg_b2：检索后处理与排序权重抽到 storage_shared —— Redis / PG 共用同一份。
 # 下面这几个名字从 storage_shared 转出，是给既有调用方（cleanup_hot_topics 等）的转出口。
 from .shared import (          # noqa: F401 — 常量与函数均为有意 re-export
@@ -42,6 +42,9 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
     attention_boost_from_topics,
     hot_topic_weighted_hits,
     is_chain_head,
+    REV_COLUMN,
+    DEFAULT_REV,
+    rev_of,
     load_fragments_by_keys,
     rrf_fuse,
     rerank_with_decay,
@@ -1406,6 +1409,42 @@ class RedisStorage(StorageBase):
         pipe.execute()
         return len(names)
 
+    # ------------------------------------------------------------------
+    # 乐观并发（CAS）—— 2026-10 ks_memory_rev_cas：**本后端明确不支持**
+    #
+    # 🔴 **为什么必须显式抛错、绝不能静默降级**：Redis 在本项目里的定位是
+    #   「只读兜底后端」（生产 = PG，SQLite 是等价备胎）。乐观并发要的是
+    #   「读版本 → 同事务内比对 → 写新版本」这一整套事务语义；Redis 侧
+    #   没有多行事务、没有 `SELECT ... FOR UPDATE`，拿 WATCH/MULTI 拼一个
+    #   出来也不可靠（跨 key 的链维护没法原子做）。
+    #   如果这里**静默忽略 expected_rev**（当成无条件覆盖），调用方会拿到
+    #   「成功」的回执，而并发写照样分叉 —— **那比明确报错坏得多**：
+    #   报错时代理知道要重试，骗它就永远分叉。
+    # ------------------------------------------------------------------
+
+    def cas_update(
+        self,
+        key: str,
+        fields: Dict[str, Any],
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """**不支持**：抛 `backend_unsupported`（绝不静默降级成无条件覆盖）。"""
+        raise BackendUnsupportedError(
+            "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+            "（Redis 侧没有行级事务，无法保证「读版本→比对→写新版本」原子）"
+        )
+
+    def cas_remove(
+        self,
+        key: str,
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """**不支持**：抛 `backend_unsupported`（绝不静默降级成无条件删除）。"""
+        raise BackendUnsupportedError(
+            "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+            "（Redis 侧没有行级事务，无法保证「读版本→比对→删除」原子）"
+        )
+
     def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
         """读一个碎片的完整 hash（v2 pipeline UPDATE 阶段需要看旧事实全文）。
 
@@ -1426,6 +1465,9 @@ class RedisStorage(StorageBase):
             for k_b, v_b in raw.items():
                 k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
                 out[k] = _decode_hash_value(v_b)
+            # rev 兜底：本后端不支持 CAS ⇒ 版本号恒为 '1'（形状与 PG/SQLite 同款，
+            # 免得调用方在 Redis 上读到「没有 rev 键」就崩）
+            out[REV_COLUMN] = rev_of(out)
             return out
         except Exception as e:
             logger.warning("storage: get_fragment error for %s: %s", key, e)
@@ -1455,6 +1497,7 @@ class RedisStorage(StorageBase):
                 for k_b, v_b in raw.items():
                     kk = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
                     doc[kk] = _decode_hash_value(v_b)
+                doc[REV_COLUMN] = rev_of(doc)   # 本后端不支持 CAS ⇒ 恒为 '1'
                 out[key] = doc
         except Exception as e:
             # 🔴 不能是 debug：2026-10-10 生产 Redis 上这条路径恒空（整批 decode
@@ -1571,9 +1614,15 @@ class RedisStorage(StorageBase):
         return n
 
     def update_fragment_fields(self, key: str, fields: Dict[str, Any]) -> bool:
-        """局部更新若干 hash 字段（HSET 单 key，不动其余字段）。"""
+        """局部更新若干 hash 字段（HSET 单 key，不动其余字段）。
+
+        🔴 **rev 不走这条路径**：版本号只由 `cas_update` 递增（并发语义，不是
+        普通字段），而**本后端根本不支持 CAS** ⇒ 写进去的 rev 是没有意义的
+        假版本号，会把读路径的 `rev_of` 兜底盖掉 ⇒ 一律剔掉。
+        """
         if not key or not fields:
             return False
+        fields = {k: v for k, v in fields.items() if k != REV_COLUMN}
         client = self._get_client()
         if not client:
             return False
@@ -1990,6 +2039,7 @@ class RedisStorage(StorageBase):
                     continue
                 frag[field] = val if isinstance(val, str) else str(val)
             frag["_key"] = key
+            frag[REV_COLUMN] = DEFAULT_REV    # 本后端不支持 CAS ⇒ 恒为 '1'
             # 子串命中没有词频口径 ⇒ 常数分（见 storage_shared.TRGM_FALLBACK_SCORE）
             frag["_bm25_score"] = TRGM_FALLBACK_SCORE
             out.append(frag)
@@ -2201,6 +2251,7 @@ class RedisStorage(StorageBase):
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                frag[REV_COLUMN] = DEFAULT_REV    # 本后端不支持 CAS ⇒ 恒为 '1'
                 # v2: 记录 Redis key，让消费侧（prefetch / pipeline）能 hget superseded_by 字段
                 doc_key = getattr(doc, "id", None) or getattr(doc, "__key", None)
                 if doc_key:
@@ -2371,6 +2422,7 @@ class RedisStorage(StorageBase):
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                frag[REV_COLUMN] = DEFAULT_REV    # 本后端不支持 CAS ⇒ 恒为 '1'
                 # v2: 记录 Redis key（同 BM25 路径）
                 doc_key = getattr(doc, "id", None) or getattr(doc, "__key", None)
                 if doc_key:

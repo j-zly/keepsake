@@ -85,6 +85,9 @@ from ..domain.splitter import extract_entities, extract_keywords, segment_query
 # 代理注册表 `ks_agent` 的 DDL 唯一定义处（本模块只 import，不重复实现语义）
 from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
 from ..govern.registry import is_broken_connection_error
+# 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
+# 标准库，不反向 import core ⇒ 不成环）。
+from ..govern.visibility import fragment_owner
 from .base import StorageBase, fire_hits
 from .shared import (          # 与 Redis 共用的检索后处理（同一批函数对象）
     FRAGMENT_FIELDS,
@@ -96,6 +99,10 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     CONTRACT_V2_MIGRATION_HINT,
     VOID_KEY,
     append_supersedes,
+    DEFAULT_REV,
+    REV_COLUMN,
+    next_rev,
+    rev_of,
     DECAY_HALF_DAYS,
     FEEDBACK_NEGATIVE_PENALTY,
     FEEDBACK_POSITIVE_BOOST,
@@ -228,6 +235,10 @@ FRAGMENT_COLUMNS = (
     # 与 maintenance 三列一样：ensure_index 会「先查后补」自动补上，但读/写路径
     # 仍按 `_contract_v2_missing` 做缺列降级（老库未迁移时不至于整条路报 500）。
     "is_latest", "supersedes", "supersede_reason", "applicability",
+    # rev（2026-10 ks_memory_rev_cas）：乐观并发版本号。**只是数据字段**，
+    # 不进任何检索排序/打分公式 —— 它只回答「我读到的还是不是最新版」。
+    # 缺列时读路径会剔掉这根（`_read_columns`）并兜成 '1'，见 storage_shared。
+    REV_COLUMN,
 )
 
 # --------------------------------------------------------------------------
@@ -336,7 +347,10 @@ _DDL_TABLES = (
         is_latest       text NOT NULL DEFAULT '1',
         supersedes      text NOT NULL DEFAULT '',
         supersede_reason text NOT NULL DEFAULT '',
-        applicability   text NOT NULL DEFAULT ''
+        applicability   text NOT NULL DEFAULT '',
+        -- 2026-10 ks_memory_rev_cas：乐观并发版本号（HTTP ETag / If-Match 的
+        -- 那套思路）。默认 '1' ⇒ 存量行 ALTER 补列后版本号与迁移前一致。
+        rev             text NOT NULL DEFAULT '1'
     )
     """),
     # 对齐 keepsake:entity_timeline:<实体> ZSET（member=碎片 key，score=时间戳）
@@ -498,6 +512,33 @@ def _contract_v2_column_ddl() -> tuple:
         (c, f"ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS {c} "
             f"{_CONTRACT_V2_COLUMN_DDL[c]}")
         for c in CONTRACT_V2_COLUMNS
+    )
+
+
+#: rev 列的列声明（2026-10 ks_memory_rev_cas）。默认 '1' ⇒ 存量行 ALTER 补列后
+#: 版本号与迁移前一致（=「没改过」），迁移对调用方是**零感知**的。
+REV_COLUMN_DDL = "text NOT NULL DEFAULT '1'"
+
+#: rev 列的迁移提示（缺列时报人话 + 迁移 SQL，绝不静默降级成「无条件覆盖」）。
+REV_MIGRATION_HINT = (
+    "ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS rev text NOT NULL DEFAULT '1';"
+)
+
+
+def _rev_column_ddl() -> tuple:
+    """rev 列的 ALTER —— (列名, 语句)。
+
+    与 `_maintenance_column_ddl` / `_contract_v2_column_ddl` 同一个套路：
+    走「先查后补」（列已在就不发 ALTER），且**必须带 `IF NOT EXISTS`** ——
+    全新库上 `_DDL_TABLES` 的 CREATE TABLE 已含 rev，再补一条不带 IF NOT EXISTS
+    的 ALTER 会撞 DuplicateColumn ⇒ 整个迁移段回滚。
+
+    🔴 **这里只补列，不建索引**：rev 的判据是「按主键点查后比对」，
+    主键索引已经覆盖 ⇒ 专门给 rev 建索引是本项目最典型的「造没人用的数据」。
+    """
+    return (
+        (REV_COLUMN,
+         f"ALTER TABLE ks_fragment ADD COLUMN IF NOT EXISTS {REV_COLUMN} {REV_COLUMN_DDL}"),
     )
 
 
@@ -892,6 +933,9 @@ class PgStorage(StorageBase):
     碎片 key、字段名、检索结果形状都按 Redis 侧对齐（见模块注释）。
     检索后处理绑定的是 `storage_shared` 的同一批函数对象（不是副本）。
     """
+
+    #: 本后端**支持** rev CAS（真实现：行级锁 + 同事务比对，见 `cas_update`）。
+    supports_rev_cas = True
 
     # ---- 共用实现绑定（与 RedisStorage 绑的是**同一个函数对象**）----
     _rrf_fuse = rrf_fuse
@@ -1537,6 +1581,9 @@ class PgStorage(StorageBase):
         for name, sql in _contract_v2_column_ddl():
             if name not in have_columns:
                 plan.append(sql)
+        for name, sql in _rev_column_ddl():
+            if name not in have_columns:
+                plan.append(sql)
         for name, sql in _search_index_ddl():
             if name not in have_indexes:
                 plan.append(sql)
@@ -1709,6 +1756,9 @@ class PgStorage(StorageBase):
                 have = set()
             missing = frozenset(c for c in CONTRACT_V2_COLUMNS if c not in have)
             self._contract_v2_missing_cache = missing
+            # rev 列（乐观并发版本号）单独记一份：它**不是**契约 v2 的列，
+            # 缺了不能拿契约 v2 的迁移 SQL 去报（那条 SQL 里没有 rev）。
+            self._rev_missing_cache = REV_COLUMN not in have
             if missing:
                 logger.warning(
                     "storage_pg: ks_fragment 缺契约 v2 列 %s —— 读路径已降级（出参不带这"
@@ -1718,13 +1768,36 @@ class PgStorage(StorageBase):
                 )
         return missing
 
-    def _read_columns(self, columns: Tuple[str, ...]) -> Tuple[str, ...]:
-        """读路径的列清单：**剔掉库里真缺的**契约 v2 列。
+    def _rev_missing(self) -> bool:
+        """库里缺 rev 列？（与 `_contract_v2_missing` **同一次探测**、同一份进程内记忆）
 
-        只剔契约 v2 四列 —— 其它列缺了就是 schema 坏了，那是 ensure_index 的活，
-        不该在这里被静默吞掉（否则「忘了补 level」会变成合并功能静默失效）。
+        缺 rev ⇒ 读路径不能 SELECT 它（出参不带这根键，调用方按 '1' 兜），
+        写路径（CAS）则必须报错（`_require_rev`）—— 无版本的并发控制等于没有。
         """
-        missing = self._contract_v2_missing()
+        self._contract_v2_missing()      # 触发探测（缓存命中即返回）
+        return bool(getattr(self, "_rev_missing_cache", True))
+
+    def _require_rev(self) -> None:
+        """CAS 写路径的缺列闸：rev 列不在 ⇒ 抛人话错（含迁移 SQL），不静默覆盖。"""
+        if not self._rev_missing():
+            return
+        raise _ContractColumnMissing(
+            f"storage_pg: ks_fragment 缺列 {REV_COLUMN}，无法做乐观并发（CAS）改写。"
+            f"请执行迁移（或重启让 ensure_index 自动补列）：{REV_MIGRATION_HINT}"
+        )
+
+    def _read_columns(self, columns: Tuple[str, ...]) -> Tuple[str, ...]:
+        """读路径的列清单：**剔掉库里真缺的**契约 v2 列 + rev 列。
+
+        只剔契约 v2 四列与 rev —— 其它列缺了就是 schema 坏了，那是 ensure_index
+        的活，不该在这里被静默吞掉（否则「忘了补 level」会变成合并功能静默失效）。
+
+        rev 缺列时出参**不带这个键**，调用方按 `storage_shared.rev_of` 兜成 '1'
+        （=「和迁移前一样」），而不是让整条读路径报 500。
+        """
+        missing = set(self._contract_v2_missing())
+        if self._rev_missing():
+            missing.add(REV_COLUMN)
         if not missing:
             return columns
         return tuple(c for c in columns if c not in missing)
@@ -2445,6 +2518,9 @@ class PgStorage(StorageBase):
                 if value is None or value == "":
                     continue
                 frag[name] = value
+            # rev 随检索结果一起回（**只是数据字段**，不进任何打分/排序公式）：
+            # 代理拿到命中就能直接带着 rev 去 CAS 改写。
+            frag[REV_COLUMN] = rev_of(row)
             frag.update(rest)
             out.append(frag)
         if gone:
@@ -2478,7 +2554,9 @@ class PgStorage(StorageBase):
                 (list(keys),),
             )
             for row in cur.fetchall():
-                out[row[0]] = self._row_to_fragment(row, cols)
+                doc = self._row_to_fragment(row, cols)
+                doc[REV_COLUMN] = rev_of(doc)   # 缺列环境容错 '1'
+                out[row[0]] = doc
         return out
 
     # ------------------------------------------------------------------
@@ -3287,7 +3365,11 @@ class PgStorage(StorageBase):
                 (key,),
             )
             row = cur.fetchone()
-        return self._row_to_fragment(row, cols) if row else None
+        if not row:
+            return None
+        frag = self._row_to_fragment(row, cols)
+        frag[REV_COLUMN] = rev_of(frag)      # 缺列环境容错 '1'
+        return frag
 
     def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量读；缺失的 key 不出现在结果里。
@@ -3313,6 +3395,7 @@ class PgStorage(StorageBase):
                     if value is None or value == "":
                         continue
                     doc[name] = value if isinstance(value, str) else str(value)
+                doc[REV_COLUMN] = rev_of(doc)   # 缺列环境容错 '1'
                 out[row[0]] = doc
         return out
 
@@ -3337,22 +3420,28 @@ class PgStorage(StorageBase):
         if not clean:
             return []
         clause, args = tag_match_sql("tags", [clean], "%s", pos_fn="strpos")
+        # rev 缺列时**不 SELECT 它**（老库未迁移 ⇒ 不能整条查询报 500）
+        has_rev = not self._rev_missing()
+        cols = "key, content, tags, created" + (", rev" if has_rev else "")
         with self._ro() as cur:
             cur.execute(
-                f"SELECT key, content, tags, created FROM ks_fragment "
+                f"SELECT {cols} FROM ks_fragment "
                 f"WHERE {clause} AND COALESCE(is_archived, '') <> '1' "
                 f"ORDER BY created ASC, key ASC",
                 tuple(args),
             )
-            return [
-                {
+            out = []
+            for r in cur.fetchall():
+                item = {
                     "key": r[0],
                     "content": r[1] or "",
                     "tags": r[2] or "",
                     "updated_at": r[3] or "",
                 }
-                for r in cur.fetchall()
-            ]
+                if has_rev:
+                    item[REV_COLUMN] = rev_of(r[4])
+                out.append(item)
+            return out
 
     # ------------------------------------------------------------------
     # 维护原语（合并 / 遗忘）—— StorageBase 接口，PG 侧实现
@@ -3460,7 +3549,10 @@ class PgStorage(StorageBase):
         """
         if not key or not fields:
             return False
-        allowed = (set(FRAGMENT_COLUMNS) | set(MAINTENANCE_COLUMNS)) - {"key"}
+        # rev **不在这条路径里**：版本号只由 `cas_update` 递增（它是并发语义，
+        # 不是普通字段）—— 局部更新顺手改 rev 会让 CAS 判据失真。
+        allowed = ((set(FRAGMENT_COLUMNS) | set(MAINTENANCE_COLUMNS))
+                   - {"key", REV_COLUMN})
         missing = self._contract_v2_missing()
         # 缺列时：调用方点名要写的契约 v2 列 → 报人话错；没点的照常写别的列。
         for c in fields:
@@ -3539,6 +3631,255 @@ class PgStorage(StorageBase):
         self._snap_drop("n_avgdl", "dfs")
         now = self.get_fragment(key) or {}
         return str(now.get("content", "")) == content
+
+    # ------------------------------------------------------------------
+    # 乐观并发（CAS）—— 2026-10 ks_memory_rev_cas
+    #
+    # 🔴 **为什么共享记忆需要它**：两个代理基于同一版各自改写 ⇒ key=内容哈希
+    #   ⇒ 各存一条 ⇒ 互相看不见对方（内容分叉）。这不是「谁覆盖谁」的问题，
+    #   是**两版都活着**的问题 —— 检索时两条都命中，代理却以为自己改成功了。
+    #   乐观并发（HTTP ETag / If-Match、CouchDB _rev）让「我读到的还是不是
+    #   最新版」变成一次**可判定的比对**，对不上就拒并把最新版回给调用方。
+    # ------------------------------------------------------------------
+
+    def cas_update(
+        self,
+        key: str,
+        fields: Dict[str, Any],
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 改写一条碎片（单事务：锁行 → 比版本 → 建新行 → 封旧边）。
+
+        🔴 **锁级别 = 行级排他锁**（`SELECT ... FOR UPDATE`）：不是表锁、不是
+        advisory lock ⇒ 只挡「同一个 key」的并发写，不同 key 互不干扰。
+        两个代理同时改同一条时，第二个的 SELECT 会**阻塞**到第一个提交 ⇒
+        它读到的是**新版本** ⇒ 版本对不上 ⇒ 判成 conflict。
+        **没有窗口能让两人都通过** —— 那正是内容分叉的根因所在。
+
+        🔴 **为什么是「新建一行」而不是原地 UPDATE**：记忆条目的 key 是
+        **内容哈希**（`memory:frag:<sha12>`）—— 改正文就意味着换 key。原地
+        UPDATE 会让同一个 key 在不同时间指向不同内容，而下游（去重 / 链回溯 /
+        导出 / 代理手里的 key）都把 key 当**内容身份** ⇒ 改完所有人手里的 key
+        都指向新内容、旧内容不可寻址。改写 = 新条目 + 旧条目转链身
+        （`is_latest='0'` + `superseded_by`），演化链因此完整可回溯
+        （语义与 `pipeline._do_update` 的 UPDATE 动作逐条同款）。
+
+        返回 `(状态, 载荷)`，形状见 `StorageBase.cas_update`。
+        """
+        if not key:
+            return ("not_found", None)
+        content = str(fields.get("content") or "")
+        if not content.strip():
+            raise ValueError("storage_pg: cas_update 的 content 不能为空")
+        self._require_rev()
+        # 正文换了 ⇒ content_tsv / embedding 换了 ⇒ N/avgdl/df 快照陈旧
+        # （与 store / upsert 同款，必须同事务外立即失效）。
+        self._snap_drop(*self._SNAPSHOT_GROUPS)
+
+        with self._tx() as cur:
+            # 🔴 FOR UPDATE：同事务里取现值再改 —— 不加锁的话两个并发写会同时
+            #    读到同一版 rev，然后双双通过比对 ⇒ 内容分叉（正是要防的事）。
+            cur.execute(
+                "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                "COALESCE(created, ''), COALESCE(category, ''), "
+                "COALESCE(source, ''), COALESCE(fragment_type, ''), "
+                "COALESCE(sentiment_score, ''), COALESCE(sentiment_label, ''), "
+                "COALESCE(feedback_score, '0'), COALESCE(applicability, ''), "
+                "COALESCE(valid_until, ''), COALESCE(is_archived, ''), "
+                "COALESCE(supersedes, '') "
+                "FROM ks_fragment WHERE key = %s FOR UPDATE",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return ("not_found", None)
+            head = self._resolve_chain_head(cur, row)
+            if head is None:
+                return ("not_found", None)
+            if head["key"] != key:
+                # 目标已经不是链头 ⇒ **有人先改了它** ⇒ 冲突（载荷指向当前链头）
+                return ("conflict", self._conflict_payload(head))
+            # 🔴 `expected_rev` 空 = **不做版本校验**（老调用方的兼容路径）。
+            #    并发场景下**必须**传，否则照样分叉。
+            want_rev = str(expected_rev or "").strip()
+            if want_rev and head["rev"] != want_rev:
+                return ("conflict", self._conflict_payload(head))
+
+            # ---- 版本对上了：建新版本行 + 封旧边（同一个事务）----
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+            new_key = self._free_fragment_key(cur, self._fragment_key_for(content))
+            new_rev = next_rev(head["rev"])
+
+            entities = extract_entities(content)
+            entities_str = ",".join(entities) if entities else ""
+            keywords = extract_keywords(content, max_keywords=5)
+            if fields.get("sentiment_score") is None or fields.get("sentiment_label") is None:
+                intensity, label = analyze_emotion(content)
+            else:
+                intensity = float(fields["sentiment_score"])
+                label = str(fields["sentiment_label"])
+
+            new_tags = fields.get("tags")
+            new_tags = str(new_tags if new_tags is not None else row[3])
+            new_category = str(fields.get("category") or row[7] or "")
+            new_source = str(fields.get("source") or row[8] or "")
+            new_type = str(fields.get("fragment_type") or row[9] or "")
+            new_app = fields.get("applicability")
+            new_app = str(new_app if new_app is not None else (row[13] or ""))
+            reason = str(fields.get("supersede_reason") or "")
+            feedback = row[12] or "0"
+
+            tsv_params = tsv_expr_params(content, entities_str, new_tags)
+            vec = self._text_to_vector(content)
+            vec_sql = "%s::vector" if vec else "NULL::vector"
+            cur.execute(
+                f"""
+                INSERT INTO ks_fragment (
+                    key, content, tags, category, source, created,
+                    sentiment_score, sentiment_label, feedback_score,
+                    entities, fragment_type, content_tsv, embedding,
+                    is_latest, supersedes, supersede_reason, applicability, rev
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          {TSV_SETWEIGHT_SQL}, {vec_sql}, %s, %s, %s, %s, %s)
+                """,
+                (
+                    new_key, content, new_tags, new_category, new_source, now_iso,
+                    str(intensity), label, feedback,
+                    entities_str, new_type,
+                    *tsv_params,
+                    *([self._vector_literal(vec)] if vec else []),
+                    "1", append_supersedes("", key), reason, new_app, new_rev,
+                ),
+            )
+            # 封旧边：旧条转链身（语义与 `supersede_fragment` / pipeline UPDATE 同款）
+            cur.execute(
+                "UPDATE ks_fragment SET superseded_by = %s, superseded_at = %s, "
+                "is_latest = '0' WHERE key = %s",
+                (new_key, now_iso, key),
+            )
+            self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
+            if entities:
+                self._record_entity_cooc(cur, entities, now_ts=now.timestamp())
+                self._insert_many(
+                    cur, "ks_entity_timeline", ("entity", "frag_key", "ts"),
+                    [(ent, new_key, now.timestamp()) for ent in entities],
+                    "ON CONFLICT (entity, frag_key) DO UPDATE SET ts = EXCLUDED.ts",
+                )
+            self._record_topics(cur, keywords, label, now_ts=now.timestamp())
+            return ("ok", {"new_key": new_key, "new_rev": new_rev, "old_key": key})
+
+    def cas_remove(
+        self,
+        key: str,
+        expected_rev: str = "",
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """CAS 删除一条碎片（版本对不上 ⇒ **不删**，回报冲突载荷）。
+
+        🔴 删的是**链头**：目标已经被人改过（成了链身）⇒ 冲突而不是删 ——
+        否则「按旧版本号删记忆」会删掉别人刚写的新一版。
+        """
+        if not key:
+            return ("not_found", None)
+        self._require_rev()
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                "COALESCE(created, '') FROM ks_fragment WHERE key = %s FOR UPDATE",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return ("not_found", None)
+            head = self._resolve_chain_head(cur, row)
+            if head is None:
+                return ("not_found", None)
+            want_rev = str(expected_rev or "").strip()
+            if head["key"] != key or (want_rev and head["rev"] != want_rev):
+                return ("conflict", self._conflict_payload(head))
+            cur.execute("DELETE FROM ks_fragment WHERE key = %s", (key,))
+            cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = %s", (key,))
+            return ("ok", None)
+
+    def _resolve_chain_head(self, cur: Any, row: tuple) -> Optional[Dict[str, Any]]:
+        """给定目标行 ⇒ 它**当前的链头**（必要时沿 `superseded_by` 回溯）。
+
+        为什么要回溯：目标 key 可能**已经被人改过**（成了链身，superseded_by
+        指向新一版）。此时「目标行的 rev」还是旧值，光比 rev 会**误判成通过**
+        ⇒ 第二个写会从链身再分叉出一条新链（内容分叉回来了）。
+        所以判据是「**我是不是当前链头**」+「版本对不对」，两条都要成立。
+
+        找不到链头（链头被删了）⇒ 返回 None ⇒ 上层判 not_found。
+        """
+        if is_chain_head(row[4]) or not row[5]:
+            return {
+                "key": row[0], "rev": rev_of(row[1]), "content": row[2] or "",
+                "tags": row[3] or "", "updated_at": row[6] or "",
+            }
+        return self._follow_chain_head(cur, row[5])
+
+    def _follow_chain_head(self, cur: Any, key: str, max_hops: int = 20
+                           ) -> Optional[Dict[str, Any]]:
+        """沿 `superseded_by` 回溯到当前链头（返回链头那行的关键字段）。
+
+        `max_hops` 是防环保险：链是单向的（superseded_by 只指向更新的一版），
+        但历史数据可能被人手工改过 ⇒ 兜一个上限，不许无限转圈。
+        """
+        current = key
+        for _ in range(max_hops):
+            cur.execute(
+                "SELECT key, COALESCE(rev, '1'), content, COALESCE(tags, ''), "
+                "COALESCE(is_latest, '1'), COALESCE(superseded_by, ''), "
+                "COALESCE(created, '') FROM ks_fragment WHERE key = %s",
+                (current,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if is_chain_head(row[4]) or not row[5]:
+                return {
+                    "key": row[0], "rev": rev_of(row[1]), "content": row[2] or "",
+                    "tags": row[3] or "", "updated_at": row[6] or "",
+                }
+            current = row[5]
+        return None
+
+    @staticmethod
+    def _conflict_payload(head: Dict[str, Any]) -> Dict[str, Any]:
+        """conflict 载荷：**当前链头**的最新内容 + 版本号 + 归属 + 时间。
+
+        🔴 载荷里给的是「链头」而不是「你提交的那一行」：输的一方必须拿到
+        **对方刚写进去的那一版**（否则它只能再读一遍才知道自己被覆盖了什么）。
+        """
+        return {
+            "current_key": head["key"],
+            "current_rev": head["rev"],
+            "current_content": head["content"],
+            "updated_owner": fragment_owner(head.get("tags", "")),
+            "updated_at": head.get("updated_at", ""),
+        }
+
+    def _free_fragment_key(self, cur: Any, base: str) -> str:
+        """找一个没被占用的 key（内容哈希 base；被占则加 `:<epoch>` 后缀）。
+
+        🔴 与 `store()` 的同内容去重路径**同一套规则**（base → base:`<epoch>`）：
+        新正文算出的哈希可能已经存在（别处写过同一段内容）⇒ 不能复用那个 key
+        （主键唯一约束会撞）。撞了就另起一个带 epoch 的 key。
+        """
+        cur.execute("SELECT 1 FROM ks_fragment WHERE key = %s", (base,))
+        if cur.fetchone() is None:
+            return base
+        stamp = int(time.time())
+        for n in range(0, 20):
+            candidate = f"{base}:{stamp}" if n == 0 else f"{base}:{stamp}:{n}"
+            cur.execute("SELECT 1 FROM ks_fragment WHERE key = %s", (candidate,))
+            if cur.fetchone() is None:
+                return candidate
+        raise RuntimeError(
+            f"storage_pg: 为内容哈希 {base} 找空闲 key 失败（20 次都撞车）"
+        )
 
     @with_deadlock_retry
     def reassign_agent(self, old_id: str, new_id: str) -> int:

@@ -254,17 +254,33 @@ def append_supersedes(existing: Any, old_key: str) -> str:
     （不是数组）。老库里就是那个形态，解不开就当「单元素列表」读进来，
     写回时补成数组 —— 读-改-写一次就自愈，不为一行老数据跑迁移。
     """
-    keys: List[str] = []
-    raw = (existing or "").strip() if isinstance(existing, str) else ""
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            keys = [str(k) for k in parsed] if isinstance(parsed, list) else [str(parsed)]
-        except (ValueError, TypeError):
-            keys = [raw]                       # 老形态：裸 key 串
+    keys = parse_supersedes(existing)
     if old_key and old_key not in keys:
         keys.append(old_key)
     return json.dumps(keys, ensure_ascii=False)
+
+
+def parse_supersedes(existing: Any) -> List[str]:
+    """`supersedes` 值 → key 列表（**只读不改**；写回用 `append_supersedes`）。
+
+    容忍两种历史形态（与 `append_supersedes` 同一把尺子）：
+      * 契约 v2 之后 = JSON 数组 `["key1","key2"]`；
+      * 契约 v2 之前 = **裸 key 串**（解不开就当「单元素列表」读）。
+
+    🔴 单点化的理由：控制台要画「演化链」就得读回这根列，解析规则必须与写侧
+    逐字同源 —— 两处各写一份，链在控制台上就会**断一截**（写的明明是数组，
+    读出来当裸串，于是只认得第一个 key）。
+    """
+    raw = (existing or "").strip() if isinstance(existing, str) else ""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return [raw]                           # 老形态：裸 key 串
+    if isinstance(parsed, list):
+        return [str(k) for k in parsed]
+    return [str(parsed)]
 
 
 def is_chain_head(value: Any) -> bool:
@@ -282,6 +298,55 @@ def is_chain_head(value: Any) -> bool:
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("utf-8", "replace")
     return str(value or "1").strip() != "0"
+
+
+# ---------------------------------------------------------------------------
+# 乐观并发版本号 rev（2026-10 ks_memory_rev_cas）
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么是乐观并发（CAS），不是悲观锁**：共享记忆被多个代理同时读写，
+#   悲观持有锁会引出「孤儿锁 / TTL / 续期 / 崩溃释放」一整套子系统，而代理
+#   随时可能被杀掉 ⇒ 锁会跟着进坟墓。乐观并发只多存一列：读的时候把 rev
+#   带出来，写的时候声明 expected_rev，对不上就**拒绝并回最新内容**，
+#   让代理自己重新读、合并后再提交。
+#   思路来源：HTTP 的 ETag / If-Match、CouchDB 的 _rev。
+#
+#: rev 列名（三后端同名：PG / SQLite 是列，Redis 是 hash 字段）。
+REV_COLUMN = "rev"
+
+#: 存量行的 rev：ALTER 补列时统一落 '1' ⇒ 迁移后行为与迁移前逐字一致。
+DEFAULT_REV = "1"
+
+
+def rev_of(row: Any) -> str:
+    """取一条碎片的 rev（缺列 / 空值 ⇒ '1'）。
+
+    🔴 **缺列环境容错**：老库未迁移时读路径根本 SELECT 不到 rev（列清单被
+    剔掉了）⇒ 这里兜成 '1'。调用方拿到的是「和迁移前一样」的版本号，
+    不会因为缺列而把所有写都拒掉（那等于全库只读，比不做还糟）。
+    """
+    if isinstance(row, dict):
+        value = row.get(REV_COLUMN)
+    else:
+        value = row
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    text = str(value or "").strip()
+    return text or DEFAULT_REV
+
+
+def next_rev(rev: Any) -> str:
+    """下一个版本号 = 当前版本号 + 1（非数字 ⇒ 回落 '2'，不抛）。
+
+    为什么宽容：rev 是 text 列（不是 int），历史值可能是任何东西；解析不出来
+    就当它是第 1 版。**冲突判定靠的是「相等」不是「大小」**，所以版本号解析
+    失败不会造成静默覆盖 —— 顶多让两个并发写都判成冲突（安全方向）。
+    """
+    text = str(rev or "").strip()
+    try:
+        return str(int(text) + 1)
+    except (TypeError, ValueError):
+        return "2"
 
 
 #: 意图惰性过期后打上的「已过期事实」标签（Hy-Memory 移植语义）。

@@ -78,15 +78,41 @@ class MemoryProvider(Protocol):
     def update(
         self,
         key: str,
+        text: str,
+        expected_rev: str = "",
         *,
-        content: Optional[str] = None,
-        tags: Optional[str] = None,
-    ) -> bool:
-        """局部更新；key 不存在或后端失败返回 False。"""
+        tags: str = "",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """**乐观并发（CAS）改写**一条记忆（2026-10 ks_memory_rev_cas）。
+
+        🔴 **为什么要 CAS**：共享记忆被多个代理同时读写。两个代理基于同一版
+        各自改写 ⇒ 各存一条（key=内容哈希）⇒ **互相看不见对方**（内容分叉，
+        检索时两条都命中，代理却以为自己改成功了）。乐观并发（HTTP ETag /
+        If-Match、CouchDB _rev）把「我读到的还是不是最新版」变成一次可判定的
+        比对：**读带 rev，写声明 expected_rev，对不上就拒并回最新内容**。
+
+        `expected_rev` 空串 = **不做版本校验**（老调用方的兼容路径；
+        但并发场景下**必须**传，否则照样分叉）。
+
+        返回结构（**结构化，不抛裸异常** —— 代理要能读懂并重试）：
+
+          * 成功：`{"ok": True, "key": <新 key>, "rev": <新 rev>, "previous_key": …}`
+          * 冲突：`{"error": "conflict", "current_rev":…, "current_content":…,
+            "updated_by":…, "current_key":…}` ← **带对方最新内容**，据此合并重提
+          * 不存在：`{"error": "not_found"}`
+
+        🔴 **后端不支持 CAS 时必须抛错**（不许静默降级成「无条件覆盖」——
+        那会让调用方拿到「成功」回执，而并发写照样分叉）。
+        """
         ...
 
-    def remove(self, target: str) -> bool:
-        """删除；key 不存在或后端失败返回 False。"""
+    def remove(self, target: str, expected_rev: str = "") -> Any:
+        """删除；key 不存在或后端失败返回 False。
+
+        `expected_rev` 给了 ⇒ **CAS 删除**：版本对不上返回**同款 conflict 结构**
+        （与 `update()` 同形），且**行仍在**（不删）；不给 ⇒ **现行为逐字不变**。
+        """
         ...
 
     # ---- 维护层 ----

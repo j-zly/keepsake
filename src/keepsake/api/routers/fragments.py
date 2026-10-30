@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from keepsake.core.shared import parse_supersedes, rev_of
 from keepsake.govern.visibility import fragment_owner
 
 from .. import config
@@ -74,6 +75,9 @@ def _to_item(row: Dict[str, Any]) -> FragmentItem:
         content=_render(row),
         updated_at=_updated_at(row),
         score=_score(row),
+        # rev（2026-10 ks_memory_rev_cas）：乐观并发版本号。缺列环境兜成 '1'
+        #（=「和迁移前一样」），控制台据此显示版本徽标。
+        rev=rev_of(row),
     )
 
 
@@ -164,6 +168,67 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+#: 演化链回溯的**上限**（防环保险：链是单向的，但历史数据可能被人手工改过）。
+_CHAIN_MAX_HOPS = 20
+
+
+def _chain_rows(storage: Any, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """这条记忆的**演化链**（最老 → 最新）。
+
+    🔴 **为什么要有链**：改写一条记忆 = **新建一个条目 + 旧条目转链身**
+    （key 是内容哈希，正文一变 key 就变）。于是「这条记忆被改过几版」不是一堆
+    散条目，而是一条**有向链**：
+      * `supersedes`（JSON 数组）= 本条顶掉了哪些旧 key ⇒ 往**回**走；
+      * `superseded_by` = 谁顶了本条 ⇒ 往**前**走。
+
+    解析规则复用 `core.shared.parse_supersedes`（与写侧 `append_supersedes`
+    **同一把尺子**，含契约 v2 之前的裸 key 形态）—— 两侧各写一份，链就会在
+    控制台上断一截。
+    """
+    back: List[Dict[str, Any]] = []
+    seen: set = set()
+    cur = row
+    while len(back) <= _CHAIN_MAX_HOPS:
+        key = str(cur.get("key") or "")
+        if key:
+            seen.add(key)
+        nxt = next((k for k in parse_supersedes(cur.get("supersedes")) if k not in seen), "")
+        if not nxt:
+            break
+        parent = storage.get_fragment(nxt)
+        if not parent:
+            break
+        back.append(parent)
+        cur = parent
+    back.reverse()                      # 最老 → 当前
+    chain: List[Dict[str, Any]] = list(back)
+    cur = row
+    while len(chain) <= _CHAIN_MAX_HOPS:
+        nxt_key = str(cur.get("superseded_by") or "")
+        if not nxt_key or nxt_key in seen:
+            break
+        nxt = storage.get_fragment(nxt_key)
+        if not nxt:
+            break
+        seen.add(nxt_key)
+        chain.append(nxt)
+        cur = nxt
+    return chain
+
+
+def _chain_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    """链上一个版本的展示形态（前端只认这几个键）。"""
+    return {
+        "key": str(row.get("key") or ""),
+        "rev": rev_of(row),
+        "content": _preview(str(row.get("content", ""))),
+        "tags": str(row.get("tags", "")),
+        "created_at": str(row.get("created", "") or ""),
+        "updated_at": _updated_at(row),
+        "is_latest": str(row.get("is_latest", "1") or "1") != "0",
+    }
+
+
 @router.get("/api/v1/fragments/{key}", response_model=FragmentDetail,
             dependencies=[Depends(require_session)])
 def get_fragment(key: str, storage: Any = Depends(get_storage)) -> FragmentDetail:
@@ -188,5 +253,7 @@ def get_fragment(key: str, storage: Any = Depends(get_storage)) -> FragmentDetai
         created_at=str(row.get("created", "") or ""),
         updated_at=_updated_at(row),
         score=_score(row),
+        rev=rev_of(row),
+        chain=[_chain_item(r) for r in _chain_rows(storage, row)],
         raw={k: _jsonable(v) for k, v in row.items() if k != "key"},
     )
