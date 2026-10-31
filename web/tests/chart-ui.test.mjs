@@ -24,7 +24,7 @@ import {
   gaugeOption,
   sparkOption,
 } from '../src/utils/chart-kit.js'
-import { CHART_PALETTE, chartPalette, usageColor } from '../src/utils/chart-theme.js'
+import { CHART_PALETTE, chartPalette, completionColor, usageColor } from '../src/utils/chart-theme.js'
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
@@ -93,6 +93,31 @@ test('① usageColor 的三档阈值（≥100 危险 / ≥90 告警 / 其余强�
   assert.equal(usageColor(90, p), p.warn)
   assert.equal(usageColor(89.9, p), p.accent)
   assert.equal(usageColor(0, p), p.accent)
+})
+
+// 🔴 2026-10 ks_cas_hard 第零部分：完成率的色档与**占用**色档是**两套**。
+//   占用（usageColor）：越高越危险（≥100 红）—— 水位条用它，档位是对的。
+//   完成率（completionColor）：越高越好 —— 100% 必须是**绿**，不是红。
+//   用户实锤过：待办完成率环 100% 显示红色 ⇒ 复用了 usageColor。
+
+test('① completionColor 的三档（100 绿 / 中间红 / 0 或缺失中性蓝）', () => {
+  const p = chartPalette()
+  assert.equal(completionColor(100, p), p.ok, '全销掉了 ⇒ 绿')
+  assert.equal(completionColor(120, p), p.ok)
+  assert.equal(completionColor(50, p), p.danger, '还有没销掉的 ⇒ 红')
+  assert.equal(completionColor(0.5, p), p.danger)
+  assert.equal(completionColor(0, p), p.accent, '0 条待办 ⇒ 中性蓝（不是满屏红）')
+  assert.equal(completionColor(undefined, p), p.accent, '数据缺失 ⇒ 中性蓝')
+  assert.equal(completionColor(NaN, p), p.accent)
+  assert.equal(completionColor('abc', p), p.accent)
+})
+
+test('① 完成率环用 completionColor（不许再复用占用档 usageColor）', () => {
+  const stats = read('views/StatsView.vue')
+  assert.match(stats, /color: completionColor\(todoPercent\.value, p\)/,
+    '完成率环的颜色必须走 completionColor')
+  assert.doesNotMatch(stats, /usageColor\(todoPercent/,
+    '完成率不许再走占用档 usageColor（100% 会被画成红色）')
 })
 
 // ---------------------------------------------------------------- ② 按需引入

@@ -10,7 +10,8 @@
      （断言**无内容分叉、无静默覆盖**）；
   4. 改写不存在的 key ⇒ `not_found`；
   5. 删除：带错 `expected_rev` ⇒ conflict 且**行仍在**；带对 ⇒ 删成功；
-     **不带 ⇒ 现行为逐字不变**；
+     **provider / storage 层不带 ⇒ 现行为逐字不变**（**MCP 对外层不带 ⇒ 一律拒**，
+     见 ⑧ —— ks_cas_hard 的 fail-closed 收紧）；
   6. 归属：caller A 不能改 caller B 名下的碎片（primary 全量）；
   7. Redis 后端改写 ⇒ 抛 `backend_unsupported`（**显式降级，不许静默**）。
 
@@ -327,8 +328,13 @@ def test_mcp_memory_update返回结构化冲突(db_path):
 
 
 def test_mcp_memory_remove带expected_rev(db_path):
-    """MCP 层删除：版本对不上 ⇒ **不删**并回冲突；不带 ⇒ 现行为。"""
-    from keepsake.mcp_server.tools import memory_remove
+    """MCP 层删除：版本对不上 ⇒ **不删**并回冲突；**不带版本号 ⇒ 一律拒**。
+
+    🔴 2026-10 ks_cas_hard：MCP 对外 **fail-closed** —— 空串不再兼容成
+    「无条件删除」。**provider / storage 内部**的空串路径仍合法（上面两条
+    provider 层用例就是）。
+    """
+    from keepsake.mcp_server.tools import ToolError, memory_remove
 
     p = _make_provider(db_path)
     try:
@@ -342,7 +348,10 @@ def test_mcp_memory_remove带expected_rev(db_path):
         assert p.get(key) is None
 
         key2 = p.add("MCP 删除测试 不带版本号")
-        assert memory_remove(p, key2, True).get("removed") is True
+        with pytest.raises(ToolError) as exc:
+            memory_remove(p, key2, True)
+        assert "memory_get" in str(exc.value), str(exc.value)
+        assert p.get(key2) is not None, "不带版本号不许删"
     finally:
         p._storage.close()
 

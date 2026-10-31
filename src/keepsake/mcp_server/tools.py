@@ -565,6 +565,12 @@ def memory_update(provider: Any, key: str, text: str, expected_rev: str,
     各自改写 ⇒ 各存一条（key=内容哈希）⇒ **互相看不见对方**（内容分叉）。
     带 rev 提交就是对不上就拒 —— 宁可拒一次，也不要静默分叉。
 
+    🔴 **MCP 对外必带版本（fail-closed，2026-10 ks_cas_hard）**：记忆是核心资产，
+    **不许留软口子** —— `expected_rev` 为空一律拒（不再兼容「空串 = 跳过版本
+    校验」的老路径）。**storage / provider 内部**的 `cas_update` / `cas_remove`
+    仍保留空串兼容路径（班车 / 提炼 cron / 控制台直调 provider 的写路**不动**），
+    但**不对外** —— 对外只有这一道闸。
+
     🔴 **归属**：非 owner 不能改别人的条目（primary 全量）。core 内容照旧
     走候选审核队列（**不开直通**）。
 
@@ -578,7 +584,13 @@ def memory_update(provider: Any, key: str, text: str, expected_rev: str,
         raise ToolError("key 不能为空")
     if not text or not text.strip():
         raise ToolError("text 不能为空")
-    out = _update_memory(provider, key, text.strip(), expected_rev or "", tags or "",
+    if not str(expected_rev or "").strip():
+        raise ToolError(
+            "并发安全要求带版本号改写：先 memory_get(key) 取 rev，"
+            "再带 expected_rev 提交（版本对不上会拒并回最新内容，"
+            "重读合并再提，勿硬写）"
+        )
+    out = _update_memory(provider, key, text.strip(), str(expected_rev).strip(), tags or "",
                          caller_agent_id=caller_agent_id, caller_role=caller_role)
     if out.get("ok"):
         return out
@@ -630,9 +642,11 @@ def memory_remove(provider: Any, key: str, confirm: bool = False, *,
     别人的条目 —— **含已共享代理的** —— 一律拒（只回「不是你的记忆」，
     **不回显任何正文**）。primary 全量可删（= 主脑现状逐字不变）。
 
-    🔴 `expected_rev`（2026-10 ks_memory_rev_cas，**可选**）：给了 ⇒ **CAS 删除**
-    —— 版本对不上就**不删**，并把最新内容回给你（冲突结构同 `memory_update`）；
-    **不给 ⇒ 现行为逐字不变**（向后兼容已接入的老代理）。
+    🔴 `expected_rev`（2026-10 ks_memory_rev_cas → ks_cas_hard，**MCP 对外必带**）：
+    **CAS 删除** —— 版本对不上就**不删**，并把最新内容回给你（冲突结构同
+    `memory_update`）。**空串/不给 ⇒ 一律拒**（记忆是核心资产，不留软口子）；
+    **storage / provider 内部**的 `cas_remove` 仍保留空串兼容路径（班车 / 提炼
+    cron / 控制台直调 provider 的写路**不动**），但**不对外**。
     """
     if not key:
         raise ToolError("key 不能为空")
@@ -640,17 +654,19 @@ def memory_remove(provider: Any, key: str, confirm: bool = False, *,
         raise ToolError(
             f"删除需要显式确认：确认后请重新调用 memory_remove(key={key!r}, confirm=True)"
         )
+    if not str(expected_rev or "").strip():
+        raise ToolError(
+            "并发安全要求带版本号删除：先 memory_get(key) 取 rev，"
+            "再带 expected_rev 提交（版本对不上会拒并回最新内容，"
+            "重读确认后再删，勿硬删）"
+        )
     if not _can_remove(provider, key, caller_agent_id, caller_role):
         raise ToolError(REMOVE_NOT_OWNER)
-    if expected_rev:
-        out = _remove_memory_cas(provider, key, expected_rev)
-        if out.get("error") == "conflict":
-            return out
-        if not out.get("ok"):
-            raise ToolError(f"删除失败（key 不存在或后端不可用）：{key}")
-        return {"key": key, "removed": True}
-    ok = provider.remove(key)
-    if not ok:
+    # 🔴 删除**只走 CAS**（无条件删除分支已删 —— 那正是要防的静默覆盖）。
+    out = _remove_memory_cas(provider, key, str(expected_rev).strip())
+    if out.get("error") == "conflict":
+        return out
+    if not out.get("ok"):
         raise ToolError(f"删除失败（key 不存在或后端不可用）：{key}")
     return {"key": key, "removed": True}
 
@@ -1383,8 +1399,9 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_update",
-        description="乐观并发改写一条记忆（CAS）：先 memory_get 拿它的 rev，"
-                    "改完内容后带 expected_rev 提交。版本对不上就拒绝并回最新内容"
+        description="乐观并发改写一条记忆（CAS）：必须先 memory_get 拿它的 rev，"
+                    "改完内容后带 expected_rev 提交（不带版本号一律拒）。"
+                    "版本对不上就拒绝并回最新内容"
                     "（error=conflict，带 current_content/current_rev）—— "
                     "收到冲突请重新读、合并后再提交，不要硬写。"
                     "子代理只能改自己的条目（别人的条目一律拒）。",
@@ -1398,11 +1415,12 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
 
     @server.tool(
         name="memory_remove",
-        description="删除一条记忆。必须 confirm=True，否则拒绝。"
-                    "子代理只能删自己的条目（别人的条目一律拒）。"
-                    "带 expected_rev 时按版本删（版本对不上就不删，并回最新内容）。",
+        description="删除一条记忆。必须 confirm=True，否则拒绝；"
+                    "必须带 expected_rev（先 memory_get 拿 rev，版本对不上就不删，"
+                    "并回最新内容）。"
+                    "子代理只能删自己的条目（别人的条目一律拒）。",
     )
-    def _remove(key: str, confirm: bool = False, expected_rev: str = "") -> Dict[str, Any]:
+    def _remove(key: str, expected_rev: str, confirm: bool = False) -> Dict[str, Any]:
         ident = _authorize("memory_remove")
         return memory_remove(provider, key, confirm,
                              expected_rev=expected_rev,

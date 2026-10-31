@@ -126,6 +126,31 @@ export function usageColor(percent, palette) {
 }
 
 /**
+ * **完成率**的配色档（与 `usageColor` 档位**相反**）。
+ *
+ * 🔴 **为什么不能复用 `usageColor`**：那一套是**占用**色档（越高越危险，
+ *   ≥100% 红），而完成率是**越高越好** —— 复用会把「100% 全销掉」画成红色
+ *   （用户实锤过这个 bug）。两套语义必须分开写。
+ *
+ * 🔴 三档：
+ *   * `percent >= 100` ⇒ `p.ok`（绿）—— 全销掉了；
+ *   * `percent <= 0` 或**数据缺失**（NaN / 非数字）⇒ `p.accent`（中性蓝）
+ *     —— 一条待办都没有时不该满屏红（那是「没数据」，不是「没完成」）；
+ *   * 其余 ⇒ `p.danger`（红）—— 还有没销掉的。
+ *
+ * @param {number} percent 完成率百分比
+ * @param {object} palette 色板
+ */
+export function completionColor(percent, palette) {
+  const p = palette || chartPalette()
+  const v = Number(percent)
+  if (!Number.isFinite(v)) return p.accent
+  if (v >= 100) return p.ok
+  if (v <= 0) return p.accent
+  return p.danger
+}
+
+/**
  * 订阅主题变化（`<html>` 的 `data-theme` / `class` 变了就回调）。
  *
  * 🔴 用 `MutationObserver` 而不是让每个组件各自 import 主题 store ——

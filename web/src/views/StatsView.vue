@@ -125,7 +125,7 @@
               <span class="todo-agent-pct num">{{ r.ratio }}%</span>
             </div>
             <div class="todo-agent-track">
-              <i :style="{ width: r.width + '%' }"></i>
+              <i :class="r.tone" :style="{ width: r.width + '%' }"></i>
             </div>
           </div>
           <button
@@ -455,7 +455,7 @@ import RingGauge from '../components/RingGauge.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, isOnline, loadAgentRows, ONLINE_HINT } from '../utils/agents'
-import { chartPalette, usageColor } from '../utils/chart-theme.js'
+import { chartPalette, completionColor } from '../utils/chart-theme.js'
 import { bucketByAgent, dayBreakdown, OTHER_KEY, stackLayout, topSeries } from '../utils/daily-by-agent'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
@@ -803,7 +803,9 @@ const gaugeMetrics = computed(() => {
   return [{
     label: '待办完成率',
     percent: todoPercent.value,
-    color: usageColor(todoPercent.value, p),
+    // 🔴 **完成率用 `completionColor`**，不用 `usageColor` —— 后者是**占用**
+    //    色档（越高越危险），会把「100% 全销掉」画成红色（用户实锤过的 bug）。
+    color: completionColor(todoPercent.value, p),
   }]
 })
 
@@ -1057,6 +1059,12 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize))
   height: 100%;
   border-radius: var(--r-chip);
   background: var(--accent);
+}
+/* 🔴 100% 的代理条走**绿**（`--ok`）—— 全销掉了。
+   其余（0 ~ 100 之间）维持蓝（上面的默认档）：小条组是满屏多行，
+   逐行标红会变成「满屏红」，看不出谁是谁。 */
+.todo-agent-track i.is-ok {
+  background: var(--ok);
 }
 /* ---------------------------------------------------------------- 按代理水位条组
  * 每代理一行：名字 + 百分比 + 细条 + 「字符 / 预算」。

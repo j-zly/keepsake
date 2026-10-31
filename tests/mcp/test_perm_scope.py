@@ -111,6 +111,13 @@ def _stored_tags(gov, key: str) -> List[str]:
     return [t.strip() for t in str(row.get("tags") or "").split(",") if t.strip()]
 
 
+def _rev(gov, key: str) -> str:
+    """这条的当前版本号（2026-10 ks_cas_hard：MCP 层删除**必须带 expected_rev**）。"""
+    row = gov.agent_gate.registry.storage.get_fragment(key) or {}
+    assert row, f"条目不存在：{key}"
+    return str(row.get("rev") or "1")
+
+
 # ---------------------------------------------------------------------------
 # A 组：删除权限按归属收窄
 # ---------------------------------------------------------------------------
@@ -119,7 +126,8 @@ def test_子代理删自己的条目通过_owner(gov, tmp_path):
     """🔴 ① 子代理删**自己**的条目 ⇒ 过（同质能力，只是范围限定在「自己的」）。"""
     keys = _seed(gov, tmp_path)
     _as_caller(gov, SUB)
-    out = call(gov, "memory_remove", key=keys["自己的"], confirm=True)
+    out = call(gov, "memory_remove", key=keys["自己的"], confirm=True,
+               expected_rev=_rev(gov, keys["自己的"]))
     assert out["removed"] is True, out
     assert gov.agent_gate.registry.storage.get_fragment(keys["自己的"]) is None
 
@@ -129,7 +137,8 @@ def test_子代理删他人条目被拒_owner(gov, tmp_path):
     keys = _seed(gov, tmp_path)
     _as_caller(gov, SUB)
     with pytest.raises(ToolError) as exc:
-        call(gov, "memory_remove", key=keys["别人的"], confirm=True)
+        call(gov, "memory_remove", key=keys["别人的"], confirm=True,
+             expected_rev=_rev(gov, keys["别人的"]))
     assert "不是你的" in str(exc.value), str(exc.value)
     # 🔴 别人的条目**还在**（没被删掉）
     assert gov.agent_gate.registry.storage.get_fragment(keys["别人的"]) is not None
@@ -141,7 +150,8 @@ def test_子代理删共享代理的条目也拒_owner(gov, tmp_path):
     gov.agent_gate.registry.set_share_memory(OTHER, True)
     _as_caller(gov, SUB)
     with pytest.raises(ToolError) as exc:
-        call(gov, "memory_remove", key=keys["别人的"], confirm=True)
+        call(gov, "memory_remove", key=keys["别人的"], confirm=True,
+             expected_rev=_rev(gov, keys["别人的"]))
     assert "不是你的" in str(exc.value), str(exc.value)
     assert gov.agent_gate.registry.storage.get_fragment(keys["别人的"]) is not None
 
@@ -150,7 +160,8 @@ def test_无归属老条目子代理可删_owner(gov, tmp_path):
     """🔴 ③ **无归属的老条目**（收紧前的公共数据）⇒ 子代理可删（与检索口径一致）。"""
     keys = _seed(gov, tmp_path)
     _as_caller(gov, SUB)
-    out = call(gov, "memory_remove", key=keys["老条目"], confirm=True)
+    out = call(gov, "memory_remove", key=keys["老条目"], confirm=True,
+               expected_rev=_rev(gov, keys["老条目"]))
     assert out["removed"] is True, out
     assert gov.agent_gate.registry.storage.get_fragment(keys["老条目"]) is None
 
@@ -158,7 +169,8 @@ def test_无归属老条目子代理可删_owner(gov, tmp_path):
 def test_primary删任意条目通过_owner(gov, tmp_path):
     """🔴 ④ primary 删任意条目 ⇒ 过（= 主脑现状逐字不变）。"""
     keys = _seed(gov, tmp_path)
-    out = call(gov, "memory_remove", key=keys["别人的"], confirm=True)
+    out = call(gov, "memory_remove", key=keys["别人的"], confirm=True,
+               expected_rev=_rev(gov, keys["别人的"]))
     assert out["removed"] is True, out
     assert gov.agent_gate.registry.storage.get_fragment(keys["别人的"]) is None
 

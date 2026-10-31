@@ -20,8 +20,11 @@ import {
   dueChipText,
   dueTone,
   groupByStatus,
+  todoAgentRows,
+  todoAgentTone,
 } from '../src/utils/todo.js'
 import { blankForm, todoFormError, todoPayload } from '../src/utils/todoForm.js'
+import { chartPalette, completionColor } from '../src/utils/chart-theme.js'
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
@@ -31,6 +34,7 @@ const DIALOG = read('components/TodoDialog.vue')
 const APP = read('App.vue')
 const API = read('api/index.js')
 const ROUTER = read('router/index.js')
+const STATS = read('views/StatsView.vue')
 
 // ---------------------------------------------------------------- 到期两态
 
@@ -84,6 +88,36 @@ test('完成率口径：已销掉（done + obsolete）÷ 全部', () => {
   assert.equal(completionPercent({ done: 3, obsolete: 1, total: 8 }), 50)
   assert.equal(completionPercent({ done: 0, obsolete: 0, total: 0 }), 0)
   assert.equal(completionPercent({}), 0)
+})
+
+// 🔴 2026-10 ks_cas_hard 第零部分：完成率的**配色**语义（越高越好），
+//   与「占用」档（越高越危险）相反 —— 混用会把 100% 画成红色。
+
+test('完成率配色：total=0 ⇒ 中性蓝（没数据，不是没完成）', () => {
+  const p = chartPalette()
+  const pct = completionPercent({ done: 0, obsolete: 0, total: 0 })
+  assert.equal(pct, 0)
+  assert.equal(completionColor(pct, p), p.accent, '0 条待办不许满屏红')
+})
+
+test('按代理小条：100% ⇒ 绿，其余 ⇒ 默认档（蓝，维持现状）', () => {
+  assert.equal(todoAgentTone(100), 'is-ok', '全销掉 ⇒ 绿')
+  assert.equal(todoAgentTone(120), 'is-ok')
+  assert.equal(todoAgentTone(50), '', '没全销掉 ⇒ 默认档（蓝）')
+  assert.equal(todoAgentTone(0), '', '没有待办 ⇒ 默认档（不是红）')
+  assert.equal(todoAgentTone(undefined), '')
+  const rows = todoAgentRows([
+    { agent: '甲', agent_id: 'a', ratio: 100 },
+    { agent: '乙', agent_id: 'b', ratio: 42 },
+  ])
+  assert.equal(rows[0].tone, 'is-ok')
+  assert.equal(rows[1].tone, '')
+})
+
+test('看板小条接上 tone（模板绑类名 + CSS 走令牌）', () => {
+  assert.match(STATS, /<i :class="r\.tone"/, '小条要按 tone 上色')
+  assert.match(STATS, /\.todo-agent-track i\.is-ok\s*\{[^}]*var\(--ok\)/,
+    '100% 的小条走 --ok 令牌（不写死色值）')
 })
 
 // ------------------------------------------------------------ 默认态 = 开放

@@ -269,22 +269,72 @@ def test_写入后能搜到并取回全文(server):
 
 
 def test_删除不带confirm_报错且数据还在(server):
-    """🔴 硬约束 2：不许静默返回 ok。"""
+    """🔴 硬约束 2：不许静默返回 ok。
+
+    🔴 2026-10 ks_cas_hard：`expected_rev` 在工具面上已是**必填**（schema 层
+    先拒），所以这里要**带上版本号**才轮得到 confirm 那道闸。
+    """
     key = call(server, "memory_add", text="待删除的记忆 探针")["key"]
+    rev = call(server, "memory_get", key=key)["rev"]
     with pytest.raises(ToolError) as exc:
-        call(server, "memory_remove", key=key)
+        call(server, "memory_remove", key=key, expected_rev=rev)
     assert "confirm" in str(exc.value)
     assert call(server, "memory_get", key=key)["content"] == "待删除的记忆 探针"
 
 
-def test_删除带confirm_成功且之后取不到(server):
+def test_删除整个不带expected_rev_参数层就拒(server):
+    """🔴 **工具面上 expected_rev 是必填参数** —— 压根不传 ⇒ schema 层就拒。"""
+    key = call(server, "memory_add", text="不带版本参数 探针")["key"]
+    with pytest.raises(ToolError) as exc:
+        call(server, "memory_remove", key=key, confirm=True)
+    assert "expected_rev" in str(exc.value), str(exc.value)
+    assert call(server, "memory_get", key=key)["content"] == "不带版本参数 探针"
+
+
+def test_删除带confirm带版本_成功且之后取不到(server):
+    """🔴 2026-10 ks_cas_hard：MCP 层删除**必须带 expected_rev**（fail-closed）。"""
     key = call(server, "memory_add", text="确认删除 探针")["key"]
-    assert call(server, "memory_remove", key=key, confirm=True)["removed"] is True
+    rev = call(server, "memory_get", key=key)["rev"]
+    out = call(server, "memory_remove", key=key, confirm=True, expected_rev=rev)
+    assert out["removed"] is True, out
     with pytest.raises(ToolError):
         call(server, "memory_get", key=key)
     # 重复删除 = 写层 fail-closed，不得谎报成功
     with pytest.raises(ToolError):
-        call(server, "memory_remove", key=key, confirm=True)
+        call(server, "memory_remove", key=key, confirm=True, expected_rev=rev)
+
+
+def test_删除不带版本号被拒_数据还在(server):
+    """🔴 **删必须带版本**：空 rev ⇒ 拒（并告诉调用方怎么拿 rev），且**绝不删**。"""
+    key = call(server, "memory_add", text="不带版本不许删 探针")["key"]
+    with pytest.raises(ToolError) as exc:
+        call(server, "memory_remove", key=key, confirm=True, expected_rev="")
+    assert "memory_get" in str(exc.value), str(exc.value)
+    assert call(server, "memory_get", key=key)["content"] == "不带版本不许删 探针"
+
+
+def test_改写不带版本号被拒_数据还在(server):
+    """🔴 **改必须带版本**：空 rev ⇒ 拒（并告诉调用方怎么拿 rev），且**绝不改**。"""
+    key = call(server, "memory_add", text="不带版本不许改 探针")["key"]
+    with pytest.raises(ToolError) as exc:
+        call(server, "memory_update", key=key, text="偷偷改写",
+             expected_rev="")
+    assert "memory_get" in str(exc.value), str(exc.value)
+    assert call(server, "memory_get", key=key)["content"] == "不带版本不许改 探针"
+
+
+def test_改写带版本成功且版本对不上回冲突(server):
+    """🔴 带对版本 ⇒ 成功；再用旧版本改 ⇒ `error=conflict`（结构化，不抛错）。"""
+    key = call(server, "memory_add", text="带版本改写 原文")["key"]
+    rev = call(server, "memory_get", key=key)["rev"]
+    out = call(server, "memory_update", key=key, text="带版本改写 新文",
+               expected_rev=rev)
+    assert out.get("ok") is True, out
+    conflict = call(server, "memory_update", key=key, text="带版本改写 再改",
+                    expected_rev=rev)
+    assert conflict.get("error") == "conflict", conflict
+    assert conflict["current_content"] == "带版本改写 新文"
+    assert conflict["current_rev"]
 
 
 def test_merge_dry_run_条数前后一致(server):

@@ -81,10 +81,12 @@ export function completionPercent(summary) {
  * * `agent` 是注册表里的显示名；`-` 桶 = 「未标注」（owner 查不到注册表），
  *   页面上显示成「未标注」—— 不假装它属于某个代理；
  * * 排序按完成率降序（谁完成得好排前面）；
- * * `width` 是细条的长度，封顶 100%（条不许画出卡片）。
+ * * `width` 是细条的长度，封顶 100%（条不许画出卡片）；
+ * * `tone` 是小条的**配色档**（见 `todoAgentTone`）：100% ⇒ 绿（`is-ok`），
+ *   其余 ⇒ 空串（默认档 = 蓝）。
  *
  * @param {object[]} byAgent 后端 `by_agent` 段（`[{agent, agent_id, ratio, ...}]`）
- * @returns {object[]} `{key, agent, agent_id, ratio, width}`
+ * @returns {object[]} `{key, agent, agent_id, ratio, width, tone}`
  */
 export function todoAgentRows(byAgent) {
   return (byAgent || [])
@@ -96,7 +98,30 @@ export function todoAgentRows(byAgent) {
         agent_id: r?.agent_id || '-',
         ratio,
         width: Math.min(100, Math.max(0, ratio)),
+        tone: todoAgentTone(ratio),
       }
     })
     .sort((a, b) => b.ratio - a.ratio)
+}
+
+/**
+ * 按代理小条的配色档。
+ *
+ * 🔴 **口径**：`ratio >= 100` ⇒ `'is-ok'`（绿，全销掉了）；其余 ⇒ `''`
+ *   （默认档 = 蓝 `var(--accent)` = 维持现状）。**0 / 缺失**也算蓝
+ *   （没有待办 ≠ 没完成，不该满屏红）。
+ *
+ * 🔴 **为什么中间档与看板的环不一样**（`completionColor` 里中间档是红）：
+ *   环是**单点**指标 —— 红 = 「还有没销掉的」，一眼要看出来；小条组是**满屏多行**
+ *   —— 每一行都标红就变成「满屏红」，反而看不出谁是谁。绿/蓝两档足够区分
+ *   「全销掉 / 没全销掉」。空串 = 默认档，是本页水位条组沿用的同一套写法。
+ *
+ * @param {number} ratio 该代理的完成率（%）
+ * @returns {string} `'is-ok'` / `''`（默认档）
+ */
+export function todoAgentTone(ratio) {
+  const v = Number(ratio)
+  if (!Number.isFinite(v) || v <= 0) return ''
+  if (v >= 100) return 'is-ok'
+  return ''
 }
