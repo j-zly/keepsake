@@ -679,9 +679,16 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
     cap = t["batch_cap"]
     backfill = int(t.get("nominate_backfill_hits") or 0)
     limit = max(HOT_SCAN_MIN, cap * HOT_SCAN_FACTOR)
+    # 🔴 **窗口锚点必须吃注入的 `now`**（规则一同规则二；漏接 = 测试红 +
+    # 未来可注入时钟做回填/对照实验时静默失真）：`since` 给了就从那一刻起算，
+    # `window_days` 作废（见 StorageBase.hits_stats）。不传 `since` ⇒ 三后端
+    # 内部退回「真挂钟减 window_days」，注入时钟形同虚设（生产语义不变：
+    # 生产 now_dt 就是真挂钟，窗口起点与现状等价 —— 只差「挂钟读在调用前
+    # 一点」那几微秒）。
+    since = now - timedelta(days=int(cfg["window_days"]))
     hot = storage.hits_stats(window_days=cfg["window_days"],
                              min_hits=cfg["nominate_min_hits"],
-                             keys=None, limit=limit) or []
+                             keys=None, limit=limit, since=since) or []
     keys = [str(r.get("key") or "") for r in hot if r.get("key")]
     rows = storage.get_fragments_batch(keys) if keys else {}
     if keys and not rows:

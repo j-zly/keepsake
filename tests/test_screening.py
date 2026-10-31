@@ -294,6 +294,7 @@ def _use_cfg(monkeypatch: Any, cfg: Dict[str, Any]) -> None:
 
 def test_memory_search默认不筛_返回逐字不变(monkeypatch):
     """🔴 回归闸：默认 false ⇒ 返回与接入前逐字一致（连 `screened` 键都没有）。"""
+    _use_cfg(monkeypatch, {"enabled": True, "default_on": False})
     provider = _FakeProvider(_hits(3))
     out = mcp_tools.memory_search(provider, "问题")
     assert "screened" not in out
