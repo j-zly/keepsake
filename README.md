@@ -241,7 +241,10 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
   "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
 
   // Query expansion (optional, on by default) — background LLM synonyms when BM25 hits < min_results
-  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
+  // max_content_len = retrieval-side length floor (chars). Entries longer than this are treated
+  // as noise and stay out of the retrieval surface. Default 5000 (the old hard limit of 600 hid
+  // 103 legitimate long entries in production). BM25's own length normalization handles relevance.
+  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}, "max_content_len": 5000},
 
   // Private-message push consumer (optional, OFF by default) — the provider hangs
   // an SSE stream on GET {base_url}/events so a fresh private message is noticed
@@ -454,6 +457,7 @@ Then reference it in config.json:
 | `entity_cooc_top_n` | — | `3` | Number of co-occurring entities to expand search |
 | `entity_cooc_min_count` | — | `2` | Min co-occurrence for entity association |
 | `retrieval.exclude_tags` | — | `core_candidate` | Tags (comma-separated) excluded from retrieval. Empty string = gate off. Resolved once in `initialize()` ⇒ **restart to apply**. See [Multi-Agent Memory Governance](#multi-agent-memory-governance) |
+| `retrieval.max_content_len` | — | `5000` | Retrieval-side **length floor**: entries longer than this many characters are treated as noise and stay out of the retrieval surface (all three backends). The old hard limit of `600` hid 103 legitimate long entries in production, so it is now a floor you can raise. Invalid values log a warning and fall back to `5000`. Length relevance itself is handled by BM25's document-length normalization (b=0.75) — no extra weight is added |
 | `push_consumer.enabled` | — | `false` | Whether the provider hangs an SSE stream (the private-message push consumer). Off = zero threads, zero connections. Read at process start ⇒ **restart the gateway to apply** |
 | `push_consumer.base_url` | — | `""` | SSE server root address (the consumer appends `/events` itself) |
 | `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | **Env var name** holding the stream credential (the credential value never lives in `config.json`). `push_consumer.credential_file` points at a secrets file instead |

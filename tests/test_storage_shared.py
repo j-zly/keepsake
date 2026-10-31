@@ -252,7 +252,10 @@ def test_storage_pg_is_actually_using_the_module():
                  "load_fragments_by_keys", "attention_boost_from_topics",
                  "hot_topic_weighted_hits", "SEARCH_FIELDS"):
         assert name in used, f"storage_pg.py import 了 {name} 却没真正使用"
-    assert storage_pg.MAX_CONTENT_LEN == 600      # 与 Redis 侧 600 字噪音上限对齐
+    # 2026-10 ks_lenfloor：长度地板**可配置**了 ⇒ 模块级 `MAX_CONTENT_LEN = 600`
+    # 退役为**类级默认**（缺省 5000，三后端同一个值，见 storage_shared 的长度地板一节）。
+    assert storage_pg.PgStorage.MAX_CONTENT_LEN == 5000
+    assert storage_pg.PgStorage.MAX_CONTENT_LEN is storage_shared.DEFAULT_MAX_CONTENT_LEN
 
 
 # ---------------------------------------------------------------- 迁移脚本的只读红线

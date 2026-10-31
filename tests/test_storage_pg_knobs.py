@@ -78,14 +78,19 @@ def test_pg_hot_topic_boost_reverts_to_constant_when_key_absent() -> None:
 
 
 def test_redis_branch_untouched() -> None:
-    """redis 分支行为不变：provider 口径的 kwargs 仍逐键落到 RedisStorage。"""
+    """redis 分支行为不变：provider 口径的 kwargs 仍逐键落到 RedisStorage。
+
+    2026-10 ks_lenfloor：多了一根 `max_content_len`（检索面长度地板，**从 cfg 读**，
+    不在 provider 的 kwargs 里）—— 其余键仍逐字原样落地。
+    """
     got = {}
     storage_from_config(
         config={"storage": {"backend": "redis"}},
         redis_cls=lambda **kw: got.update(kw),
         **CFG,
     )
-    assert got == CFG
+    assert {k: v for k, v in got.items() if k != "max_content_len"} == CFG
+    assert got["max_content_len"] == 5000
     real = RedisStorage(**CFG)
     for key, attr, _const in KNOBS:
         assert getattr(real, attr) == CFG[key]

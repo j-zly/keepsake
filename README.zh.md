@@ -235,7 +235,9 @@ memory:
   "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
 
   // 查询扩展（可选，默认开）— BM25 命中 < min_results 时后台 LLM 生成同义短词入缓存
-  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}},
+  // max_content_len = 检索面长度地板（字符）— 超过视为噪音、不进检索面；缺省 5000
+  // （旧的硬上限 600 曾把生产 103 条正经长条目整条隐身）。长度相关性由 BM25 归一承担。
+  "retrieval": {"query_expansion": {"enabled": true, "min_results": 3, "max_terms": 6, "cache_ttl": 86400}, "max_content_len": 5000},
 
   // 私信推送消费者（可选，**缺省关**）— provider 侧挂一条 SSE 流
   // （GET {base_url}/events），新私信**立刻**被看见，不必等下一轮对话。
@@ -440,6 +442,7 @@ yeah
 | `entity_cooc_top_n` | — | `3` | 搜索时扩展多少个关联实体 |
 | `entity_cooc_min_count` | — | `2` | 实体共现几次才算有效关联 |
 | `retrieval.exclude_tags` | — | `core_candidate` | 检索时要排除的标签（逗号分隔）。写空串 = 关闸。在 `initialize()` 里解析一次 ⇒ **改它要重启**。见「多代理记忆治理」节 |
+| `retrieval.max_content_len` | — | `5000` | 检索面的**长度地板**：正文超过这个字符数的条目视为噪音、**不进检索面**（三后端同尺）。旧的硬上限 `600` 曾把生产 103 条正经长条目整条隐身，现在是可配置的地板。非法值告警并回落 `5000`。长度本身的相关性由 BM25 的文档长度归一（b=0.75）承担，不另加权重 |
 | `push_consumer.enabled` | — | `false` | provider 侧是否挂 SSE 流（私信推送消费者）。关 = 零线程零连接。**进程启动时读** ⇒ 改它要重启网关 |
 | `push_consumer.base_url` | — | `""` | SSE 服务端根地址（消费者自己拼 `/events`） |
 | `push_consumer.credential_env` | `KEEPSAKE_PUSH_CREDENTIAL` | `KEEPSAKE_PUSH_CREDENTIAL` | 建流凭据的**环境变量名**（**凭据真值不落 config.json**）。另有 `push_consumer.credential_file` 指 secrets 文件 |

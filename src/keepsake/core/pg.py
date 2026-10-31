@@ -137,6 +137,10 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
     query_lexemes,
     tiebreak_by_key,
     tsv_lexemes,
+    # 检索面长度地板（2026-10 ks_lenfloor，见 storage_shared 的说明）
+    DEFAULT_MAX_CONTENT_LEN,
+    content_len_clause,
+    resolve_max_content_len,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 路径/连字符拆子词的 sanitize）。
 # 复用而不是重抄：上游 58bf19c/d00b7eb 修过这套的坑，两边各写一份必漂移。
@@ -156,7 +160,11 @@ DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
 # 旧配置键 `bm25_limit` 原样保留且优先，改配置即可回到小池做对照。
 DEFAULT_BM25_LIMIT = 200
 DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
-MAX_CONTENT_LEN = 600          # 超长条目视为噪音跳过（对齐 Redis search_bm25）
+# 🔴 2026-10 ks_lenfloor：模块级 `MAX_CONTENT_LEN = 600` **退役** ⇒ 改「类级默认」
+#    （`PgStorage.MAX_CONTENT_LEN`，缺省 5000，见 storage_shared 的长度地板一节）。
+#    600 旧值曾把 103 条生产正经条目（600–2408 字符）整条隐身 —— 条目 get 可取、
+#    search 零召回。地板**可配置**（retrieval.max_content_len，缺省 5000）；
+#    谓词吃实例值 `self._max_content_len`。
 TS_RANK_NORM = 32              # ts_rank_cd 归一化位：rank/(1+rank)（只用于召回窗口粗排）
 
 # ---- BM25 参数（与 RediSearch 默认逐字一致）----
@@ -957,6 +965,13 @@ class PgStorage(StorageBase):
     #: 本后端**支持**幂等键（真实现：`ks_idem_event` 登记表，见 `idem_lookup`）。
     supports_idempotency = True
 
+    #: 检索面长度地板的**类级默认**（2026-10 ks_lenfloor）—— 缺省 5000。
+    #: 实例值见 `self._max_content_len`（构造参数 `max_content_len` 覆盖它）。
+    #: 判据单点在 `storage_shared.is_noise_length` / `storage_shared.content_len_clause`。
+    MAX_CONTENT_LEN = DEFAULT_MAX_CONTENT_LEN
+    #: 类级兜底：`__new__` 造裸实例（不跑 `__init__`）时也能取到地板值。
+    _max_content_len = MAX_CONTENT_LEN
+
     # ---- 共用实现绑定（与 RedisStorage 绑的是**同一个函数对象**）----
     _rrf_fuse = rrf_fuse
     _apply_v2_filters = apply_v2_filters
@@ -1028,6 +1043,10 @@ class PgStorage(StorageBase):
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         final_limit: int = DEFAULT_FINAL_LIMIT,
         bm25_limit: int = DEFAULT_BM25_LIMIT,
+        # 2026-10 ks_lenfloor：检索面长度地板（超长条目视为噪音、不进检索面）。
+        # 缺省走**类级默认** `MAX_CONTENT_LEN`（5000）；配置来源见
+        # `storage_shared.max_content_len_from_config`（retrieval.max_content_len）。
+        max_content_len: Optional[int] = None,
         decay_half_days: int = DECAY_HALF_DAYS,
         attention_boost_max: float = 1.5,
         attention_base_increment: float = 2.0,
@@ -1076,6 +1095,9 @@ class PgStorage(StorageBase):
         self._candidate_count = int(candidate_count)
         self._final_limit = int(final_limit)
         self._bm25_limit = int(bm25_limit)
+        # 检索面长度地板（2026-10 ks_lenfloor）—— 谓词吃**实例值**，不写死 600。
+        self._max_content_len = resolve_max_content_len(
+            max_content_len, default=self.MAX_CONTENT_LEN)
         self._decay_half_days = int(decay_half_days)
         self._emotion_intensity_factor = float(emotion_intensity_factor)
         self._feedback_positive_boost = float(feedback_positive_boost)
@@ -1904,7 +1926,10 @@ class PgStorage(StorageBase):
         #    把整条检索打成 500，而实际只是「没有链概念的老数据照常可检索」。
         if not (self._contract_v2_missing() & {"is_latest"}):
             clauses.append(CHAIN_HEAD_SQL)
-        clauses.append(f"content <> '' AND length(content) <= {MAX_CONTENT_LEN}")
+        # 2026-10 ks_lenfloor：长度地板**可配置**（retrieval.max_content_len，缺省 5000）；
+        # 超长条目视为噪音跳过。600 旧值曾把 103 条生产正经条目整条隐身（2026-10 ks_lenfloor 案）。
+        # 谓词片段与 Redis 侧判据同源（storage_shared.content_len_clause）。
+        clauses.append(content_len_clause(self._max_content_len))
         return " AND ".join(clauses), params
 
     # 🔴 **候选阶段只回「极轻列 + md5(content)」**（2026-10 ks_pgr 收尾）。

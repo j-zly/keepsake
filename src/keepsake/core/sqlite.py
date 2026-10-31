@@ -154,6 +154,10 @@ from .shared import (
     query_lexemes,
     tiebreak_by_key,
     tsv_lexemes,
+    # 检索面长度地板（2026-10 ks_lenfloor，见 storage_shared 的说明）
+    DEFAULT_MAX_CONTENT_LEN,
+    content_len_clause,
+    resolve_max_content_len,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
 from .redis import _expand_terms, _sanitize_terms
@@ -162,7 +166,6 @@ from .pg import (
     DEFAULT_BM25_LIMIT,
     DEFAULT_CANDIDATE_COUNT,
     DEFAULT_FINAL_LIMIT,
-    MAX_CONTENT_LEN,
     _ATTENTION_SCOPES,
     _ATTENTION_TTL,
     _ENTITY_COOC_TTL,
@@ -518,6 +521,12 @@ class SqliteStorage(StorageBase):
     #: 本后端**支持**幂等键（真实现：`ks_idem_event` 登记表，见 `idem_lookup`）。
     supports_idempotency = True
 
+    #: 检索面长度地板的**类级默认**（2026-10 ks_lenfloor）—— 缺省 5000。
+    #: 实例值见 `self._max_content_len`（构造参数 `max_content_len` 覆盖它）。
+    MAX_CONTENT_LEN = DEFAULT_MAX_CONTENT_LEN
+    #: 类级兜底：`__new__` 造裸实例（不跑 `__init__`）时也能取到地板值。
+    _max_content_len = MAX_CONTENT_LEN
+
     # ---- 检索后处理：与 Redis / PG **同一个函数对象**（三后端一份实现）----
     _rrf_fuse = rrf_fuse
     _apply_v2_filters = apply_v2_filters
@@ -536,6 +545,10 @@ class SqliteStorage(StorageBase):
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         final_limit: int = DEFAULT_FINAL_LIMIT,
         bm25_limit: int = DEFAULT_BM25_LIMIT,
+        # 2026-10 ks_lenfloor：检索面长度地板（超长条目视为噪音、不进检索面）。
+        # 缺省走**类级默认** `MAX_CONTENT_LEN`（5000）；配置来源见
+        # `storage_shared.max_content_len_from_config`（retrieval.max_content_len）。
+        max_content_len: Optional[int] = None,
         decay_half_days: int = DECAY_HALF_DAYS,
         attention_boost_max: float = 1.5,
         attention_base_increment: float = 2.0,
@@ -583,6 +596,9 @@ class SqliteStorage(StorageBase):
         self._candidate_count = int(candidate_count)
         self._final_limit = int(final_limit)
         self._bm25_limit = int(bm25_limit)
+        # 检索面长度地板（2026-10 ks_lenfloor）—— 谓词吃**实例值**，不写死 600。
+        self._max_content_len = resolve_max_content_len(
+            max_content_len, default=self.MAX_CONTENT_LEN)
         self._decay_half_days = int(decay_half_days)
         self._emotion_intensity_factor = float(emotion_intensity_factor)
         self._feedback_positive_boost = float(feedback_positive_boost)
@@ -2101,7 +2117,10 @@ class SqliteStorage(StorageBase):
         # 契约 v2：只要链头（已被顶掉的链身不进检索面）—— 与上面两条同款口径。
         # 常驻层（list_by_tag 的 core 列表）**不加**，见 storage_shared 的说明。
         clauses.append(CHAIN_HEAD_SQL)
-        clauses.append(f"content <> '' AND length(content) <= {int(MAX_CONTENT_LEN)}")
+        # 2026-10 ks_lenfloor：长度地板**可配置**（retrieval.max_content_len，缺省 5000）；
+        # 超长条目视为噪音跳过。600 旧值曾把 103 条生产正经条目整条隐身（2026-10 ks_lenfloor 案）。
+        # 谓词片段与 PG 侧同源（storage_shared.content_len_clause）。
+        clauses.append(content_len_clause(self._max_content_len))
         return " AND ".join(clauses), params
 
     def _load_synonym_map(self) -> Dict[str, set]:

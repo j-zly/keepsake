@@ -57,6 +57,9 @@ from .shared import (          # noqa: F401 — 常量与函数均为有意 re-e
 )
 # 分词口径单源（2026-10 ks_recall_v1 / ks_en_stem）：与 PG / SQLite 侧同一个函数对象。
 from .shared import query_lexemes
+# 检索面长度地板（2026-10 ks_lenfloor）：与 PG / SQLite 侧同一把尺、同一份常量。
+from .shared import (DEFAULT_MAX_CONTENT_LEN, is_noise_length, max_content_len_from_config,
+                     resolve_max_content_len)
 # 词典收词判据单源（2026-10 ks_stem_fix）：纯 ASCII 词一律不进 jieba 词典。
 from .shared import jieba_dict_keep
 from ..domain.splitter import extract_keywords, extract_entities, segment_query, stem_english
@@ -355,6 +358,13 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             logger.warning("storage: 读配置失败 %s: %s", path, e)
 
     backend = resolve_backend(cfg)
+    # 2026-10 ks_lenfloor：检索面长度地板 —— **唯一配置源**在这里读一次，
+    # 三个分支共用同一个值（kwargs 显式传入时 kwargs 胜出，与 _resolve_knobs 同款口径）。
+    max_content_len = kwargs.get("max_content_len")
+    if max_content_len is None:
+        max_content_len = max_content_len_from_config(cfg)
+    else:
+        max_content_len = resolve_max_content_len(max_content_len)
     if backend == BACKEND_SQLITE:
         # 2026-10 ks_sqlite_p1：第三后端（嵌入式单文件、零第三方依赖）。
         # 只用标准库 sqlite3；`sqlite-vec` 留到第 3 批做**可选懒加载**。
@@ -376,6 +386,8 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             final_limit=int(cfg.get("top_k", 15)),
             bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
             candidate_count=int(cfg.get("candidate_k", 20)),
+            # 2026-10 ks_lenfloor：检索面长度地板（同源接线，见函数开头）
+            max_content_len=max_content_len,
             # 2026-10 ks_sqlite_p3_1：同义词三阈值**同源接线**（与 redis/provider 侧
             # 同一份 cfg 顶层键、同一组默认值；provider 把它们当 kwargs 传进来时
             # kwargs 胜出，口径与 _resolve_knobs 一致）。修前 sqlite 分支一个都不传
@@ -413,6 +425,8 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
             final_limit=int(cfg.get("top_k", 15)),
             bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
             candidate_count=int(cfg.get("candidate_k", 20)),
+            # 2026-10 ks_lenfloor：检索面长度地板（同源接线，见函数开头）
+            max_content_len=max_content_len,
             # 2026-10 ks_pg_syn：同义词三阈值**同源接线**（与 redis / sqlite 分支
             # 同一份 cfg 顶层键、同一组默认值 10/0.5/3；provider 把它们当 kwargs
             # 传进来时 kwargs 胜出，口径与 sqlite 分支逐字一致）。
@@ -433,7 +447,9 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
     # ⇒ kwargs 仍逐键胜出，**实例上 10 个键的值与修前逐键相同**（kwargs 里没有的键，
     #   修前取形参默认值 = 常量，修后取 cfg/常量；cfg 无该键时两者仍是同一个常量）。
     if kwargs:
-        return (redis_cls or RedisStorage)(**{**_resolve_knobs(cfg, {}), **kwargs})
+        return (redis_cls or RedisStorage)(**{**_resolve_knobs(cfg, {}),
+                                            "max_content_len": max_content_len,
+                                            **kwargs})
 
     return RedisStorage(
         host=cfg.get("redis_host", "127.0.0.1"),
@@ -446,6 +462,8 @@ def storage_from_config(config_path: Optional[str] = None, *, config: Optional[D
         final_limit=int(cfg.get("top_k", 15)),
         bm25_limit=int(cfg.get("bm25_limit", DEFAULT_BM25_LIMIT)),
         candidate_count=int(cfg.get("candidate_k", 20)),
+        # 2026-10 ks_lenfloor：检索面长度地板（同源接线，见函数开头）
+        max_content_len=max_content_len,
         **_resolve_knobs(cfg, {}),
     )
 
@@ -629,6 +647,13 @@ class RedisStorage(StorageBase):
     _rerank_with_decay = rerank_with_decay
     _load_fragments_by_keys = load_fragments_by_keys
 
+    #: 检索面长度地板的**类级默认**（2026-10 ks_lenfloor）—— 缺省 5000。
+    #: 实例值见 `self._max_content_len`（构造参数 `max_content_len` 覆盖它）。
+    #: 判据单点在 `storage_shared.is_noise_length`（与 PG/SQLite 的 SQL 谓词同源）。
+    MAX_CONTENT_LEN = DEFAULT_MAX_CONTENT_LEN
+    #: 类级兜底：`__new__` 造裸实例（不跑 `__init__`）时也能取到地板值。
+    _max_content_len = MAX_CONTENT_LEN
+
     def __init__(
         self,
         embedder: Optional[Embedder] = None,
@@ -639,6 +664,10 @@ class RedisStorage(StorageBase):
         final_limit: int = DEFAULT_FINAL_LIMIT,
         embed_dim: int = 1536,
         bm25_limit: int = DEFAULT_BM25_LIMIT,
+        # 2026-10 ks_lenfloor：检索面长度地板（超长条目视为噪音、不进检索面）。
+        # 缺省走**类级默认** `MAX_CONTENT_LEN`（5000）；配置来源见
+        # `storage_shared.max_content_len_from_config`（retrieval.max_content_len）。
+        max_content_len: Optional[int] = None,
         decay_half_days: int = DECAY_HALF_DAYS,
         embed_cache_ttl: int = EMBED_CACHE_TTL,
         sentiment_boost_positive: float = SENTIMENT_BOOST_POSITIVE,
@@ -698,6 +727,9 @@ class RedisStorage(StorageBase):
         self._password = password
         self._candidate_count = candidate_count
         self._final_limit = final_limit
+        # 检索面长度地板（2026-10 ks_lenfloor）—— 判据吃**实例值**，不写死 600。
+        self._max_content_len = resolve_max_content_len(
+            max_content_len, default=self.MAX_CONTENT_LEN)
         self._embed_dim = embed_dim
         self._bm25_limit = bm25_limit
         self._decay_half_days = decay_half_days
@@ -2277,8 +2309,11 @@ class RedisStorage(StorageBase):
                     continue
                 if frag.get("content"):
                     # v1.4: 过滤超长噪音条目（背景进程输出/图片描述等长文本 BM25 分虚高）
-                    # 有效记忆条目通常 <600 字符；超过则视为噪音跳过
-                    if len(frag["content"]) > 600:
+                    # 2026-10 ks_lenfloor：地板**可配置**（retrieval.max_content_len，
+                    # 缺省 5000）；600 旧值曾把 103 条生产正经条目整条隐身
+                    # （2026-10 ks_lenfloor 案）⇒ 不再是硬上限。
+                    # 判据单点：storage_shared.is_noise_length（与 PG/SQLite 同源）。
+                    if is_noise_length(len(frag["content"]), self._max_content_len):
                         continue
                     # BM25 score 越大越相关
                     frag["_bm25_score"] = float(getattr(doc, "score", 0.0))

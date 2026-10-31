@@ -48,6 +48,115 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 logger = logging.getLogger("keepsake.storage_shared")
 
 # ---------------------------------------------------------------------------
+# 检索面长度地板（2026-10 ks_lenfloor）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么从「硬上限 600」改成「可配置地板」：
+#    600 当年是「有效记忆通常 <600 字」的防噪音经验值，但生产实测有 **103 条
+#    600–2408 字符的正经结构化长条目**因此**整条隐身** —— 条目 `get` 取得到、
+#    `search` 零召回（最长的 2408 字；>5000 的 0 条）。用户拍板：不接受硬上限
+#    当产品边界 ⇒ 改成**可配置地板**，缺省 5000（生产现量全部放进来），
+#    真超长（>地板）仍按噪音滤掉。
+#
+#    长度惩罚**不另加权重**：交给 BM25 自身的文档长度归一（b=0.75），
+#    打分链路（BM25 / RRF / rerank）零触碰。
+#
+#    三后端**同一把尺**：PG 的 WHERE 谓词、SQLite 的 WHERE 谓词、Redis 的
+#    Python 侧 `continue` —— 判据只有一句「超了就是噪音」，但**必须单点**：
+#    三处各写一遍必然漂移（改了一边忘了另一边 ⇒ 两库召回面不一致）。
+#
+#    配置键：`config.json` 的 `retrieval.max_content_len`（顶层 `max_content_len`
+#    也认，`retrieval` 节优先）。非法值 / 缺失 ⇒ 回落缺省并告警。
+
+#: 检索面长度地板缺省值（生产现量最长 2408 字符 ⇒ 5000 全部放进来）。
+DEFAULT_MAX_CONTENT_LEN = 5000
+
+#: 长度告警去重表（同一进程内同一原因只告警一次 —— 配置每会话解析一次，
+#: 不去重就是每会话刷一条同样的 WARNING）。
+_LENFLOOR_WARNED: set = set()
+
+
+def is_noise_length(content_len: int, max_len: int) -> bool:
+    """正文长度是否超过检索面地板（超过 ⇒ 视为噪音，**不进检索面**）。
+
+    **三后端唯一判据**：PG/SQLite 的 SQL 谓词与 Redis 的 `continue` 都吃它。
+    """
+    return int(content_len) > int(max_len)
+
+
+def content_len_clause(max_len: int) -> str:
+    """检索面长度谓词的 **SQL 片段**（PG 与 SQLite 方言同形：`length(content)`）。
+
+    两个后端各写一遍 f-string 必然漂移（改一边忘另一边 ⇒ 两库召回面不一致）。
+    """
+    return f"content <> '' AND length(content) <= {int(max_len)}"
+
+
+def _warn_lenfloor_missing() -> None:
+    """「配置里没有这个键」的告警（每进程一次）。"""
+    if "missing" in _LENFLOOR_WARNED:
+        return
+    _LENFLOOR_WARNED.add("missing")
+    logger.warning(
+        "keepsake: retrieval.max_content_len 未配置，检索面长度地板回落 %d",
+        DEFAULT_MAX_CONTENT_LEN,
+    )
+
+
+def _warn_lenfloor_invalid(raw: Any) -> None:
+    """「配置里这个键是非法值」的告警（每进程每值一次）。"""
+    key = f"invalid:{raw!r}"
+    if key in _LENFLOOR_WARNED:
+        return
+    _LENFLOOR_WARNED.add(key)
+    logger.warning(
+        "keepsake: retrieval.max_content_len=%r 非法，检索面长度地板回落 %d",
+        raw, DEFAULT_MAX_CONTENT_LEN,
+    )
+
+
+def resolve_max_content_len(raw: Any, *, default: Optional[int] = None) -> int:
+    """把配置值 / 构造参数解析成检索面长度地板。
+
+    非法值（bool / 非整数 / 非「整数形态的字符串」/ ≤0）⇒ 回落缺省并**告警**
+    （对齐 provider 侧 `retrieval.core_char_budget` 的「非法值回落+告警」纪律）。
+    `None`（未配置）⇒ 回落 `default`（缺省即 `DEFAULT_MAX_CONTENT_LEN`）。
+    """
+    floor = DEFAULT_MAX_CONTENT_LEN if default is None else int(default)
+    if raw is None:
+        return floor
+    # bool 是 int 的子类 ⇒ 必须先拒（`int(True)` == 1 会被当成「地板 1 字符」）
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        _warn_lenfloor_invalid(raw)
+        return floor
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        _warn_lenfloor_invalid(raw)
+        return floor
+    if n <= 0:
+        _warn_lenfloor_invalid(raw)
+        return floor
+    return n
+
+
+def max_content_len_from_config(cfg: Optional[Dict[str, Any]]) -> int:
+    """从 config.json 读检索面长度地板 —— **唯一配置源**。
+
+    取 `retrieval.max_content_len`（优先）或顶层 `max_content_len`；
+    缺失 ⇒ 回落缺省并告警一次；非法 ⇒ 回落缺省并告警（见 `resolve_max_content_len`）。
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    retrieval = cfg.get("retrieval")
+    raw = retrieval.get("max_content_len") if isinstance(retrieval, dict) else None
+    if raw is None:
+        raw = cfg.get("max_content_len")
+    if raw is None:
+        _warn_lenfloor_missing()
+        return DEFAULT_MAX_CONTENT_LEN
+    return resolve_max_content_len(raw)
+
+# ---------------------------------------------------------------------------
 # 分词口径单源（2026-10 ks_recall_v1）
 # ---------------------------------------------------------------------------
 #
