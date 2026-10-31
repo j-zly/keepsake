@@ -2452,6 +2452,51 @@ class KeepsakeProvider(MemoryProvider):
             tiering_mod.backfill_nominate_hits(storage, key, _nominate_backfill_hits())
         return key
 
+    # ---- 幂等键（2026-10 ks_idem）--------------------------------------
+    #
+    # 薄方法：MCP 层**只经这三个方法**碰幂等表，**不直捅 storage**
+    # （分层纪律：provider 才是「拿存储」的那一层，走它内部的 `_require_storage`）。
+    #
+    # 后端不支持（Redis）时，`storage.idem_lookup` 抛 `BackendUnsupportedError`
+    # —— **原样上抛**，由 MCP 层转成人话 ToolError（绝不静默降级成「照写不误」：
+    # 调用方以为重试安全、其实重试会落第二条，正是本单要治的病）。
+
+    def idem_owner(self, caller_agent_id: str = "") -> str:
+        """幂等作用域的 owner = **本次实际打标的归属代理**。
+
+        🔴 口径必须与 `store()` 的归属章**同一把尺**：
+          * `caller_agent_id` 非空（凭据反查出的 MCP 远端调用方）⇒ 就是它
+            （落库时 `agent:<它>`，自报的 `agent:xxx` 被剥掉）；
+          * 空 ⇒ **进程默认身份** `self._agent_id`（本机直写 / 提炼管线）。
+
+        写成「owner 一律等于实际打标的那个 agent id」⇒ 幂等作用域天然
+        按代理隔离：A 代理的键**命中不了** B 代理的条目。
+
+        🔴 进程默认身份取**存储层那个**（`storage.default_agent_id`）——
+           落库打标就是用它（`store()` 的 `owner_agent_id or self._agent_id`），
+           取 provider 自己那个会在两边不一致时**对不上**（幂等作用域与
+           实际打标分家 ⇒ 同一个代理的两次写被判成两个作用域）。
+        """
+        caller = str(caller_agent_id or "").strip()
+        if caller:
+            return caller
+        storage = self._storage
+        if storage is not None:
+            default = str(getattr(storage, "default_agent_id", "") or "")
+            if default:
+                return default
+        return str(self._agent_id or "").strip()
+
+    def idem_lookup(self, owner: str, idem_key: str) -> Optional[Dict[str, str]]:
+        """查幂等登记（命中 ⇒ `{"frag_key":…, "created":…}`；未命中/过期 ⇒ None）。"""
+        storage = self._require_storage()
+        return storage.idem_lookup(owner, idem_key)
+
+    def idem_record(self, owner: str, idem_key: str, frag_key: str) -> bool:
+        """登记幂等键 → 首次落库的碎片 key（**只在成功落库后**调）。"""
+        storage = self._require_storage()
+        return bool(storage.idem_record(owner, idem_key, frag_key))
+
     def update(
         self,
         key: str,
@@ -2643,6 +2688,14 @@ class KeepsakeProvider(MemoryProvider):
         `notify_outlet=True` 表示**能**把未读私信提醒打到渠道 webhook
         （只含元数据，无正文）—— 是否真的发由 `push_consumer.notify_url`
         决定（缺省空 ⇒ 零外呼）。
+
+        `idempotent_write` **按存储后端探测**（2026-10 ks_idem）：PG / SQLite
+        有幂等登记表 ⇒ True；Redis 没有 ⇒ False（调用方据此知道
+        「带幂等键重试」在当前后端不被支持，**不会**静默降级）。
         """
+        storage = self._storage
+        idempotent = bool(getattr(storage, "supports_idempotency", False)) \
+            if storage is not None else False
         return Capabilities(core_tier=True, knn=True, dry_run_merge=True,
-                            push_consumer=True, notify_outlet=True, version="v1")
+                            push_consumer=True, notify_outlet=True,
+                            idempotent_write=idempotent, version="v1")

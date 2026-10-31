@@ -74,6 +74,24 @@ class StorageBase(ABC):
     #:    真正实现了 `cas_update` / `cas_remove` 的后端必须显式改成 True。
     supports_rev_cas: bool = False
 
+    #: 本后端**是否支持幂等键**（2026-10 ks_idem）。
+    #:
+    #: 🔴 **默认 False（不支持）**，与 `supports_rev_cas` 同一套纪律：
+    #:    没实现 `idem_lookup` / `idem_record` 的后端（Redis）必须**显式报错**，
+    #:    绝不静默降级成「照写不误」—— 调用方传了幂等键却拿到「写成功」的
+    #:    回执 ⇒ 它以为重试安全，其实重试会落第二条（正是本单要治的病）。
+    supports_idempotency: bool = False
+
+    @property
+    def default_agent_id(self) -> str:
+        """本后端的**进程默认身份**（落库打标用它：`owner_agent_id` 为空时）。
+
+        幂等作用域要跟**实际打标**是同一个 ⇒ 幂等 owner 取的就是它
+        （见 provider 侧的 `idem_owner`）。三个后端都在 `__init__` 里把它存成
+        `self._agent_id`；这里给一个**公开读法**，免得调用方去摸私有名。
+        """
+        return str(getattr(self, "_agent_id", "") or "")
+
     # ------------------------------------------------------------------
     # 连接管理
     # ------------------------------------------------------------------
@@ -189,6 +207,62 @@ class StorageBase(ABC):
         """
         raise BackendUnsupportedError(
             "backend_unsupported: rev CAS 需 PG/SQLite 后端"
+        )
+
+    # ------------------------------------------------------------------
+    # 幂等键（2026-10 ks_idem）
+    #
+    # 治的是**先后重试**：MCP 调用超时（客户端没收到响应）⇒ 客户端拿同一个
+    # 幂等键再发一次 ⇒ 服务端按 `(owner, idem_key)` 判重，命中就**不再写入**，
+    # 回首次落库的结果（`duplicated=True`）。
+    #
+    # 🔴 **作用域 = 归属代理**（owner）：A 代理的键**不许**命中 B 代理的条目
+    #    （owner 取本次实际打标的 `agent:<id>`）。
+    #
+    # 🔴 **默认实现 = 不支持**（抛 `BackendUnsupportedError`），与
+    #    `cas_update` / `cas_remove` 同一套纪律：Redis 侧不做这层，
+    #    调用方传了幂等键必须**显式知道**，不许被静默降级成「照写不误」。
+    #
+    # ⚠️ **局限（写进注释与 README，别让人误读成互斥锁）**：幂等表只在
+    #    **成功落库后**登记 ⇒ 它**不挡并发同键请求**（两个并发同键请求最坏
+    #    = 都写、后到者登记撞唯一键被忽略）。它治的是「超时后客户端收不到
+    #    响应再发同键」这一类**先后**重试。
+    # ------------------------------------------------------------------
+
+    def idem_lookup(self, owner: str, idem_key: str) -> Optional[Dict[str, str]]:
+        """查幂等登记：命中且未过期 ⇒ `{"frag_key":…, "created":…}`；否则 None。
+
+        命中但**已过期** ⇒ 删掉那一行并回 None（视为未命中，调用方照常重写）。
+
+        `owner` 空串是**合法作用域**（=「无归属」那一类）—— 作用域必须与落库
+        打标**同一把尺**：没有归属的条目，打标也就没有归属。空 `idem_key`
+        ⇒ 不查（没有键就谈不上幂等）。
+        默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: 幂等键需 PG/SQLite 后端"
+        )
+
+    def idem_record(self, owner: str, idem_key: str, frag_key: str) -> bool:
+        """登记幂等键 → 首次落库的碎片 key（**只在成功落库后**调）。
+
+        并发同键时**后到者静默忽略**（`ON CONFLICT DO NOTHING`）—— 不报错、
+        也不覆盖先到者的登记（先到者那次才是真·首次落库）。
+        空 `idem_key` / 空 `frag_key` ⇒ 不登记（返回 False）。
+        默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: 幂等键需 PG/SQLite 后端"
+        )
+
+    def idem_purge(self, older_than_iso: str) -> int:
+        """删掉 `created < older_than_iso` 的幂等登记行，返回删除条数。
+
+        `older_than_iso` 用 `idem_cutoff_iso()` 的格式（固定宽度 ISO-8601 UTC）
+        ⇒ 可直接按字典序比大小。默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: 幂等键需 PG/SQLite 后端"
         )
 
     @abstractmethod
@@ -670,3 +744,28 @@ def fire_hits(storage: Any, keys: Any, submit: Any = None) -> int:
 
     (submit or submit_hit_work)(_write)
     return len(pending)
+
+
+# ---------------------------------------------------------------------------
+# 幂等键的时间戳格式（2026-10 ks_idem）—— PG / SQLite 共用同一份
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么必须固定宽度**：`ks_idem_event.created` 是 text 列，TTL 判定靠
+#    **字典序 == 时序**（PG 的 text 比较、SQLite 的 TEXT 比较都是字节序）。
+#    `datetime.isoformat()` 默认在微秒为 0 时**省略微秒** ⇒ 同一个时刻有两种
+#    字符串形态 ⇒ 边界上会判错（"…T00:00:00+00:00" vs "…T00:00:00.5+00:00"）。
+#    固定 `timespec="microseconds"` 后每行同宽同形态 ⇒ 字典序恒等于时序。
+
+#: 幂等登记的存活期（天）。过期记录在判重时视为未命中（并顺手删该行）。
+IDEM_TTL_DAYS = 7
+
+
+def idem_now_iso() -> str:
+    """幂等表 `created` 列的时间戳（固定宽度 ISO-8601 UTC）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def idem_cutoff_iso(days: int = IDEM_TTL_DAYS) -> str:
+    """TTL 边界（比现在早 `days` 天）；格式同 `idem_now_iso()` ⇒ 可直接比大小。"""
+    return (datetime.now(timezone.utc)
+            - timedelta(days=int(days))).isoformat(timespec="microseconds")

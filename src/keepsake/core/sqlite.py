@@ -107,7 +107,7 @@ from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
 # 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
 # 标准库，不反向 import core ⇒ 不成环）。
 from ..govern.visibility import fragment_owner
-from .base import StorageBase, fire_hits
+from .base import StorageBase, fire_hits, idem_cutoff_iso, idem_now_iso
 from . import shared as storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
 from .shared import (
@@ -336,6 +336,19 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
         ts  TEXT NOT NULL
     )
     """),
+    # 2026-10 ks_idem：写请求幂等键登记（治「超时后重试落第二条同题条目」）。
+    # owner = 归属代理（本次实际打标的 agent:<id>）⇒ A 代理的键命中不了 B 的条目。
+    # created 用 TEXT 固定宽度 ISO-8601 UTC（见 core/base.idem_now_iso）——
+    # TTL 判定按字典序 == 时序，与 PG 侧同口径。
+    ("ks_idem_event", """
+    CREATE TABLE IF NOT EXISTS ks_idem_event (
+        owner    TEXT NOT NULL,
+        idem_key TEXT NOT NULL,
+        frag_key TEXT NOT NULL,
+        created  TEXT NOT NULL,
+        PRIMARY KEY (owner, idem_key)
+    )
+    """),
     # 2026-10 ks_agent_registry：代理注册表（身份 / 角色 / 凭据 / 上下文开关）。
     # DDL **不在这里另抄一份** —— 唯一定义处是 `govern/registry.py::KS_AGENT_DDL`
     # （它只依赖标准库，反向 import 不会成环）；两个后端建表语句复制一份必然漂，
@@ -354,6 +367,10 @@ _DDL_INDEXES: Tuple[Tuple[str, str], ...] = (
     ("idx_ks_hit_event_key_ts",
      "CREATE INDEX IF NOT EXISTS idx_ks_hit_event_key_ts "
      "ON ks_hit_event (key, ts)"),
+    # TTL 清理（idem_purge）按 created 删 ⇒ 一条 (created) 索引够了。
+    ("idx_ks_idem_event_created",
+     "CREATE INDEX IF NOT EXISTS idx_ks_idem_event_created "
+     "ON ks_idem_event (created)"),
 )
 
 
@@ -497,6 +514,9 @@ class SqliteStorage(StorageBase):
 
     #: 本后端**支持** rev CAS（真实现：BEGIN IMMEDIATE + 同事务比对，见 `cas_update`）。
     supports_rev_cas = True
+
+    #: 本后端**支持**幂等键（真实现：`ks_idem_event` 登记表，见 `idem_lookup`）。
+    supports_idempotency = True
 
     # ---- 检索后处理：与 Redis / PG **同一个函数对象**（三后端一份实现）----
     _rrf_fuse = rrf_fuse
@@ -1937,6 +1957,70 @@ class SqliteStorage(StorageBase):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
         with self._write() as cur:
             cur.execute("DELETE FROM ks_hit_event WHERE ts < ?", (cutoff,))
+            return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # 幂等键（2026-10 ks_idem）
+    #
+    # 落库形态：**ks_idem_event 登记表**（(owner, idem_key) 主键 → frag_key），
+    # 与 PG 侧同款语义，只有 SQL 方言不同（`?` 占位 + `INSERT OR IGNORE`）。
+    #
+    # ⚠️ **局限（别当互斥锁读）**：登记**只在成功落库后**写 ⇒ 并发的两个
+    #    同键请求最坏**都写**（后到者登记撞主键被静默忽略）。它治的是
+    #    「超时后客户端收不到响应再发同键」这一类**先后**重试。
+    # ------------------------------------------------------------------
+
+    def idem_lookup(self, owner: str, idem_key: str) -> Optional[Dict[str, str]]:
+        """查幂等登记：命中且未过期 ⇒ `{"frag_key":…, "created":…}`；否则 None。
+
+        过期 ⇒ **一条条件删**把那行带走（条件带 `created < 截止` ⇒ 并发下
+        刚被刷新过的行不会被误删），随后回 None（调用方照常重写）。
+        """
+        owner = str(owner or "").strip()
+        idem_key = str(idem_key or "").strip()
+        if not idem_key:
+            return None
+        cutoff = idem_cutoff_iso()
+        with self._write() as cur:
+            cur.execute(
+                "DELETE FROM ks_idem_event "
+                "WHERE owner = ? AND idem_key = ? AND created < ?",
+                (owner, idem_key, cutoff),
+            )
+            cur.execute(
+                "SELECT frag_key, created FROM ks_idem_event "
+                "WHERE owner = ? AND idem_key = ?",
+                (owner, idem_key),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"frag_key": str(row[0]), "created": str(row[1])}
+
+    def idem_record(self, owner: str, idem_key: str, frag_key: str) -> bool:
+        """登记幂等键 → 首次落库的碎片 key。
+
+        并发同键 ⇒ **后到者静默忽略**（`INSERT OR IGNORE`）：先到者那次才是
+        真·首次落库，覆盖它反而会让重试回执指向错的那条。
+        """
+        owner = str(owner or "").strip()
+        idem_key = str(idem_key or "").strip()
+        frag_key = str(frag_key or "").strip()
+        if not idem_key or not frag_key:
+            return False
+        with self._write() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO ks_idem_event (owner, idem_key, frag_key, created) "
+                "VALUES (?, ?, ?, ?)",
+                (owner, idem_key, frag_key, idem_now_iso()),
+            )
+        return True
+
+    def idem_purge(self, older_than_iso: str) -> int:
+        """删掉 `created < older_than_iso` 的幂等登记行，返回删除条数。"""
+        with self._write() as cur:
+            cur.execute("DELETE FROM ks_idem_event WHERE created < ?",
+                        (str(older_than_iso or ""),))
             return cur.rowcount or 0
 
     # ------------------------------------------------------------------

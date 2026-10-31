@@ -357,6 +357,10 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
         "knn": bool(getattr(caps, "knn", False)),
         "dry_run_merge": bool(getattr(caps, "dry_run_merge", False)),
         "core_listing": hasattr(provider, "list_core"),
+        # 🔴 幂等键（2026-10 ks_idem）：写路径**能不能带 idempotency_key**
+        #    （带同一个键重试 ⇒ 不落第二条）。False = 后端不支持，
+        #    调用方带了会被**显式拒绝**（绝不静默降级成「照写不误」）。
+        "idempotent_write": bool(getattr(caps, "idempotent_write", False)),
         # 🔴 归属语义（2026-10 ks_owner_stamp）：写入方身份 = **凭据反查**的调用方
         #    （`caller_credential`）—— 写的记忆归自己，不是 provider 进程的身份。
         "write_owner": "caller_credential",
@@ -485,8 +489,72 @@ def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
     return out
 
 
+# --------------------------------------------------------------------------
+# 幂等键（2026-10 ks_idem）—— MCP 层只经 provider 的三个薄方法，不直捅 storage
+# --------------------------------------------------------------------------
+#
+# 🔴 **不支持 ⇒ 显式报错，绝不静默降级**：调用方带了幂等键却拿到「写成功」，
+#    它会以为重试安全 —— 而重试**恰恰会落第二条**（本单要治的病）。
+#    所以「后端没有幂等登记表」必须在**写入之前**就说清楚。
+
+_IDEM_UNSUPPORTED = (
+    "当前存储后端不支持幂等键（backend_unsupported）：本次请求带了 "
+    "idempotency_key，但服务端没有幂等登记 ⇒ 超时后重试**会落第二条**同题条目。"
+    "请去掉 idempotency_key 重试，或改用支持幂等键的存储后端（PG / SQLite）。"
+)
+
+
+def _idem_owner(provider: Any, caller_agent_id: str) -> str:
+    """幂等作用域的 owner = 本次实际打标的归属代理。
+
+    口径与 `store()` 的归属章**同一把尺**（provider 侧的 `idem_owner`）：
+    调用方（凭据反查）非空 ⇒ 就是它；空 ⇒ 进程默认身份。
+    provider 没实现这个薄方法 ⇒ 退回「凭据反查出的调用方」（进程默认身份拿不到，
+    但**绝不**退化成全局共享作用域 —— 那会让 A 代理的键命中 B 代理的条目）。
+    """
+    fn = getattr(provider, "idem_owner", None)
+    if callable(fn):
+        return str(fn(caller_agent_id or "") or "")
+    return str(caller_agent_id or "").strip()
+
+
+def _idem_lookup(provider: Any, owner: str, idem_key: str) -> Optional[Dict[str, str]]:
+    """查幂等登记；不支持 ⇒ **显式 ToolError**（绝不静默降级成「照写不误」）。"""
+    fn = getattr(provider, "idem_lookup", None)
+    if not callable(fn):
+        raise ToolError(_IDEM_UNSUPPORTED)
+    try:
+        return fn(owner, idem_key)
+    except BackendUnsupportedError as e:
+        logger.warning("keepsake MCP: 幂等查重不被后端支持（显式拒绝）: %s", e)
+        raise ToolError(_IDEM_UNSUPPORTED)
+
+
+def _idem_record(provider: Any, owner: str, idem_key: str, frag_key: str) -> None:
+    """登记幂等键（**成功落库之后**才调）。
+
+    🔴 登记失败**不把这次写入变成失败**：写已经落库了，此时抛错只会让调用方
+    以为「没写进去」而重试 ⇒ 反而多落一条。降级成 warning（幂等这层暂时不生效，
+    下次重试可能重复），但**回执仍如实说「写成功了」**。
+
+    「后端压根不支持幂等」这件事由**前面那次查重**拦住了（`_idem_lookup`
+    直接抛 ToolError）—— 走到这里说明实现自相矛盾，同样只记日志：写已成功，
+    回执必须说成功。
+    """
+    fn = getattr(provider, "idem_record", None)
+    if not callable(fn):
+        logger.warning("keepsake MCP: provider 无幂等登记方法（本次写入已落库，幂等降级）")
+        return
+    try:
+        fn(owner, idem_key, frag_key)
+    except Exception as e:      # noqa: BLE001 —— 登记失败 ≠ 写入失败（见上）
+        logger.warning("keepsake MCP: 幂等登记失败（本次写入已落库，降级为无幂等）: %s: %s",
+                       type(e).__name__, e)
+
+
 def memory_add(provider: Any, text: str, tags: str = "",
-               caller_agent_id: str = "", caller_role: str = "") -> Dict[str, Any]:
+               caller_agent_id: str = "", caller_role: str = "",
+               idempotency_key: str = "") -> Dict[str, Any]:
     """写入一条记忆并返回它的 key。写层 fail-closed：失败抛错，不谎报成功。
 
     🔴 **「人工显式直写 core」只对 primary 凭据生效**（2026-10 ks_share_tighten
@@ -502,12 +570,41 @@ def memory_add(provider: Any, text: str, tags: str = "",
     记忆归它自己（`agent:<它>`），不是 provider 进程默认身份 —— 否则它写完
     自己搜不到（可见性收紧后），还混进主脑全库。`caller_agent_id` 为空 ⇒ 本机
     直写 ⇒ 归属仍走进程默认（既有行为逐字不变）。
+
+    🔴 **幂等键**（2026-10 ks_idem）：`idempotency_key` 非空 ⇒ 服务端按
+    `(归属代理, 幂等键)` 判重：
+      * **命中**已登记 ⇒ **不再写入**，回首次落库的结果并带 `duplicated=True`；
+      * **未命中** ⇒ 照常写入，**成功后**登记该键，回 `duplicated=False`。
+    空键 ⇒ **行为逐字不变**（既有调用方零感知：返回值里也不多 `duplicated` 字段）。
+
+    ⚠️ **局限（别当互斥锁读）**：幂等表**只在成功落库后**登记 ⇒ 它**不挡并发
+    同键请求**（两个并发同键请求最坏**都写**，后到者登记撞唯一键被忽略）。
+    它治的是「超时后客户端收不到响应再发同键」这一类**先后**重试。
     """
     if not text or not text.strip():
         raise ToolError("text 不能为空")
     known = bool((caller_agent_id or "").strip())
     role = str(caller_role or "").strip()
     is_primary = known and role == ROLE_PRIMARY
+    idem = str(idempotency_key or "").strip()
+    owner = ""
+    if idem:
+        # 作用域 = 归属代理（与落库打标同一把尺）⇒ A 代理的键命中不了 B 的条目。
+        owner = _idem_owner(provider, caller_agent_id)
+        hit = _idem_lookup(provider, owner, idem)
+        if hit:
+            frag_key = str(hit.get("frag_key") or "")
+            # 🔴 读失败**不吞**：后端不可达时宁可直接报错（调用方稍后重试，
+            #    登记还在 ⇒ 仍能命中），也不要把「读不到」当成「没有」⇒ 重复写。
+            frag = (provider.get(frag_key,
+                                 **_caller_kwargs(provider.get, caller_agent_id, caller_role))
+                    if frag_key else None)
+            if frag:
+                return {"key": frag_key,
+                        "tags": str(frag.get("tags") or ""),
+                        "rev": str(frag.get("rev") or DEFAULT_REV),
+                        "duplicated": True}
+            # 登记的那条已被删 ⇒ **视为未命中** ⇒ 照常重写（并覆盖登记）
     key = _add_memory(provider, text.strip(), tags or "",
                       core_direct=is_primary,
                       caller_role=(role if known else None),
@@ -521,7 +618,15 @@ def memory_add(provider: Any, text: str, tags: str = "",
     except Exception as e:      # noqa: BLE001 —— 拿不到 rev 不影响这次写入
         logger.debug("keepsake MCP: 取新写入条目的 rev 失败（忽略）: %s", e)
         frag = {}
-    return {"key": key, "tags": tags or "", "rev": str(frag.get("rev") or DEFAULT_REV)}
+    rev = str(frag.get("rev") or DEFAULT_REV)
+    if not idem:
+        # 空键 ⇒ **逐字保持既有返回形状**（不多 `duplicated` 字段）。
+        return {"key": key, "tags": tags or "", "rev": rev}
+    _idem_record(provider, owner, idem, key)
+    # 幂等路径回**库里的**标签（不是入参回显）—— 这样「首次写入」与
+    # 「重试命中」两次回执**逐字同形**（重复提交能原样回放首次结果）。
+    return {"key": key, "tags": str(frag.get("tags") or tags or ""),
+            "rev": rev, "duplicated": False}
 
 
 def _add_memory(provider: Any, text: str, tags: str, *,
@@ -1401,13 +1506,16 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
     @server.tool(
         name="memory_add",
         description="写入一条记忆，返回它的 key。归属按凭据反查出的调用方打"
-                    "（写进的是你自己的记忆，别人默认看不见）。",
+                    "（写进的是你自己的记忆，别人默认看不见）。"
+                    "超时后重试请带同一个 idempotency_key（任意稳定唯一串，如 UUID），"
+                    "重复提交不会落第二条；不传则按原行为写入。",
     )
-    def _add(text: str, tags: str = "") -> Dict[str, Any]:
+    def _add(text: str, tags: str = "", idempotency_key: str = "") -> Dict[str, Any]:
         ident = _authorize("memory_add")
         return memory_add(provider, text, tags,
                           caller_agent_id=str(ident.get("agent_id") or ""),
-                          caller_role=str(ident.get("role") or ""))
+                          caller_role=str(ident.get("role") or ""),
+                          idempotency_key=idempotency_key)
 
     @server.tool(
         name="memory_update",
