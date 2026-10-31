@@ -642,6 +642,10 @@ def memory_remove(provider: Any, key: str, confirm: bool = False, *,
     别人的条目 —— **含已共享代理的** —— 一律拒（只回「不是你的记忆」，
     **不回显任何正文**）。primary 全量可删（= 主脑现状逐字不变）。
 
+    🔴 **先存在性、后归属**（2026-10 ks_remove_sem）：判定顺序 = 确认闸 →
+    版本闸 → **存在性** → 归属。**不存在的条目**回「条目不存在：{key}」，
+    **存在的别人的条目**才回「不是你的」—— 两条独立人话，不再混成一条。
+
     🔴 `expected_rev`（2026-10 ks_memory_rev_cas → ks_cas_hard，**MCP 对外必带**）：
     **CAS 删除** —— 版本对不上就**不删**，并把最新内容回给你（冲突结构同
     `memory_update`）。**空串/不给 ⇒ 一律拒**（记忆是核心资产，不留软口子）；
@@ -660,6 +664,14 @@ def memory_remove(provider: Any, key: str, confirm: bool = False, *,
             "再带 expected_rev 提交（版本对不上会拒并回最新内容，"
             "重读确认后再删，勿硬删）"
         )
+    # 🔴 **存在性探测先行**（2026-10 ks_remove_sem）：先答「这条存不存在」，
+    #    再问「是不是你的」—— 否则**不存在的条目**和**别人的条目**都塌成
+    #    None ⇒ 一律回「不是你的」（实测 zly-hermes 双向复现）。
+    #    `provider.get(key)` **不带 caller kwargs** = 服务端进程身份（本部署
+    #    provider 是 primary 全量视角）⇒ 这个探测**只答存不存在**。
+    #    🔴 不构成泄露面：key 是**内容哈希**，持有 key 的人已知正文。
+    if not provider.get(key):
+        raise ToolError(f"条目不存在：{key}")
     if not _can_remove(provider, key, caller_agent_id, caller_role):
         raise ToolError(REMOVE_NOT_OWNER)
     # 🔴 删除**只走 CAS**（无条件删除分支已删 —— 那正是要防的静默覆盖）。

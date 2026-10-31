@@ -9,7 +9,9 @@
   ② 子代理删**别人**的条目 ⇒ 拒（「不是你的记忆」，**不回显正文**）；
   ③ **无归属的老条目**（收紧前的公共数据）⇒ 子代理可删（与检索口径一致）；
   ④ primary 删任意条目 ⇒ 过（= 主脑现状逐字不变）；
-  ⑤ 子代理调 `memory_forget`（**批处理治理面**）⇒ 拒（「治理动作仅主代理可用」）。
+  ⑤ 子代理调 `memory_forget`（**批处理治理面**）⇒ 拒（「治理动作仅主代理可用」）；
+  ⑧ **不存在的条目** ⇒ 回「不存在」，**不许**说成「不是你的」（2026-10 ks_remove_sem）；
+  ⑨ **真删掉之后再删同一个 key** ⇒ 同样回「不存在」。
 
 **B 组（子代理自荐常驻）**
   ⑥ 子代理写 `core` ⇒ 落候选 **且带提名日戳**，可被 nominate 枚举到
@@ -154,6 +156,40 @@ def test_子代理删共享代理的条目也拒_owner(gov, tmp_path):
              expected_rev=_rev(gov, keys["别人的"]))
     assert "不是你的" in str(exc.value), str(exc.value)
     assert gov.agent_gate.registry.storage.get_fragment(keys["别人的"]) is not None
+
+
+def test_子代理删不存在的条目回不存在_sem(gov, tmp_path):
+    """🔴 ⑧ **不存在的条目** ⇒ 回「不存在」，**不许**说成「不是你的」。
+
+    修前：`_can_remove` 对「别人的」与「不存在的」都折叠成 None ⇒ 一律回
+    「不是你的」—— 代理据此以为「这条存在但归属不是我」⇒ 找错了方向。
+    修后：**存在性**与**归属**两条独立人话（2026-10 ks_remove_sem）。
+    """
+    from keepsake.core.shared import fragment_key_for
+
+    _seed(gov, tmp_path)
+    _as_caller(gov, SUB)
+    ghost = fragment_key_for("根本 不存在 的 条目 内容")
+    with pytest.raises(ToolError) as exc:
+        call(gov, "memory_remove", key=ghost, confirm=True, expected_rev="1")
+    msg = str(exc.value)
+    assert "不存在" in msg, msg
+    assert "不是你的" not in msg, msg
+
+
+def test_子代理删已删条目回不存在_sem(gov, tmp_path):
+    """🔴 ⑨ **真删掉之后再删同一个 key** ⇒ 同样回「不存在」（现场复现路径）。"""
+    keys = _seed(gov, tmp_path)
+    _as_caller(gov, SUB)
+    key = keys["自己的"]
+    out = call(gov, "memory_remove", key=key, confirm=True,
+               expected_rev=_rev(gov, key))
+    assert out["removed"] is True, out
+    with pytest.raises(ToolError) as exc:
+        call(gov, "memory_remove", key=key, confirm=True, expected_rev="1")
+    msg = str(exc.value)
+    assert "不存在" in msg, msg
+    assert "不是你的" not in msg, msg
 
 
 def test_无归属老条目子代理可删_owner(gov, tmp_path):

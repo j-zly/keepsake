@@ -843,6 +843,10 @@ server.run("stdio")                         # any MCP client connects and is don
 
 Why mandatory: memories are a core asset, so the MCP surface is **fail-closed** — there is no "no version ⇒ skip the check" escape hatch. When several processes share one credential and write the same pool, this version check is **the only gate** against silently overwriting each other (the server-side row lock + version comparison is the backstop, not a substitute). The storage / provider layer keeps its internal empty-string compatibility path (batch jobs, the consolidation cron, the console's direct provider calls), but that path is **not exposed** to MCP callers.
 
+**Revive semantics (2026-10 ks_remove_sem).** The key **is the content hash** ⇒ re-`add`ing the same body is a **no-op while the entry still exists**, and a **revive of the original key** once the entry has been deleted (its `rev` goes back to 1). So the only way to check "is this entry really gone?" is **`memory_get` on that exact key** — **never** verify existence by re-`add`ing the same body: a successful `add` says nothing about existence (it is a no-op in both cases) and it silently resurrects the entry.
+
+**Timeout retry (2026-10 ks_remove_sem).** An MCP call that timed out ≠ the server never committed it. Before retrying, check whether it already landed with `memory_get` / a distinctive `memory_search`; the retried body must be **byte-for-byte identical** (same content hash ⇒ a no-op) — a body that differs lands a **second entry on the same topic**.
+
 **Transport.** `stdio` is the default. `http` (streamable-http) listens on `127.0.0.1` only — a non-loopback bind address exits with code 2 rather than starting. The memory store has no authentication of its own, so exposing it on the network is equivalent to publishing a person's long-term memory; put a reverse proxy in front of it instead. CLI: `python -m keepsake.mcp_server [--transport stdio|http] [--host …] [--port …]`.
 
 ## Private-Message Push over SSE
