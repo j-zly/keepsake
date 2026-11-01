@@ -460,3 +460,51 @@ def test_未实现可选扩展的provider显式报错():
     with pytest.raises(ToolError) as exc:
         call(s, "memory_core_list")
     assert "StorageIntrospection" in str(exc.value)
+
+# ---------------------------------------------------------------------------
+# 参数容差回归（2026-11-01，#148/#153）：expected_rev / kb id 收 int 也过校验
+# ---------------------------------------------------------------------------
+
+def test_expected_rev收int_两态同果(server):
+    """客户端把 rev 强转成 int（1 而非 "1"）必须被受理（zly 实踩：本地校验拒、调用未发出）。
+
+    容差**只放类型不放语义**：int 正确 rev ⇒ 正常改写；int 错误 rev ⇒ 照样 conflict。
+    str 形态逐字不变（回归护栏）。
+    """
+    key = call(server, "memory_add", text="容差回归 探针 revtol1101")["key"]
+    rev = call(server, "memory_get", key=key)["rev"]
+    out = call(server, "memory_update", key=key, text="容差回归 探针 revtol1101 改",
+               expected_rev=int(rev))
+    assert out["ok"] is True and out["rev"] != rev, out
+    bad = call(server, "memory_remove", key=key, confirm=True, expected_rev=int(99))
+    assert bad.get("error") == "conflict", bad
+    # update 轮转链头 ⇒ 删的目标是新 key（out["key"]）；旧 key 成链身（#157 语义）
+    ok = call(server, "memory_remove", key=out["key"], confirm=True,
+              expected_rev=out["rev"])
+    assert ok["removed"] is True, ok
+
+
+def test_删除空rev字符串仍被拒(server):
+    """容差不得开出「空 rev 跳过 CAS」的软口子（ks_cas_hard 语义逐字不变）。"""
+    key = call(server, "memory_add", text="空rev护栏 探针 revtol1101b")["key"]
+    with pytest.raises(ToolError) as exc:
+        call(server, "memory_remove", key=key, confirm=True, expected_rev="  ")
+    assert "expected_rev" in str(exc.value) or "版本" in str(exc.value), str(exc.value)
+    assert call(server, "memory_get", key=key)["content"]  # 行还在
+
+
+def test_schema声明anyof放行(server):
+    """🔴 注册壳（_update/_remove/_kb_get/_kb_remove）的 JSON schema 必须是
+    anyOf[string,integer] —— FastMCP 对 Union[str,int] 生成 anyOf；
+    若哪天退化成单一 string，本用例先红（客户端强转坑会复发）。"""
+    import anyio
+    tools = anyio.run(server.list_tools)
+    for t in tools:
+        if t.name in ("memory_update", "memory_remove"):
+            er = t.inputSchema["properties"]["expected_rev"]
+            assert "anyOf" in er, (t.name, er)
+            kinds = {x["type"] for x in er["anyOf"]}
+            assert {"string", "integer"} <= kinds, (t.name, kinds)
+        if t.name in ("kb_get", "kb_remove"):
+            i = t.inputSchema["properties"]["id"]
+            assert "anyOf" in i, (t.name, i)

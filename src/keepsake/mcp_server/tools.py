@@ -59,7 +59,7 @@ from __future__ import annotations
 import inspect
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union, runtime_checkable
 
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -655,7 +655,8 @@ def _add_memory(provider: Any, text: str, tags: str, *,
     return provider.add(text, tags=tags, **kwargs)
 
 
-def memory_update(provider: Any, key: str, text: str, expected_rev: str,
+def memory_update(provider: Any, key: str, text: str,
+                  expected_rev: Union[str, int],
                   tags: str = "", *, caller_agent_id: str = "",
                   caller_role: str = "") -> Dict[str, Any]:
     """**乐观并发（CAS）改写**一条记忆条目（2026-10 ks_memory_rev_cas）。
@@ -738,7 +739,7 @@ def _update_memory(provider: Any, key: str, text: str, expected_rev: str, tags: 
 
 
 def memory_remove(provider: Any, key: str, confirm: bool = False, *,
-                  expected_rev: str = "", caller_agent_id: str = "",
+                  expected_rev: Union[str, int] = "", caller_agent_id: str = "",
                   caller_role: str = "") -> Dict[str, Any]:
     """删除一条记忆条目。`confirm=False` ⇒ **拒绝并说明**，绝不动数据。
 
@@ -1365,7 +1366,7 @@ def kb_search(query: str, limit: int = 10, *, caller_agent_id: str = "",
     return res
 
 
-def kb_get(id: str, *, caller_agent_id: str = "", caller_role: str = "",
+def kb_get(id: Union[str, int], *, caller_agent_id: str = "", caller_role: str = "",
            registry: Any = None) -> Dict[str, Any]:
     """取一篇知识库文档的详情（标题 + 全文 + 归属 + 状态）。
 
@@ -1387,7 +1388,7 @@ def kb_get(id: str, *, caller_agent_id: str = "", caller_role: str = "",
             "agent_id": str(doc.get("agent_id") or "")}
 
 
-def kb_remove(id: str, confirm: bool = False, *, caller_agent_id: str = "",
+def kb_remove(id: Union[str, int], confirm: bool = False, *, caller_agent_id: str = "",
               caller_role: str = "", registry: Any = None) -> Dict[str, Any]:
     """删一篇知识库文档。**必须 `confirm=True`**，否则拒绝（绝不动数据）。
 
@@ -1526,7 +1527,7 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
                     "收到冲突请重新读、合并后再提交，不要硬写。"
                     "子代理只能改自己的条目（别人的条目一律拒）。",
     )
-    def _update(key: str, text: str, expected_rev: str,
+    def _update(key: str, text: str, expected_rev: Union[str, int],
                 tags: str = "") -> Dict[str, Any]:
         ident = _authorize("memory_update")
         return memory_update(provider, key, text, expected_rev, tags,
@@ -1540,7 +1541,7 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
                     "并回最新内容）。"
                     "子代理只能删自己的条目（别人的条目一律拒）。",
     )
-    def _remove(key: str, expected_rev: str, confirm: bool = False) -> Dict[str, Any]:
+    def _remove(key: str, expected_rev: Union[str, int], confirm: bool = False) -> Dict[str, Any]:
         ident = _authorize("memory_remove")
         return memory_remove(provider, key, confirm,
                              expected_rev=expected_rev,
@@ -1605,7 +1606,7 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         description="按 id 取一篇知识库文档的详情（标题 + 全文 + 归属）。"
                     "看不到的文档按「不存在」回。",
     )
-    def _kb_get(id: str) -> Dict[str, Any]:
+    def _kb_get(id: Union[str, int]) -> Dict[str, Any]:
         ident = _authorize("kb_get")
         return kb_get(id,
                       caller_agent_id=str(ident.get("agent_id") or ""),
@@ -1617,7 +1618,7 @@ def register_tools(server: Any, provider: Any, gate: Any = None, *,
         description="删一篇知识库文档。必须 confirm=True，否则拒绝。"
                     "子代理只能删自己名下的文档（别人的一律拒）。",
     )
-    def _kb_remove(id: str, confirm: bool = False) -> Dict[str, Any]:
+    def _kb_remove(id: Union[str, int], confirm: bool = False) -> Dict[str, Any]:
         ident = _authorize("kb_remove")
         return kb_remove(id, confirm,
                          caller_agent_id=str(ident.get("agent_id") or ""),

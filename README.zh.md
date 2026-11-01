@@ -741,6 +741,8 @@ server.run("stdio")                         # 任何 MCP 客户端连上就能�
 
 **冲突协议（2026-10 ks_cas_hard）。** `memory_update` 与 `memory_remove` 在 **MCP 层都强制要求 `expected_rev`** —— 也就是「你正要改的那一版」的版本号。三步：① 用 `memory_get(key)` 读当前版本（`memory_search` 命中里也带 `rev`）；② 带 `expected_rev=<那版 rev>` 提交改写 / 删除；③ 收到 `error="conflict"` 时返回载荷带 `current_content` / `current_rev`（别人刚写进去的那一版）⇒ **读它、合并、再提交，不要硬写**。
 
+**类型容差（2026-11）。** `expected_rev` 与 `kb_*` 的文档 `id` 在 MCP schema 上收 `int` 也收 `str`（`anyOf`）—— 客户端把 `"2"` 强转成 `2` 是实踩过的失败模式。容差**只放类型不放语义**：空串/纯空白 rev 照样拒，版本对不上照样 conflict。`kb_*` 的 id 走 `strip() → int()` 归一，非整数回明确的 `kb_doc_id_invalid`。
+
 为什么强制：记忆是核心资产，所以 MCP 对外是 **fail-closed** —— 没有「不带版本就跳过校验」的软口子。多个进程共用同一凭据写同一个池时，这道版本比对是**防互相静默覆盖的唯一闸**（服务端行级锁 + 版本比对是兜底，不是替代）。storage / provider 内部仍保留空串兼容路径（班车、提炼 cron、控制台直调 provider 的写路），但**不对外**暴露。
 
 **复活语义（2026-10 ks_remove_sem）。** key **就是内容哈希** ⇒ 「同正文重 add」在条目**还在**时是**空操作**，在条目**已删之后**是**把原 key 复活**（rev 归 1）。所以「这条到底删掉了没有」**只用 `memory_get` 直取那个 key** 来核对 —— **绝不用「再 add 一遍同正文」验证存在性**：add 成功与否根本说明不了存在性（两种情况都是空操作），它只会把条目悄悄复活。
