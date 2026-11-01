@@ -1106,6 +1106,8 @@ Four gates, all live in production:
 
 Gate D is resolved once in `initialize()`, so **changing it requires a restart**; the filter itself runs per query over that frozen set.
 
+**The exclusion scope is the main brain's context, not retrieval at large** (2026-10-31 ks_exclscope): the per-agent `exclude_from_primary` switch (the console's "into main-brain context" toggle) only drops entries on the **main-brain side** of retrieval — it **never stops that agent from retrieving its own entries** (a sub-agent caller still recalls its own; its visibility stays governed by the share/owner rules, which this switch has nothing to do with).
+
 `core_candidate` therefore means "a pending application to enter the resident layer", not a tag an LLM may invent. The reserved-tag judgement has exactly one implementation — `sanitize_reserved_tags()` in `core/shared.py` — shared by the distill cron (which strips reserved tags and logs them) and the console create/import paths (which return 400 on `core`). Reserved set: the exact tags `core`, `core_candidate`, `shared`, plus anything prefixed `agent:`. Matching is exact on the comma boundary, so `core_x` is not reserved.
 
 ## Verification

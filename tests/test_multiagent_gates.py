@@ -440,3 +440,100 @@ def test_prefetch_uses_same_exclusion_helper(tmp_path, monkeypatch):
         assert "候选" not in out and "正式" in out, out
     finally:
         st.close()
+
+
+# ---------------------------------------------------------------------------
+# 四、排除闸的**范围**（2026-10-31 ks_exclscope，#133 真根因）
+#
+# `ks_agent.exclude_from_primary` = 「这个代理的条目**要不要进主脑上下文**」，
+# **不是**「这个代理不能检索自己的条目」。修前 `_filter_excluded` 不分调用方地
+# 全局剔除 ⇒ 开了开关的代理连**自己**名下条目都搜不到（#133：get 能取、search 零召回）。
+# 排除闸**只对主脑侧生效**：远端非 primary 调用方照常召回（它的可见性由
+# `govern.visibility` 的 share/owner 口径管，与 exclude_from_primary 无关）。
+# ---------------------------------------------------------------------------
+
+#: 开了 exclude_from_primary 的代理 id
+EXCLUDED_AGENT = "agent-x"
+
+
+@pytest.fixture()
+def excluded_env(tmp_path):
+    """(provider, storage, registry, path)：一个开了排除开关的代理 + 它名下的一条。
+
+    运行时排除表 = config 的 `exclude_tags` + 注册表里所有 `exclude_from_primary`
+    代理的 `agent:<id>` 标签（`provider._init_governance` 组装的那份）—— 这里照抄
+    同一口径，测试不自己另造一套语义。
+    """
+    from keepsake.govern.registry import Registry
+
+    path = str(tmp_path / "excl.db")
+    seed = SqliteStorage(path=path)          # 无 agent_id ⇒ 归属标签原样落库
+    assert seed.ensure_index() is True
+    reg = Registry(seed)
+    assert reg.ensure_schema() is True
+    for aid in ("main-brain", EXCLUDED_AGENT):
+        reg.register(aid, aid)
+        reg.approve(aid)
+    reg.set_role("main-brain", "primary")
+    assert reg.set_exclude(EXCLUDED_AGENT, True) is True
+    assert seed.store(text=f"{QUERY} 己", tags=f"agent:{EXCLUDED_AGENT}",
+                      category="probe", source="probe") is True
+    seed.close()
+
+    st = SqliteStorage(path=path, is_primary=True)
+    assert st.ensure_index() is True
+    p = object.__new__(KeepsakeProvider)
+    p._config, p._storage, p._tag_filter = {}, st, ""
+    p._agent_id = "main-brain"
+    p._is_primary = True
+    p._registry = reg
+    p._role_cache = None
+    p._exclude_tags = tuple(dict.fromkeys(
+        (CORE_CANDIDATE_TAG,)
+        + tuple(f"agent:{a['agent_id']}" for a in reg.list_agents()
+                if a["exclude_from_primary"])))
+    yield p, st, reg, path
+    st.close()
+
+
+def test_被排除的代理仍搜得到自己的条目(excluded_env):
+    """🔴 #133 真根因：开了 `exclude_from_primary` 的代理**自己**必须搜得到自己的条目。
+
+    修前：排除闸不分调用方全局剔除 ⇒ 子代理零召回（get 能取、search 空）。
+    """
+    p, _st, _reg, _path = excluded_env
+    hits = p.search(QUERY, limit=20, caller_agent_id=EXCLUDED_AGENT, caller_role="sub")
+    assert [h["content"] for h in hits] == [f"{QUERY} 己"], hits
+
+
+def test_主脑侧照旧剔除被排除代理的条目(excluded_env):
+    """排除闸对主脑侧**逐字不变**：本进程=主脑 / primary 凭据 ⇒ 都搜不到。"""
+    p, _st, _reg, _path = excluded_env
+    assert p.search(QUERY, limit=20) == []
+    assert p.search(QUERY, limit=20, caller_agent_id="main-brain",
+                    caller_role="primary") == []
+
+
+def test_prefetch出口同样按主脑侧裁剪(excluded_env):
+    """prefetch（上下文注入）是**第二个**出口 —— 漏接一处就是两出口分裂。"""
+    p, _st, reg, path = excluded_env
+    p._core_cache_ttl = 60.0
+    out = p.prefetch(QUERY)
+    assert "己" not in out, out                      # 本进程 = 主脑 ⇒ 剔掉
+
+    # 子代理进程：自己的身份、自己的存储 ⇒ 不替主脑剔（自己名下条目照常进上下文）
+    sub_st = SqliteStorage(path=path, agent_id=EXCLUDED_AGENT, is_primary=False)
+    try:
+        assert sub_st.ensure_index() is True
+        sp = object.__new__(KeepsakeProvider)
+        sp._config, sp._storage, sp._tag_filter = {}, sub_st, ""
+        sp._agent_id = EXCLUDED_AGENT
+        sp._is_primary = False
+        sp._registry = reg
+        sp._role_cache = None
+        sp._exclude_tags = p._exclude_tags
+        sp._core_cache_ttl = 60.0
+        out = sp.prefetch(QUERY)
+        assert "己" in out, out
+    finally:
+        sub_st.close()

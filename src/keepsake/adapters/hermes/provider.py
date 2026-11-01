@@ -1650,7 +1650,9 @@ class KeepsakeProvider(MemoryProvider):
         # core 碎片由 system_prompt_block 无条件全量注入，这里必须排除 ——
         # 否则同一条记忆每轮出现两次（一次全量、一次检索），且两份可能不同版本。
         fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
-        fragments = self._filter_excluded(fragments)
+        # 排除闸只对**主脑侧**生效（ks_exclscope，#133）：本进程不是主脑时
+        # 不替主脑剔噪音（主脑自己的上下文由主脑那条出口管）。
+        fragments = self._filter_excluded(fragments, is_primary=scope.is_primary)
 
         # 未读私信提醒：>0 才有一行，=0 什么都不加。
         # （hint 在本方法开头已算好，这里**复用**变量，别再算第二遍 ——
@@ -2118,8 +2120,20 @@ class KeepsakeProvider(MemoryProvider):
 
     # ---- 检索层（显式抛错）----
 
-    def _filter_excluded(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _filter_excluded(self, hits: List[Dict[str, Any]], *,
+                         is_primary: bool = True) -> List[Dict[str, Any]]:
         """剔除带 `retrieval.exclude_tags` 噪音标签的命中（多代理治理的第三条规则）。
+
+        🔴 **排除范围 = 主脑上下文，不是检索全局**（2026-10-31 ks_exclscope，#133 真根因）：
+        这道闸管的是「这些条目**要不要进主脑上下文**」，**不是**「这些条目谁都搜不到」——
+        **代理永远能检索自己名下条目**（`exclude_from_primary` 与检索无关）。
+        修前本闸**不分调用方**全局应用 ⇒ 开了开关的代理连**自己**的条目都搜不到
+        （#133 现象：get 能取、search 零召回）。
+
+        判据：**只有主脑侧才剔**（`is_primary=True`）——
+        * 主脑（本进程=self._is_primary / 远端 caller_role=primary）⇒ 照旧剔除；
+        * 非 primary 的远端代理 ⇒ **不剔**（它的可见性本来就由 `govern.visibility`
+          的 share/owner 口径管，与 `exclude_from_primary` 无关）。
 
         `search()` / `prefetch()` 两个检索出口统一走这里 —— 命中形态是
         `{"content":…, "tags": "逗号串", …}`，标签判据复用 `_has_tag`
@@ -2127,7 +2141,7 @@ class KeepsakeProvider(MemoryProvider):
         排除发生在截断**之前**：不让噪音挤掉本该进上下文的名额。
         """
         tags = self._exclude_tags
-        if not tags:
+        if not tags or not is_primary:
             return hits
         return [h for h in hits
                 if not any(_has_tag(h.get("tags", ""), t) for t in tags)]
@@ -2145,9 +2159,12 @@ class KeepsakeProvider(MemoryProvider):
         """
         storage = self._require_storage()
         scope = self._visibility_scope(caller_agent_id, caller_role)
+        # 排除闸只对**主脑侧**生效（ks_exclscope，#133）：远端非 primary 调用方
+        # 不被剔除（它搜自己名下条目必须搜得到）。
         hits = self._filter_excluded(
             list(storage.search(query.strip(), tag_filter=self._tag_filter,
-                                 **self._scope_kwargs(scope))))
+                                 **self._scope_kwargs(scope))),
+            is_primary=scope.is_primary)
         self._touch("read")      # 活动计数：主脑每轮都在检索，这条路径必须记
         return hits[:limit]
 
