@@ -3741,7 +3741,10 @@ class PgStorage(StorageBase):
                 return ("not_found", None)
             head = self._resolve_chain_head(cur, row)
             if head is None:
-                return ("not_found", None)
+                # 🔴 **orphan**（2026-11 ks_err_tiers）：行**还在**，但它是**演化链的
+                #    历史链身**且**链头已被删除** ⇒ 链断裂 ⇒ 不可改写。
+                #    这**不是**「不存在」（报 not_found 会让客户端以为这条从没存在过）。
+                return ("orphan", None)
             if head["key"] != key:
                 # 目标已经不是链头 ⇒ **有人先改了它** ⇒ 冲突（载荷指向当前链头）
                 return ("conflict", self._conflict_payload(head))
@@ -3840,7 +3843,10 @@ class PgStorage(StorageBase):
                 return ("not_found", None)
             head = self._resolve_chain_head(cur, row)
             if head is None:
-                return ("not_found", None)
+                # 🔴 **orphan**（2026-11 ks_err_tiers）：行**还在**，但它是**演化链的
+                #    历史链身**且**链头已被删除** ⇒ 链断裂 ⇒ 不可删除。
+                #    这**不是**「不存在」（报 not_found 会让客户端以为这条从没存在过）。
+                return ("orphan", None)
             want_rev = str(expected_rev or "").strip()
             if head["key"] != key or (want_rev and head["rev"] != want_rev):
                 return ("conflict", self._conflict_payload(head))
@@ -3856,7 +3862,9 @@ class PgStorage(StorageBase):
         ⇒ 第二个写会从链身再分叉出一条新链（内容分叉回来了）。
         所以判据是「**我是不是当前链头**」+「版本对不对」，两条都要成立。
 
-        找不到链头（链头被删了）⇒ 返回 None ⇒ 上层判 not_found。
+        找不到链头（链头被删了）⇒ 返回 None ⇒ 上层判 **orphan**
+        （行还在，是**历史链身**且链头已删 ⇒ 链断裂 ⇒ 不可操作；
+        **不是** not_found —— 那条从没存在过）。
         """
         if is_chain_head(row[4]) or not row[5]:
             return {

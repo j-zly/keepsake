@@ -186,7 +186,11 @@ class StorageBase(ABC):
           * `("conflict", {"current_rev":…, "current_content":…,
             "updated_owner":…, "updated_at":…})` —— 版本对不上，
             **载荷里带当前最新内容**，调用方据此合并后重试；
-          * `("not_found", None)` —— key 不存在。
+          * `("not_found", None)` —— key 不存在（**从未存在过**）；
+          * `("orphan", None)` —— **演化链的历史链身**（`is_latest='0'`）
+            且**它的链头已被删除** ⇒ 演化链断裂 ⇒ **不可改写**。
+            行**还在**（能 `get` 到），所以这**不是** not_found；
+            载荷**恒为 None**（**不回显任何正文**）。
 
         默认实现 = **不支持**（抛 `BackendUnsupportedError`）。支持的后端必须
         在**同一个事务**里完成「读版本 → 比对 → 建新行 → 封旧边」。
@@ -203,7 +207,10 @@ class StorageBase(ABC):
         """CAS 删除一条碎片（`expected_rev` 对不上 ⇒ 不删，返回 conflict 载荷）。
 
         返回形状与 `cas_update` 同款：`("ok", None)` / `("conflict", 载荷)` /
-        `("not_found", None)`。默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
+        `("not_found", None)`（**从未存在过**）/ `("orphan", None)`
+        （**演化链的历史链身**且**链头已被删除** ⇒ 链断裂 ⇒ 不可删除；
+        行**还在**，载荷**恒为 None**、**不回显任何正文**）。
+        默认实现 = **不支持**（抛 `BackendUnsupportedError`）。
         """
         raise BackendUnsupportedError(
             "backend_unsupported: rev CAS 需 PG/SQLite 后端"

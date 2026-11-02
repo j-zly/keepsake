@@ -2545,6 +2545,8 @@ class KeepsakeProvider(MemoryProvider):
           * 冲突 `{"error": "conflict", "current_rev":…, "current_content":…,
             "updated_by":…, "current_key":…}`
           * 不存在 `{"error": "not_found"}`
+          * 链身断链 `{"error": "orphan"}`（**演化链的历史链身**且**链头已被
+            删除** ⇒ 不可改写；行还在，**不是** not_found）
           * 不归我 `{"error": "not_owner"}`
         """
         meta = meta or {}
@@ -2610,6 +2612,13 @@ class KeepsakeProvider(MemoryProvider):
                 "updated_by": payload.get("updated_owner", ""),
                 "updated_at": payload.get("updated_at", ""),
             }
+        if status == "orphan":
+            # 🔴 **orphan**（2026-11 ks_err_tiers）：目标行是**演化链的历史链身**
+            #    且**链头已被删除** ⇒ 链断裂 ⇒ 不可改写。
+            #    行**还在**（`get` 得到）⇒ 这**不是** not_found。
+            #    **不回显任何正文**（载荷恒空）。
+            return {"error": "orphan"}
+        # 兜底：只剩**真的** not_found（行压根不在）这一种形态了。
         return {"error": "not_found"}
 
     def _may_write_fragment(self, row: Dict[str, Any], caller_agent_id: str,
@@ -2640,6 +2649,8 @@ class KeepsakeProvider(MemoryProvider):
         * `expected_rev` 给了 ⇒ **CAS 删除**：版本对不上返回**同款 conflict 结构**
           （与 `update()` 同形：带 `current_rev` / `current_content` / `updated_by`），
           且**行仍在**（不删）；删掉了返回 `{"ok": True, "removed": True, "key": …}`。
+          **链身断链**（历史链身 + 链头已被删除）⇒ `{"error": "orphan"}`
+          （行还在，**不是** not_found）。
         """
         try:
             storage = self._require_storage()
@@ -2675,6 +2686,12 @@ class KeepsakeProvider(MemoryProvider):
                 "updated_by": payload.get("updated_owner", ""),
                 "updated_at": payload.get("updated_at", ""),
             }
+        if status == "orphan":
+            # 🔴 **orphan**（2026-11 ks_err_tiers）：目标行是**演化链的历史链身**
+            #    且**链头已被删除** ⇒ 链断裂 ⇒ 不可删除。
+            #    行**还在** ⇒ 这**不是** not_found。**不回显任何正文**。
+            return {"error": "orphan"}
+        # 兜底：只剩**真的** not_found（行压根不在）这一种形态了。
         return {"error": "not_found"}
 
     # ---- 维护层 ----

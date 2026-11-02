@@ -685,6 +685,8 @@ def memory_update(provider: Any, key: str, text: str,
       * 冲突 `{"error": "conflict", "current_rev":…, "current_content":…,
         "updated_by":…, "current_key":…}`
       * 不存在 `{"error": "not_found"}` / 不是你的 `{"error": "not_owner"}`
+      * 链身断链 `orphan` ⇒ ToolError「是演化链的历史版本，且其链头已被删除」
+        （**不是**「不存在」—— 行还在）
     """
     if not key:
         raise ToolError("key 不能为空")
@@ -706,6 +708,14 @@ def memory_update(provider: Any, key: str, text: str,
         return out
     if error == "not_found":
         raise ToolError(f"记忆条目不存在：{key}")
+    if error == "orphan":
+        # 🔴 **orphan**（2026-11 ks_err_tiers）：这条是**演化链的历史版本**，
+        #    它的**链头已被删除** ⇒ 链断裂 ⇒ 不可改写。
+        #    **这不是「不存在」** —— 行还在（`memory_get` 仍取得到）。
+        raise ToolError(
+            f"条目 {key} 是演化链的历史版本，且其链头已被删除 ⇒ 不可改写"
+            "（这不是「不存在」）。现役条目请用 memory_search 定位。"
+        )
     if error == "not_owner":
         raise ToolError(UPDATE_NOT_OWNER)
     raise ToolError(f"改写失败（后端不可用）：{key}")
@@ -784,6 +794,14 @@ def memory_remove(provider: Any, key: str, confirm: bool = False, *,
     out = _remove_memory_cas(provider, key, str(expected_rev).strip())
     if out.get("error") == "conflict":
         return out
+    if out.get("error") == "orphan":
+        # 🔴 **orphan**（2026-11 ks_err_tiers）：这条是**演化链的历史版本**，
+        #    它的**链头已被删除** ⇒ 链断裂 ⇒ 不可删除。
+        #    **这不是「不存在」** —— 行还在（存在性探测过得去，落到这一档）。
+        raise ToolError(
+            f"条目 {key} 是演化链的历史版本，且其链头已被删除 ⇒ 不可删除"
+            "（这不是「不存在」）。现役条目请用 memory_search 定位。"
+        )
     if not out.get("ok"):
         raise ToolError(f"删除失败（key 不存在或后端不可用）：{key}")
     return {"key": key, "removed": True}
