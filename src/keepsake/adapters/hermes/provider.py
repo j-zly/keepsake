@@ -2188,6 +2188,55 @@ class KeepsakeProvider(MemoryProvider):
                 return None
         return row
 
+    # ---- 删除墓碑（2026-11 ks_tombstone）------------------------------
+
+    @property
+    def supports_tombstone(self) -> bool:
+        """本 provider 的存储后端**是否留删除墓碑**。
+
+        PG / SQLite = True（删一条 ⇒ 同事务留一行：删过、何时删、当时第几版）；
+        Redis = False（该后端删除不留痕 ⇒ 能力声明里如实说 False，
+        **绝不假装「删了可查证」**）。
+        """
+        storage = getattr(self, "_storage", None)
+        if storage is None:
+            return False
+        return bool(getattr(storage, "supports_tombstone", False))
+
+    def tombstone_lookup(self, key: str, *, caller_agent_id: str = "",
+                         caller_role: str = "") -> Optional[Dict[str, str]]:
+        """查这个 key 的**删除墓碑**（命中 ⇒ 载荷；未命中 / 不可见 ⇒ None）。
+
+        🔴 **口径与 `get()` 同一把尺子**（`govern.visibility`）—— **归属不可见
+           ⇒ 按「不存在」回**（不泄露别人删过什么）：
+
+          * 墓碑**无归属**（老条目）⇒ 人人可见；
+          * 墓碑归属 == 调用方 ⇒ 可见；
+          * 调用方是 **primary** ⇒ 全量可见；
+          * 其余 ⇒ **不可见**（回 None ⇒ 上层按「不存在」回）。
+
+        🔴 **后端不留痕**（Redis）⇒ 这里回 None（**没有墓碑这回事**），
+           不抛错 —— 读路径不该因为一张附属表把「取不到条目」变成硬失败；
+           「这个后端做不了」由**能力声明**（`tombstone=false`）与存储层的
+           `backend_unsupported` 显式说清楚。
+        """
+        storage = self._require_storage()
+        fn = getattr(storage, "tombstone_lookup", None)
+        if not callable(fn):
+            return None
+        try:
+            row = fn(key)
+        except BackendUnsupportedError as e:
+            logger.debug("keepsake: 该后端不留删除墓碑（按「不存在」回）: %s", e)
+            return None
+        if not row:
+            return None
+        scope = self._visibility_scope(caller_agent_id, caller_role)
+        owner = str(row.get("agent_id") or "")
+        if owner and not scope.is_primary and owner != scope.caller_id:
+            return None            # 别人的墓碑 ⇒ 不可见（不泄露）
+        return row
+
     # ---- 可见性（2026-10 ks_share_memory）------------------------------
 
     def _visibility_scope(self, caller_agent_id: str = "",
@@ -2645,12 +2694,17 @@ class KeepsakeProvider(MemoryProvider):
     def remove(self, target: str, expected_rev: Optional[str] = None) -> Any:
         """按 key 删除。
 
-        * `expected_rev` 为 None（**默认**）⇒ **现行为逐字不变**：返回 bool。
+        * `expected_rev` 为 None（**默认**）⇒ 返回 bool。
         * `expected_rev` 给了 ⇒ **CAS 删除**：版本对不上返回**同款 conflict 结构**
           （与 `update()` 同形：带 `current_rev` / `current_content` / `updated_by`），
           且**行仍在**（不删）；删掉了返回 `{"ok": True, "removed": True, "key": …}`。
           **链身断链**（历史链身 + 链头已被删除）⇒ `{"error": "orphan"}`
           （行还在，**不是** not_found）。
+
+        🔴 **删除不留痕 ⇒ 显式拒**（2026-11 ks_tombstone）：后端**不留墓碑**
+           （Redis）时删除会**彻底查不到「删过」** ⇒ 这里**显式拒绝**
+           （`backend_unsupported`）—— **宁可删不掉，不可删无痕**。
+           PG / SQLite 有墓碑 ⇒ 照常删（删与留碑**同事务**）。
         """
         try:
             storage = self._require_storage()
@@ -2658,7 +2712,14 @@ class KeepsakeProvider(MemoryProvider):
             logger.warning("keepsake: remove(%s) 失败（fail-closed，返回 False）: %s", target, e)
             return False
         if not expected_rev:
-            # `expected_rev` 空 ⇒ **现行为逐字不变**（向后兼容已接入的老代理）
+            # 🔴 该后端删除**不留痕** ⇒ 显式拒（不静默删出一个查不到的历史）
+            if not getattr(storage, "supports_tombstone", False):
+                raise BackendUnsupportedError(
+                    "backend_unsupported: 该存储后端不留删除墓碑（tombstone）—— 删除将"
+                    "永远查不到「这条删过」，已显式拒绝。请改用支持墓碑的后端"
+                    "（PG / SQLite）。"
+                )
+            # `expected_rev` 空 ⇒ 不做版本校验（向后兼容已接入的老代理）
             try:
                 ok = bool(storage.delete_fragments_batch([target]))
             except Exception as e:

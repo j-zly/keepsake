@@ -849,7 +849,20 @@ server.run("stdio")                         # any MCP client connects and is don
 
 Why mandatory: memories are a core asset, so the MCP surface is **fail-closed** — there is no "no version ⇒ skip the check" escape hatch. When several processes share one credential and write the same pool, this version check is **the only gate** against silently overwriting each other (the server-side row lock + version comparison is the backstop, not a substitute). The storage / provider layer keeps its internal empty-string compatibility path (batch jobs, the consolidation cron, the console's direct provider calls), but that path is **not exposed** to MCP callers.
 
-**Revive semantics (2026-10 ks_remove_sem).** The key **is the content hash** ⇒ re-`add`ing the same body is a **no-op while the entry still exists**, and a **revive of the original key** once the entry has been deleted (its `rev` goes back to 1). So the only way to check "is this entry really gone?" is **`memory_get` on that exact key** — **never** verify existence by re-`add`ing the same body: a successful `add` says nothing about existence (it is a no-op in both cases) and it silently resurrects the entry.
+**Revive semantics (2026-10 ks_remove_sem; rev part revised by 2026-11 ks_tombstone).** The key **is the content hash** ⇒ re-`add`ing the same body is a **no-op while the entry still exists**, and a **revive of the original key** once the entry has been deleted. So the only way to check "is this entry really gone?" is **`memory_get` on that exact key** — **never** verify existence by re-`add`ing the same body: a successful `add` says nothing about existence (it is a no-op in both cases) and it silently resurrects the entry.
+
+🔴 **`rev` no longer goes back to 1** (2026-11 ks_tombstone): a revived entry **continues from the tombstone** (deleted at version 1 ⇒ revived as version 2; delete and revive again ⇒ version 3, …) — the version history **no longer breaks**. With no tombstone (never deleted) the `rev` still starts at 1.
+
+**Deletion trace (2026-11 ks_tombstone).** A delete is **no longer a traceless physical delete**: deleting one leaves a row in `ks_tombstone` **in the same transaction** (`key` / owner / **the `rev` it had at deletion time** / deletion time). `memory_get` therefore has two tiers:
+
+- the row is still there ⇒ the entry comes back as usual;
+- the row is gone but a **tombstone exists** ⇒ it answers in the project's usual wording: *"条目 {key} 已于 {deletion time} 删除（删除时 rev={rev}）。同正文重新 memory_add 会复活原 key（rev 从 {rev+1} 接续）。"* — clearly distinct from **"never existed"** (which still answers *"记忆条目不存在：{key}"*).
+
+🔴 **Invisible ownership ⇒ still answered as "does not exist"** (tombstone owner ≠ caller and caller is not primary): **nothing about other agents' deletions leaks** — existence itself is protected.
+
+🔴 **fail-closed**: the tombstone write and the delete share **one transaction** — if the tombstone write fails the whole delete rolls back ⇒ **rather undeleteable than deleted without a trace** (both delete paths, `cas_remove` and `delete_fragments_batch`, behave the same). The `tombstone` field of the capability declaration is that switch: **true for PG / SQLite**, **false for Redis** (that backend leaves no trace ⇒ it says false honestly, never pretending "deletions are traceable").
+
+🔴 **The delete write path on Redis** (`provider.remove`'s compatibility path without a version) **refuses explicitly** (`backend_unsupported`): on that backend a deleted entry can never be traced again ⇒ **rather undeleteable than deleted without a trace**.
 
 **Four-tier error semantics (2026-11 ks_err_tiers).** The write path (`memory_update` / `memory_remove`) now fails in **four distinct tiers** — it **no longer collapses everything into "not found"**:
 

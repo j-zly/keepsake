@@ -88,7 +88,14 @@ from ..govern.registry import is_broken_connection_error
 # 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
 # 标准库，不反向 import core ⇒ 不成环）。
 from ..govern.visibility import fragment_owner
-from .base import StorageBase, fire_hits, idem_cutoff_iso, idem_now_iso
+from .base import (
+    TOMBSTONE_TABLE,
+    StorageBase,
+    fire_hits,
+    idem_cutoff_iso,
+    idem_now_iso,
+    tombstone_now_iso,
+)
 from .shared import (          # 与 Redis 共用的检索后处理（同一批函数对象）
     FRAGMENT_FIELDS,
     SEARCH_FIELDS,
@@ -433,6 +440,17 @@ _DDL_TABLES = (
         frag_key text NOT NULL,
         created  text NOT NULL,
         PRIMARY KEY (owner, idem_key)
+    )
+    """),
+    # 2026-11 ks_tombstone：删除墓碑（删过可查证 + 复活 rev 接续）。
+    # key 就是碎片的 key（内容哈希）⇒ 复活同正文时命中它，rev 从它接续。
+    # agent_id = 被删那条的归属（写墓碑时用 govern.visibility.fragment_owner 解析）。
+    ("ks_tombstone", """
+    CREATE TABLE IF NOT EXISTS ks_tombstone (
+        key        text PRIMARY KEY,
+        agent_id   text NOT NULL DEFAULT '',
+        rev        text NOT NULL DEFAULT '1',
+        deleted_at text NOT NULL DEFAULT ''
     )
     """),
     # 2026-10 ks_agent_registry：代理注册表（身份 / 角色 / 凭据 / 上下文开关）。
@@ -964,6 +982,10 @@ class PgStorage(StorageBase):
 
     #: 本后端**支持**幂等键（真实现：`ks_idem_event` 登记表，见 `idem_lookup`）。
     supports_idempotency = True
+
+    #: 本后端**留删除墓碑**（2026-11 ks_tombstone）：删一条 ⇒ 同事务写一行
+    #: `ks_tombstone`（key / 归属 / 删除时的 rev / 删除时刻）。
+    supports_tombstone = True
 
     #: 检索面长度地板的**类级默认**（2026-10 ks_lenfloor）—— 缺省 5000。
     #: 实例值见 `self._max_content_len`（构造参数 `max_content_len` 覆盖它）。
@@ -3017,6 +3039,22 @@ class PgStorage(StorageBase):
                 key = f"{key}:{int(time.time())}"
             # row is None ⇒ 直接 INSERT（key 不变）
 
+            # 🔴 **复活语义**（2026-11 ks_tombstone）：行不在但**墓碑在**
+            #    ⇒ 「同正文重 add 复活已删条目」⇒ 新行 rev **从墓碑接续**
+            #    （不再归 1 —— 版本历史不断裂），并**消费掉**这条墓碑。
+            #    无墓碑 ⇒ 下面逐字不变（rev 走列默认值 '1'）。
+            revive_rev = ""
+            if row is None:
+                cur.execute("SELECT COALESCE(rev, '1') FROM ks_tombstone WHERE key = %s",
+                            (key,))
+                tomb = cur.fetchone()
+                if tomb is not None:
+                    self._require_rev()          # rev 列不在 ⇒ 报人话错（不静默归 1）
+                    revive_rev = next_rev(rev_of(tomb[0]))
+                    cur.execute("DELETE FROM ks_tombstone WHERE key = %s", (key,))
+            rev_col = ", rev" if revive_rev else ""
+            rev_params = ", %s" if revive_rev else ""
+
             entities_str = ",".join(entities) if entities else ""
             # ---- 批 2：同步算好检索用的两列，别让调用方回填 ----
             # 1) content_tsv = A(content 的 jieba 分词) || B(entities + tags)
@@ -3042,9 +3080,9 @@ class PgStorage(StorageBase):
                 INSERT INTO ks_fragment (
                     key, content, tags, category, source, created,
                     sentiment_score, sentiment_label, feedback_score,
-                    entities, fragment_type, content_tsv, embedding{app_cols}
+                    entities, fragment_type, content_tsv, embedding{app_cols}{rev_col}
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          {TSV_SETWEIGHT_SQL}, {vec_sql}{app_params})
+                          {TSV_SETWEIGHT_SQL}, {vec_sql}{app_params}{rev_params})
                 """,
                 (
                     key, text, final_tags, category, source, now_iso,
@@ -3053,6 +3091,7 @@ class PgStorage(StorageBase):
                     *tsv_params,
                     *([self._vector_literal(vec)] if vec else []),
                     *([app] if app else []),
+                    *([revive_rev] if revive_rev else []),
                 ),
             )
             self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
@@ -3850,6 +3889,10 @@ class PgStorage(StorageBase):
             want_rev = str(expected_rev or "").strip()
             if head["key"] != key or (want_rev and head["rev"] != want_rev):
                 return ("conflict", self._conflict_payload(head))
+            # 🔴 **留碑与删同事务**（2026-11 ks_tombstone）：先记「删的是哪一版、
+            #    谁的」，再删。留碑失败 ⇒ 抛错 ⇒ 事务回滚 ⇒ **删不掉**
+            #    （fail-closed：宁可删不掉，不可删无痕）。
+            self._write_tombstone(cur, key, head["rev"], head.get("tags", ""))
             cur.execute("DELETE FROM ks_fragment WHERE key = %s", (key,))
             cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = %s", (key,))
             return ("ok", None)
@@ -3990,21 +4033,67 @@ class PgStorage(StorageBase):
             self._snap_drop("n_avgdl", "dfs")
         return moved
 
+    def tombstone_lookup(self, key: str) -> Optional[Dict[str, str]]:
+        """查一条删除墓碑（命中 ⇒ 载荷；未命中 ⇒ None）。"""
+        if not key:
+            return None
+        with self._ro() as cur:
+            cur.execute(
+                "SELECT key, COALESCE(agent_id, ''), COALESCE(rev, '1'), "
+                "COALESCE(deleted_at, '') FROM ks_tombstone WHERE key = %s", (key,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {"key": row[0], "agent_id": row[1], "rev": row[2], "deleted_at": row[3]}
+
+    def _write_tombstone(self, cur: Any, key: str, rev: str, tags: str) -> None:
+        """写一条删除墓碑（**必须在删的那个事务里**）。
+
+        🔴 **失败必须让整个删事务回滚**（`fail-closed`）：宁可删不掉，
+           不可删无痕 —— 留痕是承诺，兑现不了就别删。这里**不吞异常**，
+           异常往上抛 ⇒ 事务回滚 ⇒ 碎片还在、墓碑没写 ⇒ 一致。
+
+        归属用 `govern.visibility.fragment_owner`（**唯一一份归属口径**，
+        与检索 / core 可见性同一把尺子）—— 不自造第二套解析。
+        """
+        cur.execute(
+            "INSERT INTO ks_tombstone (key, agent_id, rev, deleted_at) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET agent_id = EXCLUDED.agent_id, "
+            "rev = EXCLUDED.rev, deleted_at = EXCLUDED.deleted_at",
+            (key, fragment_owner(tags), rev_of(rev), tombstone_now_iso()),
+        )
+
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量硬删。一条 DELETE + 一条时间线清理（碎片没了，时间线成员就是死引用）。
 
         hot_topic / attention / hot_topic_seen 是**聚合信号**（话题级、非碎片级），
         Redis 侧 forget 也不动它们 ⇒ 这里同样不动，保持后端语义等价。
+
+        🔴 **删前留碑**（2026-11 ks_tombstone）：先 SELECT 出将被删的各行
+           `(key, rev, tags)`，删成功后**同事务**逐行写墓碑 ⇒ 批删也「删过可查证」。
+           留碑失败 ⇒ 整个事务回滚 ⇒ **删不掉**（fail-closed：宁可删不掉，
+           不可删无痕）。
         """
         keys = [k for k in keys if k]
         if not keys:
             return 0
         with self._tx() as cur:
+            # 删前取行（key, rev, tags）—— 墓碑要记「删除时那一版」。
+            # rev 列缺失的老库 ⇒ 一律按 '1' 记（与读路径的 rev_of 兜底同款）。
+            rev_expr = ("COALESCE(rev, '1')" if not self._rev_missing() else "'1'")
+            cur.execute(
+                f"SELECT key, {rev_expr}, COALESCE(tags, '') "
+                "FROM ks_fragment WHERE key = ANY(%s)", (list(keys),))
+            rows = cur.fetchall()
             cur.execute(
                 "DELETE FROM ks_fragment WHERE key = ANY(%s)", (list(keys),))
             deleted = cur.rowcount
             cur.execute(
                 "DELETE FROM ks_entity_timeline WHERE frag_key = ANY(%s)", (list(keys),))
+            # 墓碑与删**同事务**：留痕失败 ⇒ 整体回滚（不删无痕）
+            for rkey, rrev, rtags in rows:
+                self._write_tombstone(cur, rkey, rrev, rtags)
             return deleted
 
         # ------------------------------------------------------------------

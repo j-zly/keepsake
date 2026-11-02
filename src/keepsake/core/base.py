@@ -82,6 +82,17 @@ class StorageBase(ABC):
     #:    回执 ⇒ 它以为重试安全，其实重试会落第二条（正是本单要治的病）。
     supports_idempotency: bool = False
 
+    #: 本后端**是否留删除墓碑**（2026-11 ks_tombstone）。
+    #:
+    #: 墓碑 = 「这条删过、何时删、当时什么版本」的**留痕**。没有它，
+    #: `memory_get` 对已删条目回「不存在」⇒ 与**从未存在**无法区分。
+    #:
+    #: 🔴 **默认 False（不留痕）**，与上面两个开关同一套纪律：Redis 后端删除
+    #:    **不留痕** ⇒ 它**必须显式说明**（能力声明里 `tombstone=false` +
+    #:    `tombstone_lookup` 抛 `backend_unsupported`），**不许让调用方以为
+    #:    「删了可查证」**。真留痕的后端（PG / SQLite）必须显式改成 True。
+    supports_tombstone: bool = False
+
     @property
     def default_agent_id(self) -> str:
         """本后端的**进程默认身份**（落库打标用它：`owner_agent_id` 为空时）。
@@ -270,6 +281,44 @@ class StorageBase(ABC):
         """
         raise BackendUnsupportedError(
             "backend_unsupported: 幂等键需 PG/SQLite 后端"
+        )
+
+    # ------------------------------------------------------------------
+    # 删除墓碑（2026-11 ks_tombstone）
+    #
+    # 治的病：**删除是物理删，零痕迹** ⇒ 「这条删过没有」与「这条从没存在过」
+    # 在读接口上**完全一样**（`memory_get` 都回「不存在」）；同正文重 add
+    # 还会**复活原 key 且 rev 归 1**（版本历史断裂）。
+    #
+    # 墓碑 = 一行留痕：`key`（= 内容哈希）+ 归属 + **删除时的 rev** + 删除时刻。
+    # 有了它：
+    #   * `memory_get` 能回「这条删过、何时删、当时第几版」（**归属不可见的人
+    #     仍按「不存在」回** —— 不泄露别人删过什么）；
+    #   * 同正文重 add（复活）时 **rev 从墓碑接续**，版本历史不断裂。
+    #
+    # 🔴 **留碑与删必须在同一个事务里**：留碑失败 ⇒ 整个删事务回滚
+    #    （**宁可删不掉，不可删无痕**）。这是 fail-closed 方向：留痕是
+    #    **承诺**，承诺兑现不了就别删。
+    #
+    # 🔴 **默认实现 = 不支持**（抛 `BackendUnsupportedError`），与
+    #    `cas_update` / `idem_lookup` 同一套纪律：Redis 后端不留痕 ⇒
+    #    **显式说「这个后端做不了」**，绝不静默假装「没删过」。
+    # ------------------------------------------------------------------
+
+    def tombstone_lookup(self, key: str) -> Optional[Dict[str, str]]:
+        """查一条删除墓碑（命中 ⇒ 载荷；未命中 ⇒ None）。
+
+        载荷形状：`{"key":…, "agent_id":…, "rev":…, "deleted_at":…}`
+          * `agent_id` = 被删那条的**归属**（`govern.visibility.fragment_owner`
+            从它的 tags 解析出来的 —— **唯一一份归属口径**，不自造第二套）；
+          * `rev` = **删除时**那一版的版本号（复活时从它接续）；
+          * `deleted_at` = 删除时刻（UTC ISO-8601，秒精度）。
+
+        默认实现 = **不支持**（抛 `BackendUnsupportedError`）。留痕的后端
+        （PG / SQLite）必须覆写它。
+        """
+        raise BackendUnsupportedError(
+            "backend_unsupported: 删除墓碑（tombstone）需 PG/SQLite 后端"
         )
 
     @abstractmethod
@@ -776,3 +825,22 @@ def idem_cutoff_iso(days: int = IDEM_TTL_DAYS) -> str:
     """TTL 边界（比现在早 `days` 天）；格式同 `idem_now_iso()` ⇒ 可直接比大小。"""
     return (datetime.now(timezone.utc)
             - timedelta(days=int(days))).isoformat(timespec="microseconds")
+
+
+# ---------------------------------------------------------------------------
+# 删除墓碑的时间戳格式（2026-11 ks_tombstone）—— PG / SQLite 共用同一份
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么是秒精度**：墓碑的 `deleted_at` 是**给人看的**（「这条何时删的」），
+#    不参与 TTL 判定、不参与排序比较（也没有排序语义）⇒ 秒精度足够。
+#    但**必须固定宽度同形态**（`isoformat(timespec="seconds")`）：同一时刻
+#    只有一种字符串形态 ⇒ 字典序恒等于时序，将来若要按时间清理墓碑
+#    （比如「只留 N 天」），`deleted_at < 截止` 直接可比大小。
+
+#: 删除墓碑表名（PG / SQLite 同名；建表走各自的 `ensure_index` 自愈）。
+TOMBSTONE_TABLE = "ks_tombstone"
+
+
+def tombstone_now_iso() -> str:
+    """墓碑 `deleted_at` 列的时间戳（固定宽度 ISO-8601 UTC，秒精度）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")

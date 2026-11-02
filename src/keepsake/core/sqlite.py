@@ -107,7 +107,14 @@ from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
 # 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
 # 标准库，不反向 import core ⇒ 不成环）。
 from ..govern.visibility import fragment_owner
-from .base import StorageBase, fire_hits, idem_cutoff_iso, idem_now_iso
+from .base import (
+    TOMBSTONE_TABLE,
+    StorageBase,
+    fire_hits,
+    idem_cutoff_iso,
+    idem_now_iso,
+    tombstone_now_iso,
+)
 from . import shared as storage_shared
 # 检索后处理与排序权重公式：与 Redis / PG **同一个函数对象**（不重写、不复制）。
 from .shared import (
@@ -352,6 +359,17 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
         PRIMARY KEY (owner, idem_key)
     )
     """),
+    # 2026-11 ks_tombstone：删除墓碑（删过可查证 + 复活 rev 接续）。
+    # key 就是碎片的 key（内容哈希）⇒ 复活同正文时命中它，rev 从它接续。
+    # agent_id = 被删那条的归属（写墓碑时用 govern.visibility.fragment_owner 解析）。
+    ("ks_tombstone", """
+    CREATE TABLE IF NOT EXISTS ks_tombstone (
+        key        TEXT PRIMARY KEY,
+        agent_id   TEXT NOT NULL DEFAULT '',
+        rev        TEXT NOT NULL DEFAULT '1',
+        deleted_at TEXT NOT NULL DEFAULT ''
+    )
+    """),
     # 2026-10 ks_agent_registry：代理注册表（身份 / 角色 / 凭据 / 上下文开关）。
     # DDL **不在这里另抄一份** —— 唯一定义处是 `govern/registry.py::KS_AGENT_DDL`
     # （它只依赖标准库，反向 import 不会成环）；两个后端建表语句复制一份必然漂，
@@ -520,6 +538,10 @@ class SqliteStorage(StorageBase):
 
     #: 本后端**支持**幂等键（真实现：`ks_idem_event` 登记表，见 `idem_lookup`）。
     supports_idempotency = True
+
+    #: 本后端**留删除墓碑**（2026-11 ks_tombstone）：删一条 ⇒ 同事务写一行
+    #: `ks_tombstone`（key / 归属 / 删除时的 rev / 删除时刻）。
+    supports_tombstone = True
 
     #: 检索面长度地板的**类级默认**（2026-10 ks_lenfloor）—— 缺省 5000。
     #: 实例值见 `self._max_content_len`（构造参数 `max_content_len` 覆盖它）。
@@ -845,11 +867,16 @@ class SqliteStorage(StorageBase):
             return False
 
     def _schema_ready(self) -> Tuple[bool, Optional[str]]:
-        """`ks_fragment` 是否已具备**全部列** + FTS 虚表是否在（读写路径的前提）。
+        """`ks_fragment` 是否已具备**全部列** + FTS 虚表 + 墓碑表是否在（读写路径的前提）。
 
         只发 `PRAGMA table_info` / 查 `sqlite_master`（只读、不拿 schema 锁、不发 DDL），
         健康路径成本可忽略。表不存在 ⇒ 返回空集合 ⇒ 判为未就绪。
         **探测本身出错也判未就绪**（不是就绪）。返回 (是否就绪, 探测失败时的原因)。
+
+        🔴 **墓碑表也在就绪判据里**（2026-11 ks_tombstone）：老库（本次上线前建的）
+           没有 `ks_tombstone` ⇒ 判未就绪 ⇒ `_require_ready` 补跑一次
+           `ensure_index()` 把表补上 ⇒ **删路径不会因为「表不存在」而删无痕**
+           （表缺失时留碑会失败 ⇒ 整个删事务回滚 ⇒ 宁可删不掉）。
         """
         try:
             with self._lock:
@@ -859,12 +886,18 @@ class SqliteStorage(StorageBase):
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                     (FTS_TABLE,),
                 ).fetchone() is not None
+                has_tomb = cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (TOMBSTONE_TABLE,),
+                ).fetchone() is not None
         except Exception as e:      # noqa: BLE001 — 探测失败即「未就绪」，绝不当作就绪
             return False, f"{type(e).__name__}: {e}"
         if not set(ALL_COLUMNS) <= have:
             return False, "ks_fragment 缺列: " + ",".join(sorted(set(ALL_COLUMNS) - have))
         if not has_fts:
             return False, f"{FTS_TABLE} 虚表不存在（FTS5 索引未就绪）"
+        if not has_tomb:
+            return False, f"{TOMBSTONE_TABLE} 表不存在（删除留痕未就绪）"
         return True, None
 
     def _require_ready(self, op: str) -> None:
@@ -1025,17 +1058,34 @@ class SqliteStorage(StorageBase):
                         )
                     # 链身（is_latest='0'）⇒ 不动它，新写入照样要独立 key（主键唯一约束）
                     key = f"{key}:{int(time.time())}"
+                # 🔴 **复活语义**（2026-11 ks_tombstone）：行不在但**墓碑在**
+                #    ⇒ 「同正文重 add 复活已删条目」⇒ 新行 rev **从墓碑接续**
+                #    （不再归 1 —— 版本历史不断裂），并**消费掉**这条墓碑。
+                #    无墓碑 ⇒ 下面逐字不变（rev 走列默认值 '1'）。
+                revive_rev = ""
+                if row is None:
+                    tomb = cur.execute(
+                        "SELECT COALESCE(rev, '1') FROM ks_tombstone WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    if tomb is not None:
+                        revive_rev = next_rev(tomb[0])
+                        cur.execute("DELETE FROM ks_tombstone WHERE key = ?", (key,))
+                rev_col = ", rev" if revive_rev else ""
+                rev_ph = ", ?" if revive_rev else ""
+                rev_upd = ", rev=excluded.rev" if revive_rev else ""
                 entities_str = ",".join(entities) if entities else ""
                 # 批 2：分词文本与 FTS 索引**同一个写事务**、且在主表之后
                 # —— 任一步抛错都整体 ROLLBACK，绝不出现「主表有行、索引没有」。
                 tokens = self._fts_tokens(text, entities_str, final_tags)
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO ks_fragment (
                         key, content, tags, category, source, created, updated, hash,
                         sentiment_score, sentiment_label, feedback_score,
-                        entities, fragment_type, embed_bin, content_tsv, applicability
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        entities, fragment_type, embed_bin, content_tsv,
+                        applicability{rev_col}
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?{rev_ph})
                     ON CONFLICT(key) DO UPDATE SET
                         content=excluded.content, tags=excluded.tags,
                         category=excluded.category, source=excluded.source,
@@ -1047,12 +1097,12 @@ class SqliteStorage(StorageBase):
                         entities=excluded.entities, fragment_type=excluded.fragment_type,
                         embed_bin=COALESCE(excluded.embed_bin, ks_fragment.embed_bin),
                         content_tsv=excluded.content_tsv,
-                        applicability=excluded.applicability
+                        applicability=excluded.applicability{rev_upd}
                     """,
                     (key, text, final_tags, category, source, now_iso, now_iso,
                      content_hash, str(intensity), label, existing_feedback,
                      entities_str, fragment_type, self._text_to_blob(text), tokens,
-                     (applicability or "").strip()),
+                     (applicability or "").strip(), *([revive_rev] if revive_rev else [])),
                 )
                 self._fts_write(cur, key, tokens)
                 self._record_attention(cur, keywords, intensity, now_ts=now.timestamp())
@@ -1376,6 +1426,10 @@ class SqliteStorage(StorageBase):
                 want_rev = str(expected_rev or "").strip()
                 if head["key"] != key or (want_rev and head["rev"] != want_rev):
                     return ("conflict", self._conflict_payload(head))
+                # 🔴 **留碑与删同事务**（2026-11 ks_tombstone）：先记「删的是哪一版、
+                #    谁的」，再删。留碑失败 ⇒ 抛错 ⇒ `_write()` 回滚 ⇒ **删不掉**
+                #    （fail-closed：宁可删不掉，不可删无痕）。
+                self._write_tombstone(cur, key, head["rev"], head.get("tags", ""))
                 cur.execute("DELETE FROM ks_fragment WHERE key = ?", (key,))
                 cur.execute("DELETE FROM ks_entity_timeline WHERE frag_key = ?", (key,))
                 self._fts_delete(cur, key)
@@ -1797,11 +1851,64 @@ class SqliteStorage(StorageBase):
             return 0
         return moved
 
+    # ------------------------------------------------------------------
+    # 删除墓碑（2026-11 ks_tombstone）
+    # ------------------------------------------------------------------
+
+    def tombstone_lookup(self, key: str) -> Optional[Dict[str, str]]:
+        """查一条删除墓碑（命中 ⇒ 载荷；未命中 ⇒ None）。
+
+        🔴 **老库兜底**：本次上线前建的库还没有 `ks_tombstone` 表 ⇒ 首次查会
+        `no such table` ⇒ **补建一次**（`ensure_index` 自愈）再查；补建不成
+        （库坏了）⇒ 按「没有墓碑」处理（读路径不该因为一张附属表把整个读打断）。
+        """
+        if not key:
+            return None
+        sql = ("SELECT key, COALESCE(agent_id, ''), COALESCE(rev, '1'), "
+               "COALESCE(deleted_at, '') FROM ks_tombstone WHERE key = ?")
+        try:
+            with self._lock:
+                row = self._db().execute(sql, (key,)).fetchone()
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e):
+                raise
+            if not self.ensure_index():
+                return None
+            with self._lock:
+                row = self._db().execute(sql, (key,)).fetchone()
+        if row is None:
+            return None
+        return {"key": row[0], "agent_id": row[1], "rev": row[2], "deleted_at": row[3]}
+
+    def _write_tombstone(self, cur: sqlite3.Cursor, key: str, rev: str,
+                         tags: str) -> None:
+        """写一条删除墓碑（**必须在删的那个事务里**）。
+
+        🔴 **失败必须让整个删事务回滚**（`fail-closed`）：宁可删不掉，
+           不可删无痕 —— 留痕是承诺，兑现不了就别删。这里**不吞异常**，
+           异常往上抛 ⇒ `_write()` 回滚 ⇒ 碎片还在、墓碑没写 ⇒ 一致。
+
+        归属用 `govern.visibility.fragment_owner`（**唯一一份归属口径**，
+        与检索 / core 可见性同一把尺子）—— 不自造第二套解析。
+        """
+        cur.execute(
+            "INSERT INTO ks_tombstone (key, agent_id, rev, deleted_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET agent_id=excluded.agent_id, "
+            "rev=excluded.rev, deleted_at=excluded.deleted_at",
+            (key, fragment_owner(tags), rev_of(rev), tombstone_now_iso()),
+        )
+
     def delete_fragments_batch(self, keys: List[str]) -> int:
         """批量硬删 + 时间线清理（碎片没了，时间线成员就是死引用）。
 
         hot_topic / attention / hot_topic_seen 是**聚合信号**（话题级、非碎片级），
         Redis 侧 forget 也不动它们 ⇒ 这里同样不动，保持后端语义等价。
+
+        🔴 **删前留碑**（2026-11 ks_tombstone）：先 SELECT 出将被删的各行
+           `(key, rev, tags)`，删成功后**同事务**逐行写墓碑 ⇒ 批删也「删过可查证」。
+           留碑失败 ⇒ 整个事务回滚 ⇒ **删不掉**（fail-closed：宁可删不掉，
+           不可删无痕）。
         """
         keys = [k for k in keys if k]
         if not keys:
@@ -1811,6 +1918,11 @@ class SqliteStorage(StorageBase):
             with self._write() as cur:
                 for chunk in _chunks(keys):
                     placeholders = ", ".join("?" for _ in chunk)
+                    # 删前取行（key, rev, tags）—— 墓碑要记「删除时那一版」
+                    rows = cur.execute(
+                        f"SELECT key, COALESCE(rev, '1'), COALESCE(tags, '') "
+                        f"FROM ks_fragment WHERE key IN ({placeholders})", chunk,
+                    ).fetchall()
                     cur.execute(
                         f"DELETE FROM ks_entity_timeline WHERE frag_key IN ({placeholders})",
                         chunk,
@@ -1823,6 +1935,9 @@ class SqliteStorage(StorageBase):
                     cur.execute(
                         f"DELETE FROM {FTS_TABLE} WHERE frag_key IN ({placeholders})", chunk,
                     )
+                    # 墓碑与删**同事务**：留痕失败 ⇒ 整体回滚（不删无痕）
+                    for rkey, rrev, rtags in rows:
+                        self._write_tombstone(cur, rkey, rrev, rtags)
         except StorageNotReadyError:
             raise
         except Exception as e:      # noqa: BLE001

@@ -67,7 +67,7 @@ from ..api import audit
 from ..core import screening
 # rev 默认版本号（2026-10 ks_memory_rev_cas）—— 存储层缺列时兜底成 '1'
 from ..core.base import BackendUnsupportedError
-from ..core.shared import DEFAULT_REV
+from ..core.shared import DEFAULT_REV, next_rev
 from ..govern.messaging import CONTENT_MAX as MESSAGE_CONTENT_MAX, Messaging
 # 待办（2026-10 ks_todo）：存储层 + 口径单点（到期判定、可见性都在那边）。
 from ..govern.todo import (
@@ -361,6 +361,11 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
         #    （带同一个键重试 ⇒ 不落第二条）。False = 后端不支持，
         #    调用方带了会被**显式拒绝**（绝不静默降级成「照写不误」）。
         "idempotent_write": bool(getattr(caps, "idempotent_write", False)),
+        # 🔴 删除墓碑（2026-11 ks_tombstone）：删除**留痕**（可查证「这条删过、
+        #    何时删、当时第几版」；同正文重 add 复活时 rev 从墓碑**接续**）。
+        #    PG / SQLite = True；Redis = False（该后端删除不留痕 ⇒ 如实说 False，
+        #    **绝不假装「删了可查证」**）。
+        "tombstone": bool(getattr(provider, "supports_tombstone", False)),
         # 🔴 归属语义（2026-10 ks_owner_stamp）：写入方身份 = **凭据反查**的调用方
         #    （`caller_credential`）—— 写的记忆归自己，不是 provider 进程的身份。
         "write_owner": "caller_credential",
@@ -435,9 +440,22 @@ def memory_get(provider: Any, key: str, caller_agent_id: str = "",
 
     🔴 **未共享代理的条目按「不存在」回**（2026-10 ks_share_memory）：
     存在性本身也不许泄露。
+
+    🔴 **墓碑档**（2026-11 ks_tombstone）：行不在、但**墓碑在** ⇒ 回
+    「这条**删过**、何时删、当时第几版」—— 与「**从未存在过**」区分开。
+    归属不可见的墓碑（别人的）仍按「不存在」回（**不泄露别人删过什么**）。
     """
     frag = provider.get(key, **_caller_kwargs(provider.get, caller_agent_id, caller_role))
     if not frag:
+        tomb = _tombstone_of(provider, key, caller_agent_id, caller_role)
+        if tomb:
+            rev = str(tomb.get("rev") or DEFAULT_REV)
+            raise ToolError(
+                f"条目 {key} 已于 {tomb.get('deleted_at', '')} 删除"
+                f"（删除时 rev={rev}）。"
+                f"同正文重新 memory_add 会复活原 key"
+                f"（rev 从 {next_rev(rev)} 接续）。"
+            )
         raise ToolError(f"记忆条目不存在：{key}")
     return {
         "key": str(frag.get("key") or key),
@@ -448,6 +466,25 @@ def memory_get(provider: Any, key: str, caller_agent_id: str = "",
         # memory_update 要拿它当 expected_rev（版本对不上会拒绝并回最新内容）。
         "rev": str(frag.get("rev") or DEFAULT_REV),
     }
+
+
+def _tombstone_of(provider: Any, key: str, caller_agent_id: str = "",
+                   caller_role: str = "") -> Optional[Dict[str, str]]:
+    """查这个 key 的删除墓碑（provider 不支持 / 不可见 ⇒ None ⇒ 按「不存在」回）。
+
+    provider 没实现这个薄方法（别的记忆系统）⇒ None；
+    查失败 ⇒ None（读路径不该因为一张附属表把「取不到条目」变成硬失败）。
+    """
+    fn = getattr(provider, "tombstone_lookup", None)
+    if not callable(fn):
+        return None
+    try:
+        row = fn(key, **_caller_kwargs(fn, caller_agent_id, caller_role))
+    except Exception as e:      # noqa: BLE001 —— 墓碑查不到 ⇒ 按「不存在」回
+        logger.debug("keepsake MCP: 查删除墓碑失败（按「不存在」回）: %s: %s",
+                     type(e).__name__, e)
+        return None
+    return row or None
 
 
 def memory_core_list(provider: Any, preview_chars: int = CORE_PREVIEW_CHARS,
