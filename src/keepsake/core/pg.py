@@ -2609,6 +2609,17 @@ class PgStorage(StorageBase):
             )
             return {k: v for k, v in cur.fetchall() if v}
 
+    def _fetch_tags(self, keys: List[str]) -> Dict[str, str]:
+        """批量读 tags（ks_stale_gate 的薄候选行兜底；一条 SQL，不 N+1）。"""
+        if not keys:
+            return {}
+        with self._ro() as cur:
+            cur.execute(
+                "SELECT key, COALESCE(tags, '') FROM ks_fragment WHERE key = ANY(%s)",
+                (list(keys),),
+            )
+            return dict(cur.fetchall())
+
     def _fetch_fragments(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量读碎片（一条 SQL，不 N+1），字段裁到检索形状。"""
         out: Dict[str, Dict[str, Any]] = {}

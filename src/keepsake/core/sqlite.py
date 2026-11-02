@@ -2316,6 +2316,25 @@ class SqliteStorage(StorageBase):
             logger.warning("storage_sqlite: _fetch_superseded_by failed: %s", e)
         return out
 
+    def _fetch_tags(self, keys: List[str]) -> Dict[str, str]:
+        """storage_shared 的后端钩子：批量读 tags（ks_stale_gate 兜底；不 N+1）。"""
+        if not keys:
+            return {}
+        out: Dict[str, str] = {}
+        try:
+            with self._lock:
+                cur = self._db().cursor()
+                for chunk in _chunks(list(keys)):
+                    placeholders = ", ".join("?" for _ in chunk)
+                    for k, t in cur.execute(
+                        f"SELECT key, COALESCE(tags, '') FROM ks_fragment "
+                        f"WHERE key IN ({placeholders})", chunk,
+                    ):
+                        out[k] = t
+        except Exception as e:      # noqa: BLE001
+            logger.warning("storage_sqlite: _fetch_tags failed: %s", e)
+        return out
+
     def _fetch_fragments(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
         """storage_shared 的后端钩子：批量读碎片（字段裁到检索形状）。"""
         if not keys:

@@ -1108,6 +1108,29 @@ def tiebreak_by_key(
 # 共用：v2 后置过滤 + 新版继承旧版名次
 # ---------------------------------------------------------------------------
 
+#: stale 标签族（人工墓碑化/作废声明的统一词表；前缀匹配 superseded-by-* 形态）。
+_STALE_TAG_PREFIXES = ("superseded", "stale-key", "stale-copy", "deprecated")
+
+
+def is_stale_flagged(tags: Any) -> bool:
+    """tags 串里是否声明了作废（stale 标签族 ⇒ True）。
+
+    * `tags` 是逗号分隔串（存储层原生形态）；非串/空 ⇒ False（不误杀无标签行）。
+    * 逐 token 精确边界匹配：`superseded-by-memory:frag:xxx` 这类**带值形态**按
+      前缀命中（打标签者写明被谁取代 ⇒ 更强作废语义）；
+      `not-deprecated` 这种**不误命中**（token 边界保护，同 tag_match_sql 纪律）。
+    * 🔴 判据单点：检索面（apply_v2_filters）与常驻注入面（provider._core_fragments）
+      共用本函数，禁止任何一侧自造第二份词表。
+    """
+    if not isinstance(tags, str) or not tags:
+        return False
+    for tok in tags.split(","):
+        tok = tok.strip()
+        if any(tok == p or tok.startswith(p + "-") for p in _STALE_TAG_PREFIXES):
+            return True
+    return False
+
+
 def apply_v2_filters(storage: Any, fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """v2 后置过滤：剔除 consumed + superseded；可选 min_score 地板。
 
@@ -1222,7 +1245,42 @@ def apply_v2_filters(storage: Any, fragments: List[Dict[str, Any]]) -> List[Dict
         after_expire.append(f)
     after_super = after_expire
 
-    return after_super
+    # 第六道（2026-11 ks_stale_gate）：stale 标签**机械排除**（治理原则：纪律⇒机制）。
+    # 背景实测（#178 后续，zly-hermes seq433 出证据）：演化链旧副本行被人工墓碑化打上
+    # superseded / superseded-by-* / stale-key / stale-copy / deprecated 标签后，检索面
+    # 照样召回且可拿高分居首（:1793603013 实测 0.176）⇒「命中旧行以权威条为准」只是
+    # 纪律不是机制。打标签=声明作废，本闸无条件执行该声明。
+    # 🔴 数据面：PG/SQLite 薄候选行**不带真 tags**（corrected 是合成值 `"corrected"`，
+    #    会把同行真 stale 声明遮住），所以**一律**走 `_fetch_tags(keys)` 批量取真值兜底
+    #    （与 `_fetch_superseded_by` 同款钩子模式，禁 N+1；候选 ≤200 行一条 SQL）。
+    #    行内 tags 只作第二保险（Redis 等自带 tags 的后端钩子缺失时仍能排）。
+    #    钩子不存在/抛错 ⇒ 只按行内 tags 判（fail-open 不误杀：拿不到真声明时，
+    #    合成值 "corrected" 不含 stale 词、不会误排正常行）。
+    # 判据单点 is_stale_flagged —— 常驻注入面（provider._core_fragments）共用同一份。
+    all_keys = [f.get("_key") for f in after_super if f.get("_key")]
+    tags_map: Dict[str, str] = {}
+    fetcher = getattr(storage, "_fetch_tags", None)
+    if all_keys and callable(fetcher):
+        try:
+            got = fetcher(all_keys)
+            if isinstance(got, dict):
+                tags_map = got
+        except Exception as e:      # noqa: BLE001 —— 兜底读失败=本轮按行内判（不误杀）
+            logger.debug("storage_shared: _fetch_tags 批量读失败（stale 闸退行内判据）: %s", e)
+    final: List[Dict[str, Any]] = []
+    for f in after_super:
+        k = f.get("_key")
+        real_tags = tags_map.get(k) if k else None
+        if is_stale_flagged(real_tags if real_tags is not None else f.get("tags")):
+            continue
+        if k and is_stale_flagged(f.get("tags")):   # 行内第二保险（自带 tags 的后端）
+            continue
+        final.append(f)
+    n_excluded = len(after_super) - len(final)
+    if n_excluded:
+        logger.info("storage: stale 标签闸剔除 %d 条作废副本（ks_stale_gate）", n_excluded)
+
+    return final
 
 
 # ---------------------------------------------------------------------------

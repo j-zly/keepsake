@@ -42,6 +42,8 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
 
 from ...core.embedder import create_embedder, resolve_embedder_api_key
 from ...core.base import BackendUnsupportedError
+# stale 标签机械排除闸的**唯一判据**（2026-11 ks_stale_gate；检索面同函数）。
+from ...core.shared import is_stale_flagged
 from ...core.redis import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
 from ...core.ops.forgetter import Forgetter
 # 治理收口（2026-10 ks_agent_registry）：身份 / 角色 / 上下文的判定源。
@@ -1407,6 +1409,10 @@ class KeepsakeProvider(MemoryProvider):
                 return []
             _CORE_CACHE["ts"] = now
             _CORE_CACHE["frags"] = frags
+        # 第〇道（2026-11 ks_stale_gate）：常驻注入面与检索面同一把尺子——
+        # 被声明作废（stale 标签族）的行**永不注入**，即便它占着 core 标签。
+        # 判据单点 is_stale_flagged（storage_shared），与 apply_v2_filters 共用。
+        frags = [f for f in frags if not is_stale_flagged(f.get("tags"))]
         # 同口径可见性：非 primary 只留**自己的** + 已共享代理的 core
         # （primary 的 core 也要 primary 自己开共享才外露 —— 对称规则）
         scope = self._visibility_scope(caller_agent_id, caller_role)

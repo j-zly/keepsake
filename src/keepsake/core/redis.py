@@ -2576,6 +2576,25 @@ class RedisStorage(StorageBase):
     # Redis 专属取数钩子（storage_shared 的两个后端接口，各只有几行）
     # ------------------------------------------------------------------
 
+    def _fetch_tags(self, keys: List[str]) -> Dict[str, str]:
+        """批量读 tags（ks_stale_gate 兜底；pipeline 一次往返，不 N+1）。
+
+        Redis 检索行通常自带 tags，本钩子只为与 PG/SQLite 对称 + 行内缺 tags 时兜底。
+        Redis 不可达时返回 {}（调用方 fail-open 按行内判据）。
+        """
+        client = self._get_client()
+        if not client or not keys:
+            return {}
+        pipe = client.pipeline()
+        for k in keys:
+            pipe.hget(k, "tags")
+        out: Dict[str, str] = {}
+        for k, v in zip(keys, pipe.execute()):
+            if v is None:
+                continue
+            out[k] = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+        return out
+
     def _fetch_superseded_by(self, keys: List[str]) -> Dict[str, str]:
         """批量读 superseded_by（pipeline 封边写入，不进 RediSearch 索引）。
 
