@@ -2079,6 +2079,10 @@ class KeepsakeProvider(MemoryProvider):
         判标签用 `_has_tag`（逗号边界的完整标签相等）—— **禁止对 tags 字符串做
         子串 grep**：`core` 是 `core_candidate` 的前缀，子串 grep 会把候选误认成常驻。
         候选面同样过可见性（与常驻面同一把尺子）：别的代理的候选不许删。
+
+        🔴 2026-11 keepsake_core_gate_stale：候选面**也过 stale 闸**
+        （`is_stale_flagged`，判据单点同常驻面）—— 带 stale 标签族的候选不进匹配面。
+        否则同文重写会被 stale 候选的幂等查重静默吞掉（store 0 次、无日志）。
         """
         frags = list(self._core_fragments())
         try:
@@ -2092,6 +2096,19 @@ class KeepsakeProvider(MemoryProvider):
         seen = {f.get("key") for f in frags}
         for f in cands:
             if not _has_tag(f.get("tags", ""), CORE_CANDIDATE_TAG):
+                continue
+            # 🔴 2026-11 keepsake_core_gate_stale：候选面与常驻面**同一把尺子**——
+            # 被声明作废（stale 标签族）的候选**不进匹配面**（判据单点
+            # is_stale_flagged，与 `_core_fragments` 的常驻注入面共用）。
+            #
+            # 为什么必须滤：匹配面同时是**幂等查重面** ⇒ 库里存在一条同文 stale 候选时，
+            # 再 `_core_write("add", 同文本)` 会被那条 stale 候选的查重命中而
+            # **静默丢弃**（store 调用 0 次、无日志）—— 写闸把代理的写入吞了。
+            #
+            # 滤完之后同文重写不再撞 stale 候选：落库走**仓内既有语义**
+            # （同内容命中同 key ⇒ 存储层版本化 / 复活，见 README「复活语义」节），
+            # **不发明第三种语义**。
+            if is_stale_flagged(f.get("tags")):
                 continue
             key = f.get("key")
             if key in seen:

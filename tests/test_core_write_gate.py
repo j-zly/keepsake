@@ -8,6 +8,8 @@
   4. 匹配面（幂等查重 / 删除定位）= core ∪ core_candidate ⇒ replace 不留双份、
      remove 删得到（候选落库后旧的常驻面匹配会静默失效）
   5. 存量裸 `core` 条目（人工批准过的）仍删得到 —— 并集匹配回归
+  6. 匹配面与常驻注入面**同一把尺子**：带 stale 标签族的候选不进匹配面 ——
+     否则同文重写会被 stale 候选的幂等查重**静默吞掉**（store 0 次、无日志）
 
 除 SQLite 真库用例外全部 hermetic（内存 fake storage，零网络零数据库）。
 🔴 **禁止 `RedisStorage()` 无参直调**：本机残留 redis 在应答，会真写数据。
@@ -22,6 +24,7 @@ import pytest
 
 from keepsake import KeepsakeProvider, _CORE_CACHE, _has_tag
 from keepsake.adapters.hermes import provider as provider_mod
+from keepsake.core.shared import is_stale_flagged
 from keepsake.storage_sqlite import SqliteStorage
 
 
@@ -224,5 +227,48 @@ def test_sqlite_candidate_is_stored_as_candidate_and_hidden_from_core(tmp_path):
         assert [r["content"] for r in rows] == [PROBE]
         assert s.list_by_tag("core") == []
         assert p._core_fragments() == []
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------------
+# 四、stale 闸：stale 候选不许吞掉同文重写
+# ---------------------------------------------------------------------------
+
+#: stale 标签族的一个真实形态（`superseded-*` 前缀命中，见 `is_stale_flagged`）。
+STALE_CANDIDATE_TAGS = "core_candidate,memory,superseded-by-memory:frag:aaa"
+
+
+def test_stale_candidate_does_not_swallow_same_text_rewrite(backfill_count):
+    """🔴 库里已有**同文 stale 候选**时，再写同文本必须真的落库（不许静默丢弃）。
+
+    匹配面 = core ∪ core_candidate，且幂等查重用的是这张面 ⇒ stale 候选若留在
+    匹配面里，同文重写会被它的查重命中 ⇒ **store 调用 0 次、无日志**（代理的写入
+    被写闸吞了，常驻面/审核页都看不见这次提名）。
+
+    修复后：stale 候选不进匹配面（判据单点 `is_stale_flagged`，与常驻注入面同一把
+    尺子）⇒ 落库走**仓内既有语义**（同内容命中同 key ⇒ 版本化 / 复活，
+    见 README「复活语义」节），不发明第三种语义。
+    """
+    st = FakeStorage([{"key": _key_of(PROBE), "content": PROBE,
+                       "tags": STALE_CANDIDATE_TAGS, "updated_at": ""}])
+    p = _provider(st)
+    p._core_write("add", "memory", PROBE, {})
+    assert len(st.store_calls) == 1, "stale 候选不许把同文重写静默吞掉（store 0 次）"
+    assert st.store_calls[0]["text"] == PROBE
+
+
+def test_sqlite_stale_candidate_rewrite_lands_a_live_candidate(tmp_path):
+    """真库串一遍：stale 候选被版本化归档，同文重写落成一条**活的**（非 stale）候选。"""
+    s = SqliteStorage(path=str(tmp_path / "stale.db"))
+    assert s.ensure_index() is True
+    try:
+        s.store(text=PROBE, tags=STALE_CANDIDATE_TAGS, category="core",
+                source="builtin_memory", fragment_type="core")
+        p = _provider(s)
+        p._core_write("add", "memory", PROBE, {})
+        live = [r for r in s.list_by_tag("core_candidate") if r["content"] == PROBE]
+        assert len(live) == 1, "stale 候选不许把同文重写吞掉"
+        assert not is_stale_flagged(live[0]["tags"]), "新落库的候选不该带 stale 标"
     finally:
         s.close()
