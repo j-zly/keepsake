@@ -35,6 +35,11 @@
 **读可见性**（这个代理的记忆进不进别人的检索范围），不碰状态 / 角色 / 凭据 ——
 与私信开关（`dm`）同一档，不是治理动作。
 
+🔴 **知识库共享开关**（`share-kb`，2026-11 ks_share_kb）：`POST .../share-kb`
+只改**读可见性**（这个代理名下的**知识库文档**进不进别人的检索范围），不碰状态 /
+角色 / 凭据 —— 与记忆共享（`share`）、私信开关（`dm`）同一档，不是治理动作。
+🔴 与 `share_memory` **解耦**：两个旗各自独立（开一个不影响另一个）。
+
 🔴 **私信实时推送开关**（`push`，2026-10 ks_dm_sse）：`POST .../push` 只改
 **能不能被连上来**（SSE 长连接的建流闸），不碰状态 / 角色 / 凭据 ——
 与私信开关（`dm`）、共享开关（`share`）同一档，不是治理动作。
@@ -145,6 +150,19 @@ class AgentShareBody(BaseModel):
     """
 
     enabled: bool = Field(..., description="true = 共享记忆给其他已批准代理；false = 不共享")
+    confirm: Any = False
+
+
+class AgentShareKbBody(BaseModel):
+    """`POST /api/v1/agents/{agent_id}/share-kb` 的请求体：知识库共享开关 + 显式确认。
+
+    🔴 `enabled` 是**读可见性偏好**（共不共享**知识库文档**），不是治理动作 ——
+    它不碰 `status` / `role` / 已发的凭据（与记忆共享 `share` 同一档）。
+    🔴 与记忆面的 `share_memory` **解耦**：开这个不会让记忆外露，反之亦然。
+    `confirm` 要 `true`（与本文件其余写端点同一道闸）。
+    """
+
+    enabled: bool = Field(..., description="true = 共享知识库文档给其他已批准代理；false = 不共享")
     confirm: Any = False
 
 
@@ -533,6 +551,32 @@ def set_agent_share(agent_id: str, body: AgentShareBody,
     audit.record(action, agent_id, ok=True,
                  reason=f"share_memory={bool(body.enabled)} (changed={changed}); backup={backup}")
     return {"ok": True, "agent_id": agent_id, "share_memory": bool(body.enabled),
+            "changed": bool(changed), "backup": backup}
+
+
+@router.post("/api/v1/agents/{agent_id}/share-kb",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_share_kb(agent_id: str, body: AgentShareKbBody,
+                       storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """开关「这个代理名下的**知识库文档**共享不共享**给别的已批准代理**」（`share_kb`）。
+
+    🔴 **只影响读可见性**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
+    一个都不动（那是别的语义）。
+    🔴 **与记忆面的 `share_memory` 解耦**：这个旗开/关**不影响**记忆的可见性
+    （两个旗各自独立，结构同尺）。
+    🔴 **不是治理动作**：`status` / `role` / 已发的凭据 / 知识库归属一个都不碰
+    （`Registry.set_share_kb` 同纪律）—— 与记忆共享（`share`）同一档。
+    🔴 未知代理 ⇒ 404；没带 `confirm` ⇒ 400 且**不改**。
+    """
+    action = "agents.share_kb"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改知识库共享开关')
+    backup = _backup("share_kb", row)
+    changed = registry.set_share_kb(agent_id, bool(body.enabled))
+    audit.record(action, agent_id, ok=True,
+                 reason=f"share_kb={bool(body.enabled)} (changed={changed}); backup={backup}")
+    return {"ok": True, "agent_id": agent_id, "share_kb": bool(body.enabled),
             "changed": bool(changed), "backup": backup}
 
 

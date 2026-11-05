@@ -173,6 +173,7 @@
             <div class="card-tags">
               <span class="tag">私信{{ dmOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享{{ shareOn(a) ? '开' : '关' }}</span>
+              <span class="tag">共享知识库{{ shareKbOn(a) ? '开' : '关' }}</span>
               <span class="tag">{{ a.exclude_from_primary ? '不进主脑上下文' : '进主脑上下文' }}</span>
               <!-- 配了自己的注入预算才亮（没配 = 沿用全局默认，不必标） -->
               <span v-if="a.core_budget_chars" class="tag">注入预算 {{ a.core_budget_chars }} 字符</span>
@@ -369,6 +370,9 @@
             </el-form-item>
             <el-form-item label="共享记忆（打开 = 别的代理能检索到它的记忆）">
               <el-switch v-model="editShare" />
+            </el-form-item>
+            <el-form-item label="共享知识库（打开 = 别的代理能检索到它名下的知识库文档）">
+              <el-switch v-model="editShareKb" />
             </el-form-item>
             <el-form-item label="私信实时推送（SSE 长连接）">
               <el-switch v-model="editPush" />
@@ -599,6 +603,11 @@ function shareOn(a) {
   return a.share_memory === true
 }
 
+/** 共享知识库状态（缺字段按**关** —— 与记忆那个旗**解耦**，口径对称）。 */
+function shareKbOn(a) {
+  return a.share_kb === true
+}
+
 // ---------------------------------------------------------------------------
 // 四个动作的确认态：approve / revoke / role / exclude 共用一个 ConfirmDialog
 // ---------------------------------------------------------------------------
@@ -687,6 +696,8 @@ const editPush = ref(false)
 const editDm = ref(true)
 /** 记忆共享开关（布尔）：只改读可见性，缺省**关**（放宽权限的开关，缺省最严）。 */
 const editShare = ref(false)
+/** 知识库共享开关（布尔）：与记忆那个旗**解耦**，缺省同样**关**。 */
+const editShareKb = ref(false)
 /** 进入主脑上下文（布尔）：`exclude_from_primary` 的**反面**（开关语义用正面词）。 */
 const editContext = ref(true)
 /** 主代理不能改 id（后端同口径 400）：输入框直接锁死，备注名照改。 */
@@ -700,6 +711,7 @@ function openEdit(row) {
   editPush.value = row?.push_enabled === true
   editDm.value = row?.dm_enabled !== false
   editShare.value = row?.share_memory === true
+  editShareKb.value = row?.share_kb === true
   editContext.value = !row?.exclude_from_primary
   editOpen.value = true
   loadGlobalBudget()      // placeholder 里的「当前全局」顺手刷一次（fire-and-forget）
@@ -786,9 +798,12 @@ async function doEdit() {
   const dmChanged = wantDm !== (row.dm_enabled !== false)
   const wantShare = !!editShare.value
   const shareChanged = wantShare !== (row.share_memory === true)
+  // 共享知识库：与记忆那个旗**解耦**（各自独立），口径对称（同为读可见性偏好）
+  const wantShareKb = !!editShareKb.value
+  const shareKbChanged = wantShareKb !== (row.share_kb === true)
   // 什么都没改：关窗，一个请求都不发
   if (!idChanged && !nameChanged && !budgetChanged && !pushChanged
-      && !contextChanged && !dmChanged && !shareChanged) {
+      && !contextChanged && !dmChanged && !shareChanged && !shareKbChanged) {
     editOpen.value = false
     return
   }
@@ -924,6 +939,21 @@ async function doEdit() {
         '记忆共享开关',
         () => api.setAgentShare(targetId, wantShare),
         wantShare ? '记忆已共享' : '记忆已收回',
+      )
+      if (!ok) return
+    }
+    if (shareKbChanged) {
+      // 🔴 走**独立的** share-kb 端点（与记忆那个旗解耦）：后端要显式二次确认，
+      // 所以这里照 set_id / rename 的同款写法直发 http.post（confirm 恒为 true）。
+      const ok = await applySwitch(
+        '知识库共享开关',
+        () => http
+          .post(`/api/v1/agents/${encodeURIComponent(targetId)}/share-kb`, {
+            enabled: wantShareKb,
+            confirm: true,
+          })
+          .then((res) => res.data),
+        wantShareKb ? '知识库已共享' : '知识库已收回',
       )
       if (!ok) return
     }

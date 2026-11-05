@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是四十五条业务写端点加四条auth_POST():
+def test_写面仍是四十七条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -700,6 +700,8 @@ def test_写面仍是四十五条业务写端点加四条auth_POST():
     🆕 AI 配置页再加两条（43 → 45）：写 config.json 的一节（PUT settings/ai）
     + 连通检测（POST settings/ai/{节}/probe，**读性质**：不写库、不改 config，
     但要会话、也要留审计）。
+    🆕 共享知识库再加一条（46 → 47）：共享知识库开关（`share_kb`）—— 只改
+    **知识库面**的读可见性，不是治理动作（与记忆那个 `share_memory` 解耦）。
     """
     app = create_app()
     write = {r.path for r in flat_routes(app)
@@ -738,6 +740,8 @@ def test_写面仍是四十五条业务写端点加四条auth_POST():
         "/api/v1/agents/{agent_id}/delete",
         # 记忆共享开关：只改读可见性，不是治理动作
         "/api/v1/agents/{agent_id}/share",
+        # 共享知识库开关：只改知识库面的读可见性，不是治理动作
+        "/api/v1/agents/{agent_id}/share-kb",
         # per-agent 注入预算：只改一个阈值，不是治理动作
         "/api/v1/agents/{agent_id}/budget",
         # 私信实时推送：开关 + 手动/批量触发提醒

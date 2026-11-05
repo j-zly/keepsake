@@ -12,9 +12,11 @@ fastapi 是**可选依赖**（`pyproject.toml` 里没有它）—— 代理侧�
 `HTTPException` **逐字同形**的 JSON，MCP 工具面把它转成 `ToolError`。
 ⇒ 代理看到的与人在控制台看到的是同一件事。
 
-🔴 **归属与可见性用记忆那一把尺子**（`keepsake.govern.visibility`）：
+🔴 **归属与可见性用治理面那一把尺子**（`keepsake.govern.visibility`）：
 `visible_agent_ids`（看得见谁的） / `can_remove_fragment`（能删谁的）——
-不在这儿另发明一套。记忆面一个字节都不改（口径共用 ≠ 改记忆面）。
+不在这儿另发明一套。🔴 **kb 旗分旗**（2026-11 ks_share_kb）：知识库面读
+`share_kb` 那一列（与记忆面的 `share_memory` **解耦**），**结构同尺**；
+记忆面一个字节都不改（口径共用 ≠ 改记忆面）。
 
 ## 三条不可省的纪律
 
@@ -35,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from keepsake.api import audit, config
+from keepsake.govern.registry import SHARE_KB_COLUMN
 from keepsake.govern.visibility import can_remove_fragment, visible_agent_ids
 from keepsake.kb import ingest
 
@@ -380,14 +383,19 @@ def visible_scope(caller_agent_id: str, registry: Any, *,
                   is_primary: bool) -> Optional[List[str]]:
     """这个调用方看得见哪些**归属代理**（`None` = 全量，不过滤）。
 
-    判据只有一份：`govern.visibility.visible_agent_ids`（记忆的可见性口径）——
-    非 primary = {自己} ∪ {`share_memory=1` 的已批准代理}；primary = 全量。
+    判据只有一份：`govern.visibility.visible_agent_ids` —— **kb 旗分旗，结构同尺**：
+    非 primary = {自己} ∪ {`share_kb=1` 的已批准代理}；primary = 全量。
+
+    🔴 知识库面读**自己那一列**（`share_kb`），与记忆面（`share_memory`）
+    **解耦**：开记忆共享**不会**让知识库文档外露，反之亦然。
+    记忆面的可见性一个字都没改（那边缺省仍是 `share_memory`）。
 
     **无主文档（`agent_id IS NULL`）人人可见**（收紧前的公共数据，历史 1844 篇
     全是无主）：这条由调用方的 SQL 谓词补上（`agent_id IS NULL OR ...`），
     与记忆侧「无归属的条目人人可见」同一条纪律。
     """
-    ids = visible_agent_ids(caller_agent_id, registry, is_primary=is_primary)
+    ids = visible_agent_ids(caller_agent_id, registry, is_primary=is_primary,
+                            flag=SHARE_KB_COLUMN)
     return sorted(ids) if ids is not None else None
 
 

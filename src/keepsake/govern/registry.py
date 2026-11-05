@@ -107,7 +107,7 @@ REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
-    "meta", "dm_enabled", "share_memory", "core_budget_chars", "push_enabled",
+    "meta", "dm_enabled", "share_memory", "share_kb", "core_budget_chars", "push_enabled",
 )
 
 #: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -131,6 +131,14 @@ SHARE_ENABLED_VALUES: Tuple[str, ...] = ("1", "true", "yes", "on")
 #: `share_memory` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
 SHARE_COLUMN = "share_memory"
 SHARE_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
+
+#: `share_kb` 的列名与列声明（建表与补列共用同一份 ⇒ 两边不会漂）。
+#: 🔴 与 `share_memory` **同一档**：缺省是**关**（'0'）——「共享知识库」也是
+#: **放宽**权限的开关（别的代理能检索到它名下的知识库文档），缺省必须最严；
+#: 老库补列时也落 '0' ⇒ 存量行的语义不变（谁也没被共享出去过）。
+#: 「开」的值集复用 `SHARE_ENABLED_VALUES`（两个旗同一把尺子）。
+SHARE_KB_COLUMN = "share_kb"
+SHARE_KB_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 
 #: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
 #: 🔴 与 `share_memory` 同一档：**缺省是关**（'0'）——「实时推送」是**往外放行**
@@ -160,7 +168,7 @@ _FLAG_FIELDS = ("exclude_from_primary",)
 # import 它进自己的建表机制）。列全用 `text`（时刻按本库惯用的 ISO 字符串存，
 # 与 `ks_fragment.created` / `ks_hit_event.ts` 同口径），所以**两个后端逐字
 # 共用这一段**；计数器用 `integer`（SQLite 的 INTEGER / PG 的 integer 同名同义）。
-KS_AGENT_DDL = """
+KS_AGENT_DDL = f"""
 CREATE TABLE IF NOT EXISTS ks_agent (
     agent_id             text PRIMARY KEY,
     name                 text NOT NULL DEFAULT '',
@@ -173,7 +181,7 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     reads                integer NOT NULL DEFAULT 0,
     writes               integer NOT NULL DEFAULT 0,
     exclude_from_primary integer NOT NULL DEFAULT 0,
-    meta                 text NOT NULL DEFAULT '{}',
+    meta                 text NOT NULL DEFAULT '{{}}',
     -- 2026-10 ks_agent_messaging：是否接收别的代理的私信（代理互聊信箱）。
     -- 默认 '1'（开）—— 老库补列时也落 '1'，存量行的语义不变。
     dm_enabled           text NOT NULL DEFAULT '1',
@@ -181,6 +189,12 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     -- 默认 '0'（关）—— 这是**放宽**权限的开关，缺省必须是最严的那一档；
     -- 老库补列时也落 '0'，存量行的语义不变（谁也没被共享出去）。
     share_memory         text NOT NULL DEFAULT '0',
+    -- 2026-11 ks_share_kb：是否把这个代理名下的**知识库文档**共享给别的已批准
+    -- 代理。默认 '0'（关）—— 与 share_memory 同一档：放宽权限的开关，缺省最严；
+    -- 老库补列时也落 '0' ⇒ 存量行的语义不变（谁也没被共享出去过）。
+    -- 🔴 列声明**从 SHARE_KB_COLUMN_DECL 插值**（不是手抄一份）：建表与
+    -- 老库补列自愈共用同一份 ⇒ 两边不许漂。
+    share_kb             {SHARE_KB_COLUMN_DECL},
     -- 2026-10 ks_agent_budget：这个代理**自己**的常驻层注入字符预算。
     -- NULL = 沿用全局默认（config.json 的 retrieval.core_char_budget，缺省回退，
     -- 不改存量语义）；有值 = 该代理专用（正整数）。
@@ -290,6 +304,10 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     # 「新增字段不许改存量语义」：老行一个都没被共享出去）。
     share = str(row.get("share_memory") or "").strip()
     row["share_memory"] = share if share else SHARE_DISABLED_ON
+    # share_kb：缺列 / 空值 ⇒ 默认**关**（与 DDL 的 DEFAULT '0' 同口径，
+    # 「新增字段不许改存量语义」：老行一个都没被共享出去过）。
+    share_kb = str(row.get("share_kb") or "").strip()
+    row["share_kb"] = share_kb if share_kb else SHARE_DISABLED_ON
     # push_enabled：缺列 / 空值 ⇒ 默认**关**（与 DDL 的 DEFAULT '0' 同口径，
     # 「新增字段不许改存量语义」：老行一个都没被连上过）。
     push = str(row.get("push_enabled") or "").strip()
@@ -334,14 +352,15 @@ def _dm_is_on(row: Optional[Dict[str, Any]]) -> bool:
     return str((row or {}).get("dm_enabled") or DM_ENABLED_ON).strip() not in DM_DISABLED_VALUES
 
 
-def _share_is_on(row: Optional[Dict[str, Any]]) -> bool:
-    """`share_memory` 这一列的**唯一判读口**（默认**关**）。
+def _share_is_on(row: Optional[Dict[str, Any]], column: str = SHARE_COLUMN) -> bool:
+    """`share_memory` / `share_kb` 这类**放宽可见性**的列的**唯一判读口**（默认**关**）。
 
     🔴 与 `_dm_is_on` 相反：那边缺省**开**（老行语义不变），这边缺省**关** ——
-    「记忆共享」是**放宽**可见性的开关，缺省必须是最严的那一档。
+    「记忆共享」/「共享知识库」是**放宽**可见性的开关，缺省必须是最严的那一档。
     查无此代理（空行）也当关 —— 「代理存不存在」是**另一道闸**。
+    「开」的值集两个旗共用 `SHARE_ENABLED_VALUES`（同一把尺子）。
     """
-    value = str((row or {}).get("share_memory") or "").strip().lower()
+    value = str((row or {}).get(column) or "").strip().lower()
     return value in SHARE_ENABLED_VALUES
 
 
@@ -379,6 +398,10 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         # 记忆共享开关：true = 这个代理的记忆进**别的**已批准代理的检索可见范围。
         # 判读口径与 `Registry.share_memory` 同一个（`_share_is_on`）。
         "share_memory": _share_is_on(row),
+        # 知识库共享开关：true = 这个代理名下的**知识库文档**进**别的**已批准代理
+        # 的检索可见范围（与记忆面**解耦**的另一个旗）。判读口径同一个
+        # （`_share_is_on`，只是读另一列）。
+        "share_kb": _share_is_on(row, SHARE_KB_COLUMN),
         # 私信实时推送开关（SSE 快车道）：true = 允许这个代理接 SSE 长连接。
         # 判读口径与 `Registry.push_enabled` 同一个（`_push_is_on`）。
         "push_enabled": _push_is_on(row),
@@ -480,16 +503,18 @@ class _SqlBackend(_SqlBase):
     # -- ks_agent 专用 --------------------------------------------------
     def ensure_schema(self) -> bool:
         """建表走各后端自己的 ensure 机制，**外加**老库补 `dm_enabled` /
-        `share_memory` / `core_budget_chars` / `push_enabled` 列。
+        `share_memory` / `share_kb` / `core_budget_chars` / `push_enabled` 列。
 
         🔴 补列走「先查后补」（`_SqlBase.has_column`）：列已在 ⇒ **一条 DDL 都不发**
         （PG 的 `ADD COLUMN IF NOT EXISTS` 列已存在也要拿 ACCESS EXCLUSIVE，
         会与并发 DML 互等成环 —— 见 `core/pg.py::ensure_index` 的说明）。
+        🔴 列声明**从常量取**（建表 DDL 里也是同一份插值）⇒ 两边不许漂。
         """
         if not super().ensure_schema():
             return False
         for column, decl in ((DM_COLUMN, DM_COLUMN_DECL),
                              (SHARE_COLUMN, SHARE_COLUMN_DECL),
+                             (SHARE_KB_COLUMN, SHARE_KB_COLUMN_DECL),
                              (BUDGET_COLUMN, BUDGET_COLUMN_DECL),
                              (PUSH_COLUMN, PUSH_COLUMN_DECL)):
             try:
@@ -815,6 +840,8 @@ class Registry:
             "meta": {},
             "dm_enabled": DM_ENABLED_ON,
             "share_memory": SHARE_DISABLED_ON,
+            # 🔴 登记**不碰**共享知识库：缺省就是关（放宽权限的开关，缺省最严）。
+            "share_kb": SHARE_DISABLED_ON,
             # 🔴 登记**不碰**预算：新建的行一律沿用全局（NULL）——
             # 「谁都没登记过预算」是缺省态，不是某个开/关档位。
             "core_budget_chars": None,
@@ -1003,6 +1030,36 @@ class Registry:
         if str(row.get("share_memory") or SHARE_DISABLED_ON).strip() == want:
             return False
         self._be.update(aid, {"share_memory": want})
+        return True
+
+    # ---- 知识库共享开关（读可见性，与记忆面**解耦**）------------------
+    def share_kb(self, agent_id: str) -> bool:
+        """这个代理名下的**知识库文档**是否共享给别的已批准代理。默认**关**。
+
+        🔴 与 `share_memory` **解耦**（两个旗各自独立），但**口径对称**：
+        查不到代理 / 老行没有这一列 ⇒ 一律 False（放宽权限的开关，缺省最严）。
+        """
+        row = self._be.load((agent_id or "").strip())
+        if not row:
+            return False
+        return _share_is_on(row, SHARE_KB_COLUMN)
+
+    def set_share_kb(self, agent_id: str, flag: bool) -> bool:
+        """开关「这个代理名下的知识库文档是否共享给别的已批准代理」。
+        返回**值是否真的变了**。
+
+        🔴 行不存在 ⇒ False（调用方 404）；`status` / `role` / 凭据**一个都不碰**
+        —— 共不共享知识库是**读可见性偏好**，不是治理动作（与 `set_share_memory`
+        同纪律、同闸）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return False
+        want = SHARE_ENABLED_ON if flag else SHARE_DISABLED_ON
+        if str(row.get("share_kb") or SHARE_DISABLED_ON).strip() == want:
+            return False
+        self._be.update(aid, {"share_kb": want})
         return True
 
     # ---- 注入预算（per-agent）----------------------------------------

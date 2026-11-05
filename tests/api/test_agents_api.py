@@ -113,10 +113,11 @@ def test_列表形状与pending计数(env):
     # 🆕 多了 dm_enabled（私信开关）：控制台的「私信开关」读的就是这个字段
     # 🆕 多了 core_budget_chars（per-agent 注入预算）：None = 沿用全局默认
     # 🆕 多了 push_enabled（私信实时推送开关）：默认 False（往外放行的开关，缺省最严）
+    # 🆕 多了 share_kb（共享知识库开关）：默认 False（与 share_memory 解耦的另一个旗）
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
                          "credential_hint", "meta", "dm_enabled", "share_memory",
-                         "core_budget_chars", "push_enabled"}
+                         "share_kb", "core_budget_chars", "push_enabled"}
     assert item["core_budget_chars"] is None      # 缺省 = 沿用全局
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文

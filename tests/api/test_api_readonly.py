@@ -95,6 +95,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
+    # 共享知识库开关一条（ks_share_kb）：只改知识库面的读可见性，不是治理动作
+    "/api/v1/agents/{agent_id}/share-kb",
     # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
     "/api/v1/agents/{agent_id}/budget",
     # 私信实时推送开关一条（ks_dm_sse）：只改「能不能被连上来」，不是治理动作

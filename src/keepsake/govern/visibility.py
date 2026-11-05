@@ -17,6 +17,13 @@
 🔴 **只影响「读可见性」**：写路径不过滤（谁的凭据写谁的），写闸 / 分层 / 私信
 一个都不动（那是别的语义）。
 
+🔴 **两个旗，一份口径**（2026-11 ks_share_kb）：`share_memory`（记忆面）与
+`share_kb`（知识库面）是**两个独立开关**，**解耦**（开一个不影响另一个），
+但判据**同尺**：非 primary 看得见的归属 = `{自己} ∪ {该旗打开的已批准代理}`。
+`shared_agent_ids` / `visible_agent_ids` 的 `flag` 参数决定读哪一列，
+**缺省是记忆面**（`share_memory`）—— 记忆可见性逐字零变化。
+🔴 **判据只许这一份实现**：共享集不许再写第二个函数（两个旗共用同一个）。
+
 🔴 **删除口径比读更严**（2026-10 ks_perm_scope，另见 `can_remove_fragment`）：
 非 primary 只能删**自己的**（或无归属的老条目）—— 「看得见」≠「能删」。
 
@@ -40,6 +47,8 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from .registry import (
     AGENT_TAG_PREFIX,
     ROLE_PRIMARY,
+    SHARE_COLUMN,
+    SHARE_KB_COLUMN,
     STATUS_APPROVED,
 )
 
@@ -53,8 +62,12 @@ __all__ = [
 ]
 
 
-def shared_agent_ids(registry: Any) -> List[str]:
-    """**共享集**：已批准 **且** 打开「共享记忆」的代理 id（按 id 排序）。
+def shared_agent_ids(registry: Any, *, flag: str = SHARE_COLUMN) -> List[str]:
+    """**共享集**：已批准 **且** 打开共享旗的代理 id（按 id 排序）。
+
+    🔴 `flag` 决定读**哪一列**（`share_memory` = 记忆面 / `share_kb` = 知识库面）：
+    两个旗**解耦**（各自独立），但**口径对称**（同一段代码、同一把尺子）。
+    🔴 **缺省是记忆面**（`share_memory`）—— 记忆可见性逐字零变化。
 
     🔴 只认 `status=approved`：pending / revoked 的代理的记忆**不进**共享范围
     （共享是「给已批准的代理看」，不是「给谁都看」）。
@@ -74,7 +87,7 @@ def shared_agent_ids(registry: Any) -> List[str]:
     for row in lister():
         if str(row.get("status") or "") != STATUS_APPROVED:
             continue
-        if not row.get("share_memory"):
+        if not row.get(flag):
             continue
         out.append(str(row.get("agent_id") or ""))
     return sorted(a for a in out if a)
@@ -85,6 +98,7 @@ def visible_agent_ids(
     registry: Any,
     *,
     is_primary: Optional[bool] = None,
+    flag: str = SHARE_COLUMN,
 ) -> Optional[Set[str]]:
     """这个调用方**看得见哪些代理的归属**（`None` = 看不见 ⇒ 过滤掉）。
 
@@ -94,6 +108,10 @@ def visible_agent_ids(
     `is_primary` 缺省时**问注册表**（谁是 primary 由注册表说了算）；调用方
     已经有权威结论（provider 侧的本进程身份 / MCP 闸门判出的角色）时显式传入，
     免得两边对「谁是 primary」各有一份判据。
+
+    🔴 `flag` 决定共享集读**哪一列**（`share_memory` / `share_kb`）：知识库面
+    传 `share_kb` ⇒ 与记忆面**解耦**。🔴 **缺省是记忆面**（`share_memory`）——
+    记忆可见性逐字零变化（改这里的缺省会让记忆路径走新逻辑 ⇒ 越界）。
 
     🔴 查不到注册表（治理面整体不可用）⇒ `None`（不过滤）：读路径保持既有
     行为，不因为治理面挂了就让记忆读不出来（写闸那边是 fail-closed，方向相反：
@@ -111,7 +129,7 @@ def visible_agent_ids(
     visible: Set[str] = set()
     if caller:
         visible.add(caller)
-    visible.update(shared_agent_ids(registry))
+    visible.update(shared_agent_ids(registry, flag=flag))
     return visible
 
 

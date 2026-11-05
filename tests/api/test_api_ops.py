@@ -46,6 +46,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: ks_todo 起再加 3 条待办端点（新增 / 改状态 / 真删）。
 #: kb_bulk_ops 起再加 3 条知识库勾选批量端点（批量批准 / 批量驳回 / 批量真删）。
 #: ai_settings_page 起再加 2 条 AI 配置端点（写 config.json 的一节 + 连通检测）。
+#: ks_share_kb 起再加 1 条共享知识库开关端点（share_kb —— 只改**知识库面**的读
+#: 可见性，不是治理动作；与记忆那个 share_memory 端点解耦）。
 
 AUTH_POST_PATHS = {
     "/api/v1/auth/setup",
@@ -104,6 +106,8 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
+    # 共享知识库开关一条（ks_share_kb）：只改知识库面的读可见性，不是治理动作
+    "/api/v1/agents/{agent_id}/share-kb",
     # per-agent 注入预算一条（ks_agent_budget）：只改一个阈值，不是治理动作
     "/api/v1/agents/{agent_id}/budget",
     # 私信实时推送开关一条（ks_dm_sse）：只改「能不能被连上来」，不是治理动作
@@ -520,13 +524,13 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_46条业务加4条认证():
+def test_写面白名单全量断点_47条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    assert len(ALLOWED_POST_PATHS) == 50
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 46
+    assert len(ALLOWED_POST_PATHS) == 51
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 47
 
 
 def test_P1只读路由未被写面影响(client):
