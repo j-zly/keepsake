@@ -35,6 +35,7 @@ class FakeStorage:
                  *, list_raises: bool = False, list_delay: float = 0.0):
         self.rows: List[Dict[str, Any]] = list(rows or [])
         self.list_calls = 0
+        self.list_tags: List[str] = []      # 每次 list_by_tag 的标签（分面读时要用）
         self.store_calls: List[Dict[str, Any]] = []
         self.deleted: List[str] = []
         self._list_raises = list_raises
@@ -42,6 +43,7 @@ class FakeStorage:
 
     def list_by_tag(self, tag: str) -> List[Dict[str, Any]]:
         self.list_calls += 1
+        self.list_tags.append(tag)
         if self._list_delay:
             import time
             time.sleep(self._list_delay)
@@ -106,7 +108,12 @@ def test_write_stores_verbatim_without_distillation():
     _provider(st).on_memory_write("add", "memory", PROBE_TEXT)
     assert len(st.store_calls) == 1
     assert st.store_calls[0]["text"] == PROBE_TEXT, "core 层必须是原文，改写即记忆损坏"
-    assert st.store_calls[0]["tags"] == "core,memory"
+    # 2026-11 keepsake_core_gate：Hermes 桥接路径写入的**最高只到候选**
+    # （带提名日戳，不带 core —— 常驻层唯一入口 = 审核页人工 promote）。
+    tags = st.store_calls[0]["tags"]
+    assert _has_tag(tags, "core_candidate")
+    assert not _has_tag(tags, "core")
+    assert "tier:auto-hot:" in tags
     assert st.store_calls[0]["fragment_type"] == "core"
 
 
@@ -240,14 +247,18 @@ def test_core_read_is_cached_60s():
 
 
 def test_write_invalidates_core_cache_immediately():
-    """🔴 写完立刻失效缓存 —— 否则用户改的记忆要等 60s 才在上下文里变。"""
+    """🔴 写完立刻失效缓存 —— 否则用户改的记忆要等 60s 才在上下文里变。
+
+    2026-11 keepsake_core_gate：新写入落**候选** ⇒ 候选不进常驻注入面
+    （未经人工批准的条目绝不许每轮进 system prompt）；本用例锁的是「缓存确实失效」。
+    """
     st = FakeStorage()
     p = _provider(st)
     p.system_prompt_block()
     p.on_memory_write("add", "memory", PROBE_TEXT)
     out = p.system_prompt_block()
-    assert PROBE_TEXT in out
-    assert st.list_calls == 2
+    assert st.list_tags.count("core") == 2, "写完必须立刻失效核心层缓存"
+    assert PROBE_TEXT not in out, "未经人工批准的候选不进常驻注入面"
 
 
 def test_oversize_core_is_truncated_with_visible_note():
@@ -454,8 +465,12 @@ def test_sqlite_list_by_tag_is_comma_bounded_and_sorted(tmp_path):
         s.close()
 
 
-def test_sqlite_list_by_tag_roundtrips_through_provider(tmp_path):
-    """真库 + 真 provider 串起来：写入 → 注入（证明存储与注入层字段名对得上）。"""
+def test_sqlite_candidate_roundtrips_through_provider(tmp_path):
+    """真库 + 真 provider 串起来：写入 → 候选面读回（证明存储与落库字段名对得上）。
+
+    2026-11 keepsake_core_gate：桥接路径写入落候选 ⇒ 常驻面（`list_by_tag("core")`）
+    读不到它，只有候选面读得到。
+    """
     s = SqliteStorage(path=str(tmp_path / "core2.db"))
     assert s.ensure_index() is True
     try:
@@ -463,8 +478,9 @@ def test_sqlite_list_by_tag_roundtrips_through_provider(tmp_path):
         p.on_memory_write("add", "memory", PROBE_TEXT)
         _CORE_CACHE["ts"] = 0.0      # 绕开写入时已失效的缓存，读回真库
         _CORE_CACHE["frags"] = None
-        out = p.system_prompt_block()
-        assert PROBE_TEXT in out
-        assert out.count(PROBE_TEXT) == 1, "写入后只应有一份 core 注入"
+        got = s.list_by_tag("core_candidate")
+        assert [r["content"] for r in got] == [PROBE_TEXT]
+        assert s.list_by_tag("core") == [], "候选不许出现在常驻面"
+        assert PROBE_TEXT not in p.system_prompt_block()
     finally:
         s.close()

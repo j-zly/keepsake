@@ -1946,6 +1946,9 @@ class KeepsakeProvider(MemoryProvider):
         现在两侧合并成同一套：常驻记忆存进碎片库并打上 `core` 标签，
         `system_prompt_block` 每轮原文全量注入，检索层不再重复召回。
 
+        🔴 2026-11 keepsake_core_gate：**代理写入的条目不再直接进常驻层** ——
+        落 `core_candidate`（带提名日戳）待审，常驻层唯一入口 = 审核页人工 promote。
+
         🔴 **原文逐字入库，绝不经 LLM 提炼 / 摘要改写**：常驻记忆是 agent 行为的
         硬约束（「端口是 8091」被改写成「用户偏好某端口」就是记忆损坏）。
         仍走 `scrub_secrets` 打码 —— 那是安全闸（R7），不是内容改写。
@@ -1969,10 +1972,14 @@ class KeepsakeProvider(MemoryProvider):
         """`on_memory_write` 的实际动作。**调用方保证异常已被吞掉。**
 
         action 语义（对齐 Hermes memory 工具）：
-          * `add`                  → 入库为 core 碎片
+          * `add`                  → 入库为**候选**碎片（带提名日戳，不带 `core`）
           * `replace` / `update`    → 先删旧（metadata 的 key 或 old_text）再写新
           * `remove`                → 删掉 metadata 指的那条
         识别不了的 action 一律 warning + 跳过，绝不猜。
+
+        🔴 2026-11 keepsake_core_gate：本路径写入的**最高只到候选**
+        （`core_candidate` + 提名日戳）—— 常驻层（`core`）的唯一入口 =
+        审核页人工 promote。
         """
         if not self._storage:
             return
@@ -1995,40 +2002,103 @@ class KeepsakeProvider(MemoryProvider):
 
         tags = f"{_CORE_TAG},{target or 'memory'}"
 
+        # 🔴 2026-11 keepsake_core_gate：Hermes 内置 memory 工具的桥接路径
+        # （本方法）写入的**最高只到候选** —— 落 `core_candidate` + 提名日戳，
+        # 常驻层的唯一入口 = 审核页人工 promote。
+        # 转换逻辑复用 `core.tiering.candidate_tags`（**不另发明一份**）：
+        # 口径与 pipeline 侧 `_apply_write_gate` 完全同一把尺子。
+        from ...core import tiering as tiering_mod
+
+        nominated = False
+        if _has_tag(tags, _CORE_TAG):
+            tags = tiering_mod.candidate_tags(tags, datetime.now(timezone.utc))
+            nominated = True
+
+        key = ""
         if action == "remove":
             self._core_delete(metadata, content or "")
         elif action in ("replace", "update"):
             # 先删旧再写新。找不到旧条目时退化成「新增」—— 用户重写一条记忆
             # 而 Hermes 没给 old_text/key 时，这是唯一不丢内容的做法。
             self._core_delete(metadata, metadata.get("old_text") or "")
-            self._core_add(content, tags)
+            key = self._core_add(content, tags)
         elif action == "add":
-            self._core_add(content, tags)
+            key = self._core_add(content, tags)
         else:
             logger.warning("keepsake: on_memory_write action=%r 无法识别，跳过", action)
             return
+
+        # 提名即带基数（2026-11 keepsake_core_gate）：刚落的候选补上召回基数，
+        # 让它「看起来够热」（补失败不影响这次写入 —— 回填自身 fail-open）。
+        if nominated and key:
+            tiering_mod.backfill_nominate_hits(self._storage, key, _nominate_backfill_hits())
 
         # 写入/删除成功 ⇒ 核心层缓存立即失效（下一轮立刻看到新内容）。
         _CORE_CACHE["ts"] = 0.0
         _CORE_CACHE["frags"] = None
 
-    def _core_add(self, content: str, tags: str) -> None:
+    def _core_add(self, content: str, tags: str) -> str:
         """原文入库为 core 碎片；同 content 已存在则不重复入库（幂等）。
 
-        幂等判据用「现存 core 碎片里有逐字相同的一条」而不是靠 `store()` 的
-        内容 hash 去重 —— 后者对 PG/SQLite 的版本化语义不保证，而常驻记忆
+        返回**新碎片的 key**（空串 = 这次没落库：已存在，或写失败）——
+        提名基数回填要拿 key（`core.tiering.backfill_nominate_hits`）。
+
+        幂等判据用「匹配面（core ∪ core_candidate）里有逐字相同的一条」而不是靠
+        `store()` 的内容 hash 去重 —— 后者对 PG/SQLite 的版本化语义不保证，而常驻记忆
         被重复注入是要用户能看出来的故障。
         """
-        for f in self._core_fragments():
+        for f in self._core_match_fragments():
             if f.get("content") == content:
-                return
-        self._storage.store(
+                return ""
+        key = self._fragment_key_for(content)
+        # 同 key 已有行 ⇒ 存储层会**版本化**（新条走 `key:epoch` 独立 key、旧条归档）
+        # ⇒ 这时 base key 指向的是归档旧条 ⇒ 基数不能补在它身上（会给归档条目凭空加热）。
+        duplicated = False
+        try:
+            duplicated = bool(self._storage.fragment_exists(key))
+        except Exception as e:      # noqa: BLE001 —— 查不到就当新的
+            logger.debug("keepsake: fragment_exists 失败（按新条目处理）: %s", e)
+        ok = self._storage.store(
             text=content,
             tags=tags,
             category="core",
             source="builtin_memory",
             fragment_type="core",
         )
+        if not ok:
+            return ""
+        return "" if duplicated else key
+
+    def _core_match_fragments(self) -> List[Dict[str, Any]]:
+        """**匹配面** = core ∪ core_candidate 的并集（幂等查重 / 删除定位用）。
+
+        🔴 2026-11 keepsake_core_gate：代理写入的条目落在候选面 ⇒ 匹配面若只看
+        `core`，幂等查重看不见候选（replace 退化成重复新增）、删除定位不到候选
+        （remove 静默失效）。
+
+        判标签用 `_has_tag`（逗号边界的完整标签相等）—— **禁止对 tags 字符串做
+        子串 grep**：`core` 是 `core_candidate` 的前缀，子串 grep 会把候选误认成常驻。
+        候选面同样过可见性（与常驻面同一把尺子）：别的代理的候选不许删。
+        """
+        frags = list(self._core_fragments())
+        try:
+            cands = list(self._storage.list_by_tag(CORE_CANDIDATE_TAG) or [])
+        except Exception as e:      # noqa: BLE001 —— 读不到就退化成只看常驻面
+            logger.warning("keepsake: core 候选面读取失败（匹配面退化为只看常驻）: %s", e)
+            return frags
+        scope = self._visibility_scope()
+        if not scope.is_primary and self._registry is not None:
+            cands = visible_core_fragments(cands, self._registry, scope.caller_id)
+        seen = {f.get("key") for f in frags}
+        for f in cands:
+            if not _has_tag(f.get("tags", ""), CORE_CANDIDATE_TAG):
+                continue
+            key = f.get("key")
+            if key in seen:
+                continue
+            seen.add(key)
+            frags.append(f)
+        return frags
 
     def _core_delete(self, metadata: Dict[str, Any], fallback_text: str) -> None:
         """删掉 metadata 指向的那条 core 碎片。
@@ -2054,11 +2124,11 @@ class KeepsakeProvider(MemoryProvider):
                           if t and t.strip()]
             if not candidates:
                 return
-            frags = self._core_fragments()
+            frags = self._core_match_fragments()
             key = self._resolve_core_key(frags, candidates)
             if not key:
                 logger.warning(
-                    "keepsake: core 删除未命中（old_text=%r，候选 %d 个，core %d 条）——"
+                    "keepsake: core 删除未命中（old_text=%r，候选 %d 个，匹配面 %d 条）——"
                     "replace 会退化成新增，remove 等于没删",
                     candidates[-1][:80], len(candidates), len(frags))
         if key:
