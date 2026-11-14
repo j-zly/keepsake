@@ -106,6 +106,11 @@ ALLOWED_POST_PATHS = {
     # 要直接能复制」）：取出明文 / 把已在用的串校验后登记成可还原
     "/api/v1/agents/{agent_id}/reveal_credential",
     "/api/v1/agents/{agent_id}/backfill_credential",
+    # 多凭据三条（ks_multi_credential，2026-11-14 用户拍板「一个代理可以生成多个凭证」）：
+    # 新建一把 / 改标签 / 作废单把。都不动别的入口，但**能掐断一个在线入口** ⇒ 算写面。
+    "/api/v1/agents/{agent_id}/credentials",
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
     "/api/v1/agents/{agent_id}",
     "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
@@ -528,17 +533,16 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_49条业务加4条认证():
+def test_写面白名单全量断点_52条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
     assert write == ALLOWED_POST_PATHS, sorted(write)
-    # 2026-11-14 凭据可还原加两条（47 → 49 业务写、51 → 53 含 auth）：
-    # reveal_credential（取出明文，完整 agent_id 确认 + write_guard + 审计）与
-    # backfill_credential（把已在用的串登记成可还原，不换发）。
-    # 两条都不签发新钥匙，但都动得到凭据面 ⇒ 必须进这张「能改东西的口有几处」的名单。
-    assert len(ALLOWED_POST_PATHS) == 53
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 49
+    # 2026-11-14 凭据可还原加两条（47 → 49），同日多凭据再加三条（49 → 52 业务写、
+    # 53 → 56 含 auth）：新建一把 / 改标签 / 作废单把。
+    # 改名不动鉴权，但它和"作废""新建"一样是能改变"谁能连进来"的口 ⇒ 必须进名单。
+    assert len(ALLOWED_POST_PATHS) == 56
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 52
 
 
 def test_P1只读路由未被写面影响(client):

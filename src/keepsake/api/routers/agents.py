@@ -70,6 +70,7 @@ from pydantic import BaseModel, Field
 from keepsake.govern.registry import (
     ALREADY_APPROVED_NOTE,
     AlreadyApprovedError,
+    SingleCredentialBackend,
     ROLE_PRIMARY,
     ROLES,
     STATUS_APPROVED,
@@ -86,6 +87,9 @@ from ..schemas import (
     AgentItem,
     AgentList,
     AgentActionBody,
+    AgentCredentialAddBody,
+    AgentCredentialList,
+    AgentCredentialRenameBody,
     AgentRoleBody,
 )
 from .ops import _need_flag, _need_text, _reject, write_guard
@@ -491,6 +495,11 @@ _REVEAL_FAIL: Dict[str, tuple] = {
                      "请用手上的串「回填已有凭据」，或换发一条新的"),
     "hash_mismatch": (409, "hash_mismatch",
                       "解出的明文与在册 sha256 对不上账，已拒绝返回（不发出对不上账的串）"),
+    # 多凭据（11-14）：名下多把在用又没说要哪把 ⇒ **宁拒不猜**（猜错就是把另一把的钥匙递出去）。
+    # 界面正常不会撞到这里（它是逐把点「复制」），这条是给盲调 API 的人指路的。
+    "ambiguous": (409, "ambiguous_credential",
+                  "这个代理名下有多把在用的凭据，请在路径里指定 cred_id"
+                  "（GET /api/v1/agents/{agent_id}/credentials 可列出来）"),
 }
 
 #: 回填各 `why` → HTTP 口径（`empty` 在端点里先挡掉，不落进这张表）
@@ -529,16 +538,22 @@ def reveal_credential_agent(agent_id: str, body: AgentActionBody,
     #    人不看见）——它挡的是"盲发请求"（浏览器插件/CSRF 一类不带 body 的调用），
     #    真正的可追溯性靠审计（每次取出记一行，不含凭据内容）。
     _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才取出凭据')
-    res = registry.reveal_credential(agent_id)
+    # 多凭据（11-14）：`cred_id` 指名就取那把；不指名只有一名下唯一在用时才回。
+    res = registry.reveal_credential(agent_id, str(getattr(body, "cred_id", "") or ""))
     if not res["ok"]:
         why = str(res.get("why") or "")
         status, code, message = _REVEAL_FAIL.get(
             why, (500, "reveal_failed", f"取出凭据失败（{why or '未知原因'}）"))
         _reject(status, code, message, action, agent_id)
-    audit.record(action, agent_id, ok=True, reason="credential revealed (repeatable)")
+    # 🔴 审计带**哪一把**（编号不是秘密）：取出的是「默认」还是「win 笔记本」，
+    #    事后追责时必须分得开 —— 多凭据之后"取过一次"这种记法等于没记。
+    audit.record(action, agent_id, ok=True,
+                 reason="credential revealed (repeatable) cred_id=%s" % res.get("cred_id"))
     credential = str(res["credential"])
     return {"ok": True, "agent_id": agent_id, "credential": credential,
-            "credential_hint": credential[:REVOKE_HINT_LEN], "note": REVEAL_NOTE}
+            "credential_hint": credential[:REVOKE_HINT_LEN],
+            "cred_id": str(res.get("cred_id") or ""),
+            "label": str(res.get("label") or ""), "note": REVEAL_NOTE}
 
 
 @router.post("/api/v1/agents/{agent_id}/backfill_credential",
@@ -570,7 +585,8 @@ def backfill_credential_agent(agent_id: str, body: AgentBackfillBody,
         _reject(400, "credential_required",
                 "请把这个代理当前在用的那条 ksk_ 凭据粘进来（回填只是登记你已有的串，"
                 "不会签发新串）", action, agent_id)
-    res = registry.backfill_credential(agent_id, body.credential)
+    res = registry.backfill_credential(agent_id, body.credential,
+                                       str(getattr(body, "cred_id", "") or ""))
     if not res["ok"]:
         why = str(res.get("why") or "")
         status, code, message = _BACKFILL_FAIL.get(
@@ -579,6 +595,107 @@ def backfill_credential_agent(agent_id: str, body: AgentBackfillBody,
     audit.record(action, agent_id, ok=True, reason="credential backfilled (hash verified)")
     return {"ok": True, "agent_id": agent_id, "recoverable": True,
             "credential_hint": str(res.get("hint") or ""), "note": BACKFILL_OK_NOTE}
+
+
+# ---- 多凭据（2026-11-14 用户拍板：一个代理可以有多把钥匙，逐把监管）----------
+# 记忆归属**不变**：多把凭据 = 同一个 `agent_id` 的多个入口（同一份记忆池）。
+# 这组端点只是把"入口"这一层显出来：谁在用、用得多不多、想掐哪一个就掐哪一个。
+
+@router.get("/api/v1/agents/{agent_id}/credentials",
+            dependencies=[Depends(require_session)],
+            response_model=AgentCredentialList)
+def list_agent_credentials(agent_id: str,
+                           storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """这个代理名下的**全部凭据**（含已作废的，按签发时间排）。
+
+    🔴 只回公开字段：hint（8 位）/ 编号 / 标签 / 状态 / 用量（`_cred_public`）——
+    哈希与密文一个都不出（读面泄漏过一次就等于给离线的人一份可爆破的材料）。
+    """
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, "agents.list_credentials")
+    items = registry.list_credentials(agent_id)
+    return {"agent_id": agent_id, "items": items, "total": len(items)}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def add_agent_credential(agent_id: str, body: AgentCredentialAddBody,
+                         storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**再加一把**钥匙（旧的一把都不动）—— 换机器 / 多设备同时在线的正解。
+
+    🔴 与「重新生成凭据」的分界要说白：换发 = 旧的当场作废（泄露止血用），
+    新增 = 新旧并存（多入口用）。默认给的是新增，误点不会打断任何在跑的代理。
+    🔴 只给**已批准**的代理发（pending / revoked ⇒ 409）：批准时本来就会发一把，
+       给未批准的行发钥匙等于绕过审核页放行。
+    🔴 明文只在这一次响应里出现（可还原档之后仍可用「复制」反复取，那走 reveal）；
+       审计只记编号与标签，**不记内容**。
+    """
+    action = "agents.add_credential"
+    registry = _registry(storage)
+    row = _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才新建凭据')
+    if str((row or {}).get("status") or "") != STATUS_APPROVED:
+        _reject(409, "not_approved",
+                "只给**已批准**的代理加凭据（这行现在不是 approved）", action, agent_id)
+    try:
+        credential = registry.add_credential(agent_id, body.label)
+    except SingleCredentialBackend:
+        _reject(409, "single_credential_backend",
+                "当前存储后端（Redis）一把代理只放得下一把凭据 —— "
+                "多凭据请用 PG / SQLite 后端（生产已在 PG）", action, agent_id)
+        return {}     # 不可达：_reject 抛 HTTPException
+    if not credential:
+        _reject(409, "not_approved", "这个代理现在不可签发凭据（未批准 / 不在册）",
+                action, agent_id)
+    rows = registry.list_credentials(agent_id)
+    newest = rows[-1] if rows else {}
+    audit.record(action, agent_id, ok=True,
+                 reason="credential added cred_id=%s" % newest.get("cred_id"))
+    return {"ok": True, "agent_id": agent_id, "credential": credential,
+            "credential_hint": credential[:REVOKE_HINT_LEN],
+            "cred_id": str(newest.get("cred_id") or ""),
+            "label": str(newest.get("label") or ""),
+            "note": "新钥匙已生效，旧钥匙一把都没动（要停某一把请在清单里作废它）"}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def rename_agent_credential(agent_id: str, cred_id: str,
+                            body: AgentCredentialRenameBody,
+                            storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """改这把的**标签**（纯展示：不参与任何判据、不改鉴权、客户端不用重配）。"""
+    action = "agents.rename_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    if not registry.rename_credential(agent_id, cred_id, body.label):
+        _reject(409, "credential_not_found",
+                "这把不在这个代理名下（编号写错，或它是别人的凭据）", action, agent_id)
+    audit.record(action, agent_id, ok=True, reason="credential renamed cred_id=%s" % cred_id)
+    return {"ok": True, "agent_id": agent_id, "cred_id": cred_id}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def revoke_one_credential(agent_id: str, cred_id: str, body: AgentActionBody,
+                          storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**作废这一把**钥匙：其余各把照旧能用、代理照旧在册（用户拍板：弹框确认即可，
+    不要求手输编号 —— 清单里就那一行，误伤面比"停整个代理的凭据"小一档）。
+
+    🔴 密文与哈希一起清（`revoke_credential` 原语里做的）：留着密文就还能取出明文，
+       那这个"作废"是假的。
+    🔴 已作废的再点 ⇒ False ⇒ 409（不谎报"刚废掉"，界面据此提示"这把这前就废了"）。
+    """
+    action = "agents.revoke_credential_one"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才作废这把凭据')
+    if not registry.revoke_credential(agent_id, cred_id):
+        _reject(409, "credential_not_found",
+                "这把不在这个代理名下，或它本来就已是作废状态", action, agent_id)
+    audit.record(action, agent_id, ok=True,
+                 reason="credential revoked cred_id=%s" % cred_id)
+    return {"ok": True, "agent_id": agent_id, "cred_id": cred_id,
+            "note": "这把已作废，用它的客户端会立刻连不上；其余各把不受影响"}
 
 
 @router.delete("/api/v1/agents/{agent_id}",

@@ -108,6 +108,11 @@ ALLOWED_POST_PATHS = {
     # 挂在 AUTH_POST_PATHS 之外：这条枚举闸顺带验证它确实带了会话依赖（见逐条断言）。
     "/api/v1/agents/{agent_id}/reveal_credential",
     "/api/v1/agents/{agent_id}/backfill_credential",
+    # 多凭据三条（ks_multi_credential，2026-11-14 用户拍板「一个代理可以生成多个凭证」）：
+    # 新建一把 / 改标签 / 作废单把。都不动别的入口，但**能掐断一个在线入口** ⇒ 算写面。
+    "/api/v1/agents/{agent_id}/credentials",
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
     # 待办三条（ks_todo 一等公民）：新增 / 改状态 / 真删
     "/api/v1/todos",
     "/api/v1/todos/{todo_id}/status",

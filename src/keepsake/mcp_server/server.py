@@ -365,16 +365,24 @@ class AgentGate:
             credential_hint=str(res.get("credential_hint") or ""),
         )
 
-    def record_activity(self, caller: str, tool_name: str) -> None:
-        """按工具口径打活动（`check` 与治理工具面共用的记账点）。"""
-        self._registry.touch(caller, "write" if tool_name in GATE_WRITE_TOOLS else "read")
+    def record_activity(self, caller: str, tool_name: str,
+                        cred_id: str = "") -> None:
+        """按工具口径打活动（`check` 与治理工具面共用的记账点）。
+
+        `cred_id`（2026-11-14 多凭据）：一并打到**那一把**上 ⇒ 控制台能看出
+        「同一个代理的哪台机器在跑、哪台早就不动了」。传空（本机 bootstrap 通道、
+        或旧调用方）就只打代理维度，行为与改造前一致。
+        """
+        self._registry.touch(caller, "write" if tool_name in GATE_WRITE_TOOLS else "read",
+                             cred_id)
 
     def check(self, tool_name: str) -> Dict[str, Any]:
         """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
         res = self.identify(tool_name)
         if not res.get("ok"):
             raise ToolError(self.denied_text(res))
-        self.record_activity(res["agent_id"], tool_name)
+        # 逐把打点：`verify` 通过时带回命中的 `cred_id`（本机 bootstrap 通道没有 ⇒ 空串）
+        self.record_activity(res["agent_id"], tool_name, str(res.get("cred_id") or ""))
         return res
 
 

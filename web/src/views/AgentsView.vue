@@ -156,34 +156,19 @@
               </div>
               <div class="row">
                 <span class="k">凭据</span>
-                <span class="v mono">
-                  {{ hintText(a) }}
-                  <!-- 🔴 这个钮复制的是**整条凭据**（2026-11-14 用户当场指出：只给一个
-                       "复制前缀"的钮等于骗人 —— 前缀不是凭据、粘出去也连不上）。
-                       点它要先过手输**完整 agent_id** 的确认闸（与后端同档），
-                       确认后才解密并写进剪贴板；不可还原的行**根本不给这个钮**
-                       （给了必然失败，那种钮的存在本身是误导）。 -->
-                  <button
-                    v-if="a.recoverable"
-                    class="copy-btn"
-                    title="复制完整凭据"
-                    @click="copyCredNow(a)"
-                  >
-                    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
-                      stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
-                      <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
-                    </svg>
-                  </button>
+                <span class="v">
+                  <!-- 多凭据（11-14）：卡面只报"几把在用 / 最近谁在动"。逐把的复制、
+                       新建、作废都在抽屉里点名做 —— 一个代理可能有十把钥匙，摊在卡面上
+                       会把卡片撑成一堵墙，而"复制的是哪一把"必须是有意指的动作。 -->
+                  <el-button link type="primary" size="small" @click="openCreds(a)">
+                    {{ credLine(a) }}
+                  </el-button>
                 </span>
               </div>
             </div>
 
             <!-- 状态 chip：**只读**（拨开关的地方在编辑弹框里，卡面不再挂控件） -->
             <div class="card-tags">
-              <span class="tag" :class="a.recoverable ? '' : 'tag--warn'">
-                凭据{{ a.recoverable ? '可复制' : '不可还原' }}
-              </span>
               <span class="tag">私信{{ dmOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享{{ shareOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享知识库{{ shareKbOn(a) ? '开' : '关' }}</span>
@@ -257,6 +242,8 @@
     />
 
     <!-- 一次性凭据：共用组件（登记页 / 审核页同一份实现，不许复制第二份）；关掉即从内存里抹掉 -->
+    <CredentialListDrawer v-model="credsOpen" :agent="credsAgent" @changed="load(true)" />
+
     <CredentialDialog
       v-model="credOpen"
       :credential="cred"
@@ -402,19 +389,10 @@
               />
             </el-form-item>
 
-            <!-- 组三：凭据（危险区）—— 换发 / 停凭据 / 删除 -->
+            <!-- 组三：凭据（危险区）—— 清单 / 换发（止血）/ 作废全部 / 删除 -->
             <div class="eg-title eg-title--danger">凭据（危险区）</div>
             <div class="eg-danger">
-              <!-- 可还原档（2026-11-14）：明文能重复取出，确认闸 = 完整 agent_id。
-                   🔴 只有 recoverable 为真才给这个钮 —— 不可还原的行点了必然 409，
-                   那种钮的存在本身就是误导（用户会以为复制坏了而去找换发）。 -->
-              <el-button
-                v-if="editRow?.status === 'approved' && editRow?.recoverable"
-                :disabled="busy"
-                @click="revealNow(editRow)"
-              >
-                查看 / 复制凭据
-              </el-button>
+              <el-button :disabled="busy" @click="openCreds(editRow)">管理凭据</el-button>
               <el-button
                 v-if="editRow?.status === 'approved'"
                 :disabled="busy"
@@ -423,11 +401,11 @@
                 重新生成凭据
               </el-button>
               <el-button
-                v-if="editRow?.status === 'approved' && editRow?.credential_hint"
+                v-if="editRow?.credential_active"
                 :disabled="busy"
                 @click="askFromEdit('clearcred')"
               >
-                停凭据
+                作废全部凭据
               </el-button>
               <el-button
                 v-if="editRow?.status === 'revoked'"
@@ -437,30 +415,6 @@
               >
                 删除这个代理
               </el-button>
-              <span v-if="editRow?.status !== 'approved' && !editRow?.credential_hint" class="tip">
-                这个代理现在没有凭据。
-              </span>
-            </div>
-
-            <!-- 不可还原的老行：把「回填已有凭据」这条路摆出来，而不是只报 409。
-                 用户手上的串本来就能用，换发才会把线上代理打断 —— 所以默认动作是登记，
-                 不是重签。粘贴框只进内存：提交后立刻清空，不落任何浏览器持久存储、不进地址栏。 -->
-            <div v-if="editRow?.status === 'approved' && !editRow?.recoverable" class="eg-backfill">
-              <el-input
-                v-model="backfillText"
-                type="password"
-                show-password
-                :disabled="busy"
-                placeholder="把这个代理当前在用的 ksk_ 凭据粘进来（登记，不会换发）"
-              />
-              <el-button
-                :disabled="busy || !backfillText.trim()"
-                @click="submitBackfill"
-
-              >
-                回填已有凭据
-              </el-button>
-              <p class="tip">此条未存密文，解不出来；粘它正在用的串可登记，不换发。</p>
             </div>
           </div>
         </div>
@@ -484,12 +438,13 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import CredentialDialog from '../components/CredentialDialog.vue'
+import CredentialListDrawer from '../components/CredentialListDrawer.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import http, { api } from '../api'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
-import { toLocal } from '../utils/format'
+import { since, toLocal } from '../utils/format'
 import { isStale } from '../utils/kb'
 
 /** 状态徽标的显示词；后端给什么就显示什么（未知值也不吞，退回原串）。 */
@@ -531,8 +486,21 @@ function statusTone(a) {
 }
 
 /** 凭据只回显前 8 位；后端把空串同时用作「未发放」和「已轮换/已清」，一句话说清。 */
-function hintText(a) {
-  return a.credential_hint ? `${a.credential_hint}…` : '未发放'
+function credLine(a) {
+  // 「N 把在用」+「最近谁在动」：监管要的正是这两件事，串本身留给抽屉。
+  const n = a.credential_active || 0
+  const base = n ? `${n} 把在用` : (a.credential_count ? '已全部作废' : '未发放')
+  return a.last_used_at ? `${base} · 最近 ${since(a.last_used_at)}` : base
+}
+
+/** 凭据抽屉（逐把的清单 / 新建 / 复制 / 作废都在那里面）。 */
+const credsOpen = ref(false)
+const credsAgent = ref(null)
+
+function openCreds(row) {
+  if (!row) return
+  credsAgent.value = row
+  credsOpen.value = true
 }
 
 /** 静默重拉的失败提示：连着几轮都失败只报第一次，免得 10 秒刷一次屏。 */
@@ -638,8 +606,6 @@ const cred = ref('')
 const credNote = ref('')
 /** CredentialDialog 的口径：'issue' = 签发/换发（旧语义）；'reveal' = 从存档取出（可重复）。 */
 const credMode = ref('issue')
-/** 回填用的粘贴框（只进内存：提交即清、关弹框即清；不落浏览器持久存储、不进地址栏与日志）。 */
-const backfillText = ref('')
 
 function forget() {
   cred.value = ''
@@ -664,73 +630,10 @@ function showCred(r, mode = 'issue') {
   return true
 }
 
-/**
- * 一键取出整条凭据（2026-11-14 用户定档：不要求输入任何东西）。
- * 卡面钮 = 直接进剪贴板（不上屏、不落 cred ref）；编辑弹框 = 显示出来给人核对/手抄。
- * 🔴 失败必须说清并**不动 UI**（不假装复制成功）：剪贴板在非安全上下文可能整体不可用，
- *    那种情况下给一条能手动选中的路，而不是静默。
- */
-async function copyCredNow(row) {
-  if (!row || busy.value) return
-  busy.value = true
-  try {
-    const r = await api.revealCredential(row.agent_id)
-    if (!r?.credential) {
-      showError('后端没有返回凭据，复制未发生')
-      return
-    }
-    const ok = await copyText(r.credential)
-    ok
-      ? showToast(`已复制完整凭据：${row.agent_id}（已记审计）`)
-      : showError('剪贴板不可用，请用编辑弹框里的「查看 / 复制凭据」手动选中复制')
-  } catch (e) {
-    showError(e?.message || '取出凭据失败')
-  } finally {
-    busy.value = false
-  }
-}
-
-/** 编辑弹框里取出并显示明文（走两页共用的 CredentialDialog，mode=reveal）。 */
-async function revealNow(row) {
-  if (!row || busy.value) return
-  busy.value = true
-  try {
-    const r = await api.revealCredential(row.agent_id)
-    if (showCred(r, 'reveal')) showToast(`已取出凭据：${row.agent_id}（已记审计）`)
-  } catch (e) {
-    showError(e?.message || '取出凭据失败')
-  } finally {
-    busy.value = false
-  }
-}
-
-/** 回填已在用的串：不换发、不签字。防认错行由服务端 sha256 对账兜，所以不需要打字确认。 */
-async function submitBackfill() {
-  const row = editRow.value
-  const text = backfillText.value.trim()
-  if (!row || busy.value) return
-  if (!text) {
-    showError('请先把这个代理当前在用的 ksk_ 凭据粘进来')
-    return
-  }
-  editOpen.value = false
-  busy.value = true
-  try {
-    const r = await api.backfillCredential(row.agent_id, text)
-    if (r?.ok) {
-      showToast(`已登记，这条现在可重复复制：${row.agent_id}`)
-      await load(true)
-    } else {
-      showToast(r?.note || '回填未生效', 'warning')
-    }
-  } catch (e) {
-    showError(e?.message || '回填失败')
-  } finally {
-    // 🔴 无论成败都从内存里擦掉：粘进来的是一把可用钥匙，留在 ref 里等于多一个泄漏点
-    backfillText.value = ''
-    busy.value = false
-  }
-}
+// 逐把凭据的动作（列出 / 新建 / 取出 / 改名 / 作废 / 登记已有串）全部在
+// `components/CredentialListDrawer.vue` 里做 **一份**：
+// 页面上不留第二处实现 —— 两处各写一份迟早漂，漂了就出现"这边说能复制、那边说不能"。
+// 🔴 明文只活在那个组件的内存态里：不进 URL、不进浏览器持久存储、关掉即抹。
 
 // ---------------------------------------------------------------------------
 // 登记新代理 / 改名：两条新的治理动作（后端 /api/v1/agents 与 .../rename）
@@ -799,8 +702,6 @@ const editPrimary = computed(() => editRow.value?.role === 'primary')
 
 function openEdit(row) {
   editRow.value = row
-  // 🔴 每次开框都从空串开始：上一回粘进来的是一把可用钥匙，不该在内存里活到下一次。
-  backfillText.value = ''
   editId.value = row?.agent_id || ''
   editName.value = row?.name || ''
   editBudget.value = row?.core_budget_chars == null ? '' : String(row.core_budget_chars)
@@ -1076,7 +977,7 @@ const dlgTitle = computed(() => {
   if (dlgKind.value === 'rotate') return `重新生成 ${id} 的凭据？`
   if (dlgKind.value === 'revoke') return `吊销 ${id}？`
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
-  if (dlgKind.value === 'clearcred') return `停掉 ${id} 的凭据？`
+  if (dlgKind.value === 'clearcred') return `作废 ${id} 的全部凭据？`
   // 🔴 凭据类三条必须各写各的标题：兜底那句是「删除 xxx？」，漏写就把一次复制显示成删除（11-14 实踩）
   return `删除 ${id}？`
 })
@@ -1086,7 +987,7 @@ const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'rotate') return '重新生成凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
-  if (dlgKind.value === 'clearcred') return '停凭据'
+  if (dlgKind.value === 'clearcred') return '作废全部凭据'
   if (dlgKind.value === 'delete') return '确认删除'
   return '确认修改'
 })

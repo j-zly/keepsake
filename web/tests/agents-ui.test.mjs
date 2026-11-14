@@ -435,10 +435,12 @@ function deleteButton() {
   return VIEW.slice(start, at + "askFromEdit('delete')".length)
 }
 
-test('停凭据：只有「已批准且有凭据提示」的行才渲染这个钮', () => {
+test('作废全部凭据：只有「还有在用的凭据」的行才渲染这个钮', () => {
   const btn = clearCredButton()
-  assert.match(btn, /v-if="editRow\?\.status === 'approved' && editRow\?\.credential_hint"/,
-    '门开在「已批准 + 有凭据提示」上（没凭据没得停）')
+  // 多凭据（11-14）之后判据从"有 hint"改成"有在用的把"：
+  // 一个代理可能有多把、也可能全作废后只剩 revoked 行 —— 后者不该再给一个必然空转的钮。
+  assert.match(btn, /v-if="editRow\?\.credential_active"/,
+    '门开在「名下还有在用的凭据」上（没钥匙没得作废）')
   // 它在**编辑弹框**里（不在卡面）：卡面只留一个直接动作 + 一支铅笔
   assert.ok(VIEW.indexOf("askFromEdit('clearcred')") > VIEW.indexOf('title="编辑代理"'),
     '停凭据钮在编辑弹框里')

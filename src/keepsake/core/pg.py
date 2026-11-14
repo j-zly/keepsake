@@ -83,7 +83,9 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 from ..domain.emotion import analyze_emotion
 from ..domain.splitter import extract_entities, extract_keywords, segment_query
 # 代理注册表 `ks_agent` 的 DDL 唯一定义处（本模块只 import，不重复实现语义）
-from ..govern.registry import KS_AGENT_DDL, TABLE as TABLE_KS_AGENT
+from ..govern.registry import (KS_AGENT_DDL, CRED_INDEX_DDL, CRED_INDEX_NAME,
+                               KS_CREDENTIAL_DDL, TABLE_CREDENTIAL,
+                               TABLE as TABLE_KS_AGENT)
 from ..govern.registry import is_broken_connection_error
 # 归属判据（`agent:<id>` 标签）—— 与检索/core 可见性同一把尺子（govern 只依赖
 # 标准库，不反向 import core ⇒ 不成环）。
@@ -458,9 +460,15 @@ _DDL_TABLES = (
     # （它只依赖标准库，反向 import 不会成环）；两个后端建表语句复制一份必然漂，
     # 而漂的后果是「注册表在一侧永远不存在、治理在换后端时静默失效」。
     (TABLE_KS_AGENT, KS_AGENT_DDL),
+    # 2026-11 ks_multi_credential：一个代理可持多把凭据（逐把作废 / 逐把看用量）。
+    # DDL 同样**不在这里另抄** —— 唯一定义处 `govern/registry.py::KS_CREDENTIAL_DDL`。
+    (TABLE_CREDENTIAL, KS_CREDENTIAL_DDL),
 )
 
 _DDL_INDEXES = (
+    # 多凭据（11-14）：一把凭据一个哈希，全局唯一 —— 撞号就是复制粘贴事故，
+    # 让库直接拒（语句来自 registry，别处不抄第二份）。
+    (CRED_INDEX_NAME, CRED_INDEX_DDL),
     ("idx_ks_entity_timeline_ts",
      "CREATE INDEX IF NOT EXISTS idx_ks_entity_timeline_ts "
      "ON ks_entity_timeline (entity, ts DESC)"),

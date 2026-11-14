@@ -123,7 +123,10 @@ def test_列表形状与pending计数(env):
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
                          "credential_hint", "meta", "dm_enabled", "share_memory",
-                         "share_kb", "core_budget_chars", "push_enabled", "recoverable"}
+                         "share_kb", "core_budget_chars", "push_enabled", "recoverable",
+                         # 多凭据（ks_multi_credential，11-14）：名下几把 / 几把在用 / 最近被用。
+                         # 🔴 依旧只有计数与布尔，密文列与哈希不在读面上。
+                         "credential_count", "credential_active", "last_used_at"}
     assert item["core_budget_chars"] is None      # 缺省 = 沿用全局
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文

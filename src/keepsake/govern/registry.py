@@ -153,6 +153,117 @@ SHARE_KB_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 ENC_COLUMN = "credential_enc"
 ENC_COLUMN_DECL = "text NULL"
 
+# ===========================================================================
+# 多凭据（`ks_credential`）—— 2026-11-14 用户拍板
+# ===========================================================================
+#: 一个代理可以同时持有多把凭据：多台机器 / 多个进程各拿一把，能**单独作废**、
+#: 能**逐把看用量**（用户原话：「一个代理多个凭证，我只是想对一个代理进来的多个
+#: 代理进行监管」）。
+#: 🔴 这**不是**身份隔离：凭据只是入口，身份与记忆归属仍是 `agent_id`，多把共用
+#:    同一个记忆池（用户已确认「记忆都是算一起的这个不变」）。要独立记忆就注册独立代理。
+TABLE_CREDENTIAL = "ks_credential"
+
+#: `cred_id` 长度（十六进制）。它只是**定位与展示用的编号，不是秘密**，
+#: 可以进 URL、进审计、进界面；真正的秘密只有 `credential_hash` 对应的那把明文。
+CRED_ID_HEX_LEN = 12
+
+#: 标签长度上限（防把整段说明塞进列表行）。
+CRED_LABEL_MAX_LEN = 40
+
+#: 批准时自动签发的那一把 / 老三列迁移过来的那一把的默认标签。
+CRED_LABEL_DEFAULT = "默认"
+
+CRED_STATUS_ON = "active"
+CRED_STATUS_OFF = "revoked"
+
+#: 列序（读与写共用同一份 ⇒ 不会漂），含密文列名（与代理表同一个 `ENC_COLUMN`）。
+CRED_FIELDS: Tuple[str, ...] = (
+    "cred_id", "agent_id", "label", "credential_hash", "credential_hint",
+    ENC_COLUMN, "status", "created_at", "used_at", "reads", "writes",
+)
+
+#: 🔴 自本表起，`ks_agent` 上的 `credential_hash` / `credential_hint` /
+#: `credential_enc` **三列冻结**：新代码一律不读不写，只作「退回旧版二进制」的
+#: 复原底（旧版只认那三列，值还在 ⇒ 回滚不用重新签发、线上代理不断线）。
+#: 留着不用 ≠ 第二张鉴权面：鉴权只有 `verify()` / `verify_any()` 一个入口，
+#: 它们只查本表（`tests/test_agent_credentials.py` 钉死了这条）。
+KS_CREDENTIAL_DDL = f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_CREDENTIAL} (
+        cred_id            text PRIMARY KEY,
+        -- 归属代理。不设外键级联：删除顺序由代码保证（`Registry.delete`），
+        -- 与 ks_message 同一做法（FK 会让"先删哪张"变成部署顺序约束，得不偿失）。
+        agent_id           text NOT NULL,
+        -- 给人看的名字（"108 执行器" / "win 笔记本"）。空 = 未命名。
+        -- 🔴 标签不参与任何判据：改它不影响鉴权，也不需要客户端重配。
+        label              text NOT NULL DEFAULT '',
+        -- 鉴权唯一依据：sha256(明文)。明文永不入库（与代理表同一纪律）。
+        credential_hash    text NOT NULL,
+        credential_hint    text NOT NULL DEFAULT '',
+        -- Fernet 密文存档，只为「控制台能重复复制」。校验面**永远不读这一列**。
+        -- NULL = 不可还原（没主密钥时签的、或从老三列迁来的老凭据）。
+        credential_enc     {ENC_COLUMN_DECL},
+        -- active / revoked。作废一把**不动代理行**（与"吊销代理"分档：
+        -- 吊销 = 停权限留记录；作废一把 = 只掐这一个入口，其余照旧连）。
+        status             text NOT NULL DEFAULT '{CRED_STATUS_ON}',
+        created_at         text NOT NULL DEFAULT '',
+        -- 最近一次用它鉴权通过的时刻（打点限频 60s ⇒ 遥测，不是账本）。
+        used_at            text NOT NULL DEFAULT '',
+        reads              integer NOT NULL DEFAULT 0,
+        writes             integer NOT NULL DEFAULT 0
+    )
+"""
+
+#: 一个哈希只能属于一把钥匙（撞号 = 复制粘贴事故，直接让库拒绝，比代码里查一遍可靠）。
+CRED_INDEX_NAME = "uq_ks_credential_hash"
+CRED_INDEX_DDL = (f"CREATE UNIQUE INDEX IF NOT EXISTS {CRED_INDEX_NAME} "
+                  f"ON {TABLE_CREDENTIAL} (credential_hash)")
+
+
+class SingleCredentialBackend(RuntimeError):
+    """这个存储后端只能放一把凭据（Redis 侧没有表结构）⇒ 调用方给**人话**，
+    不许静默少发一把（静默少发比报错难查十倍）。"""
+
+
+def new_credential_id() -> str:
+    """凭据编号（不是秘密，见 `CRED_ID_HEX_LEN` 的说明）。"""
+    return secrets.token_hex(CRED_ID_HEX_LEN // 2)
+
+
+def _legacy_cred_id(credential_hash: str) -> str:
+    """Redis 后端没有 `cred_id` 列 ⇒ 由哈希派生一个**稳定**编号
+    （同一把凭据两次拿到的 id 必须一致，否则界面上的按钮会点到别把上）。"""
+    return hashlib.sha256(str(credential_hash or "").encode("utf-8")).hexdigest()[:CRED_ID_HEX_LEN]
+
+
+def _cred_label(raw: Any) -> str:
+    """标签归一：去首尾空白、截到上限，空 ⇒ 「默认」。
+
+    截断而不是报错：标签是给人贴的备忘，为几个字拒掉整次签发是本末倒置。
+    """
+    text = str(raw or "").strip()[:CRED_LABEL_MAX_LEN]
+    return text or CRED_LABEL_DEFAULT
+
+
+def _cred_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    """凭据的对外形状（控制台列表 / MCP 治理面共用）。
+
+    🔴 不含 `credential_hash`、不含密文、更不含明文 —— 界面拿 `credential_hint`
+    （本来就公开的 8 位）比对，`cred_id` 定位，`recoverable` 决定给不给「复制」钮。
+    """
+    return {
+        "cred_id": row["cred_id"],
+        "label": row["label"],
+        "credential_hint": row["credential_hint"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "used_at": row["used_at"],
+        # 作废时刻（在用为空）。
+        "revoked_at": str(row.get("revoked_at") or ""),
+        "reads": row["reads"],
+        "writes": row["writes"],
+        "recoverable": bool(str(row.get(ENC_COLUMN) or "")),
+    }
+
 #: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
 #: 🔴 与 `share_memory` 同一档：**缺省是关**（'0'）——「实时推送」是**往外放行**
 #: 的开关（别人能连上来推事件给你），缺省必须是最严的那一档（老行没有这一列
@@ -397,7 +508,12 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
 
     🔴 **不含 `credential_hash`**：注册表的对外读面永远不回显凭据摘要，
     更不含明文（明文只在 approve 的一次性响应里）。
+
+    多凭据（11-14）之后，凭据相关的四个字段来自 `row["_cred"]`（调用方用
+    `_cred_summary()` 挂上），**不再读代理行的老三列** —— 那是迁移前的快照，
+    拿它显示会出现「界面上还有一把、实际已经作废」的假账。缺 `_cred` 一律按 0 把算。
     """
+    cred = row.get("_cred") or {}
     return {
         "agent_id": row["agent_id"],
         "name": row["name"],
@@ -408,12 +524,16 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "reads": row["reads"],
         "writes": row["writes"],
         "exclude_from_primary": row["exclude_from_primary"],
-        "credential_hint": row["credential_hint"],
-        # 这条凭据**能不能还原成明文**（= 控制台上「查看/复制凭据」可不可用）。
-        # 🔴 只报布尔：密文本身绝不出读面（它不是秘密但不能白送 —— 配上主密钥就是明文）。
-        # 判据 = 有凭据账（hash）且有密文；老行/没主密钥 ⇒ False，面板据此给「回填」引导。
-        "recoverable": bool(str(row.get("credential_hash") or ""))
-        and bool(str(row.get(ENC_COLUMN) or "")),
+        # 凭据摘要（监管面的入口，逐把明细在 `list_credentials`）：
+        #   count/active → 「这代理有几个入口」；last_used_at → 「最近谁在用」。
+        #   hint/recoverable 指**最后一把在用的**那把（界面上先给个能比对的头 8 位；
+        #   要取哪把必须进清单点，绝不在列表页猜 —— 猜错就是把另一把的钥匙递出去）。
+        # 🔴 只报这些：密文与哈希都不出读面。
+        "credential_hint": str(cred.get("credential_hint") or ""),
+        "recoverable": bool(cred.get("recoverable")),
+        "credential_count": int(cred.get("credential_count") or 0),
+        "credential_active": int(cred.get("credential_active") or 0),
+        "last_used_at": str(cred.get("last_used_at") or ""),
         "meta": row["meta"],
         # 私信开关（投递偏好）：控制台要能看见当前状态 —— 判读口径与
         # `Registry.dm_enabled` 同一个（`_dm_is_on`），两处不许各写一份。
@@ -548,6 +668,19 @@ class _SqlBackend(_SqlBase):
                 logger.warning("keepsake: 注册表补列 %s 失败（%s: %s）",
                                column, type(e).__name__, e)
                 return False
+        # ---- 多凭据（11-14）：老三列 → ks_credential，幂等 ----
+        # 表本身由 `core/pg.py` / `core/sqlite.py` 的 DDL 清单建（与 ks_agent 同一处，
+        # 这里不自发 DDL）。**迁不动就返回 False**：新代码的鉴权只认凭据表，
+        # 悄悄迁失败 = 所有代理集体 `bad_credential`，那必须响，不能闷着上线。
+        try:
+            moved = _CredSqlBackend(self._st, self.kind).migrate_from_agents(self.all_rows())
+            if moved:
+                logger.info("keepsake: %d 条老凭据已灌进 %s（老三列冻结留作回滚底）",
+                            moved, TABLE_CREDENTIAL)
+        except Exception as e:      # noqa: BLE001
+            logger.error("keepsake: 凭据表迁移失败（%s: %s）—— 拒绝以半套账启动",
+                         type(e).__name__, e)
+            return False
         return True
 
     def load(self, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -636,6 +769,270 @@ class _SqlBackend(_SqlBase):
             return cur.rowcount > 0
 
         return bool(self.write(_fn))
+
+
+class _CredSqlBackend(_SqlBase):
+    """`ks_credential` 的存取（PG / SQLite 共用 `_SqlBase` 的连线、占位符与事务入口）。
+
+    🔴 与代理表共用一份 `_SqlBase` 的理由同旧：SQL 只差占位符，复制一份必然漂。
+    """
+
+    def list(self, agent_id: str = "") -> List[Dict[str, Any]]:
+        sql = f"SELECT {', '.join(CRED_FIELDS)} FROM {TABLE_CREDENTIAL}"
+        params: Tuple[Any, ...] = ()
+        if agent_id:
+            sql += f" WHERE agent_id = {self.ph}"
+            params = (agent_id,)
+        # 稳定序：先按签发时间，再按编号 ⇒ 同一批数据两次渲染的行序一致。
+        sql += " ORDER BY created_at, cred_id"
+        return [dict(zip(CRED_FIELDS, row)) for row in self.read(sql, params)]
+
+    def get(self, cred_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.read(
+            f"SELECT {', '.join(CRED_FIELDS)} FROM {TABLE_CREDENTIAL} WHERE cred_id = {self.ph}",
+            (cred_id,))
+        return dict(zip(CRED_FIELDS, rows[0])) if rows else None
+
+    def by_hash(self, credential_hash: str) -> Optional[Dict[str, Any]]:
+        """按**哈希**查（哈希不是秘密，明文才是）⇒ 反查身份走索引，不逐行比。"""
+        if not credential_hash:
+            return None
+        rows = self.read(
+            f"SELECT {', '.join(CRED_FIELDS)} FROM {TABLE_CREDENTIAL} "
+            f"WHERE credential_hash = {self.ph}", (credential_hash,))
+        return dict(zip(CRED_FIELDS, rows[0])) if rows else None
+
+    def insert(self, row: Dict[str, Any]) -> None:
+        cols = ", ".join(CRED_FIELDS)
+        marks = ", ".join(self.ph for _ in CRED_FIELDS)
+        values = tuple(None if (f == ENC_COLUMN and not row.get(f)) else row.get(f)
+                       for f in CRED_FIELDS)
+        self.write(lambda cur: cur.execute(
+            f"INSERT INTO {TABLE_CREDENTIAL} ({cols}) VALUES ({marks})", values))
+
+    def set_fields(self, cred_id: str, fields: Dict[str, Any]) -> bool:
+        """改某把的几个字段（label / status / 密文）；命中才算成功。
+
+        🔴 空 `fields` 直接 False —— 拼出 `SET  WHERE` 是语法错误，白抛一次栈。
+        """
+        if not fields:
+            return False
+        sets = ", ".join(f"{f} = {self.ph}" for f in fields)
+        enc = ENC_COLUMN
+
+        def _fn(cur: Any) -> bool:
+            values = tuple(None if (f == enc and not v) else v
+                           for f, v in fields.items())
+            cur.execute(f"UPDATE {TABLE_CREDENTIAL} SET {sets} WHERE cred_id = {self.ph}",
+                        (*values, cred_id))
+            return cur.rowcount > 0
+
+        return bool(self.write(_fn))
+
+    def bump(self, cred_id: str, column: str) -> None:
+        """逐把计数（`reads` / `writes`）+ 刷新 `used_at`。
+
+        🔴 `column` 只接受本模块常量名：它是拼进 SQL 的，绝不能来自请求。
+        """
+        if column not in ("reads", "writes"):
+            raise ValueError(f"bump: 非法计数列 {column!r}")
+        self.write(lambda cur: cur.execute(
+            f"UPDATE {TABLE_CREDENTIAL} SET {column} = COALESCE({column}, 0) + 1, "
+            f"used_at = {self.ph} WHERE cred_id = {self.ph}",
+            (_now_iso(), cred_id)))
+
+    def revoke_all(self, agent_id: str) -> int:
+        """把这个代理**在用的**凭据全部作废（吊销代理 / 停凭据 / 换发都走它）。
+        已作废的行留着 —— 它们是"谁在什么时候被掐掉"的历史。"""
+        def _fn(cur: Any) -> int:
+            cur.execute(
+                f"UPDATE {TABLE_CREDENTIAL} SET status = {self.ph} "
+                f"WHERE agent_id = {self.ph} AND status = {self.ph}",
+                (CRED_STATUS_OFF, agent_id, CRED_STATUS_ON))
+            return cur.rowcount
+
+        return int(self.write(_fn) or 0)
+
+    def delete_agent(self, agent_id: str) -> int:
+        def _fn(cur: Any) -> int:
+            cur.execute(f"DELETE FROM {TABLE_CREDENTIAL} WHERE agent_id = {self.ph}",
+                        (agent_id,))
+            return cur.rowcount
+
+        return int(self.write(_fn) or 0)
+
+    def rename_agent(self, old_id: str, new_id: str) -> int:
+        """换主键时把凭据一起搬走 —— 否则「改名」会变成「所有入口集体掉线」。"""
+        def _fn(cur: Any) -> int:
+            cur.execute(f"UPDATE {TABLE_CREDENTIAL} SET agent_id = {self.ph} "
+                        f"WHERE agent_id = {self.ph}", (new_id, old_id))
+            return cur.rowcount
+
+        return int(self.write(_fn) or 0)
+
+    def summaries(self, rows: Optional[List[Dict[str, Any]]] = None
+                  ) -> Dict[str, Dict[str, Any]]:
+        """代理列表要的汇总：几把 / 几把在用 / 最近使用 / 最后一把在用的 hint 与可还原性。
+
+        🔴 一次读全表在内存里折叠，**不逐代理查**（列表页 N 个代理就 N 次查询是白给的
+        性能坑）。行数与代理数同量级（治理面，不是用户面）。
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in (rows if rows is not None else self.list()):
+            aid = str(row.get("agent_id") or "")
+            if not aid:
+                continue
+            item = out.setdefault(aid, {
+                "credential_count": 0, "credential_active": 0, "last_used_at": "",
+                "credential_hint": "", "recoverable": False,
+            })
+            item["credential_count"] += 1
+            if str(row.get("used_at") or "") > item["last_used_at"]:
+                item["last_used_at"] = str(row.get("used_at") or "")
+            if row.get("status") == CRED_STATUS_ON:
+                # 行序已按签发时间排好 ⇒ 后写覆盖前写 = "最后一把在用的"。
+                item["credential_active"] += 1
+                item["credential_hint"] = str(row.get("credential_hint") or "")
+                item["recoverable"] = bool(str(row.get(ENC_COLUMN) or ""))
+        return out
+
+    def migrate_from_agents(self, agents: List[Dict[str, Any]]) -> int:
+        """老三列（每代理一把）灌进本表，标签「默认」。幂等：按哈希判重。
+
+        🔴 只灌**不改**老三列（冻结但不清空）⇒ 回滚到旧版二进制时，旧版仍能用原串
+        鉴权，不会出现「升级升一半、两个在线代理集体掉线」这种收不了场的局面。
+        """
+        moved = 0
+        for row in agents:
+            stored = str(row.get("credential_hash") or "")
+            if not stored or self.by_hash(stored):
+                continue
+            self.insert({
+                "cred_id": _legacy_cred_id(stored),
+                "agent_id": row["agent_id"],
+                "label": CRED_LABEL_DEFAULT,
+                "credential_hash": stored,
+                "credential_hint": str(row.get("credential_hint") or ""),
+                ENC_COLUMN: str(row.get(ENC_COLUMN) or ""),
+                "status": CRED_STATUS_ON,
+                "created_at": str(row.get("first_seen_at") or _now_iso()),
+                "used_at": str(row.get("last_seen_at") or ""),
+                "reads": int(row.get("reads") or 0),
+                "writes": int(row.get("writes") or 0),
+            })
+            moved += 1
+        return moved
+
+
+class _CredRedisBackend:
+    """Redis 后端的**单把**凭据账 —— 老三列就是它的存储，不造假表。
+
+    🔴 为什么不做多把：Redis 侧只有 `keepsake:agent:<id>` 一个 hash，塞一列 JSON
+    装多把就等于在同一份语义上写两套实现（PG/SQLite 走 SQL、Redis 走 JSON 解析），
+    漂了就是「换了个后端凭据行为不一样」的故障。生产早已在 PG（Redis 是备胎），
+    所以这里只做**兼容映射**：读、校验、作废、回填照常；**加第二把**直接抛
+    `SingleCredentialBackend` ⇒ 调用方拿到人话，而不是静默少发一把。
+    """
+
+    kind = "redis"
+
+    def __init__(self, backend: Any) -> None:
+        self._be = backend
+
+    def _row(self, agent: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        stored = str(agent.get("credential_hash") or "")
+        if not stored:
+            return None
+        return {
+            "cred_id": _legacy_cred_id(stored),
+            "agent_id": agent["agent_id"],
+            "label": CRED_LABEL_DEFAULT,
+            "credential_hash": stored,
+            "credential_hint": str(agent.get("credential_hint") or ""),
+            ENC_COLUMN: str(agent.get(ENC_COLUMN) or ""),
+            "status": CRED_STATUS_ON,
+            "created_at": str(agent.get("first_seen_at") or ""),
+            "used_at": str(agent.get("last_seen_at") or ""),
+            # 计数沿用代理行的（单把 = 同一批活动）；不去重复加，也不假装分得开。
+            "reads": int(agent.get("reads") or 0),
+            "writes": int(agent.get("writes") or 0),
+        }
+
+    def list(self, agent_id: str = "") -> List[Dict[str, Any]]:
+        if agent_id:
+            row = self._be.load(agent_id)
+            got = self._row(row) if row else None
+            return [got] if got else []
+        out = []
+        for agent in self._be.all_rows():
+            got = self._row(agent)
+            if got:
+                out.append(got)
+        return out
+
+    def get(self, cred_id: str) -> Optional[Dict[str, Any]]:
+        return next((r for r in self.list() if r["cred_id"] == cred_id), None)
+
+    def by_hash(self, credential_hash: str) -> Optional[Dict[str, Any]]:
+        if not credential_hash:
+            return None
+        return next((r for r in self.list()
+                     if hmac.compare_digest(credential_hash, r["credential_hash"])), None)
+
+    def insert(self, row: Dict[str, Any]) -> None:
+        """写入 = 落到老三列（只有一个位置）。已有凭据 ⇒ 明确拒绝第二把。"""
+        aid = row["agent_id"]
+        current = self._row(self._be.load(aid) or {})
+        if current and current["credential_hash"] != row["credential_hash"]:
+            raise SingleCredentialBackend(aid)
+        self._be.update(aid, {
+            "credential_hash": row["credential_hash"],
+            "credential_hint": row["credential_hint"],
+            ENC_COLUMN: row.get(ENC_COLUMN) or "",
+        })
+
+    def set_fields(self, cred_id: str, fields: Dict[str, Any]) -> bool:
+        row = self.get(cred_id)
+        if not row:
+            return False
+        aid = row["agent_id"]
+        merged = {**row, **fields}
+        self._be.update(aid, {
+            "credential_hash": merged["credential_hash"],
+            "credential_hint": merged["credential_hint"],
+            ENC_COLUMN: merged.get(ENC_COLUMN) or "",
+        })
+        return True
+
+    def bump(self, cred_id: str, column: str) -> None:
+        """逐把计数在这里是 no-op：单把后端的活动已经记在代理行上，
+        两处都加会把同一件事数两遍。"""
+
+    def revoke_all(self, agent_id: str) -> int:
+        had = self._row(self._be.load(agent_id) or {})
+        self._be.update(agent_id, {"credential_hash": "", "credential_hint": "",
+                                   ENC_COLUMN: ""})
+        return 1 if had else 0
+
+    def delete_agent(self, agent_id: str) -> int:
+        return self.revoke_all(agent_id)
+
+    def rename_agent(self, old_id: str, new_id: str) -> int:
+        return 1 if self._row(self._be.load(old_id) or {}) else 0
+
+    def summaries(self, rows: Optional[List[Dict[str, Any]]] = None
+                  ) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in (rows if rows is not None else self.list()):
+            out[row["agent_id"]] = {
+                "credential_count": 1, "credential_active": 1,
+                "last_used_at": row["used_at"], "credential_hint": row["credential_hint"],
+                "recoverable": bool(str(row.get(ENC_COLUMN) or "")),
+            }
+        return out
+
+    def migrate_from_agents(self, agents: List[Dict[str, Any]]) -> int:
+        return 0      # 老三列就是它的存储，没有可迁的东西
 
 
 class _RedisBackend:
@@ -805,6 +1202,10 @@ class Registry:
         #: 不另开连接、不另拼 DSN。
         self.storage = storage
         self._be: Any = _SqlBackend(storage, kind) if kind != "redis" else _RedisBackend(storage)
+        # 🔴 凭据账与代理账**同后端不同实现**：SQL 走 `ks_credential` 表，
+        # Redis 走老三列的单把兼容映射（`add_credential` 在那边会明确拒绝）。
+        self._cred: Any = (_CredSqlBackend(storage, kind) if kind != "redis"
+                           else _CredRedisBackend(self._be))
         # `touch()` 的限频表按实例存（进程内遥测，重启归零是正常的）
         self._last_touch: Dict[str, float] = {}
         self._touch_lock = threading.Lock()
@@ -823,12 +1224,14 @@ class Registry:
     def list_agents(self) -> List[Dict[str, Any]]:
         """全部代理（按 agent_id 排序；空库返回 `[]`，不是 None）。"""
         rows = self._be.all_rows()
-        return [_public(r) for r in sorted(rows, key=lambda r: r["agent_id"])]
+        summary = self._cred.summaries()      # 一次读全表，不在循环里逐代理查
+        return [_public(self._cred_summary(r, summary))
+                for r in sorted(rows, key=lambda r: r["agent_id"])]
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """单个代理（对外形状）；不存在返回 None。"""
         row = self._be.load((agent_id or "").strip())
-        return _public(row) if row else None
+        return _public(self._cred_summary(row)) if row else None
 
     def pending_count(self) -> int:
         return sum(1 for r in self._be.all_rows() if r["status"] == STATUS_PENDING)
@@ -876,7 +1279,82 @@ class Registry:
         return self.get(aid) or {}
 
     # ---- 批准 / 吊销 / 角色 / 上下文开关 -------------------------------
-    def approve(self, agent_id: str, reissue: bool = False) -> Optional[str]:
+    def _cred_summary(self, row: Dict[str, Any],
+                      summary: Optional[Dict[str, Dict[str, Any]]] = None
+                      ) -> Dict[str, Any]:
+        """把凭据汇总挂到代理行上（`_public` 靠 `row["_cred"]` 出凭据字段）。"""
+        data = summary if summary is not None else self._cred.summaries()
+        out = dict(row)
+        out["_cred"] = data.get(str(row.get("agent_id") or ""), {})
+        return out
+
+    # ---- 多凭据（11-14 用户拍板：一个代理可发多把，逐把监管）------------
+    def list_credentials(self, agent_id: str) -> List[Dict[str, Any]]:
+        """某个代理名下的全部凭据（含已作废的，按签发时间排；不含任何秘密材料）。"""
+        return [_cred_public(r) for r in self._cred.list((agent_id or "").strip())]
+
+    def add_credential(self, agent_id: str, label: str = "") -> Optional[str]:
+        """给一个**已批准**的代理再加一把钥匙，返回明文（只在这里出现一次）。
+
+        与 `approve(reissue=True)` 的分界：这里**不作废任何旧钥匙** —— 多把并存，
+        正是这个功能存在的理由（换机器时新旧同时在线，切完再掐旧的）。
+        代理不在册 / 没批准 ⇒ None（调用方 404 / 409）。
+        🔴 Redis 后端已有凭据 ⇒ 抛 `SingleCredentialBackend`（宁可报错也不静默少发）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row or row["status"] != STATUS_APPROVED:
+            return None
+        return self._issue(aid, label)
+
+    def _issue(self, aid: str, label: str = "") -> str:
+        """签一把新凭据并落账（`approve` 与 `add_credential` 共用的唯一落点）。"""
+        credential = new_credential()
+        # 密文只在主密钥在场时存；不在场这把照旧可用，只是不可再取出（面板如实显示）。
+        self._cred.insert({
+            "cred_id": new_credential_id(),
+            "agent_id": aid,
+            "label": _cred_label(label),
+            "credential_hash": hash_credential(credential),
+            "credential_hint": credential_hint(credential),
+            ENC_COLUMN: credcrypto.encrypt(credential) or "",
+            "status": CRED_STATUS_ON,
+            "created_at": _now_iso(),
+            "used_at": "",
+            "reads": 0,
+            "writes": 0,
+        })
+        return credential
+
+    def revoke_credential(self, agent_id: str, cred_id: str) -> bool:
+        """作废**一把**钥匙：代理照旧在册、其余钥匙照旧能用。
+
+        🔴 必须 `agent_id` + `cred_id` 两个都对得上才动手 —— 只按 `cred_id` 找的话，
+        一个手滑的 URL 就能废掉别人家的钥匙（跨代理越权，本仓同类事故先例见过）。
+        """
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return False
+        if row["status"] == CRED_STATUS_OFF:
+            return False        # 已经废过：不谎报"刚废掉"（界面据此提示"这把这前就废了"）
+        return self._cred.set_fields(cid, {
+            "status": CRED_STATUS_OFF,
+            ENC_COLUMN: "",     # 🔴 密文一起清：留着就随时能再取出来用，作废是假的
+        })
+
+    def rename_credential(self, agent_id: str, cred_id: str, label: str) -> bool:
+        """改标签（纯展示，不参与任何判据 ⇒ 不需要确认闸、也不影响客户端）。"""
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return False
+        return self._cred.set_fields(cid, {"label": _cred_label(label)})
+
+    def approve(self, agent_id: str, reissue: bool = False,
+                label: str = "") -> Optional[str]:
         """批准并**生成一条一次性凭据**，返回明文；代理不存在返回 None。
 
         明文**只在这里出现一次**（返回值 = 控制台的响应体），库里只落 sha256。
@@ -895,23 +1373,25 @@ class Registry:
             return None
         if not reissue and row.get("status") == STATUS_APPROVED:
             raise AlreadyApprovedError(aid)
-        credential = new_credential()
-        # 密文存档（可还原）：**只在主密钥在场时**写；不在场时写空 ⇒ 这条照旧可用，
-        # 只是不可再次取出（面板如实显示「不可还原」）。校验面完全不读这一列。
-        self._be.update(aid, {
-            "status": STATUS_APPROVED,
-            "credential_hash": hash_credential(credential),
-            "credential_hint": credential_hint(credential),
-            ENC_COLUMN: credcrypto.encrypt(credential) or "",
-        })
-        return credential
+        # 换发（reissue）= 先把在用的全部掐掉再签新的 —— 与旧版"一把被顶掉"同语义，
+        # 只是现在名正言顺：那把钥匙在凭据账上变 revoked，历史留痕、用量留痕。
+        # 🔴 老三列此时**一并清掉**：它们是回滚底，但"作废"必须是两边都作废 ——
+        #   留着的话退回旧版二进制的瞬间，那把该死的钥匙又活了（安全方向优先于回滚便利）。
+        if reissue:
+            self._cred.revoke_all(aid)
+            self._be.update(aid, {"credential_hash": "", "credential_hint": "",
+                                  ENC_COLUMN: ""})
+        self._be.update(aid, {"status": STATUS_APPROVED})
+        return self._issue(aid, label)
 
     def revoke(self, agent_id: str) -> bool:
         """吊销（随时可做）：`status=revoked` 且**清掉凭据哈希**（旧凭据立即作废）。"""
         aid = (agent_id or "").strip()
         if not self._be.load(aid):
             return False
-        # 🔴 三列一起清：密文留着的话，「已吊销」的行照样能被取出明文 ⇒ 停钥匙没停干净
+        # 🔴 两本账一起掐：代理行清老三列（回滚后也照样作废）+ 凭据表全部置 revoked。
+        #    只掐一边的后果：新代码看凭据表 ⇒ 旧代码看老三列 ⇒ 两边各留一把活钥匙。
+        self._cred.revoke_all(aid)
         self._be.update(aid, {"status": STATUS_REVOKED,
                               "credential_hash": "", "credential_hint": "",
                               ENC_COLUMN: ""})
@@ -929,15 +1409,21 @@ class Registry:
         aid = (agent_id or "").strip()
         if not self._be.load(aid):
             return False
-        # 🔴 密文一起清：`revoke_credential` 的语义是「那把钥匙当场作废」，
-        #    密文还在 ⇒ 随时能再取出来用，作废就是假的。
+        # 🔴 两本账一起掐（同 revoke）；密文留在哪一边，作废就在哪一边是假的。
+        # 多凭据之后这一动作的语义 = **停这个代理的全部钥匙**（要停单把去凭据清单）。
+        self._cred.revoke_all(aid)
         self._be.update(aid, {"credential_hash": "", "credential_hint": "",
                               ENC_COLUMN: ""})
         return True
 
     # ---- 可还原凭据（控制台「查看/复制凭据」与「回填已有凭据」的原语）----------
-    def reveal_credential(self, agent_id: str) -> Dict[str, Any]:
-        """把某条代理的凭据**明文**取回来（重复复制用）。
+    def reveal_credential(self, agent_id: str, cred_id: str = "") -> Dict[str, Any]:
+        """把某把凭据的**明文**取回来（重复复制用）。
+
+        `cred_id` 省略时的规则（**宁拒不猜**）：名下正好一把在用的 ⇒ 就是它；
+        一把都没有 ⇒ `no_credential`；**多把在用 ⇒ `ambiguous`（附候选编号）**，
+        绝不替调用方挑一把 —— 挑错就是把另一把的钥匙递出去。
+        旧调用方（只认单把年代的 API/测试）因此行为不变，只有真多把时才需要指名。
 
         返回 `{"ok": bool, "credential": str|None, "why": str}` —— `why` 是给调用方
         分诊用的，几种失败后果不同、处置动作也不同，不许糊成一句「取不出来」：
@@ -959,24 +1445,42 @@ class Registry:
         🔴 明文只进返回值：这里不写日志、不写审计（"取过一次"由调用方记，不含内容）。
         """
         aid = (agent_id or "").strip()
-        row = self._be.load(aid)
-        if not row:
+        if not self._be.load(aid):
             return {"ok": False, "credential": None, "why": "no_row"}
-        if not str(row.get("credential_hash") or ""):
+        rows = [r for r in self._cred.list(aid) if r.get("status") == CRED_STATUS_ON]
+        cid = (cred_id or "").strip()
+        if cid:
+            row = next((r for r in rows if r["cred_id"] == cid), None)
+            if not row:
+                # 不区分"不存在"与"已作废"：两者处置动作一样（换一把/重新签发），
+                # 而区分它们等于向外探测别人的编号存不存在。
+                return {"ok": False, "credential": None, "why": "no_credential",
+                        "cred_id": cid}
+        elif len(rows) == 1:
+            row = rows[0]
+        elif not rows:
             return {"ok": False, "credential": None, "why": "no_credential"}
+        else:
+            return {"ok": False, "credential": None, "why": "ambiguous",
+                    "cred_ids": [r["cred_id"] for r in rows]}
         enc = str(row.get(ENC_COLUMN) or "")
         if not enc:
-            return {"ok": False, "credential": None, "why": "not_recoverable"}
+            return {"ok": False, "credential": None, "why": "not_recoverable",
+                    "cred_id": row["cred_id"]}
         plain, why = credcrypto.decrypt_with_reason(enc)
         if not plain:
-            return {"ok": False, "credential": None, "why": why}
-        # 🔴 取出的明文必须与在册 hash 对得上才回 —— 密文与 hash 是两列，
+            return {"ok": False, "credential": None, "why": why,
+                    "cred_id": row["cred_id"]}
+        # 🔴 取出的明文必须与**这把自己**的在册 hash 对得上才回 —— 密文与 hash 是两列，
         #    任何一处被手工改过都不该把「对不上账」的串当凭据发出去。
         if not hmac.compare_digest(hash_credential(plain), str(row["credential_hash"])):
-            return {"ok": False, "credential": None, "why": "hash_mismatch"}
-        return {"ok": True, "credential": plain, "why": "ok"}
+            return {"ok": False, "credential": None, "why": "hash_mismatch",
+                    "cred_id": row["cred_id"]}
+        return {"ok": True, "credential": plain, "why": "ok",
+                "cred_id": row["cred_id"], "label": row["label"]}
 
-    def backfill_credential(self, agent_id: str, credential: str) -> Dict[str, Any]:
+    def backfill_credential(self, agent_id: str, credential: str,
+                            cred_id: str = "") -> Dict[str, Any]:
         """把**已有**凭据的明文登记成可还原（校验通过才写，绝不换发）。
 
         场景：可还原机制上线之前签发的行（库里只有 sha256），操作者手上还留着那条串。
@@ -1001,20 +1505,40 @@ class Registry:
         row = self._be.load(aid)
         if not row:
             return {"ok": False, "why": "no_row", "hint": ""}
-        stored = str(row.get("credential_hash") or "")
         plain = (credential or "").strip()
-        hint_now = str(row.get("credential_hint") or "")
         if not plain:
-            return {"ok": False, "why": "empty", "hint": hint_now}
-        if not stored:
-            return {"ok": False, "why": "no_hash", "hint": ""}
-        if not hmac.compare_digest(hash_credential(plain), stored):
+            return {"ok": False, "why": "empty",
+                    "hint": str(row.get("credential_hint") or "")}
+        got = hash_credential(plain)
+        cid = (cred_id or "").strip()
+        # 正主：凭据账上哈希对得上的那把（`cred_id` 给了就必须同时对上，防认错把）。
+        target = next(
+            (r for r in self._cred.list(aid)
+             if hmac.compare_digest(got, str(r.get("credential_hash") or ""))
+             and (not cid or r["cred_id"] == cid)),
+            None)
+        if target is None and not cid:
+            # 迁移漏网的（老三列有账、凭据表没有）⇒ 顺手补一把进表，再照常回填密文。
+            legacy = str(row.get("credential_hash") or "")
+            if legacy and hmac.compare_digest(got, legacy):
+                self._cred.migrate_from_agents([row])
+                target = self._cred.by_hash(legacy)
+        if target is None:
+            # 名下**根本没有凭据账**（没批准过 / 全部作废清了账）⇒ 这不是"粘错了"，
+            # 是"没有可比的东西"。两种后果不同（前者重粘一次、后者要先批准），必须分开报。
+            if not self._cred.list(aid) and not str(row.get("credential_hash") or ""):
+                return {"ok": False, "why": "no_hash", "hint": ""}
+            # 🔴 对不上账 ⇒ 一个字节都不改。粘错的串、或那是**别的代理**的凭据。
             return {"ok": False, "why": "mismatch", "hint": credential_hint(plain)}
+        if str(target.get(ENC_COLUMN) or ""):
+            return {"ok": True, "why": "ok", "hint": target["credential_hint"],
+                    "cred_id": target["cred_id"]}      # 已经可还原，幂等返回
         enc = credcrypto.encrypt(plain)
         if not enc:
             return {"ok": False, "why": "key_missing", "hint": credential_hint(plain)}
-        self._be.update(aid, {ENC_COLUMN: enc})
-        return {"ok": True, "why": "ok", "hint": credential_hint(plain)}
+        self._cred.set_fields(target["cred_id"], {ENC_COLUMN: enc})
+        return {"ok": True, "why": "ok", "hint": credential_hint(plain),
+                "cred_id": target["cred_id"]}
     def delete(self, agent_id: str) -> bool:
         """**整行删除**：这一行从注册表里消失（凭据哈希一起没）。命中即 True。
 
@@ -1028,7 +1552,12 @@ class Registry:
             return False
         if row["role"] == ROLE_PRIMARY:
             return False
-        return self._be.delete(aid)
+        gone = self._be.delete(aid)
+        if gone:
+            # 代理行没了，凭据一行都不留：留在表里就是**无人认领的活钥匙**
+            # （反查能查到 agent_id，但那个人已经不在册 ⇒ 只靠 verify 的代理闸兜着）。
+            self._cred.delete_agent(aid)
+        return gone
 
     def set_role(self, agent_id: str, role: str) -> List[str]:
         """设角色；置 primary 时**其余 primary 自动降 sub**。返回被降级者 id 列表。
@@ -1250,7 +1779,12 @@ class Registry:
             return False
         if self._be.load(new):
             return False
-        return self._be.rename_id(old, new)
+        moved = self._be.rename_id(old, new)
+        if moved:
+            # 🔴 凭据账跟着搬。漏这一步的后果不是"显示不对"，是**所有入口当场鉴权失败**
+            #    （凭据行还挂在旧 agent_id 上，`verify(new)` 名下查不到任何一把）。
+            self._cred.rename_agent(old, new)
+        return moved
 
     # ---- 凭据校验 ----------------------------------------------------
     def verify(self, agent_id: str, credential: str) -> Dict[str, Any]:
@@ -1267,11 +1801,23 @@ class Registry:
         if row["status"] != STATUS_APPROVED:
             return {"ok": False, "role": row["role"], "status": row["status"],
                     "reason": "not_approved"}
+        # 🔴 多凭据起，代理行的老三列**不再是鉴权依据**（它只是迁移前的快照）。
+        #    比对仍然常数时间，且要 `status=active`：作废的那把即使在代理批准态下也不能用。
         got = hash_credential(credential or "")
-        if not row["credential_hash"] or not hmac.compare_digest(got, row["credential_hash"]):
+        hit = None
+        for cred in self._cred.list(aid):
+            if (cred.get("status") == CRED_STATUS_ON
+                    and str(cred.get("credential_hash") or "")
+                    and hmac.compare_digest(got, str(cred["credential_hash"]))):
+                hit = cred
+                break
+        if not hit:
             return {"ok": False, "role": row["role"], "status": row["status"],
                     "reason": "bad_credential"}
-        return {"ok": True, "role": row["role"], "status": row["status"], "reason": ""}
+        # `cred_id` / `credential_label` 只给**内部**（打点与以后的按凭证授权），
+        # 不进任何对外文案 —— 对外一直只到 hint（8 位）这一档。
+        return {"ok": True, "role": row["role"], "status": row["status"], "reason": "",
+                "cred_id": hit["cred_id"], "credential_label": hit["label"]}
 
     def verify_local(self, agent_id: str) -> Dict[str, Any]:
         """**本机文件通道**（主脑进程内）：不经凭据，只认 `meta.bootstrap='local'` 且已批准。
@@ -1305,28 +1851,40 @@ class Registry:
             out["reason"] = "no_credential"
             return out
         got = hash_credential(credential)
-        for row in self._be.all_rows():
-            if row["credential_hash"] and hmac.compare_digest(got, row["credential_hash"]):
-                res = self.verify(row["agent_id"], credential)
-                res["agent_id"] = row["agent_id"]
-                return res
-        return out
+        # 一次索引查（`credential_hash` 上有唯一索引）⇒ 不再全表逐行比。
+        # 🔴 拿到行之后**仍走 verify()**：代理状态、这把的 status 都由它统一判，
+        #    这里绝不自己下一个"看着对"的结论（两处判据迟早漂成两个安全等级）。
+        hit = self._cred.by_hash(got)
+        if not hit:
+            return out
+        res = self.verify(hit["agent_id"], credential)
+        res["agent_id"] = hit["agent_id"]
+        return res
 
     # ---- 活动计数 ----------------------------------------------------
-    def touch(self, agent_id: str, kind: str = "read") -> bool:
+    def touch(self, agent_id: str, kind: str = "read", cred_id: str = "") -> bool:
         """打活动（`read` / `write`）；**限频 60s**，返回本次是否真的写了库。
+
+        给了 `cred_id` 就**顺带打那一把**（独立限频键 `代理#凭据`）—— 用户要的多凭据
+        就是为这个：同一代理从三台机器进来，得看得出哪台在跑、哪台早就不动了。
 
         限频理由：检索路径每轮都可能调它，而 `last_seen_at` / `reads` 是遥测，
         不是账本 —— 每轮写库会把注册表变成热路径上的写放大点。
         """
         aid = (agent_id or "").strip()
         column = "writes" if str(kind).lower().startswith("w") else "reads"
+        cid = (cred_id or "").strip()
+        # 限频键分开：代理维度与凭据维度各有各的 60 秒窗口，
+        # 用同一个键会因为先打到的那一边把另一边饿掉（漏计某台机器）。
+        throttle_key = f"{aid}#{cid}" if cid else aid
         with self._touch_lock:
-            last = self._last_touch.get(aid)
+            last = self._last_touch.get(throttle_key)
             now = time.monotonic()
             if last is not None and now - last < TOUCH_MIN_INTERVAL_S:
                 return False
-            self._last_touch[aid] = now
+            self._last_touch[throttle_key] = now
+        if cid:
+            self._cred.bump(cid, column)      # Redis 后端是 no-op（单把 = 活动已在代理行）
         self._be.bump(aid, column)
         return True
 
@@ -1356,7 +1914,7 @@ class Registry:
         if row["status"] == STATUS_REVOKED:
             logger.error(
                 "keepsake: 代理 %s 已被吊销，本机 bootstrap 不复活它（请到控制台重新批准）", aid)
-            return _public(row)
+            return _public(self._cred_summary(row))
         others = [r["agent_id"] for r in self._be.all_rows()
                   if r["role"] == ROLE_PRIMARY and r["agent_id"] != aid]
         fields: Dict[str, Any] = {

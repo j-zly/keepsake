@@ -202,8 +202,24 @@ export const api = {
   //    挡的是不带 body 的盲发调用；由前端自动带上，用户看不见、也不需要填。
   //    防"认错行"不靠打字：回填那条路由 sha256 对账兜（粘错串整体拒绝）。
   // reveal 不改数据但读的是密钥面 ⇒ 后端仍叠 write_guard + 每次取出一行审计（不含内容）。
-  revealCredential: (agentId) =>
+  // 取某一把的明文。🔴 `credId` 省略时后端只在"名下恰好一把在用"才回 ——
+  // 多把在用又不指名 ⇒ 409 ambiguous（宁拒不猜，挑错就是把另一把的钥匙递出去）。
+  revealCredential: (agentId, credId = '') =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/reveal_credential`,
+      { confirm: true, cred_id: credId }).then((r) => r.data),
+  // ---- 多凭据（ks_multi_credential，2026-11-14）：一个代理多把钥匙，逐把监管 ----
+  agentCredentials: (agentId) =>
+    http.get(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials`).then((r) => r.data),
+  // 新建一把：**不顶掉任何旧钥匙**（与「重新生成凭据」换发的分界就在这）
+  addCredential: (agentId, label) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials`,
+      { label, confirm: true }).then((r) => r.data),
+  renameCredential: (agentId, credId, label) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/rename`,
+      { label }).then((r) => r.data),
+  // 作废单把（用户拍板：弹框点确认即可，不要求手输编号）
+  revokeCredential: (agentId, credId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/revoke`,
       { confirm: true }).then((r) => r.data),
   // 把**已经在用**的凭据登记成可还原：不换发、不签发新串（⇒ 线上代理不断线）。
   // 🔴 明文只在这一发请求里出浏览器，前端不留副本（粘贴框提交后立刻清空）。

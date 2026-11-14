@@ -446,6 +446,12 @@ class AgentItem(BaseModel):
     #: false = 机制上线前签发的老行、或签发时服务端没有主密钥 ⇒ 只能回填已有串或换发。
     #: 🔴 读面不含密文本身（`credential_enc` 永不出库到响应）。
     recoverable: bool = Field(False, description="凭据是否可还原为明文（可重复复制）")
+    #: 多凭据（2026-11-14）：名下几把 / 几把在用 / 最近一次被用。
+    #: `credential_hint` 与 `recoverable` 指的是**最后一把在用的**那把（逐把明细在
+    #: `GET /api/v1/agents/{agent_id}/credentials`）—— 列表页给个头，取哪把必须进清单点。
+    credential_count: int = Field(0, description="名下凭据总数（含已作废）")
+    credential_active: int = Field(0, description="在用凭据把数（一个代理多入口 = 多把）")
+    last_used_at: str = Field("", description="最近一次有凭据通过鉴权的时刻（限频遥测）")
     meta: Dict[str, Any] = Field(default_factory=dict)
     #: 私信开关（`dm_enabled`）：false = 这个代理**不收**私信（别人投不进来）。
     #: 默认**开**（老行缺列也算开 —— 新增字段不许改存量语义）。
@@ -475,6 +481,44 @@ class AgentList(BaseModel):
     count: int = 0
 
 
+class AgentCredentialItem(BaseModel):
+    """一把凭据的对外形状（凭据清单的一行）。
+
+    🔴 没有 hash、没有密文、更没有明文：`credential_hint` 是本来就公开的 8 位，
+    `cred_id` 只是定位编号（能进 URL 与审计，不是秘密）。
+    """
+
+    cred_id: str = Field("", description="凭据编号（定位用，不是秘密）")
+    label: str = Field("", description="用途名（如「108 执行器」）；不参与任何判据")
+    credential_hint: str = Field("", description="前 8 位，供人工比对（不是凭据）")
+    status: str = Field("", description="active = 在用 / revoked = 已作废")
+    created_at: str = Field("", description="签发时刻")
+    used_at: str = Field("", description="最近一次用它鉴权通过（限频 60s 的遥测）")
+    revoked_at: str = Field("", description="作废时刻（在用为空）")
+    reads: int = Field(0, description="用这把的读次数")
+    writes: int = Field(0, description="用这把的写次数")
+    recoverable: bool = Field(False, description="这把能否还原成明文（决定给不给「复制」钮）")
+
+
+class AgentCredentialList(BaseModel):
+    agent_id: str = ""
+    items: List[AgentCredentialItem] = Field(default_factory=list)
+    total: int = 0
+
+
+class AgentCredentialAddBody(BaseModel):
+    """新建一把：只带用途名。**不作废任何旧钥匙**（新旧同时在线是这个功能的意义）。"""
+
+    label: str = Field("", description="这把钥匙的用途名（如「win 笔记本」）")
+    confirm: Any = Field(False, description="显式意图位 true（前端自动带，用户不输入）")
+
+
+class AgentCredentialRenameBody(BaseModel):
+    """改标签：纯展示，不改鉴权、不动客户端 ⇒ 不设确认闸（与 rename agent 同档）。"""
+
+    label: str = ""
+
+
 class AgentActionBody(BaseModel):
     """approve / revoke / exclude 三条端点共用的请求体。
 
@@ -490,6 +534,10 @@ class AgentActionBody(BaseModel):
     confirm: Any = False
     exclude: bool = False
     reissue: bool = False
+    #: 只对 `reveal_credential` 有意义（2026-11-14 多凭据）：指名要取哪一把。
+    #: 留空时**只在名下恰好一把在用**才回 —— 多把在用又不指名 ⇒ 409
+    #: `ambiguous_credential`（挑错就是把另一把的钥匙递出去，宁拒不猜）。
+    cred_id: str = Field("", description="只对这把这个编号生效（多把时必填）")
 
 
 class AgentBackfillBody(BaseModel):
@@ -497,12 +545,15 @@ class AgentBackfillBody(BaseModel):
 
     `credential` = 操作者手上那条正在用的 `ksk_` 串：服务端只拿它算 sha256 与在册摘要
     比对，**对不上就一个字节都不改**；它不是新凭据、不会被签发。
-    `confirm` 必须是**完整 agent_id**（与 delete 同档）—— 给错的行登记钥匙是不可逆的错。
+    `confirm` = 显式意图位 `true`（前端自动带，**不要求人打任何字** —— 2026-11-14 用户拍板）。
+    防"给错的行登记钥匙"不靠打字：粘来的串必须与该行的在册 sha256 对上，对不上整体拒绝。
+    `cred_id` 可选：多把并列时指名回填哪一把（留空 = 按哈希自己找对的那把）。
     🔴 明文不进审计 / 日志 / 错误消息；比对失败也不回显粘来的内容。
     """
 
     credential: str = ""
     confirm: Any = False
+    cred_id: str = Field("", description="指名回填哪一把（留空 = 按哈希自己找对的那把）")
 
 
 class AgentRoleBody(BaseModel):

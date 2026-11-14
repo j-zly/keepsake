@@ -70,9 +70,20 @@ def env(tmp_path, monkeypatch):
 
 
 def _raw(reg: Registry, aid: str) -> Dict[str, Any]:
-    """注册表**原始行**（含密文列）。🔴 别用 `Registry.get()` —— 那是 `_public`
-    对外形状，本来就不该带密文，测试要验的正是库里的真列。"""
+    """代理**原始行**（含已冻结的老三列）。
+
+    🔴 2026-11-14 多凭据之后，密文与哈希的真列在 **`ks_credential`** 上 ——
+    要验"库里到底存了什么"必须读 `_cred_raw()`；本函数留着正是为了钉
+    「代理行上那几个老字段不再被写」（见 test_签发落密文且校验面仍只认hash）。
+    """
     return reg._be.load(aid)        # noqa: SLF001（测试就是要读原始行）
+
+
+def _cred_raw(reg: Registry, aid: str, nth: int = 0) -> Dict[str, Any]:
+    """凭据账的**原始行**（含 hash 与密文）。`nth` 按签发序取第几把。"""
+    rows = reg._cred.list(aid)      # noqa: SLF001（同上：验的是库里的真列）
+    assert rows, f"{aid} 名下没有任何凭据账"
+    return rows[nth]
 
 
 def _seed_approved(client, reg: Registry, aid: str = "worker") -> str:
@@ -152,12 +163,16 @@ def test_换密钥后解不开要报得出来(tmp_path, monkeypatch):
 def test_签发落密文且校验面仍只认hash(env):
     client, reg, _ = env
     cred = _seed_approved(client, reg, "worker")
-    row = _raw(reg, "worker")
+    row = _cred_raw(reg, "worker")
     assert row[ENC_COLUMN], "签发后必须落密文"
     assert cred not in row[ENC_COLUMN]            # 库里存的是密文不是明文
     assert row["credential_hash"] == hash_credential(cred)
     # 校验面走的还是 hash：密文列清空也不影响 verify
     assert reg.verify("worker", cred)["ok"] is True
+    # 🔴 多凭据的单一事实源：签发动**只**落凭据账，代理行老三列一个字都不写。
+    #（老三列只是迁移前的快照 —— 还在写它就有第二张鉴权面，两边迟早漂。）
+    legacy = _raw(reg, "worker")
+    assert not legacy["credential_hash"] and not legacy[ENC_COLUMN]
 
 
 def test_取出的明文真能用且可重复(env):
@@ -234,10 +249,13 @@ def test_没主密钥时签发照旧但不可还原(env, monkeypatch):
     monkeypatch.delenv("KEEPSAKE_CREDENTIAL_KEY_FILE", raising=False)
     monkeypatch.delenv("KEEPSAKE_CREDENTIAL_KEY", raising=False)
     cred = _seed_approved(client, reg, "worker")
-    row = _raw(reg, "worker")
+    row = _cred_raw(reg, "worker")
     assert row["credential_hash"] == hash_credential(cred)
     assert not row[ENC_COLUMN], "没密钥 ⇒ 密文列为空（不许把明文塞进去）"
-    assert cred not in json.dumps({k: str(v) for k, v in row.items()}, ensure_ascii=False)
+    # 两个账都扫一遍：明文不许落在任何一处（凭据账是主战场，代理行也别漏）
+    dumped = json.dumps([{k: str(v) for k, v in r.items()}
+                         for r in (row, _raw(reg, "worker"))], ensure_ascii=False)
+    assert cred not in dumped
     item = [x for x in client.get("/api/v1/agents", headers=AUTH).json()["items"]
             if x["agent_id"] == "worker"][0]
     assert item["recoverable"] is False
@@ -254,8 +272,9 @@ def test_没主密钥时签发照旧但不可还原(env, monkeypatch):
 # ------------------------------------------------------------------ 老行回填
 
 def _wipe_enc(reg: Registry, aid: str) -> None:
-    """把密文列清空 = 模拟「可还原机制上线前签发的老行」（只有 sha256）。"""
-    reg._be.update(aid, {ENC_COLUMN: ""})            # noqa: SLF001（测试就是要打这条）
+    """清空密文 = 模拟「可还原机制上线前签发的老凭据」（账上只有 sha256）。"""
+    for row in reg._cred.list(aid):                   # noqa: SLF001（同上）
+        reg._cred.set_fields(row["cred_id"], {ENC_COLUMN: ""})
 
 
 def test_老行reveal报not_recoverable(env):
@@ -294,7 +313,8 @@ def test_回填粘对串之后可重复复制(env):
     assert r.status_code == 200, r.text
     assert r.json()["recoverable"] is True
     # 换发没有发生：hash 与回填前一致（= 线上代理用的还是原来那把钥匙）
-    assert _raw(reg, "worker")["credential_hash"] == hash_credential(cred)
+    assert _cred_raw(reg, "worker")["credential_hash"] == hash_credential(cred)
+    assert len(reg.list_credentials("worker")) == 1, "回填不许顺手多签一把"
     for _ in range(2):
         got = client.post("/api/v1/agents/worker/reveal_credential",
                           json={"confirm": True}, headers=AUTH)
@@ -373,8 +393,9 @@ def test_密文与账对不上时拒绝返回(env, monkeypatch):
     reg.register("other", "other")
     cred2 = _seed_approved(client, reg, "other")      # 别的代理的密文
     assert cred2 != cred
-    enc_other = _raw(reg, "other")[ENC_COLUMN]
-    reg._be.update("worker", {ENC_COLUMN: enc_other})  # noqa: SLF001
+    enc_other = _cred_raw(reg, "other")[ENC_COLUMN]
+    # 把别人的密文挂到 worker 的那把上（= 手工改坏一列的最小仿真）
+    reg._cred.set_fields(_cred_raw(reg, "worker")["cred_id"], {ENC_COLUMN: enc_other})
     r = client.post("/api/v1/agents/worker/reveal_credential",
                     json={"confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "hash_mismatch"
