@@ -442,6 +442,10 @@ class AgentItem(BaseModel):
     exclude_from_primary: bool = Field(
         False, description="该代理的条目是否排除出主脑上下文（退役键的新家）")
     credential_hint: str = Field("", description="凭据前 8 位，供人工比对（不是凭据）")
+    #: 这条凭据能否**还原成明文**（控制台「查看/复制凭据」是否可用）。
+    #: false = 机制上线前签发的老行、或签发时服务端没有主密钥 ⇒ 只能回填已有串或换发。
+    #: 🔴 读面不含密文本身（`credential_enc` 永不出库到响应）。
+    recoverable: bool = Field(False, description="凭据是否可还原为明文（可重复复制）")
     meta: Dict[str, Any] = Field(default_factory=dict)
     #: 私信开关（`dm_enabled`）：false = 这个代理**不收**私信（别人投不进来）。
     #: 默认**开**（老行缺列也算开 —— 新增字段不许改存量语义）。
@@ -486,6 +490,19 @@ class AgentActionBody(BaseModel):
     confirm: Any = False
     exclude: bool = False
     reissue: bool = False
+
+
+class AgentBackfillBody(BaseModel):
+    """`backfill_credential` 的请求体（把**已有**凭据登记成可还原）。
+
+    `credential` = 操作者手上那条正在用的 `ksk_` 串：服务端只拿它算 sha256 与在册摘要
+    比对，**对不上就一个字节都不改**；它不是新凭据、不会被签发。
+    `confirm` 必须是**完整 agent_id**（与 delete 同档）—— 给错的行登记钥匙是不可逆的错。
+    🔴 明文不进审计 / 日志 / 错误消息；比对失败也不回显粘来的内容。
+    """
+
+    credential: str = ""
+    confirm: Any = False
 
 
 class AgentRoleBody(BaseModel):

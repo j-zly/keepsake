@@ -9,6 +9,11 @@
   父页随即把明文抹掉；不进 URL、不进浏览器存储、不进日志。
   复制只到剪贴板为止，转交由人自己走别的渠道。
 
+  2026-11-14 加可还原档（用户拍板「不能换发，要直接能复制」）之后，本组件多一个
+  `mode`：`issue`（签发/换发，回到旧语义时要说"关掉就没了"）与 `reveal`（从服务端加密
+  存档取出，随时能再来一次，每次取出都有审计）。两档**说的是不同的事实**，所以文案分档，
+  不许把旧口径那句话原样贴在新档上（那会让用户以为没复制成功就完蛋，进而乱点换发）。
+
   closeOnClickModal: false —— 误点遮罩不该等于「凭据作废」。
 -->
 <template>
@@ -24,19 +29,33 @@
     @update:model-value="onDismiss"
     @closed="onClosed"
   >
-    <p class="warn">只显示这一次，请立即转交给代理进程 —— 关掉这个弹框就再也拿不到了。</p>
+    <p class="warn">{{ warnText }}</p>
     <pre class="pre">{{ credential }}</pre>
+    <!-- 🔴 同时给一条**可选中**的只读输入框：`<pre>` 里的长串缩放后可能选不全，
+         而剪贴板 API 在非安全上下文里会整体不可用（clipboard.js 的 execCommand 降级
+         也只是尽力而为）—— 手抄也必须有一条错不了的路。绑 prop 渲染，不另存副本。 -->
+    <input
+      class="cred-plain"
+      type="text"
+      readonly
+      :value="credential"
+      spellcheck="false"
+      autocomplete="off"
+      aria-label="凭据明文（只读，可全选复制）"
+      @focus="$event.target.select()"
+    />
     <div class="cred-acts">
-      <el-button @click="doCopy">复制凭据</el-button>
+      <el-button type="primary" @click="doCopy">复制凭据</el-button>
     </div>
     <p class="tip">{{ note }}</p>
     <template #footer>
-      <el-button :disabled="busy" @click="close">我已转交，关掉</el-button>
+      <el-button :disabled="busy" @click="close">{{ mode === 'reveal' ? '我已复制，关掉' : '我已转交，关掉' }}</el-button>
     </template>
   </el-dialog>
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { copyText } from '../utils/clipboard'
 import { showError, showToast } from '../utils/dialog'
 
@@ -49,14 +68,25 @@ const props = defineProps({
   note: { type: String, default: '' },
   /** 父页正在写库时禁掉关闭（免得半路关窗把状态搞花） */
   busy: { type: Boolean, default: false },
+  /** `issue` = 签发 / 换发；`reveal` = 从加密存档取出（可重复）。只影响文案口径。 */
+  mode: { type: String, default: 'issue' },
 })
+
+/** 两档说的是不同的事实 —— 文案跟着事实走（见文件头的口径说明）。 */
+const warnText = computed(() =>
+  props.mode === 'reveal'
+    ? '这是服务端解密出来的明文，之后还能再用「查看 / 复制凭据」取出（每次取出都记审计，审计里不含凭据内容）。'
+    : '请立即转交给代理进程。这行凭据若带加密存档（可还原），关掉弹框后还能再取出；显示「不可还原」时，关掉就只剩你手上这一份了。',
+)
 
 const emit = defineEmits(['update:modelValue', 'closed'])
 
 /** 复制到剪贴板；失败要说人话（凭据形态长，只靠手抄容易错） */
 async function doCopy() {
   const ok = await copyText(props.credential)
-  ok ? showToast(`已复制：${props.credential}`) : showError('复制失败，请手动选中复制')
+  // 🔴 成功提示**不回显凭据**：旧写法 `已复制：${credential}` 会把整把钥匙打进
+  //    屏幕上的 toast —— 截图 / 录屏 / 投屏都收得到，与"明文不进日志"是同一条纪律。
+  ok ? showToast('已复制到剪贴板') : showError('复制失败，请用下面那个输入框手动全选复制')
 }
 
 function close() {
@@ -82,6 +112,19 @@ function onClosed() {
   font-size: 13px;
   font-weight: 500;
   line-height: 1.65;
+}
+.cred-plain {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 .cred-acts {
   margin-top: 12px;

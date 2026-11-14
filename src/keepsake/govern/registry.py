@@ -58,6 +58,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import credcrypto
+
 logger = logging.getLogger("keepsake.govern.registry")
 
 # --------------------------------------------------------------------------
@@ -108,6 +110,9 @@ AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
     "meta", "dm_enabled", "share_memory", "share_kb", "core_budget_chars", "push_enabled",
+    # 凭据密文列（可还原存档）；这里写**字面量**不用 ENC_COLUMN —— AGENT_FIELDS 定义
+    # 在常量之前，用名字会在 import 期 NameError（与 dm_enabled 等同一条规矩）。
+    "credential_enc",
 )
 
 #: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -139,6 +144,14 @@ SHARE_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 #: 「开」的值集复用 `SHARE_ENABLED_VALUES`（两个旗同一把尺子）。
 SHARE_KB_COLUMN = "share_kb"
 SHARE_KB_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
+
+#: `credential_enc` 的列名与列声明（建表与老库补列共用同一份 ⇒ 两边不会漂）。
+#: 🔴 缺省 **NULL**（不是 ''）：这一列存在与否代表「这条凭据能不能还原成明文」，
+#: 机制上线前的老行必须落 NULL ⇒ 面板如实显示「不可还原」，而不是假装可还原又取不出。
+#: 声明里**不带 NOT NULL / DEFAULT** ⇒ PG 加可空无默认列是元数据操作，不重写整表
+#: （与 `core_budget_chars` 同一档做法）。
+ENC_COLUMN = "credential_enc"
+ENC_COLUMN_DECL = "text NULL"
 
 #: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
 #: 🔴 与 `share_memory` 同一档：**缺省是关**（'0'）——「实时推送」是**往外放行**
@@ -176,6 +189,11 @@ CREATE TABLE IF NOT EXISTS ks_agent (
     status               text NOT NULL DEFAULT 'pending',
     credential_hash      text NOT NULL DEFAULT '',
     credential_hint      text NOT NULL DEFAULT '',
+    -- 2026-11 ks_credential_recoverable：凭据的 Fernet 密文存档，只为「控制台能重复复制」。
+    -- 🔴 校验面**永远不看这一列**（鉴权只认 credential_hash）⇒ 它缺失/解不开都不影响
+    --    代理读写，只影响「能不能把明文再取出来」。NULL = 不可还原（机制前的老行、
+    --    或服务端没配主密钥）。缺省 NULL 而非 ''：新增字段不许改存量语义。
+    credential_enc       {ENC_COLUMN_DECL},
     first_seen_at        text NOT NULL DEFAULT '',
     last_seen_at         text NOT NULL DEFAULT '',
     reads                integer NOT NULL DEFAULT 0,
@@ -278,7 +296,7 @@ def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not row["agent_id"]:
         return None
     for f in ("name", "role", "status", "credential_hash", "credential_hint",
-              "first_seen_at", "last_seen_at"):
+              "first_seen_at", "last_seen_at", "credential_enc"):
         row[f] = str(row.get(f) or "")
     for f in _INT_FIELDS:
         try:
@@ -391,6 +409,11 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "writes": row["writes"],
         "exclude_from_primary": row["exclude_from_primary"],
         "credential_hint": row["credential_hint"],
+        # 这条凭据**能不能还原成明文**（= 控制台上「查看/复制凭据」可不可用）。
+        # 🔴 只报布尔：密文本身绝不出读面（它不是秘密但不能白送 —— 配上主密钥就是明文）。
+        # 判据 = 有凭据账（hash）且有密文；老行/没主密钥 ⇒ False，面板据此给「回填」引导。
+        "recoverable": bool(str(row.get("credential_hash") or ""))
+        and bool(str(row.get(ENC_COLUMN) or "")),
         "meta": row["meta"],
         # 私信开关（投递偏好）：控制台要能看见当前状态 —— 判读口径与
         # `Registry.dm_enabled` 同一个（`_dm_is_on`），两处不许各写一份。
@@ -516,7 +539,8 @@ class _SqlBackend(_SqlBase):
                              (SHARE_COLUMN, SHARE_COLUMN_DECL),
                              (SHARE_KB_COLUMN, SHARE_KB_COLUMN_DECL),
                              (BUDGET_COLUMN, BUDGET_COLUMN_DECL),
-                             (PUSH_COLUMN, PUSH_COLUMN_DECL)):
+                             (PUSH_COLUMN, PUSH_COLUMN_DECL),
+                             (ENC_COLUMN, ENC_COLUMN_DECL)):
             try:
                 if not self.has_column(column):
                     self.add_column(column, decl)
@@ -846,6 +870,8 @@ class Registry:
             # 「谁都没登记过预算」是缺省态，不是某个开/关档位。
             "core_budget_chars": None,
             "push_enabled": PUSH_DISABLED_ON,
+            # 密文列登记时为空：新行还没凭据。approve 才会写它（且只在主密钥在场时）。
+            ENC_COLUMN: "",
         })
         return self.get(aid) or {}
 
@@ -870,10 +896,13 @@ class Registry:
         if not reissue and row.get("status") == STATUS_APPROVED:
             raise AlreadyApprovedError(aid)
         credential = new_credential()
+        # 密文存档（可还原）：**只在主密钥在场时**写；不在场时写空 ⇒ 这条照旧可用，
+        # 只是不可再次取出（面板如实显示「不可还原」）。校验面完全不读这一列。
         self._be.update(aid, {
             "status": STATUS_APPROVED,
             "credential_hash": hash_credential(credential),
             "credential_hint": credential_hint(credential),
+            ENC_COLUMN: credcrypto.encrypt(credential) or "",
         })
         return credential
 
@@ -882,12 +911,15 @@ class Registry:
         aid = (agent_id or "").strip()
         if not self._be.load(aid):
             return False
+        # 🔴 三列一起清：密文留着的话，「已吊销」的行照样能被取出明文 ⇒ 停钥匙没停干净
         self._be.update(aid, {"status": STATUS_REVOKED,
-                              "credential_hash": "", "credential_hint": ""})
+                              "credential_hash": "", "credential_hint": "",
+                              ENC_COLUMN: ""})
         return True
 
     def clear_credential(self, agent_id: str) -> bool:
-        """**只停凭据**：清掉 `credential_hash` / `credential_hint` 两列，代理行留在册。
+        """**只停凭据**：清掉 `credential_hash` / `credential_hint` / `credential_enc`
+        三列，代理行留在册。
 
         🔴 `status` / `role` / `name` / `meta` / 计数**一个都不碰** ——
         这是「只废钥匙」与「吊销」的分界：吊销把 `status` 置 revoked
@@ -897,9 +929,92 @@ class Registry:
         aid = (agent_id or "").strip()
         if not self._be.load(aid):
             return False
-        self._be.update(aid, {"credential_hash": "", "credential_hint": ""})
+        # 🔴 密文一起清：`revoke_credential` 的语义是「那把钥匙当场作废」，
+        #    密文还在 ⇒ 随时能再取出来用，作废就是假的。
+        self._be.update(aid, {"credential_hash": "", "credential_hint": "",
+                              ENC_COLUMN: ""})
         return True
 
+    # ---- 可还原凭据（控制台「查看/复制凭据」与「回填已有凭据」的原语）----------
+    def reveal_credential(self, agent_id: str) -> Dict[str, Any]:
+        """把某条代理的凭据**明文**取回来（重复复制用）。
+
+        返回 `{"ok": bool, "credential": str|None, "why": str}` —— `why` 是给调用方
+        分诊用的，几种失败后果不同、处置动作也不同，不许糊成一句「取不出来」：
+
+        * `no_row`          —— 代理不在册（调用方 404）；
+        * `no_credential`   —— 这行现在**没有凭据**（没批准过 / 已停过 / 已吊销），
+                               取不出东西是正常的，不是故障；
+        * `not_recoverable` —— 有凭据但**密文没存**（机制上线前签发的老行、
+                               或签发时服务端还没有主密钥）⇒ 正解是「回填已有凭据」
+                               或换发，不是重试；
+        * `key_missing`     —— 密文在，但服务端读不到主密钥 ⇒ 运维问题（配
+                               `KEEPSAKE_CREDENTIAL_KEY[_FILE]`），与数据无关；
+        * `key_mismatch`    —— 主密钥在场且密文形状正常，但解不开 ⇒ 换过密钥或密文
+                               被改坏，**重试无用**，只能回填 / 换发；
+        * `hash_mismatch`   —— 解出来了但与在册 sha256 对不上账（两列任一处被手工
+                               改过）⇒ 绝不把对不上账的串当凭据发出去。
+
+        🔴 只读注册表自己的行，**不碰校验路径**：鉴权仍然只认 `credential_hash`。
+        🔴 明文只进返回值：这里不写日志、不写审计（"取过一次"由调用方记，不含内容）。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return {"ok": False, "credential": None, "why": "no_row"}
+        if not str(row.get("credential_hash") or ""):
+            return {"ok": False, "credential": None, "why": "no_credential"}
+        enc = str(row.get(ENC_COLUMN) or "")
+        if not enc:
+            return {"ok": False, "credential": None, "why": "not_recoverable"}
+        plain, why = credcrypto.decrypt_with_reason(enc)
+        if not plain:
+            return {"ok": False, "credential": None, "why": why}
+        # 🔴 取出的明文必须与在册 hash 对得上才回 —— 密文与 hash 是两列，
+        #    任何一处被手工改过都不该把「对不上账」的串当凭据发出去。
+        if not hmac.compare_digest(hash_credential(plain), str(row["credential_hash"])):
+            return {"ok": False, "credential": None, "why": "hash_mismatch"}
+        return {"ok": True, "credential": plain, "why": "ok"}
+
+    def backfill_credential(self, agent_id: str, credential: str) -> Dict[str, Any]:
+        """把**已有**凭据的明文登记成可还原（校验通过才写，绝不换发）。
+
+        场景：可还原机制上线之前签发的行（库里只有 sha256），操作者手上还留着那条串。
+        做法 = 拿粘来的明文算 sha256，与在册 `credential_hash` **常数时间**比对，
+        对上才写密文 —— 既不用换发（线上代理不断），也不会把别人的串挂到别的行上。
+
+        返回 `{"ok": bool, "why": str, "hint": str}`：
+
+        * `ok`          —— 校验通过且密文已落库（此后这条永久可复制）；
+        * `no_row`      —— 不在册；
+        * `no_hash`     —— 这行现在没有凭据（没批准过 / 已停过）⇒ 没有账可比，
+                           回填无意义，正解是批准 / 换发；
+        * `empty`       —— 粘进来的东西是空的（UI 先挡，这里兜底）；
+        * `mismatch`    —— 🔴 明文与在册 hash 对不上 ⇒ **一个字节都不改**
+                           （串打错了，或那是别的代理的凭据）；
+        * `key_missing` —— 对得上但服务端没有主密钥 ⇒ 写不了密文（**不许**退化成
+                           把明文塞进库），先配密钥再回填。
+
+        🔴 任何分支都不把明文写进日志/审计；`hint` 只回本来就公开的那 8 位。
+        """
+        aid = (agent_id or "").strip()
+        row = self._be.load(aid)
+        if not row:
+            return {"ok": False, "why": "no_row", "hint": ""}
+        stored = str(row.get("credential_hash") or "")
+        plain = (credential or "").strip()
+        hint_now = str(row.get("credential_hint") or "")
+        if not plain:
+            return {"ok": False, "why": "empty", "hint": hint_now}
+        if not stored:
+            return {"ok": False, "why": "no_hash", "hint": ""}
+        if not hmac.compare_digest(hash_credential(plain), stored):
+            return {"ok": False, "why": "mismatch", "hint": credential_hint(plain)}
+        enc = credcrypto.encrypt(plain)
+        if not enc:
+            return {"ok": False, "why": "key_missing", "hint": credential_hint(plain)}
+        self._be.update(aid, {ENC_COLUMN: enc})
+        return {"ok": True, "why": "ok", "hint": credential_hint(plain)}
     def delete(self, agent_id: str) -> bool:
         """**整行删除**：这一行从注册表里消失（凭据哈希一起没）。命中即 True。
 

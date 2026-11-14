@@ -61,7 +61,11 @@ test('凭据纪律：本页不碰浏览器持久存储，凭据只活在前端�
 test('凭据展示：全文 + 复制 + 一次性红色提醒（共用组件，两页同一份实现）', () => {
   const CRED = read('components/CredentialDialog.vue')
   assert.match(CRED, /<pre class="pre">\{\{ credential \}\}<\/pre>/, '凭据全文要显示出来（用户要抄走）')
-  assert.match(CRED, /只显示这一次，请立即转交给代理进程/, '一次性提醒是这句，且要给红色语义色')
+  // 口径分两档（2026-11-14 可还原机制）：issue 说「请立即转交」，reveal 说「之后还能再取出」。
+  // 旧文案那句"关掉就再也拿不到了"在新档下是**假话**，会把人逼去乱点换发 —— 所以按档钉。
+  assert.match(CRED, /请立即转交给代理进程/, '签发档：交付提醒要给红色语义色')
+  assert.match(CRED, /之后还能再用「查看 \/ 复制凭据」取出/, '取出档：要说清可以重复取出')
+  assert.match(CRED, /mode === 'reveal'/, '两档由 mode 分岔，不许一份文案糊两端')
   assert.match(CRED, /class="warn"/, '提醒走红色语义类')
   assert.match(CRED, /@click="doCopy"/, '有复制按钮（凭据形态长，只靠手抄容易错）')
   // 确认框不许让凭据被顺手截走：误点遮罩不该等于「看过就作废」
@@ -240,7 +244,7 @@ test('换发失败：不弹凭据框，红条透出后端 message（不留「以
   assert.match(errBlock, /e\.message/, '后端 message 原样透出')
   assert.doesNotMatch(errBlock, /credOpen\.value = true/, '失败路径不许弹凭据框')
   // 就算后端 200 却没回明文，也不许弹一个空框（空框 = 让人以为换成了）
-  assert.match(VIEW, /function showCred\(r\) \{/, '凭据在本页只有一个入口')
+  assert.match(VIEW, /function showCred\(r, mode = 'issue'\) \{/, '凭据在本页只有一个入口（mode 只是文案档）')
   assert.match(VIEW, /if \(!r\?\.credential\) \{/, '没有明文不开框')
 })
 

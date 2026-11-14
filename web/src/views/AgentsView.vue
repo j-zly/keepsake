@@ -165,12 +165,32 @@
               </div>
               <div class="row">
                 <span class="k">凭据</span>
-                <span class="v mono">{{ hintText(a) }}</span>
+                <span class="v mono">
+                  {{ hintText(a) }}
+                  <!-- 复制的是**前 8 位记认**（本来就显示在页面上、不构成秘密），
+                       用途是把「哪把钥匙」贴进工单/聊天里核对，不必手抄。
+                       🔴 明文只能从「查看 / 复制凭据」那条带确认闸的路走。 -->
+                  <button
+                    v-if="a.credential_hint"
+                    class="copy-btn"
+                    title="复制凭据前缀（前 8 位，不是凭据本身）"
+                    @click="doCopy(a.credential_hint)"
+                  >
+                    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+                      stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="5.4" y="5.4" width="8" height="8" rx="1.6" />
+                      <path d="M10.6 5.4V4A1.4 1.4 0 0 0 9.2 2.6H4A1.4 1.4 0 0 0 2.6 4v5.2A1.4 1.4 0 0 0 4 10.6h1.4" />
+                    </svg>
+                  </button>
+                </span>
               </div>
             </div>
 
             <!-- 状态 chip：**只读**（拨开关的地方在编辑弹框里，卡面不再挂控件） -->
             <div class="card-tags">
+              <span class="tag" :class="a.recoverable ? '' : 'tag--warn'">
+                凭据{{ a.recoverable ? '可重复复制' : '不可还原' }}
+              </span>
               <span class="tag">私信{{ dmOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享{{ shareOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享知识库{{ shareKbOn(a) ? '开' : '关' }}</span>
@@ -248,6 +268,7 @@
       v-model="credOpen"
       :credential="cred"
       :note="credNote"
+      :mode="credMode"
       :busy="busy"
       @closed="forget"
     />
@@ -402,6 +423,16 @@
             <!-- 组三：凭据（危险区）—— 换发 / 停凭据 / 删除 -->
             <div class="eg-title eg-title--danger">凭据（危险区）</div>
             <div class="eg-danger">
+              <!-- 可还原档（2026-11-14）：明文能重复取出，确认闸 = 完整 agent_id。
+                   🔴 只有 recoverable 为真才给这个钮 —— 不可还原的行点了必然 409，
+                   那种钮的存在本身就是误导（用户会以为复制坏了而去找换发）。 -->
+              <el-button
+                v-if="editRow?.status === 'approved' && editRow?.recoverable"
+                :disabled="busy"
+                @click="askFromEdit('reveal')"
+              >
+                查看 / 复制凭据
+              </el-button>
               <el-button
                 v-if="editRow?.status === 'approved'"
                 :disabled="busy"
@@ -428,8 +459,33 @@
                 这个代理现在没有凭据（已吊销 / 待审的行不签发凭据 —— 批准时才会发）。
               </span>
             </div>
+
+            <!-- 不可还原的老行：把「回填已有凭据」这条路摆出来，而不是只报 409。
+                 用户手上的串本来就能用，换发才会把线上代理打断 —— 所以默认动作是登记，
+                 不是重签。粘贴框只进内存：提交后立刻清空，不落任何浏览器持久存储、不进地址栏。 -->
+            <div v-if="editRow?.status === 'approved' && !editRow?.recoverable" class="eg-backfill">
+              <el-input
+                v-model="backfillText"
+                type="password"
+                show-password
+                :disabled="busy"
+                placeholder="把这个代理当前在用的 ksk_ 凭据粘进来（登记，不会换发）"
+              />
+              <el-button
+                :disabled="busy || !backfillText.trim()"
+                @click="askFromEdit('backfill')"
+              >
+                回填已有凭据
+              </el-button>
+              <p class="tip">
+                这条凭据签发于「可还原」机制之前（库里只有 sha256），所以取不出明文。
+                把它现在**正在用**的那条串粘进来登记一下：服务端只拿它算 sha256 与在册摘要比对，
+                对得上才存密文 —— **不换发、旧串照旧可用、线上代理不断线**。对不上则一个字节都不改。
+              </p>
+            </div>
             <p class="tip">
-              重新生成凭据 = 换发：旧的那条立即作废，新的一条**只出现一次**（关掉弹框就拿不到了）。
+              查看 / 复制凭据 = 从服务端加密存档里取出明文（要手输**完整 agent_id**，每次取出都记审计）。
+              重新生成凭据 = 换发：旧的那条立即作废，之后所有客户端都得换成新串才连得上。
               停凭据 = 只废那把钥匙（代理照旧在册，状态 / 角色都不动）。
               删除 = 整行抹掉（删前会备份一份，可人工复原）—— 只给已吊销的行。
             </p>
@@ -616,10 +672,15 @@ function shareKbOn(a) {
 const credOpen = ref(false)
 const cred = ref('')
 const credNote = ref('')
+/** CredentialDialog 的口径：'issue' = 签发/换发（旧语义）；'reveal' = 从存档取出（可重复）。 */
+const credMode = ref('issue')
+/** 回填用的粘贴框（只进内存：提交即清、关弹框即清；不落浏览器持久存储、不进地址栏与日志）。 */
+const backfillText = ref('')
 
 function forget() {
   cred.value = ''
   credNote.value = ''
+  credMode.value = 'issue'
 }
 
 /**
@@ -627,13 +688,14 @@ function forget() {
  * 没有明文就**不开框**并说红条 —— 弹一个空框 = 让人以为凭据已经换到手。
  * 明文只在这一刻落到前端内存态：弹框一关（@closed）就抹掉。
  */
-function showCred(r) {
+function showCred(r, mode = 'issue') {
   if (!r?.credential) {
-    showError('后端没有返回新凭据，操作未生效，请重试')
+    showError('后端没有返回凭据，操作未生效，请重试')
     return false
   }
   cred.value = r.credential
   credNote.value = r.note || ''
+  credMode.value = mode
   credOpen.value = true
   return true
 }
@@ -705,6 +767,8 @@ const editPrimary = computed(() => editRow.value?.role === 'primary')
 
 function openEdit(row) {
   editRow.value = row
+  // 🔴 每次开框都从空串开始：上一回粘进来的是一把可用钥匙，不该在内存里活到下一次。
+  backfillText.value = ''
   editId.value = row?.agent_id || ''
   editName.value = row?.name || ''
   editBudget.value = row?.core_budget_chars == null ? '' : String(row.core_budget_chars)
@@ -987,6 +1051,8 @@ const dlgTitle = computed(() => {
 const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'approve') return wasRevoked.value ? '重新批准' : '批准'
   if (dlgKind.value === 'rotate') return '重新生成凭据'
+  if (dlgKind.value === 'reveal') return '查看 / 复制凭据'
+  if (dlgKind.value === 'backfill') return '回填已有凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
   if (dlgKind.value === 'clearcred') return '停凭据'
@@ -1001,6 +1067,11 @@ const dlgExpect = computed(() => {
   if (dlgKind.value === 'clearcred') return revokePrefix.value
   if (dlgKind.value === 'role') return dlgRow.value?.agent_id || ''
   if (dlgKind.value === 'delete') return dlgRow.value?.agent_id || ''
+  // 🔴 取出明文与回填都按**最高一档**（完整 agent_id，与 delete 同档）：前者产出一把
+  //    能读写全库的钥匙，后者一旦认错行就是把别人的串登记到这台机器上。
+  //    后端 `_need_text` 就是这道闸 —— 前端不许比后端松。
+  if (dlgKind.value === 'reveal') return dlgRow.value?.agent_id || ''
+  if (dlgKind.value === 'backfill') return dlgRow.value?.agent_id || ''
   return ''
 })
 
@@ -1055,6 +1126,20 @@ const dlgConsequences = computed(() => {
       '要恢复：重新生成凭据（换一把新的）即可 —— 这一步不吊销、不改权限。',
     ]
   }
+  if (dlgKind.value === 'reveal') {
+    return [
+      '服务端会解密这条凭据并在这里显示明文；库里照旧只认 sha256 —— 取出动作不改任何状态，也不影响这个代理的读写。',
+      '每次取出都记一行审计（审计里只有「取出过」这件事，不含凭据内容）。',
+      '明文离开这里就不再受控：贴进聊天 / 截图 / 工单之前想清楚，复制完就把弹框关掉。',
+    ]
+  }
+  if (dlgKind.value === 'backfill') {
+    return [
+      '只做校验与登记：**不签发新凭据**，这个代理现在用的那条串照旧可用（线上不断线）。',
+      '粘进来的串会算 sha256 与在册摘要比对，对不上就一个字节都不改（也不会把明文写进库）。',
+      '登记成功后这条永久可「查看 / 复制凭据」；服务端没有主密钥时这一步会被拒（503）——那是运维问题，不是你粘错了串。',
+    ]
+  }
   if (dlgKind.value === 'delete') {
     return [
       '整行抹掉：这个代理从注册表里消失（列表里也查不到了）。',
@@ -1100,6 +1185,29 @@ async function doAction(typed) {
           ? `已设为主代理：${row.agent_id}（原主 ${r.demoted.join('、')} 已降为子代理）`
           : `已设为主代理：${row.agent_id}`,
       )
+    } else if (kind === 'reveal') {
+      // 取出明文：typed 就是手输的完整 agent_id（后端那道 _need_text 同源）。
+      const r = await api.revealCredential(row.agent_id, typed)
+      if (showCred(r, 'reveal')) showToast(`已取出凭据：${row.agent_id}（每次取出都记审计）`)
+    } else if (kind === 'backfill') {
+      // 回填：把「已有的串」登记成可还原 —— 不换发，所以旧串照旧能用。
+      const text = backfillText.value.trim()
+      if (!text) {
+        showError('请先把这个代理当前在用的 ksk_ 凭据粘进来')
+        return
+      }
+      try {
+        const r = await api.backfillCredential(row.agent_id, text, typed)
+        if (r?.ok) {
+          showToast(`已登记，这条现在可重复复制：${row.agent_id}`)
+          await load(true)
+        } else {
+          showToast(r?.note || '回填未生效', 'warning')
+        }
+      } finally {
+        // 🔴 无论成败都从内存里擦掉：粘进来的是一把可用钥匙，留在 ref 里等于多一个泄漏点
+        backfillText.value = ''
+      }
     } else if (kind === 'clearcred') {
       // 🔴 停凭据 = 只废那把钥匙：confirm 是 true（后端那侧才敢承诺状态不动）
       const r = await http
@@ -1275,6 +1383,26 @@ async function doAction(typed) {
   border-radius: var(--r-inset);
   background: var(--panel);
 }
+/* 回填已有凭据（不可还原的老行专用入口）：与危险区同一层，但不是红 ——
+   它不换发、不作废任何东西，做成红色会让人以为要点掉旧钥匙。 */
+.eg-backfill {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px dashed var(--border-2);
+  border-radius: var(--r-inset);
+  background: var(--panel);
+}
+.eg-backfill .el-input {
+  flex: 1 1 260px;
+}
+.eg-backfill .tip {
+  flex-basis: 100%;
+}
+
 /* 编辑代理弹框：宽体双栏（用户 10-28 拍板：太长 → 改宽，左=信息+角色，右=开关+凭据） */
 .eg-grid {
   display: grid;

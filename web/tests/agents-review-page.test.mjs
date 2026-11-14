@@ -122,7 +122,8 @@ test('凭据显示只有一份实现：两页共用组件，不许复制粘贴',
   }
   // 组件本身：全文 + 复制 + 一次性红色提醒 + 关窗即抹（@closed="forget"）
   assert.match(CRED, /<pre class="pre">\{\{ credential \}\}<\/pre>/)
-  assert.match(CRED, /只显示这一次，请立即转交给代理进程/)
+  // 文案分档后钉签发档那句（审核页只有签发/换发，走的正是 issue 档）
+  assert.match(CRED, /请立即转交给代理进程/)
   assert.match(CRED, /:close-on-click-modal="false"/, '误点遮罩不该等于「凭据作废」')
   assert.match(REVIEW, /@closed="forget"/, '审核页关窗也要抹掉明文')
   assert.match(REVIEW, /function forget\(\) \{\s*\n\s*cred\.value = ''\s*\n\s*credNote\.value = ''/)

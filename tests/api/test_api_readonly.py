@@ -103,6 +103,11 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/push",
     # 消息中心手动 / 批量触发提醒一条（ks_dm_sse）：推一帧事件，不改数据
     "/api/v1/messages/nudge",
+    # 凭据可还原两条（ks_credential_recoverable，2026-11-14）：reveal 不改数据但读的是
+    # 密钥面 ⇒ 与写面同闸（require_session + write_guard + 完整 agent_id 确认）。
+    # 挂在 AUTH_POST_PATHS 之外：这条枚举闸顺带验证它确实带了会话依赖（见逐条断言）。
+    "/api/v1/agents/{agent_id}/reveal_credential",
+    "/api/v1/agents/{agent_id}/backfill_credential",
     # 待办三条（ks_todo 一等公民）：新增 / 改状态 / 真删
     "/api/v1/todos",
     "/api/v1/todos/{todo_id}/status",

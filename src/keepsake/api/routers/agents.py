@@ -18,9 +18,17 @@
 为什么：以前重复 approve（审核页双击 / 治理工具再批一次 / UI 状态未刷新重复点）
 会**静默换发**一条新凭据把旧的顶掉 —— 线上代理瞬间全断，操作者却毫无感知。
 
-🔴 **凭据纪律**：明文只在 `approve` 的响应体里出现**一次**，之后库里只有 sha256。
-审计 / 备份 / 错误消息里都不许出现明文 —— 本文件没有一处把它写进 `audit.record`
-的 `reason`（那里只写「issued」这类与凭据无关的字样）。
+🔴 **凭据纪律**（2026-11-14 改档：用户拍板「不能换发，要直接能复制」）：
+* 签发（`approve`）的响应体里明文出现一次，同时库里落 `sha256`（**校验只认它**）
+  + 一份 **Fernet 密文**（`credential_enc`，只为"能重复取出"）；
+* `POST .../reveal_credential` 能把明文再取出来：确认闸 = **完整 agent_id**（与
+  `delete` 同档）+ `write_guard`（不留痕的密钥读取等于没发生过），每次取出记一行审计；
+* `POST .../backfill_credential` 把**上线前签发**的老凭据登记成可还原 —— 粘来的串
+  必须与在册 sha256 对上才写密文，对不上一个字节都不改（⇒ 全程不换发、不断线）；
+* 主密钥只从环境读（`KEEPSAKE_CREDENTIAL_KEY` / `..._KEY_FILE`）：**没有密钥就不落密文、
+  也不降级成明文入库**，面板据此显示「不可还原」；
+* 审计 / 备份 / 错误消息 / 读面（`GET /agents`）里都不许出现明文**或密文**
+  —— 读面只回 `recoverable` 布尔（见 `registry._public`）。
 
 🔴 **现役 primary 的三道闸**（`revoke` / `role` / `exclude` 一律 409）：前端
 不给那三个钮只是「不让人看见」，绕开 UI 直接打 API 一样能点进来 —— 所以同一道
@@ -72,7 +80,13 @@ from keepsake.govern.registry import (
 from .. import audit
 from .. import config
 from ..deps import get_storage, require_session
-from ..schemas import AgentItem, AgentList, AgentActionBody, AgentRoleBody
+from ..schemas import (
+    AgentBackfillBody,
+    AgentItem,
+    AgentList,
+    AgentActionBody,
+    AgentRoleBody,
+)
 from .ops import _need_flag, _need_text, _reject, write_guard
 
 router = APIRouter(tags=["agents"])
@@ -86,8 +100,9 @@ REVOKE_HINT_LEN = 8
 
 #: 批准响应里回显的一次性提示（前端据此弹「只此一次，请立即保存」）
 CREDENTIAL_ONCE_NOTE = (
-    "凭据只此一次返回，库里只存 sha256 —— 关掉弹框就再也拿不到了；"
-    "丢失请走「重新生成凭据」换一条（显式 reissue，旧凭据随即失效）。"
+    "本次响应里明文只此一次返回；服务端另存了一份密文，之后可在「查看 / 复制凭据」"
+    "随时取出（需登录 + 手输完整 agent_id，每次取出记审计）。若这行显示「不可还原」，"
+    "用「回填已有凭据」把你手上这条登记进来即可，不必换发。"
 )
 
 #: 置 primary 时的回显说明：必须让操作者看见「旧主将降为 sub」这个后果。
@@ -442,6 +457,117 @@ def revoke_credential(agent_id: str, body: AgentActionBody,
     return {"ok": True, "agent_id": agent_id, "cleared": True,
             "status": row.get("status", ""), "backup": backup,
             "note": "凭据已作废（代理行仍在册，状态与角色一个都没动）"}
+
+
+#: 「可还原」相关文案（口径单点：端点与前端拿同一份说法，别各写一套）
+REVEAL_NOTE = (
+    "这条凭据的明文已加密存档，可随时取出复制；服务端校验仍只认 sha256，"
+    "取出动作本身已记审计（审计里不含凭据内容）。"
+)
+REVEAL_NOT_RECOVERABLE_NOTE = (
+    "这条凭据签发时服务端还没有可还原存档（库里只有 sha256），取不出明文。"
+    "若你手上还留着那条串，用「回填已有凭据」登记后即可重复复制；否则只能换发（旧串随即失效）。"
+)
+BACKFILL_OK_NOTE = (
+    "已校验通过（与你手上的串与在册 sha256 逐字对上），这条凭据现在可重复复制。"
+)
+BACKFILL_MISMATCH_NOTE = (
+    "粘来的串与这行在册的凭据摘要对不上，一个字节都没改 —— 请确认粘的是这个代理当前"
+    "在用的那条（不是别的应用、不是已换发过的旧串）。"
+)
+
+#: reveal 各 `why` → HTTP 口径与给人看的话（分诊表放一处，端点里不写 if 链）
+_REVEAL_FAIL: Dict[str, tuple] = {
+    "no_row": (409, "agent_race", "代理在取出凭据的过程中消失，请重试"),
+    "no_credential": (409, "no_credential",
+                      "这个代理现在没有凭据（没批准过，或已停过 / 已吊销）"),
+    "not_recoverable": (409, "not_recoverable", REVEAL_NOT_RECOVERABLE_NOTE),
+    "key_missing": (503, "key_missing",
+                    "服务端没配主密钥（KEEPSAKE_CREDENTIAL_KEY / ..._KEY_FILE），"
+                    "密文解不开 —— 这是运维配置，不是数据问题"),
+    "key_mismatch": (409, "key_mismatch",
+                     "密文在但解不开（换过主密钥或密文被改坏），重试无用 —— "
+                     "请用手上的串「回填已有凭据」，或换发一条新的"),
+    "hash_mismatch": (409, "hash_mismatch",
+                      "解出的明文与在册 sha256 对不上账，已拒绝返回（不发出对不上账的串）"),
+}
+
+#: 回填各 `why` → HTTP 口径（`empty` 在端点里先挡掉，不落进这张表）
+_BACKFILL_FAIL: Dict[str, tuple] = {
+    "no_row": (409, "agent_race", "代理在回填过程中消失，请重试"),
+    "no_hash": (409, "no_credential",
+                "这行现在没有凭据可比对（没批准过 / 已停过）—— 回填无意义，请走批准或换发"),
+    "mismatch": (409, "credential_mismatch", BACKFILL_MISMATCH_NOTE),
+    "key_missing": (503, "key_missing",
+                    "明文与在册摘要对上了，但服务端没有主密钥 ⇒ 写不了密文"
+                    "（**不会**退化成把明文存进库）。先配 KEEPSAKE_CREDENTIAL_KEY 再回填"),
+}
+
+
+@router.post("/api/v1/agents/{agent_id}/reveal_credential",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def reveal_credential_agent(agent_id: str, body: AgentActionBody,
+                            storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**取出凭据明文**（重复复制）—— 2026-11-14 用户拍板「不能换发，要直接能复制」。
+
+    🔴 确认闸 = **完整 agent_id**（与 `delete` 同一档，比吊销的手输前 8 位高一档）：
+    这一步的产物是一把能用它读写全库的钥匙，取错代理不该发生。传 `true` 一律 400。
+    🔴 叠 `write_guard`：这是**凭据面**的动作，审计落不下账的机器上不许取出明文
+    （哪怕它不改数据）—— 不留痕的密钥读取等于没发生过，那正是最不能接受的一种失忆。
+    🔴 审计只记「revealed」这一事实，**明文永不进审计 / 日志 / 备份**；
+    失败分支由 `_reject` 留一行 `ok=false`（reason 是错误码，不含内容）。
+    读面（`GET /agents`）只回 `recoverable` 布尔，不回密文（见 `_public`）。
+    """
+    action = "agents.reveal_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    _need_text(body.confirm, agent_id, action, agent_id, f"完整 agent_id（{agent_id}）")
+    res = registry.reveal_credential(agent_id)
+    if not res["ok"]:
+        why = str(res.get("why") or "")
+        status, code, message = _REVEAL_FAIL.get(
+            why, (500, "reveal_failed", f"取出凭据失败（{why or '未知原因'}）"))
+        _reject(status, code, message, action, agent_id)
+    audit.record(action, agent_id, ok=True, reason="credential revealed (repeatable)")
+    credential = str(res["credential"])
+    return {"ok": True, "agent_id": agent_id, "credential": credential,
+            "credential_hint": credential[:REVOKE_HINT_LEN], "note": REVEAL_NOTE}
+
+
+@router.post("/api/v1/agents/{agent_id}/backfill_credential",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def backfill_credential_agent(agent_id: str, body: AgentBackfillBody,
+                              storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """把**已经在用**的凭据登记成可还原（**不换发、不断线**）。
+
+    判据只有一条：粘来的明文算 sha256 后必须与这行在册的 `credential_hash`
+    **常数时间比对**相等 ⇒ 对上才写密文，对不上**一个字节都不改**（`mismatch`）。
+    为什么需要这条路：可还原机制上线前签发的行只有 sha256，操作者手上明明有串，
+    面板却说"取不出来"，唯一出路是换发 —— 而换发会让那个代理当场用不了
+    （它配置里的旧串立刻作废）。回填把这两件事解耦：账对得上就登记，钥匙不动。
+
+    🔴 同样过**完整 agent_id** 确认闸 + `write_guard`（写入密文是有后果的治理写）。
+    🔴 明文不进审计 / 日志 / 返回值之外的任何地方；`mismatch` 的审计 reason 只是错误码。
+    🔴 没有主密钥时**不降级成明文入库**（`key_missing` 503）—— 这一步做不到就是做不到，
+    比"先存明文以后再说"诚实得多。
+    """
+    action = "agents.backfill_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    _need_text(body.confirm, agent_id, action, agent_id, f"完整 agent_id（{agent_id}）")
+    if not (body.credential or "").strip():
+        _reject(400, "credential_required",
+                "请把这个代理当前在用的那条 ksk_ 凭据粘进来（回填只是登记你已有的串，"
+                "不会签发新串）", action, agent_id)
+    res = registry.backfill_credential(agent_id, body.credential)
+    if not res["ok"]:
+        why = str(res.get("why") or "")
+        status, code, message = _BACKFILL_FAIL.get(
+            why, (500, "backfill_failed", f"回填失败（{why or '未知原因'}）"))
+        _reject(status, code, message, action, agent_id)
+    audit.record(action, agent_id, ok=True, reason="credential backfilled (hash verified)")
+    return {"ok": True, "agent_id": agent_id, "recoverable": True,
+            "credential_hint": str(res.get("hint") or ""), "note": BACKFILL_OK_NOTE}
 
 
 @router.delete("/api/v1/agents/{agent_id}",

@@ -41,6 +41,10 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/share",
     # per-agent 注入预算（ks_agent_budget）：只改一个阈值，不是治理动作
     "/api/v1/agents/{agent_id}/budget",
+    # 凭据可还原（ks_credential_recoverable，2026-11-14）：取出明文与回填都要过会话闸；
+    # reveal 不改数据但读的是密钥面 ⇒ 与写面同闸（write_guard + 完整 agent_id 确认）。
+    "/api/v1/agents/{agent_id}/reveal_credential",
+    "/api/v1/agents/{agent_id}/backfill_credential",
 )
 
 #: 非 POST 的写端点（DELETE 与 POST 别名是同一条路，只是方法不同）。
@@ -114,10 +118,12 @@ def test_列表形状与pending计数(env):
     # 🆕 多了 core_budget_chars（per-agent 注入预算）：None = 沿用全局默认
     # 🆕 多了 push_enabled（私信实时推送开关）：默认 False（往外放行的开关，缺省最严）
     # 🆕 多了 share_kb（共享知识库开关）：默认 False（与 share_memory 解耦的另一个旗）
+    # recoverable（ks_credential_recoverable，2026-11-14）：这条凭据能否还原成明文。
+    # 🔴 读面只加这一个**布尔**，密文列 `credential_enc` 不在其上（见 registry._public）。
     assert set(item) == {"agent_id", "name", "role", "status", "first_seen_at",
                          "last_seen_at", "reads", "writes", "exclude_from_primary",
                          "credential_hint", "meta", "dm_enabled", "share_memory",
-                         "share_kb", "core_budget_chars", "push_enabled"}
+                         "share_kb", "core_budget_chars", "push_enabled", "recoverable"}
     assert item["core_budget_chars"] is None      # 缺省 = 沿用全局
     assert item["role"] == "sub" and item["status"] == "pending"
     # 🔴 读面永远不回显凭据哈希 / 明文
