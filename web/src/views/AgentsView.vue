@@ -167,14 +167,16 @@
                 <span class="k">凭据</span>
                 <span class="v mono">
                   {{ hintText(a) }}
-                  <!-- 复制的是**前 8 位记认**（本来就显示在页面上、不构成秘密），
-                       用途是把「哪把钥匙」贴进工单/聊天里核对，不必手抄。
-                       🔴 明文只能从「查看 / 复制凭据」那条带确认闸的路走。 -->
+                  <!-- 🔴 这个钮复制的是**整条凭据**（2026-11-14 用户当场指出：只给一个
+                       "复制前缀"的钮等于骗人 —— 前缀不是凭据、粘出去也连不上）。
+                       点它要先过手输**完整 agent_id** 的确认闸（与后端同档），
+                       确认后才解密并写进剪贴板；不可还原的行**根本不给这个钮**
+                       （给了必然失败，那种钮的存在本身是误导）。 -->
                   <button
-                    v-if="a.credential_hint"
+                    v-if="a.recoverable"
                     class="copy-btn"
-                    title="复制凭据前缀（前 8 位，不是凭据本身）"
-                    @click="doCopy(a.credential_hint)"
+                    title="复制完整凭据（需手输完整 agent_id 确认）"
+                    @click="ask('copycred', a)"
                   >
                     <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
                       stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
@@ -568,7 +570,10 @@ function statusTone(a) {
 
 /** 凭据只回显前 8 位；后端把空串同时用作「未发放」和「已轮换/已清」，一句话说清。 */
 function hintText(a) {
-  return a.credential_hint ? `${a.credential_hint}…（只显示前 8 位）` : '未发放 / 已轮换不显示'
+  if (!a.credential_hint) return '未发放 / 已轮换不显示'
+  // 有钥匙但服务端还原不出来 ⇒ 明确给下一步（回填已在用的串，或换发），别只留个前缀让人猜
+  if (!a.recoverable) return `${a.credential_hint}…（前 8 位；此条不可还原，去「编辑 → 回填已有凭据」）`
+  return `${a.credential_hint}…（点旁边的钮复制整条）`
 }
 
 /** 静默重拉的失败提示：连着几轮都失败只报第一次，免得 10 秒刷一次屏。 */
@@ -1045,6 +1050,10 @@ const dlgTitle = computed(() => {
   if (dlgKind.value === 'revoke') return `吊销 ${id}？`
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
   if (dlgKind.value === 'clearcred') return `停掉 ${id} 的凭据？`
+  // 🔴 凭据类三条必须各写各的标题：兜底那句是「删除 xxx？」，漏写就把一次复制显示成删除（11-14 实踩）
+  if (dlgKind.value === 'reveal') return `取出 ${id} 的凭据明文？`
+  if (dlgKind.value === 'copycred') return `复制 ${id} 的完整凭据？`
+  if (dlgKind.value === 'backfill') return `把已有的串登记给 ${id}？`
   return `删除 ${id}？`
 })
 
@@ -1052,6 +1061,7 @@ const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'approve') return wasRevoked.value ? '重新批准' : '批准'
   if (dlgKind.value === 'rotate') return '重新生成凭据'
   if (dlgKind.value === 'reveal') return '查看 / 复制凭据'
+  if (dlgKind.value === 'copycred') return '复制完整凭据'
   if (dlgKind.value === 'backfill') return '回填已有凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
@@ -1071,6 +1081,7 @@ const dlgExpect = computed(() => {
   //    能读写全库的钥匙，后者一旦认错行就是把别人的串登记到这台机器上。
   //    后端 `_need_text` 就是这道闸 —— 前端不许比后端松。
   if (dlgKind.value === 'reveal') return dlgRow.value?.agent_id || ''
+  if (dlgKind.value === 'copycred') return dlgRow.value?.agent_id || ''
   if (dlgKind.value === 'backfill') return dlgRow.value?.agent_id || ''
   return ''
 })
@@ -1133,6 +1144,13 @@ const dlgConsequences = computed(() => {
       '明文离开这里就不再受控：贴进聊天 / 截图 / 工单之前想清楚，复制完就把弹框关掉。',
     ]
   }
+  if (dlgKind.value === 'copycred') {
+    return [
+      '服务端会解密这条凭据并**直接写进你的剪贴板**（不在页面上显示明文，少一处被截走的机会）。',
+      '库里照旧只认 sha256 —— 复制动作不改任何状态、不影响这个代理的读写，但每次都会记一行审计（审计里不含凭据内容）。',
+      '剪贴板里的东西离开这个页面就不再受控：粘给代理进程后就把它清掉 / 覆盖掉。',
+    ]
+  }
   if (dlgKind.value === 'backfill') {
     return [
       '只做校验与登记：**不签发新凭据**，这个代理现在用的那条串照旧可用（线上不断线）。',
@@ -1185,6 +1203,17 @@ async function doAction(typed) {
           ? `已设为主代理：${row.agent_id}（原主 ${r.demoted.join('、')} 已降为子代理）`
           : `已设为主代理：${row.agent_id}`,
       )
+    } else if (kind === 'copycred') {
+      // 整条凭据直接进剪贴板：不显示、不落到 cred ref（关掉页面内存里也不留副本）。
+      const r = await api.revealCredential(row.agent_id, typed)
+      if (!r?.credential) {
+        showError('后端没有返回凭据，复制未发生')
+        return
+      }
+      const ok = await copyText(r.credential)
+      ok
+        ? showToast(`已复制完整凭据到剪贴板：${row.agent_id}`)
+        : showError('剪贴板不可用，请改用编辑弹框里的「查看 / 复制凭据」手动选中复制')
     } else if (kind === 'reveal') {
       // 取出明文：typed 就是手输的完整 agent_id（后端那道 _need_text 同源）。
       const r = await api.revealCredential(row.agent_id, typed)

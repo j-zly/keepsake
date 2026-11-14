@@ -90,12 +90,40 @@ test('7) 回填的粘贴框：开框清空、提交后必清（失败也清）',
   assert.doesNotMatch(VIEW, /backfillText[\s\S]{0,40}(localStorage|sessionStorage)/, '不落持久存储')
 })
 
-test('8) 卡面「凭据」那栏能复制前缀（记认），且只复制前缀', () => {
+// 用户 11-14 当场打回：「为什么只能复制 ksk_4d3a？？不应该是复制全部的凭证吗」
+// —— 卡面上放一个"只复制前 8 位"的钮等于骗人：前缀不是凭据，粘出去连不上，
+//    而页面上唯一那个复制钮会让人以为已经拿到钥匙。所以卡面钮必须走整条凭据那条路。
+test('8) 卡面复制钮复制的是整条凭据（不是前缀），且只给可还原的行', () => {
   const kv = VIEW.slice(VIEW.indexOf('<span class="k">凭据</span>'))
   const row = kv.slice(0, kv.indexOf('</div>'))
   assert.match(row, /class="copy-btn"/, '凭据那栏要有复制钮')
-  assert.match(row, /doCopy\(a\.credential_hint\)/, '复制的是前 8 位记认，不是明文')
-  assert.match(row, /v-if="a\.credential_hint"/, '没凭据的行不给这个钮')
+  assert.match(row, /ask\(\'copycred\', a\)/, '钮走「复制完整凭据」那条带确认闸的路')
+  assert.match(row, /v-if="a\.recoverable"/, '不可还原的行不给这个钮（给了必然失败 = 误导）')
+  assert.doesNotMatch(row, /doCopy\(a\.credential_hint\)/, '不许再有"只复制前缀"的钮')
+  // 复制动作的产物必须是整条串：走 reveal 端点 + copyText
+  const body = VIEW.slice(VIEW.indexOf('async function doAction'))
+  const branch = body.slice(body.indexOf("kind === 'copycred'"))
+  const block = branch.slice(0, branch.indexOf("} else if"))
+  assert.match(block, /api\.revealCredential\(row\.agent_id, typed\)/, '取出整条串')
+  assert.match(block, /copyText\(r\.credential\)/, '写进剪贴板的是整条 credential，不是 hint')
+  assert.doesNotMatch(block, /credential_hint/, '这条路上不该出现前缀')
+  assert.doesNotMatch(block, /showCred\(/, '一键复制不把明文显示到屏幕上（少一处被截走的机会）')
+})
+
+test('8b) 不可还原的行：前缀旁说清下一步，而不是留一个会失败的钮', () => {
+  const fn = VIEW.slice(VIEW.indexOf('function hintText(a)'))
+  const body = fn.slice(0, fn.indexOf('\n}'))
+  assert.match(body, /a\.recoverable/, '要分可还原/不可还原两档')
+  assert.match(body, /回填已有凭据/, '不可还原时给出去回填的话，而不是让人以为页面坏了')
+  assert.match(body, /点旁边的钮复制整条/, '可还原时说明这个钮复制整条')
+})
+
+test('8c) 弹框标题分档（兜底是"删除 xxx？"，凭据类漏写就把复制显示成删除）', () => {
+  const t = VIEW.slice(VIEW.indexOf('const dlgTitle = computed'))
+  const body = t.slice(0, t.indexOf('\n})'))
+  for (const kind of ['reveal', 'copycred', 'backfill']) {
+    assert.match(body, new RegExp(`dlgKind\\.value === '${kind}'`), `${kind} 必须有自家标题`)
+  }
 })
 
 test('9) 不可还原的行说清下一步（回填优先，不是默认换发）', () => {
