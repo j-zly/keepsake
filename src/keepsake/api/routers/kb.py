@@ -71,7 +71,14 @@ from fastapi import Path          # 文档切片的路径参数（P9 新增；�
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from keepsake.govern.registry import CREDENTIAL_PREFIX, ROLE_PRIMARY, Registry
+from keepsake.govern.registry import (
+    CREDENTIAL_PREFIX,
+    ROLE_PRIMARY,
+    SCOPE_FEATURE_TEXT,
+    SCOPE_KB,
+    Registry,
+    has_scope,
+)
 from keepsake.kb import ingest
 from keepsake.kb import service as kb_service
 from keepsake.kb.service import KbError
@@ -620,6 +627,25 @@ def _bearer(raw: Optional[str]) -> str:
     return s[len("Bearer "):].strip() if s.startswith("Bearer ") else ""
 
 
+def _require_kb_scope(res: Dict[str, Any]) -> None:
+    """知识库面：代理身份还要看**这把凭据**有没有被授权用知识库。
+
+    🔴 判据与 MCP 闸门同一个 `has_scope`（两处各写一份迟早漂成两个安全等级）：
+       界面上勾掉「知识库」之后，MCP 的 `kb_*` 工具与 HTTP 的 KB 写入口必须**同时**拒绝。
+    站内会话（人自己）不走这条路，行为不变。
+    """
+    # 🔴 判据只看 `res`（校验结论）里真有的东西。上一版这里写的是
+    #    `res.get("kind") == "agent"` —— 而 `kind` 是本函数**返回值**才有的字段，
+    #    永远不在 res 里 ⇒ 整条件恒假 ⇒ 闸静默永真（比写反更阴：测试不写就永远看不见）。
+    if not has_scope(res, SCOPE_KB):
+        names = "、".join(SCOPE_FEATURE_TEXT.get(s, s)
+                          for s in (res.get("scopes") or [])) or "无"
+        _reject(403, "scope_denied",
+                f"这把凭据未被授权使用知识库功能（当前授权：{names}）—— "
+                "请到控制台「代理登记 → 凭据清单 → 授权」勾选",
+                "kb.write", str(res.get("agent_id") or "unknown"))
+
+
 def writer_identity(authorization: Optional[str] = Header(default=None),
                     storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """写端点的**调用方身份**（认证 + 「这条写入要不要审」的判据，一处判完）。
@@ -650,6 +676,8 @@ def writer_identity(authorization: Optional[str] = Header(default=None),
         _reject(403, "agent_denied",
                 AGENT_DENIED_NOTE.format(agent_id=res.get("agent_id") or "未知"),
                 "kb.write", str(res.get("agent_id") or "unknown"))
+    # 🔴 身份过了再看**这把凭据**的授权：知识库面要 kb 档（与 MCP 闸门同一个 has_scope）
+    _require_kb_scope(res)
     role = str(res.get("role") or "")
     agent_id = str(res.get("agent_id") or "")
     return {"kind": "agent", "agent_id": agent_id, "role": role,

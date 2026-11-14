@@ -112,6 +112,8 @@ ALLOWED_POST_PATHS = {
     # 新建一把 / 改标签 / 作废单把。都不动别的入口，但**能掐断一个在线入口** ⇒ 算写面。
     "/api/v1/agents/{agent_id}/credentials",
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+    # 授权档位一条（ks_credential_scopes）：改这把能用的功能，立即生效
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
     # 待办三条（ks_todo 一等公民）：新增 / 改状态 / 真删
     "/api/v1/todos",

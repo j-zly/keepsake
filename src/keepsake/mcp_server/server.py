@@ -50,7 +50,13 @@ from typing import Any, Callable, Dict, List, Optional
 import anyio
 from mcp.server.fastmcp import FastMCP
 
-from ..govern.registry import CREDENTIAL_HINT_LEN, is_connection_error
+from ..govern.registry import (
+    CREDENTIAL_HINT_LEN,
+    SCOPES_ALL,
+    SCOPE_FEATURE_TEXT,
+    has_scope,
+    is_connection_error,
+)
 from .events import register_events_route
 from .factory import DEFAULT_AGENT_ID, default_provider
 from .internal import register_internal_route
@@ -143,6 +149,46 @@ GATE_WRITE_TOOLS = frozenset({
     "kb_store", "kb_remove",
     "todo_add", "todo_done",
 })
+
+# ---- 功能授权（scope）与工具面的对应（2026-11-14 用户拍板）-----------------
+#: 用户的原话：「根据凭证授权是能使用记忆功能和知识库功能，只授权记忆的话知识库是
+#: 不能使用，只授权知识库的话记忆功能不能使用」⇒ 授权挂在**这把凭据**上。
+#:
+#: 🔴 判据按**前缀**派生，不写工具名单：以后新加 `memory_*` / `kb_*` 工具会**自动**
+#:    落到对应授权里。列名单的写法迟早漏一条，而漏的那条是静默放行（最难查的那种）。
+#: 🔴 不在前缀内的工具（message_* / todo_* / agent_*）本轮**不受 scope 约束**，
+#:    沿用各自的 role / 归属闸 —— 加档位是显式改动，不顺手扩面。
+
+#: 被授权档拒绝时的对外文案（🔴 只回"缺哪一档 / 现在有哪些"，不回任何凭据内容）。
+GATE_DENIED_SCOPE = (
+    "这把凭据未被授权使用{feature}（当前授权：{scopes}）—— "
+    "请到控制台「代理登记 → 凭据清单 → 授权」勾选"
+)
+
+
+def scope_of_tool(tool_name: str) -> str:
+    """这个工具属于哪一档授权；不属于任何档 ⇒ 空串（不受 scope 约束）。"""
+    name = str(tool_name or "")
+    for scope in SCOPES_ALL:
+        if name.startswith(f"{scope}_"):
+            return scope
+    return ""
+
+
+def scope_denied_text(scope: str, scopes: Any) -> str:
+    """拒绝文案。`scopes` 为空时明说"无"，不许显示成空白让人以为显示坏了。"""
+    picked = _parse_scopes_text(scopes)
+    return GATE_DENIED_SCOPE.format(
+        feature=SCOPE_FEATURE_TEXT.get(scope, scope or "该功能"),
+        scopes="、".join(SCOPE_FEATURE_TEXT.get(s, s) for s in picked) or "无")
+
+
+def _parse_scopes_text(raw: Any) -> list:
+    """把校验结论里的 scopes 归一成列表（闸门只做展示用，判据在 `has_scope`）。"""
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return [str(x) for x in raw]
+    return [t for t in str(raw or "").replace(",", " ").split() if t]
+
 
 #: stdio 的凭据复核周期（秒）。吊销 / 停用最多 60s 生效。
 GATE_RECHECK_S = 60.0
@@ -377,10 +423,20 @@ class AgentGate:
                              cred_id)
 
     def check(self, tool_name: str) -> Dict[str, Any]:
-        """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。"""
+        """tool 调用前的唯一入口：通过则打活动并放行，不通过抛 `ToolError`（人话）。
+
+        两道闸在这一处串起来：**先身份**（批准态 + 凭据有效）**再授权**（这把凭据
+        能不能用这个功能）。顺序不许倒：身份没过就不要对外说"缺哪一档权限"，
+        那等于向没有凭据的人透露这把钥匙的功能配置。
+        🔴 被授权档拒掉的调用**不打活动**（raise 在 `record_activity` 之前）：
+           否则一次被拒的越权尝试会给这把凭据刷上用量，监管面就成了噪声源。
+        """
         res = self.identify(tool_name)
         if not res.get("ok"):
             raise ToolError(self.denied_text(res))
+        need = scope_of_tool(tool_name)
+        if need and not has_scope(res, need):
+            raise ToolError(scope_denied_text(need, res.get("scopes")))
         # 逐把打点：`verify` 通过时带回命中的 `cred_id`（本机 bootstrap 通道没有 ⇒ 空串）
         self.record_activity(res["agent_id"], tool_name, str(res.get("cred_id") or ""))
         return res

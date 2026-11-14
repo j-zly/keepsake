@@ -45,6 +45,15 @@
           <span v-else-if="!r.recoverable" class="cl-tag cl-tag--warn">不可还原</span>
         </div>
         <div class="cl-meta">
+          <!-- 授权档位（11-14 用户口径：只授记忆就不能用知识库，反之亦然）。
+               直接在行内勾，改完立刻生效——闸门每次工具调用都现查注册表。 -->
+          <span class="cl-scopes">
+            <el-checkbox-group v-model="r._scopes" size="small" @change="saveScopes(r)">
+              <el-checkbox value="memory" label="记忆" />
+              <el-checkbox value="kb" label="知识库" />
+            </el-checkbox-group>
+            <span v-if="r._scopesError" class="cl-scopes-err">没改动（{{ r._scopesError }}）</span>
+          </span>
           <span>签于 {{ fmt(r.created_at) }}</span>
           <span>{{ r.status === 'active' ? (r.used_at ? `最近 ${since(r.used_at)}` : '还没用过') : `废于 ${fmt(r.revoked_at || r.used_at)}` }}</span>
           <span>读 {{ r.reads }} · 写 {{ r.writes }}</span>
@@ -156,7 +165,9 @@ async function load() {
   loadErr.value = ''
   try {
     const r = await api.agentCredentials(aid)
-    rows.value = r.items || []
+    // `_scopes` 是行内的编辑态副本（el-checkbox-group 要可写数组）；
+    // 每次开抽屉都从服务端重读 ⇒ 不在本地留旧值，避免"界面勾着、实际没生效"。
+    rows.value = (r.items || []).map((c) => ({ ...c, _scopes: [...(c.scopes || [])], _scopesError: '' }))
   } catch (e) {
     loadErr.value = `读不到凭据清单（${e?.message || '未知错误'}）`
     rows.value = []
@@ -267,6 +278,28 @@ async function saveLabel(r) {
   }
 }
 
+async function saveScopes(r) {
+  // 只有勾法真变了才发请求（否则一次点击就是一条无意义的审计行）
+  const next = [...(r._scopes || [])].sort()
+  const prev = [...(r.scopes || [])].sort()
+  if (next.join(',') === prev.join(',')) return
+  const wanted = ['memory', 'kb'].filter((s) => next.includes(s))
+  try {
+    const res = await api.setCredentialScopes(props.agent.agent_id, r.cred_id, wanted)
+    r.scopes = [...(res.scopes || wanted)]
+    r._scopes = [...r.scopes]
+    r._scopesError = ''
+    const names = { memory: '记忆', kb: '知识库' }
+    showToast(`授权已更新：${r.label || '未命名'} → ${r.scopes.map((s) => names[s] || s).join('、') || '无'}`)
+    emit('changed')
+  } catch (e) {
+    // 失败要**回滚勾选态**：界面留着勾上的样子 = 骗人
+    r._scopes = [...(r.scopes || [])]
+    r._scopesError = e?.response?.data?.detail?.message || e?.message || '保存失败'
+    showError(r._scopesError)
+  }
+}
+
 async function submitBackfill() {
   const aid = props.agent?.agent_id
   const text = backfillText.value.trim()
@@ -366,6 +399,17 @@ async function submitBackfill() {
 .cl-tag--off {
   border-color: var(--border);
   color: var(--text-3, var(--text-2));
+}
+
+.cl-scopes {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cl-scopes-err {
+  color: var(--danger);
+  font-size: 12px;
 }
 
 .cl-meta {

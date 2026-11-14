@@ -14,6 +14,7 @@ import { createApp } from 'vue'
 import {
   ElButton,
   ElCheckbox,
+  ElCheckboxGroup,
   ElCollapse,
   ElCollapseItem,
   ElDatePicker,
@@ -90,6 +91,7 @@ app.use(router)
 for (const c of [
   ElButton,
   ElCheckbox,
+  ElCheckboxGroup,
   ElCollapse,
   ElCollapseItem,
   ElDatePicker,

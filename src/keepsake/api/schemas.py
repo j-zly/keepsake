@@ -498,6 +498,9 @@ class AgentCredentialItem(BaseModel):
     reads: int = Field(0, description="用这把的读次数")
     writes: int = Field(0, description="用这把的写次数")
     recoverable: bool = Field(False, description="这把能否还原成明文（决定给不给「复制」钮）")
+    #: 这把凭据被授权用哪些功能（`memory` / `kb`；空列表 = 什么都不能用）。
+    #: 缺省全授权（新增字段不改存量语义），收紧只能在界面上显式勾。
+    scopes: List[str] = Field(default_factory=list, description="功能授权档位")
 
 
 class AgentCredentialList(BaseModel):
@@ -511,6 +514,17 @@ class AgentCredentialAddBody(BaseModel):
 
     label: str = Field("", description="这把钥匙的用途名（如「win 笔记本」）")
     confirm: Any = Field(False, description="显式意图位 true（前端自动带，用户不输入）")
+
+
+class AgentCredentialScopesBody(BaseModel):
+    """`{"scopes": ["memory"], "confirm": true}` —— 改这把凭据能用哪些功能。
+
+    没列出来的档位就是**不给用**（不是"保持原样"）：界面上是复选框，
+    语义必须与复选框一致，否则用户以为勾掉了一个、实际两个都在。
+    """
+
+    scopes: List[str] = Field(default_factory=list, description="要授予的档位；空 = 都不给")
+    confirm: Any = Field(False, description="显式意图位 true（前端自动带）")
 
 
 class AgentCredentialRenameBody(BaseModel):

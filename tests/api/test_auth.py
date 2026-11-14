@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是五十二条业务写端点加四条auth_POST():
+def test_写面仍是五十三条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -748,6 +748,8 @@ def test_写面仍是五十二条业务写端点加四条auth_POST():
         # 多凭据三条（ks_multi_credential，11-14）：新建 / 改标签 / 作废单把
         "/api/v1/agents/{agent_id}/credentials",
         "/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+        # 授权档位一条（ks_credential_scopes）
+        "/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
         "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
         "/api/v1/agents/{agent_id}",
         "/api/v1/agents/{agent_id}/delete",

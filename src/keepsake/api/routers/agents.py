@@ -90,6 +90,7 @@ from ..schemas import (
     AgentCredentialAddBody,
     AgentCredentialList,
     AgentCredentialRenameBody,
+    AgentCredentialScopesBody,
     AgentRoleBody,
 )
 from .ops import _need_flag, _need_text, _reject, write_guard
@@ -672,6 +673,41 @@ def rename_agent_credential(agent_id: str, cred_id: str,
                 "这把不在这个代理名下（编号写错，或它是别人的凭据）", action, agent_id)
     audit.record(action, agent_id, ok=True, reason="credential renamed cred_id=%s" % cred_id)
     return {"ok": True, "agent_id": agent_id, "cred_id": cred_id}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def set_agent_credential_scopes(agent_id: str, cred_id: str,
+                                body: AgentCredentialScopesBody,
+                                storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """改这把凭据的**功能授权**（记忆 / 知识库）。
+
+    用户口径（11-14）：「只授权记忆的话知识库是不能使用，只授权知识库的话记忆功能不能使用」。
+    ⇒ 授权挂在**这把钥匙**上，同一个代理的另几把不受牵连（这正是多凭据的意义）。
+
+    🔴 立即生效：闸门每次工具调用都现查注册表；stdio 传输按 `GATE_RECHECK_S` 复核
+       （与吊销/停用同一档老口径，不另造一套延迟）。
+    🔴 不认识的档位名 ⇒ 400（不宽容：打错的 `memmory` 解析成空集合 = 静默全禁，
+       比报错难查得多）。
+    🟡 允许两档都关（这把变成"能连通、什么都不能用"）：将来加新档位时不阻塞，
+       界面要如实显示「无授权」，别让它看起来像坏了。
+    """
+    action = "agents.set_credential_scopes"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才改授权')
+    try:
+        scopes = registry.set_credential_scopes(agent_id, cred_id, body.scopes)
+    except ValueError as e:
+        _reject(400, "bad_scope", str(e), action, agent_id)
+        return {}
+    if scopes is None:
+        _reject(409, "credential_not_found",
+                "这把不在这个代理名下（编号写错，或它是别人的凭据）", action, agent_id)
+    audit.record(action, agent_id, ok=True,
+                 reason="credential scopes set cred_id=%s -> %s" % (cred_id, ",".join(scopes)))
+    return {"ok": True, "agent_id": agent_id, "cred_id": cred_id, "scopes": list(scopes),
+            "note": "授权已生效（这把之外的一把都不受影响）"}
 
 
 @router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",

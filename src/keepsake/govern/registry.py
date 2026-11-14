@@ -165,6 +165,86 @@ TABLE_CREDENTIAL = "ks_credential"
 
 #: `cred_id` 长度（十六进制）。它只是**定位与展示用的编号，不是秘密**，
 #: 可以进 URL、进审计、进界面；真正的秘密只有 `credential_hash` 对应的那把明文。
+# ---- 功能授权（scope）：2026-11-14 用户拍板 ----
+# 「根据凭证授权是能使用记忆功能和知识库功能，只授权记忆的话知识库是不能使用，
+#  只授权知识库的话记忆功能不能使用」⇒ 授权挂在**凭据**上（不是代理上）：
+#  同一个代理的 A 把能读记忆、B 把只能查知识库，互不牵连。
+SCOPE_MEMORY = "memory"
+SCOPE_KB = "kb"
+
+#: 认识的档位**就这两档**。私信 / 待办 / 治理工具本轮**不受 scope 约束**
+#: （沿用原有的 role / 归属闸）—— 要再加档位是显式改动，不顺手扩面。
+SCOPES_ALL: Tuple[str, ...] = (SCOPE_MEMORY, SCOPE_KB)
+
+#: 给人看的档位名（MCP 闸门、KB 写入口、控制台共用这一份 ⇒ 三处不会各说各话）。
+SCOPE_FEATURE_TEXT = {SCOPE_MEMORY: "记忆功能", SCOPE_KB: "知识库功能"}
+
+#: 分隔符（库里存的是 `memory,kb` 这种串，读写都只经 `_parse_scopes` /
+#: `_normalize_scopes`，别处不许自己 split）。
+SCOPES_SEP = ","
+
+#: 🔴 缺省 = **全授权**。新增字段不许改存量语义（本仓一惯口径）：
+#:    线上两把凭据现在就都在同时用记忆与知识库，缺省给"最严"会当场把它们锁死。
+#:    收紧授权必须是控制台上的显式动作（勾一下、留审计），不是升级的副作用。
+SCOPES_DEFAULT = SCOPES_SEP.join(SCOPES_ALL)
+
+#: `scopes` 的列名与列声明（建表与老库补列共用同一份 ⇒ 两边不许漂）。
+#: 声明里带 DEFAULT ⇒ PG 加"有默认的非空列"是元数据操作，不重写整表，
+#: 且**存量行自动拿到全授权**（正是上面那条缺省语义的落点）。
+SCOPES_COLUMN = "scopes"
+SCOPES_COLUMN_DECL = f"text NOT NULL DEFAULT '{SCOPES_DEFAULT}'"
+
+
+def _parse_scopes(raw: Any) -> Tuple[str, ...]:
+    """把库里的串/列表解析成**固定顺序**的元组（未知值一律丢掉）。
+
+    返回顺序按 `SCOPES_ALL` 排 ⇒ 界面与审计看到的永远是同一个串（`memory,kb`
+    而不是 `kb,memory`），改一次授权不会产生"看起来变了"的噪声。
+    """
+    if raw is None:
+        return ()
+    items = raw if isinstance(raw, (list, tuple, set, frozenset)) \
+        else str(raw).split(SCOPES_SEP)
+    picked = {str(x).strip().lower() for x in items if str(x or "").strip()}
+    return tuple(sc for sc in SCOPES_ALL if sc in picked)
+
+
+def _normalize_scopes(raw: Any, strict: bool = True) -> str:
+    """写库前的归一化。`strict=True`（治理入口用）：出现不认识的档位 ⇒ ValueError。
+
+    🔴 为什么不能宽容：打错的 `memmory` 会被解析成"空集合"，界面上看着像
+    "只授了知识库"，实际是**什么都不能干** —— 静默少授权比报错难查十倍。
+    """
+    if isinstance(raw, str):
+        tokens = [t.strip().lower() for t in raw.split(SCOPES_SEP) if t.strip()]
+    else:
+        tokens = [str(t).strip().lower() for t in (raw or []) if str(t).strip()]
+    if strict:
+        unknown = [t for t in tokens if t not in SCOPES_ALL]
+        if unknown:
+            raise ValueError(
+                f"未知的授权档位 {unknown}（认识的就 {list(SCOPES_ALL)}）")
+    return SCOPES_SEP.join(_parse_scopes(tokens))
+
+
+def has_scope(res: Any, scope: str) -> bool:
+    """从**校验结论**里判这一档能不能用（闸门与路由共用这一个判据）。
+
+    🔴 两种"没有 scopes"必须分开：
+      * 结论里**根本没这个键**（旧版本进程、本机 bootstrap 通道的结果）⇒ 视为全授权
+        （向后兼容；缺键 ≠ 无权限，否则升级一瞬全线断功能）；
+      * 键在但是**空集合**（人在界面上把两档都关掉）⇒ 什么都不许用。
+    """
+    if not isinstance(res, dict):
+        return True
+    if "scopes" not in res:
+        return True
+    raw = res.get("scopes")
+    return scope in _parse_scopes(raw)
+
+
+#: `cred_id` 的长度（十六进制）。它只是**定位与展示用的编号，不是秘密**，
+#: 可以进 URL、进审计、进界面；真正的秘密只有 `credential_hash` 对应的那把明文。
 CRED_ID_HEX_LEN = 12
 
 #: 标签长度上限（防把整段说明塞进列表行）。
@@ -180,6 +260,7 @@ CRED_STATUS_OFF = "revoked"
 CRED_FIELDS: Tuple[str, ...] = (
     "cred_id", "agent_id", "label", "credential_hash", "credential_hint",
     ENC_COLUMN, "status", "created_at", "used_at", "reads", "writes",
+    SCOPES_COLUMN,
 )
 
 #: 🔴 自本表起，`ks_agent` 上的 `credential_hash` / `credential_hint` /
@@ -209,7 +290,12 @@ KS_CREDENTIAL_DDL = f"""
         -- 最近一次用它鉴权通过的时刻（打点限频 60s ⇒ 遥测，不是账本）。
         used_at            text NOT NULL DEFAULT '',
         reads              integer NOT NULL DEFAULT 0,
-        writes             integer NOT NULL DEFAULT 0
+        writes             integer NOT NULL DEFAULT 0,
+        -- 功能授权（2026-11-14 用户拍板）：逗号分隔，值集只认 SCOPES_ALL。
+        -- 缺省 `memory,kb` = 全授权 ⇒ 存量行升级后行为一字不变（收紧要人来勾）。
+        -- 🔴 判据只有一处（`has_scope` + 闸门里的 `scope_of_tool`）：
+        --    这一列在别处再解一遍，迟早出现"这边说能用、那边说不能用"。
+        scopes             {SCOPES_COLUMN_DECL}
     )
 """
 
@@ -262,6 +348,8 @@ def _cred_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "reads": row["reads"],
         "writes": row["writes"],
         "recoverable": bool(str(row.get(ENC_COLUMN) or "")),
+        # 授权档位（固定顺序列表；空列表 = 这把什么都不能用，界面要如实显示）。
+        "scopes": list(_parse_scopes(row.get(SCOPES_COLUMN))),
     }
 
 #: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
@@ -607,7 +695,7 @@ class _SqlBase:
             return fn(cur)
 
     # -- 老库补列（先查后补）------------------------------------------
-    def has_column(self, column: str) -> bool:
+    def has_column(self, column: str, table: str = TABLE) -> bool:
         """这张表有没有某列（**先查后补**的第一步）。
 
         🔴 为什么不直接发 `ADD COLUMN IF NOT EXISTS`：PG 侧**列已存在也要拿
@@ -619,18 +707,18 @@ class _SqlBase:
                 "SELECT 1 FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = %s AND column_name = %s LIMIT 1",
-                (TABLE, column),
+                (table, column),
             )
             return bool(rows)
-        rows = self.read(f"PRAGMA table_info({TABLE})")
+        rows = self.read(f"PRAGMA table_info({table})")
         return any(str(r[1]) == column for r in rows)
 
-    def add_column(self, column: str, decl: str) -> None:
+    def add_column(self, column: str, decl: str, table: str = TABLE) -> None:
         """补一列（已存在 ⇒ 吞掉「重复列」错误，不当失败）。"""
         if self.kind == "postgres":
-            sql = f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {column} {decl}"
+            sql = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {decl}"
         else:
-            sql = f"ALTER TABLE {TABLE} ADD COLUMN {column} {decl}"
+            sql = f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
         try:
             self.write(lambda cur: cur.execute(sql))
         except Exception as e:      # noqa: BLE001 —— 并发补列撞车（duplicate column）
@@ -673,7 +761,13 @@ class _SqlBackend(_SqlBase):
         # 这里不自发 DDL）。**迁不动就返回 False**：新代码的鉴权只认凭据表，
         # 悄悄迁失败 = 所有代理集体 `bad_credential`，那必须响，不能闷着上线。
         try:
-            moved = _CredSqlBackend(self._st, self.kind).migrate_from_agents(self.all_rows())
+            cred_be = _CredSqlBackend(self._st, self.kind)
+            if not cred_be.ensure_columns():
+                # 补列失败 ⇒ **不再往下灌**，但也不能把"已灌完的老库"误判成失败：
+                # 列已在（本轮没补动）时 ensure_columns 返回 True；返回 False 只在
+                # 真的动了 DDL 又失败时出现 ⇒ 这里返回 False 是正当的 fail-closed。
+                return False
+            moved = cred_be.migrate_from_agents(self.all_rows())
             if moved:
                 logger.info("keepsake: %d 条老凭据已灌进 %s（老三列冻结留作回滚底）",
                             moved, TABLE_CREDENTIAL)
@@ -777,6 +871,22 @@ class _CredSqlBackend(_SqlBase):
     🔴 与代理表共用一份 `_SqlBase` 的理由同旧：SQL 只差占位符，复制一份必然漂。
     """
 
+    def ensure_columns(self) -> bool:
+        """老库补 `scopes` 列（**先查后补**，与 ks_agent 补列同一套做法）。
+
+        🔴 必须在 `migrate_from_agents` 之前跑完：补列没成就去灌数据会撞
+        `no such column: scopes`，而迁移失败在本仓是"拒绝启动"级别的事（不许闷着上线）。
+        列声明带 DEFAULT ⇒ 存量行自动落"全授权"，升级不改变任何人的可用范围。
+        """
+        try:
+            if not self.has_column(SCOPES_COLUMN, TABLE_CREDENTIAL):
+                self.add_column(SCOPES_COLUMN, SCOPES_COLUMN_DECL, TABLE_CREDENTIAL)
+        except Exception as e:      # noqa: BLE001 —— 交调用方决定降级
+            logger.warning("keepsake: 凭据表补列 %s 失败（%s: %s）",
+                           SCOPES_COLUMN, type(e).__name__, e)
+            return False
+        return True
+
     def list(self, agent_id: str = "") -> List[Dict[str, Any]]:
         sql = f"SELECT {', '.join(CRED_FIELDS)} FROM {TABLE_CREDENTIAL}"
         params: Tuple[Any, ...] = ()
@@ -828,6 +938,10 @@ class _CredSqlBackend(_SqlBase):
             return cur.rowcount > 0
 
         return bool(self.write(_fn))
+
+    def set_scopes(self, cred_id: str, scopes: str) -> bool:
+        """写这把的授权串（串已由 `_normalize_scopes` 归一过）。"""
+        return self.set_fields(cred_id, {SCOPES_COLUMN: scopes})
 
     def bump(self, cred_id: str, column: str) -> None:
         """逐把计数（`reads` / `writes`）+ 刷新 `used_at`。
@@ -919,6 +1033,9 @@ class _CredSqlBackend(_SqlBase):
                 "used_at": str(row.get("last_seen_at") or ""),
                 "reads": int(row.get("reads") or 0),
                 "writes": int(row.get("writes") or 0),
+                # 老三列没有"这把被限制了什么"的概念 ⇒ 迁过来一律全授权，
+                # 语义与迁移前**逐字一致**（升级不该改变谁能用什么）。
+                SCOPES_COLUMN: SCOPES_DEFAULT,
             })
             moved += 1
         return moved
@@ -956,6 +1073,8 @@ class _CredRedisBackend:
             # 计数沿用代理行的（单把 = 同一批活动）；不去重复加，也不假装分得开。
             "reads": int(agent.get("reads") or 0),
             "writes": int(agent.get("writes") or 0),
+            # 同上：这一档后端不支持逐把限制 ⇒ 如实给全授权，不假装能收紧。
+            SCOPES_COLUMN: SCOPES_DEFAULT,
         }
 
     def list(self, agent_id: str = "") -> List[Dict[str, Any]]:
@@ -1020,6 +1139,13 @@ class _CredRedisBackend:
     def rename_agent(self, old_id: str, new_id: str) -> int:
         return 1 if self._row(self._be.load(old_id) or {}) else 0
 
+    def set_scopes(self, cred_id: str, scopes: str) -> bool:
+        """Redis 后端没有这一列 ⇒ **明确拒绝**，不静默当成"改好了"。
+
+        静默改不动比报错恶劣得多：界面上勾了"只授知识库"，实际两档都还能用。
+        """
+        raise SingleCredentialBackend("scopes")
+
     def summaries(self, rows: Optional[List[Dict[str, Any]]] = None
                   ) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -1028,6 +1154,9 @@ class _CredRedisBackend:
                 "credential_count": 1, "credential_active": 1,
                 "last_used_at": row["used_at"], "credential_hint": row["credential_hint"],
                 "recoverable": bool(str(row.get(ENC_COLUMN) or "")),
+                # 单把后端的存储里没有这一列 ⇒ 如实报"全授权"（与它的实际行为一致：
+                # 这一档后端上闸永远放行，见 _CredRedisBackend 的说明）。
+                "scopes": SCOPES_ALL,
             }
         return out
 
@@ -1323,8 +1452,31 @@ class Registry:
             "used_at": "",
             "reads": 0,
             "writes": 0,
+            # 新签发 = 全授权（缺省档）。要收紧请在凭据清单上勾（走 set_credential_scopes）。
+            SCOPES_COLUMN: SCOPES_DEFAULT,
         })
         return credential
+
+    def set_credential_scopes(self, agent_id: str, cred_id: str,
+                              scopes: Any) -> Optional[Tuple[str, ...]]:
+        """改这把凭据能用哪些功能（`memory` / `kb`，见 `SCOPES_ALL`）。
+
+        返回改完后的档位元组；这把不在这个代理名下 ⇒ None（调用方 409）。
+        值集里有不认识的档位 ⇒ ValueError（🔴 不宽容：打错的 `memmory` 会被解析成
+        空集合，界面显示"只授了知识库"而实际**什么都不能用** —— 静默少授权比报错难查）。
+
+        生效时延：闸门每次工具调用都现查注册表（http 传输），所以**立即生效**；
+        只有 stdio 传输按 `GATE_RECHECK_S` 复核（与吊销/停用同一档老口径，不另造延迟）。
+        """
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return None
+        normalized = _normalize_scopes(scopes)      # 校验 + 归一（顺序固定）
+        if not self._cred.set_scopes(cid, normalized):
+            return None
+        return _parse_scopes(normalized)
 
     def revoke_credential(self, agent_id: str, cred_id: str) -> bool:
         """作废**一把**钥匙：代理照旧在册、其余钥匙照旧能用。
@@ -1817,7 +1969,10 @@ class Registry:
         # `cred_id` / `credential_label` 只给**内部**（打点与以后的按凭证授权），
         # 不进任何对外文案 —— 对外一直只到 hint（8 位）这一档。
         return {"ok": True, "role": row["role"], "status": row["status"], "reason": "",
-                "cred_id": hit["cred_id"], "credential_label": hit["label"]}
+                "cred_id": hit["cred_id"], "credential_label": hit["label"],
+                # 🔴 授权档位随结论一起出：闸门/路由只读这个字段判，绝不在自己那边
+                #    再 split 一次串（两处解析迟早漂成两个安全等级）。
+                "scopes": list(_parse_scopes(hit.get(SCOPES_COLUMN)))}
 
     def verify_local(self, agent_id: str) -> Dict[str, Any]:
         """**本机文件通道**（主脑进程内）：不经凭据，只认 `meta.bootstrap='local'` 且已批准。

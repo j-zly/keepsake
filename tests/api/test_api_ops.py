@@ -110,6 +110,8 @@ ALLOWED_POST_PATHS = {
     # 新建一把 / 改标签 / 作废单把。都不动别的入口，但**能掐断一个在线入口** ⇒ 算写面。
     "/api/v1/agents/{agent_id}/credentials",
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/rename",
+    # 授权档位一条（ks_credential_scopes）：改这把能用的功能，立即生效
+    "/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
     "/api/v1/agents/{agent_id}",
     "/api/v1/agents/{agent_id}/delete",
@@ -533,7 +535,7 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_52条业务加4条认证():
+def test_写面白名单全量断点_53条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
@@ -541,8 +543,8 @@ def test_写面白名单全量断点_52条业务加4条认证():
     # 2026-11-14 凭据可还原加两条（47 → 49），同日多凭据再加三条（49 → 52 业务写、
     # 53 → 56 含 auth）：新建一把 / 改标签 / 作废单把。
     # 改名不动鉴权，但它和"作废""新建"一样是能改变"谁能连进来"的口 ⇒ 必须进名单。
-    assert len(ALLOWED_POST_PATHS) == 56
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 52
+    assert len(ALLOWED_POST_PATHS) == 57
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 53
 
 
 def test_P1只读路由未被写面影响(client):

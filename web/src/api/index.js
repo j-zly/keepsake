@@ -217,6 +217,10 @@ export const api = {
   renameCredential: (agentId, credId, label) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/rename`,
       { label }).then((r) => r.data),
+  // 改这把的功能授权（记忆 / 知识库）。没勾上的就是不给用 —— 与复选框一致。
+  setCredentialScopes: (agentId, credId, scopes) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/scopes`,
+      { scopes, confirm: true }).then((r) => r.data),
   // 作废单把（用户拍板：弹框点确认即可，不要求手输编号）
   revokeCredential: (agentId, credId) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/revoke`,
