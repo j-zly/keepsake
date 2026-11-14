@@ -26,6 +26,7 @@
       </p>
       <div class="filter-result">
         <span>共 {{ candCount === null ? '—' : candCount }} 条待审</span>
+        <span v-if="candDir === 'promote' && !progEnabled" class="prog-off">自动复核 关</span>
         <!-- 每页条数：审核是逐条判的动作，默认给 10（一屏不看太多）；
              分页与条数都只改本地页码/条数，重拉走同一个 loadCandidates。 -->
         <div class="size-switch">
@@ -71,6 +72,20 @@
             </button>
           </span>
           <p class="card-body" :title="row.content">{{ row.content }}</p>
+          <div v-if="candDir === 'promote'" class="prog">
+            <template v-if="progOf(row.key)">
+              <span class="prog-hits">{{ progOf(row.key).hits }} / {{ progApproveHits }}</span>
+              <span v-if="progOf(row.key).source === 'auto'" class="prog-bar">
+                <i :class="'is-' + progOf(row.key).verdict"
+                   :style="{ width: progPct(progOf(row.key)) + '%' }" />
+              </span>
+              <span class="prog-when">{{ progWhen(progOf(row.key)) }}</span>
+              <span class="prog-verdict" :class="'is-' + progOf(row.key).verdict">{{
+                progVerdict(progOf(row.key)) }}</span>
+            </template>
+            <span v-else class="prog-hits prog-hits--dim">{{
+              progFailed ? '进度不可用' : '进度读取中…' }}</span>
+          </div>
 
           <!-- 冲突证据：写侧管线判「这条常驻与新事实矛盾」时留下的 key（后端
                tier:evid:<key>）。审核的人得看得见跟哪条打架才判得了，所以这里
@@ -269,6 +284,49 @@ async function loadEvid(rows) {
   )
 }
 
+/** 候选复核进度（后端算，这里只画）：`{key: item}` + 页级阈值与开关状态。 */
+const prog = ref({})
+const progApproveHits = ref(0)
+const progEnabled = ref(true)
+const progFailed = ref(false)
+
+function progOf(key) {
+  return prog.value[key] || null
+}
+function progPct(p) {
+  return p.pct === null || p.pct === undefined ? 0 : Math.round(p.pct * 100)
+}
+/** 自动提名给「复核日」，人工/子代理提名只给「近 N 天」—— 后者没有自动复核这回事 */
+function progWhen(p) {
+  return p.source === 'auto' ? `复核 ${p.review_at}` : `近 ${p.window_days} 天`
+}
+const PROG_VERDICT = { waiting: '未满窗', approve: '到线', reject: '会驳回', manual: '人工' }
+function progVerdict(p) {
+  return PROG_VERDICT[p.verdict] || p.verdict
+}
+
+/** 拉本页候选的复核进度。失败只让进度条换成「进度不可用」，绝不动列表（那会像条目掉了）。 */
+async function loadProg(rows) {
+  const seq = candSeq
+  prog.value = {}
+  progFailed.value = false
+  if (candDir.value !== 'promote') return
+  const keys = rows.map((r) => r.key).filter(Boolean)
+  if (!keys.length) return
+  try {
+    const d = await api.candidatesProgress(keys)
+    if (seq !== candSeq) return
+    const map = {}
+    for (const it of d?.items || []) map[it.key] = it
+    prog.value = map
+    progApproveHits.value = Number(d?.approve_hits || 0)
+    progEnabled.value = !!d?.enabled
+  } catch {
+    if (seq !== candSeq) return
+    progFailed.value = true
+  }
+}
+
 /**
  * 分页条总数，口径与「记忆条目」页（FragmentsView）完全一致：
  * 接口给了 count 就用它；没给（count=null）时按 has_more 撑出「下一页」——
@@ -364,6 +422,7 @@ async function loadCandidates() {
     candError.value = ''
     // 证据懒加载：不 await（列表先出，证据后到），失败全在 loadEvid 内部兜住
     loadEvid(data.items)
+    loadProg(data.items)
   } catch (e) {
     if (seq !== candSeq) return
     cands.value = []
@@ -469,6 +528,67 @@ async function doCandidate() {
   align-items: center;
 }
 /* 冲突证据：两行夹住（label 不折、正文超长截断），窄卡里也不会把卡片撑变形 */
+/* 复核进度：一条细栏 + 数字，色只用 tokens 里已有的三种语义色 */
+.prog {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.prog-hits {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.prog-hits--dim {
+  color: var(--text-faint);
+}
+.prog-bar {
+  flex: 1;
+  height: 4px;
+  min-width: 36px;
+  border-radius: 999px;
+  background: var(--border-2);
+  overflow: hidden;
+}
+.prog-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.prog-bar i.is-approve {
+  background: var(--ok);
+}
+.prog-bar i.is-reject {
+  background: var(--warn);
+}
+.prog-when {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.prog-verdict {
+  padding: 0 7px;
+  border: 1px solid var(--border-2);
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.prog-verdict.is-approve {
+  color: var(--ok);
+}
+.prog-verdict.is-reject {
+  color: var(--warn);
+}
+.prog-off {
+  padding: 0 7px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  font-size: 11px;
+}
+
 .evid {
   margin: 6px 0 2px;
   padding: 6px 8px;

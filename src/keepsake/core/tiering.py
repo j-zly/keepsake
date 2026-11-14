@@ -525,6 +525,85 @@ def _hits_since_nomination(storage: Any, rows: List[Dict[str, Any]]) -> Dict[str
     return hits
 
 
+def candidates_progress(
+    storage: Any,
+    keys: List[str],
+    *,
+    t: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """一批候选「离批准还差什么」→ 审核页用（**只读，一个字段都不写**）。
+
+    🔴 数法必须与班车**完全同一份实现**：自动提名的候选走
+    `_hits_since_nomination()`（窗口锚在提名日，含提名时补的基数），
+    人工/子代理提名（无 `tier:auto-hot:` 戳）走滚动窗，并且**不给窗口与百分比** ——
+    它们本来就不参与自动复核，编个进度等于骗人。
+
+    `now` 可注入（缺省取当前时刻）：与规则一「窗口锚点接上注入 now」同口径，
+    否则跨午夜的用例在测试里永远对不上。
+
+    返回：`{approve_hits, review_window_days, enabled, items:[…]}`，
+    items 每项只有 key 与数字/日期，**不含正文**（审核页已经有正文，这个端点是遥测）。
+
+    `verdict`（班车到点会怎么处理）：
+
+    * `waiting`  —— 未满观察窗，班车现在不动它；
+    * `approve` —— 已到窗且命中 ≥ 阈值 ⇒ 下一班会自动打 core；
+    * `reject`  —— 已到窗且命中 < 阈值 ⇒ 下一班会自动驳回（摘候选标，留检索层）；
+    * `manual`  —— 无提名日戳，只能人批。
+    """
+    cfg = t or resolve_tiering()
+    pa = cfg.get("promote_auto") or {}
+    approve_hits = int(pa.get("promote_approve_hits") or DEFAULTS["promote_auto"]["promote_approve_hits"])
+    review_days = int(pa.get("review_window_days") or DEFAULTS["promote_auto"]["review_window_days"])
+    nom_window = int((cfg.get("promote_nominate") or {}).get("window_days")
+                     or DEFAULTS["promote_nominate"]["window_days"])
+    moment = now or datetime.now(timezone.utc)
+
+    wanted = [str(k) for k in (keys or []) if str(k).strip()]
+    rows_map = storage.get_fragments_batch(wanted) if wanted else {}
+    rows: List[Dict[str, Any]] = []
+    for key in wanted:
+        row = rows_map.get(key)
+        if not row:
+            continue                      # 已删的碎片：命中事件可能还在，但条目没了
+        if CANDIDATE_TAG not in tag_list(row.get("tags")):
+            continue                      # 已经不是候选（批过/驳过/被摘标），不报进度
+        row = dict(row)
+        row.setdefault("key", key)
+        rows.append(row)
+
+    auto_rows = [r for r in rows if nominated_on(r) is not None]
+    hits: Dict[str, int] = dict(_hits_since_nomination(storage, auto_rows))
+    manual_keys = [str(r.get("key")) for r in rows if nominated_on(r) is None]
+    if manual_keys:
+        got, _ = _hits_by_key(storage, manual_keys, window_days=nom_window)
+        hits.update(got)
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        key = str(r.get("key"))
+        nominated = nominated_on(r)
+        got = int(hits.get(key) or 0)
+        if nominated is None:
+            items.append({"key": key, "source": "manual", "hits": got,
+                          "window_days": nom_window, "nominated_at": "", "review_at": "",
+                          "due": False, "pct": None, "gap": None, "verdict": "manual"})
+            continue
+        review_at = nominated + timedelta(days=review_days)
+        due = moment >= review_at
+        verdict = ("approve" if got >= approve_hits else "reject") if due else "waiting"
+        items.append({
+            "key": key, "source": "auto", "hits": got,
+            "window_days": None, "nominated_at": nominated.strftime("%Y-%m-%d"),
+            "review_at": review_at.strftime("%Y-%m-%d"), "due": due,
+            "pct": round(min(1.0, got / approve_hits), 4) if approve_hits else None,
+            "gap": max(0, approve_hits - got), "verdict": verdict,
+        })
+    return {"approve_hits": approve_hits, "review_window_days": review_days,
+            "enabled": bool(cfg.get("enabled")), "items": items}
+
+
 def _hits_by_key(storage: Any, keys: List[str], window_days: Optional[int] = None,
                  since: Optional[datetime] = None) -> Tuple[Dict[str, int], Dict[str, str]]:
     """一批 key 的窗口命中数 / 最近命中时刻 → `({key: hits}, {key: last_hit})`。

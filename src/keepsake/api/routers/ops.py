@@ -926,6 +926,41 @@ def _read_config_quiet() -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+#: 候选进度一次最多问多少把：审核页每页最多 50，给 4 倍余量。
+#: 🔴 不复用 `BULK_MAX_KEYS`（那是批量读正文的上限，且定义在本文件更靠后）——
+#: 两个数字各自演进，绑在一起反而会在下次改批量接口时静默改掉这里的语义。
+PROGRESS_MAX_KEYS = 200
+
+
+@router.get("/api/v1/tiering/candidates-progress",
+            dependencies=[Depends(require_session)])
+def candidates_progress(
+    keys: str = Query("", description=f"逗号分隔的候选 key，一次最多 {PROGRESS_MAX_KEYS} 把"),
+    storage: Any = Depends(get_storage),
+) -> Dict[str, Any]:
+    """晋升候选「离批准还差什么」（**只读遥测**，一个字段都不写）。
+
+    判据与窗口**全在** `core.tiering.candidates_progress()` —— 与分级班车复核是
+    同一份实现，所以页面与自动审核永远不会各说一套（这里只搬数字，不解释语义）。
+
+    * 自动提名（带 `tier:auto-hot:<日>` 戳）⇒ 命中数**锚在提名日**、含提名时补的
+      基数，另给 `review_at / due / pct / verdict`（班车到点会批还是会驳）；
+    * 人工或子代理提名（无该戳）⇒ `verdict=manual`，只给滚动窗命中，**不给进度**；
+    * 已经不是候选的 key（批过 / 驳过 / 被摘标）⇒ 从 items 里消失，前端不画条。
+
+    超过上限**报错而不是静默截断**：截断会让"这条没进度"看起来像数据坏了。
+    """
+    from keepsake.core import tiering as tiering_mod
+
+    wanted = [k.strip() for k in keys.split(",") if k.strip()]
+    if len(wanted) > PROGRESS_MAX_KEYS:
+        raise HTTPException(status_code=400, detail={
+            "error": "too_many_keys",
+            "message": f"一次最多 {PROGRESS_MAX_KEYS} 把，本次 {len(wanted)} 把",
+        })
+    return tiering_mod.candidates_progress(storage, wanted, t=_tiering_settings())
+
+
 @router.get("/api/v1/tiering/status", dependencies=[Depends(require_session)])
 def tiering_status(storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """分级班车状态（**只读端点**：不挂 `write_guard`）。

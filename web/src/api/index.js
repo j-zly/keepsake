@@ -143,6 +143,11 @@ export const api = {
   // ---- 常驻层分级班车（提名 / 自动升 / 压力降）----
   // 状态：{enabled, last_run, last_stats, budget:{used,total,ratio}, settings}
   tieringStatus: () => http.get('/api/v1/tiering/status').then((r) => r.data),
+  // 晋升候选的复核进度（一页一次批量问）：判据在后端，这里不写阈值也不写窗口天数。
+  candidatesProgress: (keys) =>
+    http
+      .get('/api/v1/tiering/candidates-progress', { params: { keys: (keys || []).join(',') } })
+      .then((r) => r.data),
   // 设置开关与阈值：body 装的是 config.json 里 `tiering` 整节（与表单一一对应），
   // confirm 传**当前生效 enabled** 的字符串 'true'/'false'（开这个开关等于让
   // 班车每天动常驻层，确认串是「现在是不是开着」而不是条数）。
