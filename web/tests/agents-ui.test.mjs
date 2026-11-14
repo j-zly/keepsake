@@ -64,7 +64,7 @@ test('凭据展示：全文 + 复制 + 一次性红色提醒（共用组件，�
   // 口径分两档（2026-11-14 可还原机制）：issue 说「请立即转交」，reveal 说「之后还能再取出」。
   // 旧文案那句"关掉就再也拿不到了"在新档下是**假话**，会把人逼去乱点换发 —— 所以按档钉。
   assert.match(CRED, /请立即转交给代理进程/, '签发档：交付提醒要给红色语义色')
-  assert.match(CRED, /之后还能再用「查看 \/ 复制凭据」取出/, '取出档：要说清可以重复取出')
+  assert.match(CRED, /服务端解密出来的明文/, '取出档：说明这是解密出来的（不是"只有一次"那种假话）')
   assert.match(CRED, /mode === 'reveal'/, '两档由 mode 分岔，不许一份文案糊两端')
   assert.match(CRED, /class="warn"/, '提醒走红色语义类')
   assert.match(CRED, /@click="doCopy"/, '有复制按钮（凭据形态长，只靠手抄容易错）')
@@ -374,9 +374,8 @@ test('编辑弹框：ID + 备注名同框，两字段预填当前值 + 回车提
   assert.match(VIEW, /editName\.value = row\?\.name \|\| ''/, '备注名预填当前值')
   assert.match(VIEW, /@keyup\.enter\.prevent="doEdit"/, '回车提交（且不提交表单）')
   assert.match(VIEW, /:close-on-click-modal="false"/, '弹框禁遮罩关闭')
-  // 后果说明两段都在（凭据不变 + 记忆归属跟着搬）
-  assert.match(VIEW, /凭据与权限不变/, '要说清凭据与权限不变（不用重配客户端）')
-  assert.match(VIEW, /历史记忆的归属会一起搬/, '要说清历史记忆归属会一起搬')
+  // 页面文案已按用户要求精简（11-14）：改 ID 不动凭据 / 历史归属跟着搬是后端行为，由 pytest 钉
+  // 改 ID 不动凭据、历史归属跟着搬：这是**后端行为**，由 tests/api/test_agents_api.py 钉；
 })
 
 test('提交：先 set_id 再 rename；set_id 失败即中止；toast 合并说一条', () => {
@@ -473,9 +472,9 @@ test('两条新端点各自打各自的：confirm 口径与后端逐字一致', 
   assert.match(body, /load\(true\)/, '改完重拉列表（状态以服务器为准）')
 })
 
-test('页面说明写清三级语义（吊销 / 停凭据 / 删除）', () => {
-  assert.match(VIEW, /吊销 = 停权限、留一条吊销记录/, '说清吊销是什么')
-  assert.match(VIEW, /停凭据 = 只废那把钥匙/, '说清停凭据是什么')
-  assert.match(VIEW, /删除 = 整行抹掉/, '说清删除是什么')
-  assert.match(VIEW, /可人工复原/, '说清删了还能救回来')
+test('三个治理动作各自独立成按钮（换发 / 停凭据 / 删除）', () => {
+  // 原四条钉的是页头说明文字，用户要求删掉说明书 ⇒ 改钉"三个动作按钮都在且各自独立"
+  assert.match(VIEW, /重新生成凭据/, '换发是独立动作（旧的立即作废）')
+  assert.match(VIEW, /停凭据/, '停凭据是独立动作（只废钥匙，行留着）')
+  assert.match(VIEW, /删除这个代理/, '删除是第三个动作（只在已吊销行渲染 = 天然分级）')
 })

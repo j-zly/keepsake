@@ -20,7 +20,7 @@ const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
 const VIEW = read('views/AgentsView.vue')
 
 test('编辑弹框：有「共享知识库」开关行（与共享记忆同构）', () => {
-  assert.match(VIEW, /label="共享知识库（打开 = 别的代理能检索到它名下的知识库文档）"/,
+  assert.match(VIEW, /label="共享知识库"/,
     '编辑弹框里有共享知识库开关行')
   assert.match(VIEW, /<el-switch v-model="editShareKb" \/>/, '共享知识库开关件')
   assert.match(VIEW, /editShareKb\.value = row\?\.share_kb === true/,

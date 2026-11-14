@@ -33,7 +33,7 @@ test('接口层：nudge 走 /api/v1/messages/nudge', () => {
 })
 
 test('页面：编辑弹框里有「私信实时推送」开关', () => {
-  assert.match(VIEW, /<el-form-item label="私信实时推送（SSE 长连接）">/, '编辑弹框里有一栏推送开关')
+  assert.match(VIEW, /<el-form-item label="私信实时推送">/, '编辑弹框里有一栏推送开关（标签不写 SSE 说明）')
   assert.match(VIEW, /v-model="editPush"/, '开关绑的是弹框里的本地态')
   assert.match(VIEW, /editPush\.value = row\?\.push_enabled === true/, '打开弹框时从服务器口径初始化')
 })

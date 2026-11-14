@@ -28,16 +28,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">代理登记</h1>
-      <p class="page-sub">
-        已批准代理的日常维护台：改名、设角色、上下文过滤、吊销都在这里。
-      </p>
-      <p class="page-sub">
-        新接入的代理默认待审 —— 待审那一摞在「代理审核」页；未批准与已吊销的代理读写全拒。
-      </p>
-      <p class="page-sub">
-        三级语义别混：吊销 = 停权限、留一条吊销记录；停凭据 = 只废那把钥匙（代理照旧在册）；
-        删除 = 整行抹掉（删前会备份一份，可人工复原）。
-      </p>
+      <p class="page-sub">待审的代理在「代理审核」页。</p>
       <!-- 页头操作区：登记 = 「还没连上就先占个位」的那一步（批准在审核页） -->
       <div class="head-acts">
         <el-button type="primary" @click="openRegister">登记新代理</el-button>
@@ -191,7 +182,7 @@
             <!-- 状态 chip：**只读**（拨开关的地方在编辑弹框里，卡面不再挂控件） -->
             <div class="card-tags">
               <span class="tag" :class="a.recoverable ? '' : 'tag--warn'">
-                凭据{{ a.recoverable ? '可重复复制' : '不可还原' }}
+                凭据{{ a.recoverable ? '可复制' : '不可还原' }}
               </span>
               <span class="tag">私信{{ dmOn(a) ? '开' : '关' }}</span>
               <span class="tag">共享{{ shareOn(a) ? '开' : '关' }}</span>
@@ -355,9 +346,9 @@
                 spellcheck="false"
                 @keyup.enter.prevent="doEdit"
               />
-              <p v-if="editPrimary" class="tip">主代理 ID 不可改（备注名照常可以改）。</p>
+              <p v-if="editPrimary" class="tip">主代理 ID 不可改。</p>
             </el-form-item>
-            <el-form-item label="备注名（必填）">
+            <el-form-item label="备注名">
               <el-input
                 v-model="editName"
                 placeholder="给人看的名字"
@@ -369,35 +360,31 @@
 
             <!-- 组一：角色（设主 / 上下文） -->
             <div class="eg-title">角色</div>
-            <el-form-item label="进入主脑上下文（关掉 = 它之后写的东西不进主脑每轮注入）">
+            <el-form-item label="进入主脑上下文">
               <el-switch v-model="editContext" :disabled="editPrimary" />
-              <p class="tip">主代理恒在主脑上下文里，这一项对它锁死（后端同口径 400）。</p>
+              <p class="tip">主代理恒在主脑上下文里。</p>
             </el-form-item>
-            <el-form-item label="设为主代理（全库唯一；当前主代理会自动降为子代理）">
+            <el-form-item label="设为主代理">
               <el-button v-if="!editPrimary" :disabled="busy" @click="askFromEdit('role')">
                 设为主代理
               </el-button>
               <span v-else class="tip">它已经是主代理了。</span>
-              <p class="tip">
-                改前会备份整份注册表（含被降级的那一行），可人工复原；
-                确认框要手输完整 agent_id（改的是全库唯一的主脑，不是单个开关）。
-              </p>
             </el-form-item>
           </div>
 
           <div class="eg-col">
             <!-- 组二：开关（私信 / 共享记忆 / 实时推送 / 注入预算） -->
             <div class="eg-title">开关</div>
-            <el-form-item label="私信（关掉 = 别人投不进来）">
+            <el-form-item label="私信接收">
               <el-switch v-model="editDm" />
             </el-form-item>
-            <el-form-item label="共享记忆（打开 = 别的代理能检索到它的记忆）">
+            <el-form-item label="共享记忆">
               <el-switch v-model="editShare" />
             </el-form-item>
-            <el-form-item label="共享知识库（打开 = 别的代理能检索到它名下的知识库文档）">
+            <el-form-item label="共享知识库">
               <el-switch v-model="editShareKb" />
             </el-form-item>
-            <el-form-item label="私信实时推送（SSE 长连接）">
+            <el-form-item label="私信实时推送">
               <el-switch v-model="editPush" />
               <p class="tip">
                 开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
@@ -458,7 +445,7 @@
                 删除这个代理
               </el-button>
               <span v-if="editRow?.status !== 'approved' && !editRow?.credential_hint" class="tip">
-                这个代理现在没有凭据（已吊销 / 待审的行不签发凭据 —— 批准时才会发）。
+                这个代理现在没有凭据。
               </span>
             </div>
 
@@ -480,30 +467,11 @@
               >
                 回填已有凭据
               </el-button>
-              <p class="tip">
-                这条凭据签发于「可还原」机制之前（库里只有 sha256），所以取不出明文。
-                把它现在**正在用**的那条串粘进来登记一下：服务端只拿它算 sha256 与在册摘要比对，
-                对得上才存密文 —— **不换发、旧串照旧可用、线上代理不断线**。对不上则一个字节都不改。
-              </p>
+              <p class="tip">此条未存密文，解不出来；粘它正在用的串可登记，不换发。</p>
             </div>
-            <p class="tip">
-              查看 / 复制凭据 = 从服务端加密存档里取出明文（要手输**完整 agent_id**，每次取出都记审计）。
-              重新生成凭据 = 换发：旧的那条立即作废，之后所有客户端都得换成新串才连得上。
-              停凭据 = 只废那把钥匙（代理照旧在册，状态 / 角色都不动）。
-              删除 = 整行抹掉（删前会备份一份，可人工复原）—— 只给已吊销的行。
-            </p>
           </div>
         </div>
       </el-form>
-      <p class="tip">
-        改 ID：凭据与权限不变 —— 已经发出去的凭据继续有效（客户端不用重配）；
-        历史记忆的归属会一起搬过去（它写过的记忆仍归它）。
-        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
-        <br />
-        改备注名：状态、角色与已发的凭据都不动（改名不会作废它正在用的凭据）。
-        <br />
-        开关与注入预算：只改这个代理自己的设置，状态 / 角色 / 凭据一个都不动，改完立刻生效。
-      </p>
       <template #footer>
         <el-button :disabled="busy" @click="editOpen = false">取消</el-button>
         <el-button
@@ -571,10 +539,7 @@ function statusTone(a) {
 
 /** 凭据只回显前 8 位；后端把空串同时用作「未发放」和「已轮换/已清」，一句话说清。 */
 function hintText(a) {
-  if (!a.credential_hint) return '未发放 / 已轮换不显示'
-  // 有钥匙但服务端还原不出来 ⇒ 明确给下一步（回填已在用的串，或换发），别只留个前缀让人猜
-  if (!a.recoverable) return `${a.credential_hint}…（前 8 位；此条不可还原，去「编辑 → 回填已有凭据」）`
-  return `${a.credential_hint}…（点旁边的钮复制整条）`
+  return a.credential_hint ? `${a.credential_hint}…` : '未发放'
 }
 
 /** 静默重拉的失败提示：连着几轮都失败只报第一次，免得 10 秒刷一次屏。 */

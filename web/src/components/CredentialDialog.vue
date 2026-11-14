@@ -74,9 +74,7 @@ const props = defineProps({
 
 /** 两档说的是不同的事实 —— 文案跟着事实走（见文件头的口径说明）。 */
 const warnText = computed(() =>
-  props.mode === 'reveal'
-    ? '这是服务端解密出来的明文，之后还能再用「查看 / 复制凭据」取出（每次取出都记审计，审计里不含凭据内容）。'
-    : '请立即转交给代理进程。这行凭据若带加密存档（可还原），关掉弹框后还能再取出；显示「不可还原」时，关掉就只剩你手上这一份了。',
+  props.mode === 'reveal' ? '服务端解密出来的明文，可随时再取。' : '请立即转交给代理进程。',
 )
 
 const emit = defineEmits(['update:modelValue', 'closed'])
