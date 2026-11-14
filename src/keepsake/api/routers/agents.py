@@ -21,8 +21,9 @@
 🔴 **凭据纪律**（2026-11-14 改档：用户拍板「不能换发，要直接能复制」）：
 * 签发（`approve`）的响应体里明文出现一次，同时库里落 `sha256`（**校验只认它**）
   + 一份 **Fernet 密文**（`credential_enc`，只为"能重复取出"）；
-* `POST .../reveal_credential` 能把明文再取出来：确认闸 = **完整 agent_id**（与
-  `delete` 同档）+ `write_guard`（不留痕的密钥读取等于没发生过），每次取出记一行审计；
+* `POST .../reveal_credential` 能把明文再取出来：闸 = 会话 + `write_guard` +
+  显式意图位 `{"confirm": true}`（**用户点一下就复制，不输入任何东西**，2026-11-14 拍板），
+  每次取出记一行审计；
 * `POST .../backfill_credential` 把**上线前签发**的老凭据登记成可还原 —— 粘来的串
   必须与在册 sha256 对上才写密文，对不上一个字节都不改（⇒ 全程不换发、不断线）；
 * 主密钥只从环境读（`KEEPSAKE_CREDENTIAL_KEY` / `..._KEY_FILE`）：**没有密钥就不落密文、
@@ -100,8 +101,8 @@ REVOKE_HINT_LEN = 8
 
 #: 批准响应里回显的一次性提示（前端据此弹「只此一次，请立即保存」）
 CREDENTIAL_ONCE_NOTE = (
-    "本次响应里明文只此一次返回；服务端另存了一份密文，之后可在「查看 / 复制凭据」"
-    "随时取出（需登录 + 手输完整 agent_id，每次取出记审计）。若这行显示「不可还原」，"
+    "本次响应里明文只此一次返回；服务端另存了一份密文，之后在卡面点「复制」即可取出整条"
+    "（需登录，每次取出记审计、审计里不含凭据）。若这行显示「不可还原」，"
     "用「回填已有凭据」把你手上这条登记进来即可，不必换发。"
 )
 
@@ -510,8 +511,9 @@ def reveal_credential_agent(agent_id: str, body: AgentActionBody,
                             storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """**取出凭据明文**（重复复制）—— 2026-11-14 用户拍板「不能换发，要直接能复制」。
 
-    🔴 确认闸 = **完整 agent_id**（与 `delete` 同一档，比吊销的手输前 8 位高一档）：
-    这一步的产物是一把能用它读写全库的钥匙，取错代理不该发生。传 `true` 一律 400。
+    确认闸 = **显式意图位** `{"confirm": true}`（前端自动带，用户点一下就复制，
+    不用输入任何东西 —— 2026-11-14 用户拍板）。这一位挡的是不带 body 的盲发调用，
+    🔴 不是拿来当"人质确认"：登录态 + 逐行按钮 + 每次取出的审计行才是这道动作的真实防线。
     🔴 叠 `write_guard`：这是**凭据面**的动作，审计落不下账的机器上不许取出明文
     （哪怕它不改数据）—— 不留痕的密钥读取等于没发生过，那正是最不能接受的一种失忆。
     🔴 审计只记「revealed」这一事实，**明文永不进审计 / 日志 / 备份**；
@@ -521,7 +523,12 @@ def reveal_credential_agent(agent_id: str, body: AgentActionBody,
     action = "agents.reveal_credential"
     registry = _registry(storage)
     _need_agent(registry, agent_id, action)
-    _need_text(body.confirm, agent_id, action, agent_id, f"完整 agent_id（{agent_id}）")
+    # 🔴 2026-11-14 用户否掉了"手输完整 agent_id"那一档（原话：复制是直接能复制不用输入什么东西）。
+    #    重新评估后这档确实只剩摩擦、没有防护增量：调用方已是登录态超管，钮又是**逐行**点的，
+    #    手输挡不住任何真实误操作路径。现在只留一个**显式意图位**（`confirm: true`，前端自动带、
+    #    人不看见）——它挡的是"盲发请求"（浏览器插件/CSRF 一类不带 body 的调用），
+    #    真正的可追溯性靠审计（每次取出记一行，不含凭据内容）。
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才取出凭据')
     res = registry.reveal_credential(agent_id)
     if not res["ok"]:
         why = str(res.get("why") or "")
@@ -546,7 +553,8 @@ def backfill_credential_agent(agent_id: str, body: AgentBackfillBody,
     面板却说"取不出来"，唯一出路是换发 —— 而换发会让那个代理当场用不了
     （它配置里的旧串立刻作废）。回填把这两件事解耦：账对得上就登记，钥匙不动。
 
-    🔴 同样过**完整 agent_id** 确认闸 + `write_guard`（写入密文是有后果的治理写）。
+    🔴 同样过**显式意图位** `{"confirm": true}` + `write_guard`（写入密文是有后果的治理写）；
+    防"把别人的串登记到这行"由 sha256 对账承担，比手输更硬。
     🔴 明文不进审计 / 日志 / 返回值之外的任何地方；`mismatch` 的审计 reason 只是错误码。
     🔴 没有主密钥时**不降级成明文入库**（`key_missing` 503）—— 这一步做不到就是做不到，
     比"先存明文以后再说"诚实得多。
@@ -554,7 +562,10 @@ def backfill_credential_agent(agent_id: str, body: AgentBackfillBody,
     action = "agents.backfill_credential"
     registry = _registry(storage)
     _need_agent(registry, agent_id, action)
-    _need_text(body.confirm, agent_id, action, agent_id, f"完整 agent_id（{agent_id}）")
+    # 同 reveal：显式意图位，不要求手输。🔴 这条路真正的防认错行闸**在数据层**——
+    # 粘来的串必须与该行在册 sha256 对上，对不上就整体拒绝（`credential_mismatch`），
+    # 所以再要求手输一遍 agent_id 只是把同一个错误让人犯两次打字。
+    _need_flag(body.confirm, action, agent_id, '必须显式传 {"confirm": true} 才回填')
     if not (body.credential or "").strip():
         _reject(400, "credential_required",
                 "请把这个代理当前在用的那条 ksk_ 凭据粘进来（回填只是登记你已有的串，"

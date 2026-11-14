@@ -175,8 +175,8 @@
                   <button
                     v-if="a.recoverable"
                     class="copy-btn"
-                    title="复制完整凭据（需手输完整 agent_id 确认）"
-                    @click="ask('copycred', a)"
+                    title="复制完整凭据"
+                    @click="copyCredNow(a)"
                   >
                     <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
                       stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
@@ -431,7 +431,7 @@
               <el-button
                 v-if="editRow?.status === 'approved' && editRow?.recoverable"
                 :disabled="busy"
-                @click="askFromEdit('reveal')"
+                @click="revealNow(editRow)"
               >
                 查看 / 复制凭据
               </el-button>
@@ -475,7 +475,8 @@
               />
               <el-button
                 :disabled="busy || !backfillText.trim()"
-                @click="askFromEdit('backfill')"
+                @click="submitBackfill"
+
               >
                 回填已有凭据
               </el-button>
@@ -703,6 +704,74 @@ function showCred(r, mode = 'issue') {
   credMode.value = mode
   credOpen.value = true
   return true
+}
+
+/**
+ * 一键取出整条凭据（2026-11-14 用户定档：不要求输入任何东西）。
+ * 卡面钮 = 直接进剪贴板（不上屏、不落 cred ref）；编辑弹框 = 显示出来给人核对/手抄。
+ * 🔴 失败必须说清并**不动 UI**（不假装复制成功）：剪贴板在非安全上下文可能整体不可用，
+ *    那种情况下给一条能手动选中的路，而不是静默。
+ */
+async function copyCredNow(row) {
+  if (!row || busy.value) return
+  busy.value = true
+  try {
+    const r = await api.revealCredential(row.agent_id)
+    if (!r?.credential) {
+      showError('后端没有返回凭据，复制未发生')
+      return
+    }
+    const ok = await copyText(r.credential)
+    ok
+      ? showToast(`已复制完整凭据：${row.agent_id}（已记审计）`)
+      : showError('剪贴板不可用，请用编辑弹框里的「查看 / 复制凭据」手动选中复制')
+  } catch (e) {
+    showError(e?.message || '取出凭据失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 编辑弹框里取出并显示明文（走两页共用的 CredentialDialog，mode=reveal）。 */
+async function revealNow(row) {
+  if (!row || busy.value) return
+  busy.value = true
+  try {
+    const r = await api.revealCredential(row.agent_id)
+    if (showCred(r, 'reveal')) showToast(`已取出凭据：${row.agent_id}（已记审计）`)
+  } catch (e) {
+    showError(e?.message || '取出凭据失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 回填已在用的串：不换发、不签字。防认错行由服务端 sha256 对账兜，所以不需要打字确认。 */
+async function submitBackfill() {
+  const row = editRow.value
+  const text = backfillText.value.trim()
+  if (!row || busy.value) return
+  if (!text) {
+    showError('请先把这个代理当前在用的 ksk_ 凭据粘进来')
+    return
+  }
+  editOpen.value = false
+  busy.value = true
+  try {
+    const r = await api.backfillCredential(row.agent_id, text)
+    if (r?.ok) {
+      showToast(`已登记，这条现在可重复复制：${row.agent_id}`)
+      await load(true)
+    } else {
+      showToast(r?.note || '回填未生效', 'warning')
+    }
+  } catch (e) {
+    showError(e?.message || '回填失败')
+  } finally {
+    // 🔴 无论成败都从内存里擦掉：粘进来的是一把可用钥匙，留在 ref 里等于多一个泄漏点
+    backfillText.value = ''
+    busy.value = false
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,18 +1120,12 @@ const dlgTitle = computed(() => {
   if (dlgKind.value === 'role') return `把 ${id} 设为主代理？`
   if (dlgKind.value === 'clearcred') return `停掉 ${id} 的凭据？`
   // 🔴 凭据类三条必须各写各的标题：兜底那句是「删除 xxx？」，漏写就把一次复制显示成删除（11-14 实踩）
-  if (dlgKind.value === 'reveal') return `取出 ${id} 的凭据明文？`
-  if (dlgKind.value === 'copycred') return `复制 ${id} 的完整凭据？`
-  if (dlgKind.value === 'backfill') return `把已有的串登记给 ${id}？`
   return `删除 ${id}？`
 })
 
 const dlgConfirmText = computed(() => {
   if (dlgKind.value === 'approve') return wasRevoked.value ? '重新批准' : '批准'
   if (dlgKind.value === 'rotate') return '重新生成凭据'
-  if (dlgKind.value === 'reveal') return '查看 / 复制凭据'
-  if (dlgKind.value === 'copycred') return '复制完整凭据'
-  if (dlgKind.value === 'backfill') return '回填已有凭据'
   if (dlgKind.value === 'revoke') return '确认吊销'
   if (dlgKind.value === 'role') return '设为主代理'
   if (dlgKind.value === 'clearcred') return '停凭据'
@@ -1077,12 +1140,6 @@ const dlgExpect = computed(() => {
   if (dlgKind.value === 'clearcred') return revokePrefix.value
   if (dlgKind.value === 'role') return dlgRow.value?.agent_id || ''
   if (dlgKind.value === 'delete') return dlgRow.value?.agent_id || ''
-  // 🔴 取出明文与回填都按**最高一档**（完整 agent_id，与 delete 同档）：前者产出一把
-  //    能读写全库的钥匙，后者一旦认错行就是把别人的串登记到这台机器上。
-  //    后端 `_need_text` 就是这道闸 —— 前端不许比后端松。
-  if (dlgKind.value === 'reveal') return dlgRow.value?.agent_id || ''
-  if (dlgKind.value === 'copycred') return dlgRow.value?.agent_id || ''
-  if (dlgKind.value === 'backfill') return dlgRow.value?.agent_id || ''
   return ''
 })
 
@@ -1137,27 +1194,6 @@ const dlgConsequences = computed(() => {
       '要恢复：重新生成凭据（换一把新的）即可 —— 这一步不吊销、不改权限。',
     ]
   }
-  if (dlgKind.value === 'reveal') {
-    return [
-      '服务端会解密这条凭据并在这里显示明文；库里照旧只认 sha256 —— 取出动作不改任何状态，也不影响这个代理的读写。',
-      '每次取出都记一行审计（审计里只有「取出过」这件事，不含凭据内容）。',
-      '明文离开这里就不再受控：贴进聊天 / 截图 / 工单之前想清楚，复制完就把弹框关掉。',
-    ]
-  }
-  if (dlgKind.value === 'copycred') {
-    return [
-      '服务端会解密这条凭据并**直接写进你的剪贴板**（不在页面上显示明文，少一处被截走的机会）。',
-      '库里照旧只认 sha256 —— 复制动作不改任何状态、不影响这个代理的读写，但每次都会记一行审计（审计里不含凭据内容）。',
-      '剪贴板里的东西离开这个页面就不再受控：粘给代理进程后就把它清掉 / 覆盖掉。',
-    ]
-  }
-  if (dlgKind.value === 'backfill') {
-    return [
-      '只做校验与登记：**不签发新凭据**，这个代理现在用的那条串照旧可用（线上不断线）。',
-      '粘进来的串会算 sha256 与在册摘要比对，对不上就一个字节都不改（也不会把明文写进库）。',
-      '登记成功后这条永久可「查看 / 复制凭据」；服务端没有主密钥时这一步会被拒（503）——那是运维问题，不是你粘错了串。',
-    ]
-  }
   if (dlgKind.value === 'delete') {
     return [
       '整行抹掉：这个代理从注册表里消失（列表里也查不到了）。',
@@ -1203,40 +1239,6 @@ async function doAction(typed) {
           ? `已设为主代理：${row.agent_id}（原主 ${r.demoted.join('、')} 已降为子代理）`
           : `已设为主代理：${row.agent_id}`,
       )
-    } else if (kind === 'copycred') {
-      // 整条凭据直接进剪贴板：不显示、不落到 cred ref（关掉页面内存里也不留副本）。
-      const r = await api.revealCredential(row.agent_id, typed)
-      if (!r?.credential) {
-        showError('后端没有返回凭据，复制未发生')
-        return
-      }
-      const ok = await copyText(r.credential)
-      ok
-        ? showToast(`已复制完整凭据到剪贴板：${row.agent_id}`)
-        : showError('剪贴板不可用，请改用编辑弹框里的「查看 / 复制凭据」手动选中复制')
-    } else if (kind === 'reveal') {
-      // 取出明文：typed 就是手输的完整 agent_id（后端那道 _need_text 同源）。
-      const r = await api.revealCredential(row.agent_id, typed)
-      if (showCred(r, 'reveal')) showToast(`已取出凭据：${row.agent_id}（每次取出都记审计）`)
-    } else if (kind === 'backfill') {
-      // 回填：把「已有的串」登记成可还原 —— 不换发，所以旧串照旧能用。
-      const text = backfillText.value.trim()
-      if (!text) {
-        showError('请先把这个代理当前在用的 ksk_ 凭据粘进来')
-        return
-      }
-      try {
-        const r = await api.backfillCredential(row.agent_id, text, typed)
-        if (r?.ok) {
-          showToast(`已登记，这条现在可重复复制：${row.agent_id}`)
-          await load(true)
-        } else {
-          showToast(r?.note || '回填未生效', 'warning')
-        }
-      } finally {
-        // 🔴 无论成败都从内存里擦掉：粘进来的是一把可用钥匙，留在 ref 里等于多一个泄漏点
-        backfillText.value = ''
-      }
     } else if (kind === 'clearcred') {
       // 🔴 停凭据 = 只废那把钥匙：confirm 是 true（后端那侧才敢承诺状态不动）
       const r = await http

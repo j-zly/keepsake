@@ -196,17 +196,20 @@ export const api = {
   // （SSE 长连接的建流闸），不碰状态 / 角色 / 凭据。
   setAgentPush: (agentId, enabled) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/push`, { enabled, confirm: true }).then((r) => r.data),
-  // ---- 凭据可还原（ks_credential_recoverable，2026-11-14）----
-  // 🔴 confirm 必须是**完整 agent_id**（与 delete 同档，后端 `_need_text` 同一道闸）：
-  //    reveal 的产物是一把能读写全库的钥匙，回填一旦认错行就是把别人的串登记进来。
-  // reveal 不改数据但读的是密钥面 ⇒ 后端仍叠 write_guard + 审计（每次取出记一行，不含内容）。
-  revealCredential: (agentId, confirm) =>
-    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/reveal_credential`, { confirm }).then((r) => r.data),
-  // 把**已经在用**的凭据登记成可还原：只校验 sha256 是否对得上，对不上后端一个字节都不改，
-  // 也不会签发新串（⇒ 线上代理不断线）。明文只在这一发请求里出浏览器，前端不留副本。
-  backfillCredential: (agentId, credential, confirm) =>
+  // ---- 凭据可还原（ks_credential_recoverable，2026-11-14 二次定档）----
+  // 🔴 用户口径：「复制是直接能复制不用输入什么东西」⇒ **不要求人打任何字**。
+  //    但这一层的 `confirm: true` 不许省：它是后端的**显式意图位**（缺位 400），
+  //    挡的是不带 body 的盲发调用；由前端自动带上，用户看不见、也不需要填。
+  //    防"认错行"不靠打字：回填那条路由 sha256 对账兜（粘错串整体拒绝）。
+  // reveal 不改数据但读的是密钥面 ⇒ 后端仍叠 write_guard + 每次取出一行审计（不含内容）。
+  revealCredential: (agentId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/reveal_credential`,
+      { confirm: true }).then((r) => r.data),
+  // 把**已经在用**的凭据登记成可还原：不换发、不签发新串（⇒ 线上代理不断线）。
+  // 🔴 明文只在这一发请求里出浏览器，前端不留副本（粘贴框提交后立刻清空）。
+  backfillCredential: (agentId, credential) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/backfill_credential`,
-      { credential, confirm }).then((r) => r.data),
+      { credential, confirm: true }).then((r) => r.data),
   // 手动 / 批量触发提醒：给点名的收件代理推一帧 `dm-nudge` 事件（只元数据）。
   // 🔴 回包里逐代理的 `delivered` 是**后端如实回报**的 —— 没挂着流就是 false，
   //   前端不许自己乐观成「已送达」。

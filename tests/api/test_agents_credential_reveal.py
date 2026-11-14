@@ -8,7 +8,9 @@
 2. **取出的明文真的能用**：reveal 出来的串再过 `verify` 必须 ok ——
    否则"能复制"就是句假话（复制一把不能用钥匙比不给钥匙更糟）。
 3. **可重复**：连取两次内容逐字一致（用户的原始诉求就是这个）。
-4. **确认闸 = 完整 agent_id**：`true` 一律 400，不弱化（密钥读取与删行同档）。
+4. **闸的形状（2026-11-14 二次定档）**：取出与回填都只要显式意图位 `confirm=true`（用户原话
+   「复制是直接能复制不用输入什么东西」）；缺位/`false` 仍 400（挡盲发请求），而防认错行
+   在回填那条路上由 **sha256 对账**承担（粘错串整体拒绝），比手输更硬。
 5. **没主密钥 ⇒ fail-closed**：签发照旧成功、`recoverable=false`、reveal 说清楚原因；
    🔴 绝不允许任何路径把**明文**写进库里。
 6. **老行回填**：清掉密文（模拟机制前签发的行）⇒ reveal 报 `not_recoverable`；
@@ -164,7 +166,7 @@ def test_取出的明文真能用且可重复(env):
     got = None
     for _ in range(2):
         r = client.post("/api/v1/agents/worker/reveal_credential",
-                        json={"confirm": "worker"}, headers=AUTH)
+                        json={"confirm": True}, headers=AUTH)      # 意图位：不需要人打字
         assert r.status_code == 200, r.text
         assert r.json()["credential"] == cred, "连取两次必须逐字一致（重复复制的本义）"
         got = r.json()["credential"]
@@ -177,24 +179,41 @@ def test_取出的明文真能用且可重复(env):
     assert all(cred not in json.dumps(x, ensure_ascii=False) for x in takes)
 
 
-def test_确认闸完整agent_id(env):
+def test_一键取出只要意图位_不再要求手输(env):
+    """2026-11-14 用户二次定档：「复制是直接能复制不用输入什么东西」。
+
+    钉三件事，缺一就算口径漂移：
+      ① `confirm: true` 就能取出（人不需要打任何字）；
+      ② 缺位 / `false` / 拿旧形状"手输一串 id"来当值，仍然 400 —— 意图位只认真正的
+         `true`，这一位是**防盲发请求**的，不许连它一起删掉；
+      ③ 未认证仍然 401、不在册仍然 404（会话闸与存在性闸没被这次改动带松）。
+    """
     client, reg, _ = env
-    _seed_approved(client, reg, "worker")
-    # 缺 confirm ⇒ confirm_required
-    r = client.post("/api/v1/agents/worker/reveal_credential", json={}, headers=AUTH)
-    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
-    # 传 true ⇒ 走的是**文本闸**的不匹配分支（`_need_text` 先判缺失再判不等，
-    # `True` 是非空值 ⇒ 落到"不等"）；与 `delete` 完全同一既有行为。两样都是 400 拒绝。
+    cred = _seed_approved(client, reg, "worker")
     r = client.post("/api/v1/agents/worker/reveal_credential",
                     json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_mismatch"
-    r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "work"}, headers=AUTH)       # 前 8 位都不够
-    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_mismatch"
+    assert r.status_code == 200 and r.json()["credential"] == cred, "点一下就得出整条串"
+    for body in ({}, {"confirm": False}, {"confirm": "worker"}):
+        rr = client.post("/api/v1/agents/worker/reveal_credential", json=body, headers=AUTH)
+        assert rr.status_code == 400, f"{body} 不该成功"
     assert client.post("/api/v1/agents/nope/reveal_credential",
-                       json={"confirm": "nope"}, headers=AUTH).status_code == 404
+                       json={"confirm": True}, headers=AUTH).status_code == 404
     assert client.post("/api/v1/agents/worker/reveal_credential",
-                       json={"confirm": "worker"}).status_code == 401
+                       json={"confirm": True}).status_code == 401
+
+
+def test_回填的防认错行靠对账不靠手输(env):
+    """回填也不需要打字：粘错串由 sha256 对账拒绝（`credential_mismatch`），
+    缺意图位仍然 400。这两条各钉一次，别把它们混成"同一个闸"。"""
+    client, reg, _ = env
+    cred = _seed_approved(client, reg, "worker")
+    _wipe_enc(reg, "worker")
+    r = client.post("/api/v1/agents/worker/backfill_credential",
+                    json={"credential": cred, "confirm": True}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["recoverable"] is True
+    r = client.post("/api/v1/agents/worker/backfill_credential",
+                    json={"credential": cred}, headers=AUTH)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
 
 
 def test_读面不含密文只给布尔(env):
@@ -223,11 +242,11 @@ def test_没主密钥时签发照旧但不可还原(env, monkeypatch):
             if x["agent_id"] == "worker"][0]
     assert item["recoverable"] is False
     r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "worker"}, headers=AUTH)
+                    json={"confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "not_recoverable"
     # 回填这时也做不了（没密钥写不了密文），且必须明说而不是"成功"
     r = client.post("/api/v1/agents/worker/backfill_credential",
-                    json={"credential": cred, "confirm": "worker"}, headers=AUTH)
+                    json={"credential": cred, "confirm": True}, headers=AUTH)
     assert r.status_code == 503 and r.json()["detail"]["error"] == "key_missing"
     assert not _raw(reg, "worker")[ENC_COLUMN]
 
@@ -244,7 +263,7 @@ def test_老行reveal报not_recoverable(env):
     _seed_approved(client, reg, "worker")
     _wipe_enc(reg, "worker")
     r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "worker"}, headers=AUTH)
+                    json={"confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "not_recoverable"
     assert "回填" in r.json()["detail"]["message"]
 
@@ -255,7 +274,7 @@ def test_回填粘错串拒绝且不改一个字节(env):
     _wipe_enc(reg, "worker")
     before = dict(_raw(reg, "worker"))
     r = client.post("/api/v1/agents/worker/backfill_credential",
-                    json={"credential": "ksk_" + "0" * 32, "confirm": "worker"}, headers=AUTH)
+                    json={"credential": "ksk_" + "0" * 32, "confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "credential_mismatch"
     after = dict(_raw(reg, "worker"))
     assert after["credential_hash"] == before["credential_hash"]
@@ -271,14 +290,14 @@ def test_回填粘对串之后可重复复制(env):
     cred = _seed_approved(client, reg, "worker")
     _wipe_enc(reg, "worker")
     r = client.post("/api/v1/agents/worker/backfill_credential",
-                    json={"credential": cred, "confirm": "worker"}, headers=AUTH)
+                    json={"credential": cred, "confirm": True}, headers=AUTH)
     assert r.status_code == 200, r.text
     assert r.json()["recoverable"] is True
     # 换发没有发生：hash 与回填前一致（= 线上代理用的还是原来那把钥匙）
     assert _raw(reg, "worker")["credential_hash"] == hash_credential(cred)
     for _ in range(2):
         got = client.post("/api/v1/agents/worker/reveal_credential",
-                          json={"confirm": "worker"}, headers=AUTH)
+                          json={"confirm": True}, headers=AUTH)
         assert got.status_code == 200 and got.json()["credential"] == cred
     ok = [x for x in _audit_lines(tmp_path)
           if x["action"] == "agents.backfill_credential" and x["ok"]]
@@ -289,16 +308,16 @@ def test_回填的空串与没凭据的行(env):
     client, reg, _ = env
     reg.register("fresh", "fresh")                    # 没批准过 ⇒ 没有账
     r = client.post("/api/v1/agents/fresh/backfill_credential",
-                    json={"credential": "", "confirm": "fresh"}, headers=AUTH)
+                    json={"credential": "", "confirm": True}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "credential_required"
     r = client.post("/api/v1/agents/fresh/backfill_credential",
-                    json={"credential": "ksk_" + "1" * 32, "confirm": "fresh"}, headers=AUTH)
+                    json={"credential": "ksk_" + "1" * 32, "confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "no_credential"
     # 🔴 鉴权在最外层：无 token 时**先 401**，轮不到 body 的确认闸 —— 这条钉住
     #    "新端点没有绕过会话闸的旁路"（与 test_agents_api 的逐条 401 同一意图）。
     assert client.post("/api/v1/agents/fresh/backfill_credential",
                        json={"credential": "ksk_" + "1" * 32,
-                             "confirm": "fresh"}).status_code == 401
+                             "confirm": True}).status_code == 401
     # 带 token 但缺 confirm ⇒ 才是确认闸的 400
     assert client.post("/api/v1/agents/fresh/backfill_credential",
                        json={"credential": "ksk_" + "1" * 32},
@@ -325,7 +344,7 @@ def test_停钥匙后密文一起清掉(env, endpoint):
     assert [x for x in client.get("/api/v1/agents", headers=AUTH).json()["items"]
             if x["agent_id"] == "worker"][0]["recoverable"] is False
     got = client.post("/api/v1/agents/worker/reveal_credential",
-                      json={"confirm": "worker"}, headers=AUTH)
+                      json={"confirm": True}, headers=AUTH)
     assert got.status_code == 409 and got.json()["detail"]["error"] == "no_credential"
 
 
@@ -337,13 +356,13 @@ def test_换过主密钥后取出要报得清(env, tmp_path, monkeypatch):
     other.write_text(Fernet.generate_key().decode("ascii") + "\n", encoding="utf-8")
     monkeypatch.setenv("KEEPSAKE_CREDENTIAL_KEY_FILE", str(other))
     r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "worker"}, headers=AUTH)
+                    json={"confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "key_mismatch"
     # 原密钥回来 ⇒ 照旧能取出（证明问题在密钥不在数据）
     monkeypatch.setenv("KEEPSAKE_CREDENTIAL_KEY_FILE",
                        str(tmp_path / "cred.key"))
     r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "worker"}, headers=AUTH)
+                    json={"confirm": True}, headers=AUTH)
     assert r.status_code == 200 and r.json()["credential"] == cred
 
 
@@ -357,6 +376,6 @@ def test_密文与账对不上时拒绝返回(env, monkeypatch):
     enc_other = _raw(reg, "other")[ENC_COLUMN]
     reg._be.update("worker", {ENC_COLUMN: enc_other})  # noqa: SLF001
     r = client.post("/api/v1/agents/worker/reveal_credential",
-                    json={"confirm": "worker"}, headers=AUTH)
+                    json={"confirm": True}, headers=AUTH)
     assert r.status_code == 409 and r.json()["detail"]["error"] == "hash_mismatch"
     assert cred2 not in r.text
