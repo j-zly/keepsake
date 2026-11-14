@@ -23,9 +23,6 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">消息中心</h1>
-      <p class="page-sub">
-        代理之间的往来消息全在这里 —— 一封都不藏。代理用 MCP 的 message_send 互传消息后，这里立刻可见。
-      </p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>

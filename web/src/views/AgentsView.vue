@@ -298,10 +298,7 @@
           <el-checkbox v-model="regApproveNow">立即批准并签发一次性凭据</el-checkbox>
         </el-form-item>
       </el-form>
-      <p class="tip">
-        agent_id 只允许小写字母、数字与连字符，且必须以字母或数字开头、总长 2~40 位。
-        登记只是占位（pending）—— 不批准的代理读写全拒；已存在的同名代理会被直接拒绝，绝不覆盖。
-      </p>
+      <p class="tip">2~40 位：小写字母、数字与连字符，字母或数字开头。</p>
       <template #footer>
         <el-button :disabled="busy" @click="regOpen = false">取消</el-button>
         <el-button
@@ -386,10 +383,6 @@
             </el-form-item>
             <el-form-item label="私信实时推送">
               <el-switch v-model="editPush" />
-              <p class="tip">
-                开启后，代理可拨一条 SSE 长连接（<code>GET /events</code>）；
-                有人给它投私信时服务端顺这条流推一帧摘要（<b>只有元数据，没有正文</b>）。
-              </p>
             </el-form-item>
             <!--
               注入预算（per-agent）：留空 = 沿用全局默认。

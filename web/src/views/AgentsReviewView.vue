@@ -22,12 +22,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">代理审核</h1>
-      <p class="page-sub">
-        新接入的代理默认待审，批准时签发一次性凭据；未批准期间它的每一次读写都被拒绝。
-      </p>
-      <p class="page-sub">
-        批准 = 放行读写并签发凭据（明文只显示一次，当场转交）；吊销 = 判它不该进来。
-      </p>
+      <p class="page-sub">新接入的代理默认待审，批准后才能读写。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>

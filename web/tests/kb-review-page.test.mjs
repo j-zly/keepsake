@@ -124,6 +124,6 @@ test('零后端改动：这批只动前端，接口口径一个字没改', () =>
   assert.doesNotMatch(KBR, /\/api\/v1\//, '页面里不许硬编码接口路径（统一走 api 层）')
   assert.match(KBR, /r\?\.pending_count/, '字段名 pending_count 不许改')
   assert.match(KBR, /r\?\.count/, '字段名 count 不许改')
-  assert.match(KBR, /子代理（非主代理）提交的知识文档一律先进这里/,
+  assert.match(KBR, /子代理写的文档在这里批准后才进检索/,
     '页面自带上下文：谁在写会被拦下来看，站内手建不经过这一关')
 })

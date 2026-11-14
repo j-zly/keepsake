@@ -254,8 +254,8 @@ test('① 筛选面板化：筛选区只管筛，不再混着新增表单', () =
   assert.match(VIEW, /v-model="status"/, '状态筛选')
   assert.match(VIEW, /清除筛选/, '有「清除筛选」回默认态')
   // 归属/到期日那句提示长句挪进弹框，不占页面主区
-  assert.doesNotMatch(VIEW, /在册且已批准/, '那句提示长句不许留在页面主区')
-  assert.match(DIALOG, /在册且已批准/, '提示长句在弹框表单下方')
+  assert.doesNotMatch(VIEW, /留空 = 主代理；到期日/, '表单提示只许待在弹框里，不许占页面主区')
+  assert.match(DIALOG, /留空 = 主代理；到期日/, '提示仍在弹框表单下方（压短了但没丢）')
 })
 
 test('② 弹框开→提交→关：开时重置、空标题前端先拦、提交成功关框+刷新+toast', () => {

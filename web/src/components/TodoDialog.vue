@@ -61,9 +61,7 @@
         />
       </el-form-item>
     </el-form>
-    <p class="tip">
-      归属必须在册且已批准（留空 = 主代理）；到期日填 ISO 日期（YYYY-MM-DD），留空表示不限期。
-    </p>
+    <p class="tip">留空 = 主代理；到期日 YYYY-MM-DD，可空。</p>
     <template #footer>
       <el-button :disabled="busy" @click="close">取消</el-button>
       <el-button type="primary" :loading="busy" :disabled="!form.title.trim()" @click="submit">

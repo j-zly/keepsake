@@ -41,7 +41,7 @@
       :value="credential"
       spellcheck="false"
       autocomplete="off"
-      aria-label="凭据明文（只读，可全选复制）"
+      aria-label="凭据明文"
       @focus="$event.target.select()"
     />
     <div class="cred-acts">

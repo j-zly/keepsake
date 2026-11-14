@@ -2,7 +2,6 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">看板</h1>
-      <p class="page-sub">三个域的存量与预算，加上定时任务。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>

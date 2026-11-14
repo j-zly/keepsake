@@ -36,7 +36,7 @@
     <div class="page-head">
       <h1 class="page-title">待办</h1>
       <p class="page-sub">
-        谁欠谁一件事，写在这儿才算数。开放 {{ summary.open }} 条，其中
+        开放 {{ summary.open }} 条，其中
         <b :class="summary.overdue ? 'tone-danger' : ''">{{ summary.overdue }}</b> 条已过期。
       </p>
       <!-- 页头只有**一个**主动作：新增走弹框（表单不再裸铺在页面顶部） -->

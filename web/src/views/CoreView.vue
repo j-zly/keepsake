@@ -2,7 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">常驻层</h1>
-      <p class="page-sub">带 core 标签的记忆条目，每轮 system_prompt 全量注入，占用注入预算。</p>
+      <p class="page-sub">每轮全量注入的记忆条目。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -215,13 +215,7 @@
           <el-input v-model="draftConfirm" placeholder="见上方「注入预算」卡片" />
         </el-form-item>
       </el-form>
-      <p class="tip">
-        预算即每轮 system_prompt 注入常驻层的字符上限，超出的老条目从尾部截断（并标注截断）。
-        改完立刻热生效，不必重启服务。
-        <br />
-        这是全局默认：没有单独设预算的代理都用它；要在「代理登记」页给某个代理
-        单独设预算，去那张卡的「编辑」弹框里填「注入预算」（留空 = 沿用这里）。
-      </p>
+      <p class="tip">改完立刻生效。单个代理可在「代理登记」页覆盖。</p>
       <template #footer>
         <el-button :disabled="busyBudget" @click="budgeting = false">取消</el-button>
         <el-button type="primary" :loading="busyBudget" :disabled="!canSaveBudget" @click="saveBudget">

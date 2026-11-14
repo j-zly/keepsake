@@ -2,7 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆条目</h1>
-      <p class="page-sub">全库记忆条目，按 BM25 全文检索召回；点卡片进抽屉看全文与编辑。</p>
+      <p class="page-sub">点卡片看全文与编辑。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>

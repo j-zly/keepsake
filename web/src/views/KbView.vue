@@ -418,7 +418,7 @@
       </el-form>
       <p v-if="tagsInvalid(draftTags)" class="banner banner--danger">{{ tagsHint(draftTags) }}</p>
       <p v-else class="tip">{{ tagsHint(draftTags) }}</p>
-      <p class="tip">内容类型创建后不可改（要换类型就删掉重建）。链接只存 URL 与摘要，不抓取网页。标签只影响筛选，不参与内容判据（改标签不会把文档变成另一篇）。</p>
+      <p class="tip">链接只存 URL 与摘要，不抓取网页。</p>
       <template #footer>
         <el-button :disabled="busyCreate" @click="creating = false">取消</el-button>
         <el-button
@@ -482,11 +482,7 @@
       </el-form>
       <p v-if="tagsInvalid(editTags)" class="banner banner--danger">{{ tagsHint(editTags) }}</p>
       <p v-else class="tip">{{ tagsHint(editTags) }}</p>
-      <p class="tip">
-        正文不回显：列表接口只返回标题，正文只存在于切片里（且读接口每条只给前 300 字），
-        拿截断的切片回显再保存会把原文截断。要改正文请粘贴完整全文。类型不可改 ——
-        换了类型就等于换了篇内容（切块策略都跟着变），要换请删掉重建。
-      </p>
+      <p class="tip">正文不回显，要改请粘贴完整全文。</p>
       <template #footer>
         <el-button :disabled="busyEdit" @click="editing = false">取消</el-button>
         <el-button
@@ -529,7 +525,7 @@
         有 {{ importParse.broken }} 行不是合法的 {"title", "content"}（缺标题/缺正文/不是 JSON），未计入下方条目 —— 不静默丢行，请修正后重试。
       </p>
       <p v-else-if="importParse.items.length" class="tip">
-        已解析 {{ importParse.items.length }} 篇（其中 {{ importParse.items.filter((i) => i.tags.length).length }} 篇带标签），点「预演」后端会按内容去重并回显将新增多少篇；导入**只进手动域**。
+        已解析 {{ importParse.items.length }} 篇，点「预演」看将新增多少。
       </p>
       <p v-if="importPlan" class="tip">
         预演结果：将新增 {{ importPlan.would_add }} 篇 · 已存在跳过 {{ importPlan.unchanged }} 篇 ·

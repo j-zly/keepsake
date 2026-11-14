@@ -173,18 +173,18 @@
       append-to-body
     >
       <el-form label-position="top">
-        <el-form-item label="总开关（默认关：先用 --dry 观察，确认无误再开）">
+        <el-form-item label="总开关（默认关）">
           <el-switch v-model="tDraft.enabled" />
         </el-form-item>
-        <el-form-item label="升提名：窗口天数 / 最少命中数（默认 3000，7 天窗总打点≈7k 时基本关死本轨）">
+        <el-form-item label="升提名：窗口天数 / 最少命中数（默认 3000）">
           <el-input-number v-model="tDraft.promote_nominate.window_days" :min="1" :max="365" />
           <el-input-number v-model="tDraft.promote_nominate.nominate_min_hits" :min="1" :max="100000" />
         </el-form-item>
-        <el-form-item label="自动审核：候选挂够天数 / 同一窗通过命中数（默认 7 天 / 5000 次；不满窗不动）">
+        <el-form-item label="自动审核：候选挂够天数 / 同一窗通过命中数（默认 7 天 / 5000 次）">
           <el-input-number v-model="tDraft.promote_auto.review_window_days" :min="1" :max="365" />
           <el-input-number v-model="tDraft.promote_auto.promote_approve_hits" :min="1" :max="100000" />
         </el-form-item>
-        <el-form-item label="降级：告警水位 / 释放水位（0.90 / 0.80），水位满时强降 1 条">
+        <el-form-item label="降级：告警水位 / 释放水位（0.90 / 0.80）">
           <el-input-number v-model="tDraft.demote_pressure.warn_ratio" :min="0.01" :max="1" :step="0.05" />
           <el-input-number v-model="tDraft.demote_pressure.release_ratio" :min="0" :max="1" :step="0.05" />
         </el-form-item>

@@ -2,10 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆审核</h1>
-      <p class="page-sub">
-        晋升候选（申请进常驻层）与退居建议（班车建议退出常驻层）是同一个队列、两个方向，
-        批准的动作正好相反 —— 先看准方向再按。
-      </p>
+      <p class="page-sub">「晋升候选」与「退居建议」同一个队列、方向相反。</p>
     </div>
 
     <!-- 常驻候选审核：后端写闸把「非主代理写 core」降级成 core_candidate，这里审。

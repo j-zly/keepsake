@@ -29,9 +29,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">知识库审核</h1>
-      <p class="page-sub">
-        子代理（非主代理）提交的知识文档一律先进这里，批准之后才切块进检索；驳回只标状态、不删正文，随时可以再审。站内手建与主代理写入不经过这一关。
-      </p>
+      <p class="page-sub">子代理写的文档在这里批准后才进检索。</p>
     </div>
 
     <section>
@@ -184,10 +182,7 @@
           />
         </el-form-item>
       </el-form>
-      <p class="tip">
-        驳回只是把它标成「已驳回」，正文不删（子代理随时能改好重提，你也能在队列里重新批准）。
-        理由会记进该文档的审核台账<template v-if="rejectBulk">；批量驳回时这一条理由覆盖整批</template>。
-      </p>
+      <p class="tip">正文不删；理由记进该文档的审核台账。</p>
       <template #footer>
         <el-button :disabled="busyReview || busyBulk" @click="rejectAsk = false">取消</el-button>
         <el-button
