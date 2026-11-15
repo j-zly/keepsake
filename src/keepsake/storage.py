@@ -1,19 +1,20 @@
-"""兼容层：`keepsake.storage` → 真实实现已搬到 `keepsake.core.redis`。
+"""兼容层：`keepsake.storage` → 真实实现已搬到 `keepsake.core.factory`。
 
-RedisStorage（默认后端，Redis + RediSearch）。搬家是为了分层，本文件保证旧导入路径**逐字不变**。
+历史：本模块曾是 Redis 后端的正身，后改为 `core/redis.py` 的模块别名；
+2026-11 Redis 后端整体移除，工厂/后端判定/权重键口径独立成 `core/factory.py`，
+别名随之改指它 —— cron/脚本里 30+ 处 `from keepsake.storage import
+storage_from_config` 逐字可用。
 
-用 sys.modules 模块别名而不是 `from .core.redis import *`：别名与实现是**同一个
-module 对象**，所以模块级私有名（`_SNAPSHOTS` / `_expand_terms` 之类）与
-monkeypatch 落点都还在原处；`import *` 会拷一份快照，patch 就会打空 ——
-那才是真正的行为变化。
+用 sys.modules 模块别名而不是 `from .core.factory import *`：别名与实现是**同一个
+module 对象**，共享同一份 globals —— monkeypatch("keepsake.storage.X") 才会打在
+实现真正使用的名字上（拷贝式 re-export 会让 patch 打空）。
 
-⚠️ 只搬文件、零行为变化：本文件不含任何实现代码。
+注意：`RedisStorage` 名字随 Redis 后端一起消失（不再转口）。需要构造存储一律走
+`storage_from_config()`；`storage.backend` 必须显式 `postgres` / `sqlite`。
 """
 
-from __future__ import annotations
-
-import sys as _sys
 import importlib as _importlib
+import sys as _sys
 
-_impl = _importlib.import_module("keepsake.core.redis")
+_impl = _importlib.import_module("keepsake.core.factory")
 _sys.modules[__name__] = _impl

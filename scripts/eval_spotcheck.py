@@ -31,7 +31,7 @@ from pathlib import Path
 #     AttributeError: 'RedisStorage' object has no attribute 'health_check'
 # （安装版没有这个方法，源码树有 —— 说明跑的根本不是源码树）。
 #
-# 改成按脚本自身位置推 src，与 scripts/eval_compare_backends.py 的做法一致：
+# 改成按脚本自身位置推 src，与 scripts/recall_eval.py 的做法一致：
 #   * 在源码树里跑 ⇒ 用的就是源码树（正在改的代码立刻生效）
 #   * 在安装位置跑 ⇒ ROOT 就是安装目录，行为不变
 # 不硬编码任何绝对路径 ⇒ 换机器、换安装位置都不用改这里。
@@ -94,25 +94,12 @@ PARAPHRASE = {
 
 
 def build_storage():
-    from keepsake.storage import RedisStorage
-    from keepsake.embedder import create_embedder
+    # 2026-11：改走统一工厂（embedder 与后端选择都由工厂按同一份 cfg 装配）。
+    from keepsake.core.factory import storage_from_config
 
-    ec = CFG.get("embedder", {}) or {}
-    embedder = None
-    if ec.get("provider"):
-        embedder = create_embedder(
-            provider=ec.get("provider", ""),
-            api_key=ec.get("api_key", ""),
-            base_url=ec.get("base_url", ""),
-            model=ec.get("model", ""),
-        )
-    return RedisStorage(
-        host=CFG.get("redis_host", "127.0.0.1"),
-        port=CFG.get("redis_port", 6379),
-        password=CFG.get("redis_password") or None,
-        embedder=embedder,
-        is_primary=True,
-    )
+    cfg = dict(CFG)
+    cfg["is_primary"] = True
+    return storage_from_config(config=cfg)
 
 
 def search_safe(stor, query):

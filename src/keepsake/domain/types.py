@@ -4,7 +4,7 @@
 的数据侧地基，任何适配器都可以在不碰 core 的前提下引用。
 
 Fragment / Hit 刻意用 `TypedDict` 而不是 dataclass：
-存储层三个后端（Redis / PG / SQLite）返回的本来就是 `Dict[str, Any]`，
+存储层两个后端（PG / SQLite）返回的本来就是 `Dict[str, Any]`，
 TypedDict 只在类型检查层面描述形状，**运行时仍是那个 dict 本身** ——
 不引入一次多余的对象转换，也就不会有「取回来变成另一种类型」的行为漂移。
 """

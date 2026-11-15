@@ -1,4 +1,4 @@
-"""待办（`ks_todo`）存储层测试 —— 三后端一份语义（2026-10 ks_todo）。
+"""待办（`ks_todo`）存储层测试 —— 两后端一份语义（2026-10 ks_todo；2026-11 Redis 档移除）。
 
 覆盖任务书判据：
 
@@ -6,10 +6,10 @@
 2. **权限矩阵**：`can_access` 口径 = owner ∪ creator，primary 全量；
 3. **可见性**：非 primary 只见 owner=自己 ∪ creator=自己（被指派者必见自己的活）；
 4. **到期口径单点**：`due_state` = none / soon / overdue（基准日 = UTC 今天）；
-5. **三后端一致**：PG / SQLite / Redis **同一份断言**逐个跑；
+5. **两后端一致**：PG / SQLite **同一份断言**逐个跑；
 6. **老数据兼容**：缺字段的行不炸，缺省值回落。
 
-全程 hermetic：SQLite 用 `tmp_path` 临时库、Redis 用内存假 client、
+全程 hermetic：SQLite 用 `tmp_path` 临时库、
 PG 只连白名单里的测试库（`KEEPSAKE_PG_TEST_HOST（缺省 postgres.test.example）/keepsake_test`）且用例自带清理。
 """
 
@@ -62,108 +62,12 @@ def lite(tmp_path):
     st.close()
 
 
-class FakeRedisClient:
-    """内存假 Redis：hash + list + 计数器（键值存 bytes，模拟 decode_responses=False）。"""
-
-    def __init__(self) -> None:
-        self.hashes: Dict[str, Dict[str, bytes]] = {}
-        self.lists: Dict[str, List[bytes]] = {}
-        self.counters: Dict[str, int] = {}
-
-    @staticmethod
-    def _key(key: Any) -> str:
-        return key.decode() if isinstance(key, (bytes, bytearray)) else str(key)
-
-    @staticmethod
-    def _val(value: Any) -> bytes:
-        if isinstance(value, bytes):
-            return value
-        if isinstance(value, bytearray):
-            return bytes(value)
-        return str(value).encode()
-
-    def hgetall(self, key):
-        return dict(self.hashes.get(self._key(key), {}))
-
-    def hset(self, key, field=None, value=None, mapping=None):
-        slot = self.hashes.setdefault(self._key(key), {})
-        pairs = dict(mapping or {})
-        if field is not None:
-            pairs[field] = value
-        for k, v in pairs.items():
-            slot[str(k)] = self._val(v)
-
-    def rpush(self, key, *values):
-        slot = self.lists.setdefault(self._key(key), [])
-        for v in values:
-            slot.append(self._val(v))
-        return len(slot)
-
-    def lrange(self, key, start, stop):
-        """与真 Redis 同款：负数下标**相对末尾**，越界夹到边界内。"""
-        slot = list(self.lists.get(self._key(key), []))
-        n = len(slot)
-        if n == 0:
-            return []
-        start = n + start if start < 0 else start
-        stop = n + stop if stop < 0 else stop
-        start = max(0, min(start, n))
-        stop = max(-1, min(stop, n - 1))
-        if stop < start:
-            return []
-        return slot[start:stop + 1]
-
-    def lrem(self, key, count, value):
-        slot = self.lists.get(self._key(key))
-        if not slot:
-            return 0
-        target = self._val(value)
-        removed = 0
-        keep: List[bytes] = []
-        for item in slot:
-            if item == target and (count == 0 or removed < abs(count)):
-                removed += 1
-                continue
-            keep.append(item)
-        self.lists[self._key(key)] = keep
-        return removed
-
-    def delete(self, key):
-        k = self._key(key)
-        existed = k in self.hashes
-        self.hashes.pop(k, None)
-        return 1 if existed else 0
-
-    def incr(self, key):
-        k = self._key(key)
-        self.counters[k] = self.counters.get(k, 0) + 1
-        return self.counters[k]
-
-
-class FakeRedisStorage:
-    """Redis 后端替身（只有 `_get_client`，正是 `_backend_of` 认 Redis 的判据）。"""
-
-    def __init__(self) -> None:
-        self.client = FakeRedisClient()
-
-    def _get_client(self):
-        return self.client
-
-
-@pytest.fixture()
-def red():
-    storage = FakeRedisStorage()
-    store = TodoStore(storage)
-    assert store.ensure_schema() is True
-    yield store, storage
-
-
 # --------------------------------------------------------------------------
-# ① 三后端闭环（同一份断言，逐个后端跑）
+# ① 两后端闭环（同一份断言，逐个后端跑）
 # --------------------------------------------------------------------------
 
 def _closed_loop(store: TodoStore, owner: str = "worker-a") -> None:
-    """加一条 → 读 → 改状态 → 计数 → 删 —— 三后端逐字段同款。
+    """加一条 → 读 → 改状态 → 计数 → 删 —— 两后端逐字段同款。
 
     🔴 计数与列表**按 owner 收窄**：PG 真库是**共享库**（别的用例也在里面写），
     不按 owner 收窄的话，计数会被别人的行污染。
@@ -212,25 +116,6 @@ def _closed_loop(store: TodoStore, owner: str = "worker-a") -> None:
 def test_sqlite_闭环(lite):
     store, _ = lite
     _closed_loop(store)
-
-
-def test_redis_闭环(red):
-    store, _ = red
-    _closed_loop(store)
-
-
-def test_sqlite与redis返回形状逐字一致(lite, red):
-    """🔴 三后端「一份语义」的硬判据：同一串操作，两边返回的**键集合**一致。"""
-    store_sql, _ = lite
-    store_red, _ = red
-    for store in (store_sql, store_red):
-        store.add("同一条", "正文", owner="a", creator="a", due="")
-    row_sql = store_sql.get(1)
-    row_red = store_red.get(1)
-    assert set(row_sql) == set(row_red)
-    for key in ("title", "detail", "owner", "creator", "status", "due",
-                "created", "updated", "done_at", "due_state"):
-        assert type(row_sql[key]) is type(row_red[key]), key
 
 
 # --------------------------------------------------------------------------
@@ -435,7 +320,7 @@ def test_老行缺字段不炸(lite):
 
 
 # --------------------------------------------------------------------------
-# ⑥ PG 真库（三后端一致的最后一块）
+# ⑥ PG 真库（两后端一致的最后一块）
 # --------------------------------------------------------------------------
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
@@ -473,8 +358,8 @@ def pg_store():
 
 
 @PG_ONLY
-def test_pg_闭环与三后端一致(pg_store):
-    """🔴 PG 侧与 SQLite / Redis **同一份断言**（三后端一份语义）。"""
+def test_pg_闭环与两后端一致(pg_store):
+    """🔴 PG 侧与 SQLite **同一份断言**（两后端一份语义）。"""
     owner = f"todo-test-{uuid.uuid4().hex[:8]}"
     try:
         _closed_loop(pg_store, owner)

@@ -14,7 +14,7 @@ Keepsake 当前「零过滤直存」让几类内容污染召回：
 
 `decide(text, category, existing_meta=None) -> IngestDecision`
 
-  纯函数，零副作用、零 Redis 依赖，单测可直跑。
+  纯函数，零副作用、零后端依赖，单测可直跑。
   规则按序短路 R1-R7：
 
     R1 compaction 摘要     → reject / reason="compaction"
@@ -323,7 +323,7 @@ def decide(
     existing_meta: Optional[Dict[str, Any]] = None,
     gate_cfg: Optional[Dict[str, Any]] = None,
 ) -> IngestDecision:
-    """写闸门裁决函数（纯函数，无副作用、无 Redis 依赖）。
+    """写闸门裁决函数（纯函数，无副作用、无后端依赖）。
 
     参数:
         text: 待写入的文本（建议调用方先 strip）。
@@ -402,7 +402,7 @@ def update_state_only(storage: Any, existing_meta: Dict[str, Any]) -> bool:
 
     2026-10 ks_pcli：改走 StorageBase 接口 `touch_fragment()`，不再摸
     `_get_client()`（PgStorage 没有它 ⇒ AttributeError 会冒泡进 R6 决策）。
-    Redis 侧行为逐字不变（同一 pipeline：hincrby touch_count + hset updated_at）；
+    （历史：Redis 侧当时逐字不变；该后端已于 2026-11 移除）
     PG 侧 `touch_fragment` 返回 False 并自记原因日志（ks_fragment 无这两列）。
     R6 的核心语义「绝不覆盖 content」由调用方 store() 短路保证，与后端无关。
     """

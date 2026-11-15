@@ -41,10 +41,10 @@ except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agen
         return f"[tool_error] {msg}"
 
 from ...core.embedder import create_embedder, resolve_embedder_api_key
-from ...core.base import BackendUnsupportedError
+from ...core.base import BackendUnsupportedError, StorageBase
 # stale 标签机械排除闸的**唯一判据**（2026-11 ks_stale_gate；检索面同函数）。
 from ...core.shared import is_stale_flagged
-from ...core.redis import DEFAULT_BM25_LIMIT, RedisStorage, storage_from_config
+from ...core.factory import DEFAULT_BM25_LIMIT, storage_from_config
 from ...core.ops.forgetter import Forgetter
 # 治理收口（2026-10 ks_agent_registry）：身份 / 角色 / 上下文的判定源。
 # `govern` 只依赖标准库，这里 import 它不会与 `core/*` 成环。
@@ -87,7 +87,7 @@ FEEDBACK_SCHEMA = {
         "properties": {
             "fragment_key": {
                 "type": "string",
-                "description": "碎片的 Redis key（如 memory:frag:abc123），从相关碎片的 key 字段获得。",
+                "description": "碎片 key（如 memory:frag:abc123），从检索结果的 key 字段获得。",
             },
             "is_positive": {
                 "type": "boolean",
@@ -734,7 +734,7 @@ def _has_tag(tags: Any, tag: str) -> bool:
     """`tags` 字段（逗号串）里是否含 `tag` —— **逗号边界的完整标签相等**。
 
     与 `storage_shared.tag_match_sql`（PG/SQLite 的 SQL 判据）、
-    `storage._tags_padded`（Redis 的 Python 判据）同一口径：`core` 不会命中
+    `storage._tags_padded`（历史 Redis 侧的 Python 判据）同一口径：`core` 不会命中
     `core-x` / `xcore`。三处判据必须同步改，否则「写进去了但检索排不掉」。
     """
     if not tags or not tag:
@@ -803,36 +803,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _build_query_expansion_llm_fn(cfg: dict):
-    """构造一个 LLM callable 给 query_expansion 用。
-
-    返回 (messages, model) -> Optional[str]。失败时返回 None（不抛），
-    避免后台线程把 daemon 拖死。
-
-    实现：
-        * 复用 consolidator.resolve_llm_channel_cached（按 mtime 热生效）
-        * 复用 consolidator._call_llm（统一错误处理 / 重试）
-        * 通道 unconfigured 或 key 缺失 → 返回 None
-    """
-    from ...core.ops.consolidator import resolve_llm_channel_cached, _call_llm
-
-    def _call(messages, model):
-        try:
-            ch = resolve_llm_channel_cached(cfg)
-        except Exception as e:
-            logger.debug("keepsake: qexp resolve_llm_channel failed: %s", e)
-            return None
-        if not ch.get("valid"):
-            return None
-        try:
-            return _call_llm(messages, model, channel=ch, max_retries=0)
-        except Exception as e:
-            logger.debug("keepsake: qexp _call_llm raised: %s", e)
-            return None
-
-    return _call
-
-
 class _ReadScope(NamedTuple):
     """一次读取的**可见范围**（`provider._visibility_scope` 算出来的唯一形状）。
 
@@ -866,7 +836,7 @@ class KeepsakeProvider(MemoryProvider):
     """
 
     _initialized: bool = False
-    _storage: Optional[RedisStorage] = None
+    _storage: Optional[StorageBase] = None
     _tag_filter: str = ""
     _is_primary: bool = False
     #: 主脑检索出口要剔除的噪音标签（`retrieval.exclude_tags`，初始化时读入 +
@@ -893,8 +863,6 @@ class KeepsakeProvider(MemoryProvider):
 
             memory:
               provider: keepsake
-                redis_host: 127.0.0.1
-                redis_port: 6379
                 top_k: 5
                 candidate_k: 10
                 tag_filter: ""
@@ -920,9 +888,6 @@ class KeepsakeProvider(MemoryProvider):
         """
         # 1. 硬编码默认值（不含 embedder — 由配置文件/环境变量按需开启）
         cfg: dict = {
-            "redis_host": "127.0.0.1",
-            "redis_port": 6379,
-            "redis_password": "",
             "top_k": 5,
             "candidate_k": 10,
             "tag_filter": "",
@@ -941,16 +906,9 @@ class KeepsakeProvider(MemoryProvider):
             # 空节/缺字段 = 无有效 LLM 通道 → pipeline 不启动 + 调用方走 v1 兜底
             # （不再硬编码回落付费模型——见 consolidator.resolve_llm_channel）
             "llm": {},
-            # 2026-09 ks_retr：LLM 查询扩展（治词汇鸿沟；热路径零拖慢）
-            # enabled 默认开；缓存未命中且结果 < min_results 才起后台扩展
-            "retrieval": {
-                "query_expansion": {
-                    "enabled": True,
-                    "min_results": 3,
-                    "max_terms": 6,
-                    "cache_ttl": 86400,
-                },
-            },
+            # 2026-11：retrieval.query_expansion 节随 Redis 后端移除 —— LLM 查询扩展
+            # 的缓存挂在 Redis hash（`keepsake:qexp`）上，PG / SQLite 从未接线，
+            # 生产口径下这个开关一直是死配置。要复活该功能需在 SQL 侧重建缓存表。
             # 2026-10 ks_push_consumer：provider 侧挂 SSE 流（私信推送最后一米）。
             # 🔴 **缺省关**（零线程零连接）；凭据**只从环境变量 / secrets 文件读**
             # （`credential_env` / `credential_file`），config.json 不落真值。
@@ -982,9 +940,6 @@ class KeepsakeProvider(MemoryProvider):
 
         # 3. 环境变量覆盖
         env_overrides = {
-            "redis_host": os.environ.get("KEEPSAKE_REDIS_HOST"),
-            "redis_port": os.environ.get("KEEPSAKE_REDIS_PORT"),
-            "redis_password": os.environ.get("KEEPSAKE_REDIS_PASSWORD"),
             "top_k": os.environ.get("KEEPSAKE_TOP_K"),
             "candidate_k": os.environ.get("KEEPSAKE_CANDIDATE_K"),
             "tag_filter": os.environ.get("KEEPSAKE_TAG_FILTER"),
@@ -1069,14 +1024,12 @@ class KeepsakeProvider(MemoryProvider):
         return "keepsake"
 
     def is_available(self) -> bool:
-        try:
-            import redis as _  # noqa: F401
-        except ImportError:
-            return False
+        # 2026-11：Redis 后端移除后本接口不再依赖 redis-py；
+        # 后端可用性由 initialize() 的 health_check() 判定，不在这里猜。
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """初始化 — 加载配置、连接 Redis、自动创建 index。
+        """初始化 — 加载配置、连接存储后端、自动建索引/自愈 schema。
 
         2026-09 ks_pipefix：把合并完成的 cfg 深拷贝存到 self._resolved_config。
         修复前 _init_pipeline 用 self._config（Hermes 传入的 inline 原始配置，
@@ -1099,8 +1052,6 @@ class KeepsakeProvider(MemoryProvider):
         from ...domain.splitter import init_domain_dict
         init_domain_dict()
 
-        redis_host = cfg.get("redis_host", "127.0.0.1")
-        redis_port = int(cfg.get("redis_port", 6379))
         top_k = int(cfg.get("top_k", 5))
         candidate_k = int(cfg.get("candidate_k", 10))
         self._tag_filter = cfg.get("tag_filter", "")
@@ -1130,16 +1081,11 @@ class KeepsakeProvider(MemoryProvider):
             embed_dim = 1536
             logger.info("keepsake: BM25-only mode (no embedder configured)")
 
-        # 2026-10 ks_pg_b1：后端由 `storage.backend` 决定（缺省 redis = 行为不变）。
-        # 显式传 redis_cls=RedisStorage —— 这样 `keepsake.RedisStorage` 的
-        # monkeypatch 仍能拦到构造（既有测试靠它打桩，不连真实 Redis）。
+        # 2026-11：后端由 `storage.backend` 决定（必须显式 postgres / sqlite，
+        # 缺失/非法/写 redis 一律 ValueError —— 无默认后端，见 core/factory.py）。
         self._storage = storage_from_config(
             config=cfg,
-            redis_cls=RedisStorage,
             embedder=embedder,
-            host=redis_host,
-            port=redis_port,
-            password=cfg.get("redis_password") or None,
             candidate_count=candidate_k,
             final_limit=top_k,
             embed_dim=embed_dim,
@@ -1168,32 +1114,15 @@ class KeepsakeProvider(MemoryProvider):
             entity_cooc_min_count=int(cfg.get("entity_cooc_min_count", 2)),
             # v2（2026-09）：检索侧相似度地板，按 _sim 归一化值过滤
             v2_min_score=float(cfg.get("v2_min_score", 0.05)),
-            # 2026-09 ks_retr：LLM 查询扩展配置（热路径零延迟）
-            query_expansion_enabled=bool(
-                cfg.get("retrieval", {}).get("query_expansion", {}).get("enabled", True)
-            ),
-            query_expansion_min_results=int(
-                cfg.get("retrieval", {}).get("query_expansion", {}).get("min_results", 3)
-            ),
-            query_expansion_max_terms=int(
-                cfg.get("retrieval", {}).get("query_expansion", {}).get("max_terms", 6)
-            ),
-            query_expansion_ttl=int(
-                cfg.get("retrieval", {}).get("query_expansion", {}).get("cache_ttl", 86400)
-            ),
-            # 2026-09 ks_retr：把 LLM 通道绑成 query_expansion_llm_fn
-            # （通道未配置/无效 → 传 None → 后台扩展调用静默失败，不影响热路径）
-            query_expansion_llm_fn=_build_query_expansion_llm_fn(cfg),
         )
 
         # 自动创建/验证 index
         if not self._storage.ensure_index():
             # 2026-10 ks_pg_b1：探活改走后端中立的 health_check()，
-            # 不再在消息里假定后端一定是 Redis（后端由 storage.backend 决定）
+            # 消息保持后端中立（后端由 storage.backend 决定）
             logger.warning(
-                "keepsake: 存储后端 %s 未就绪（health_check=%s, redis %s:%s）",
+                "keepsake: 存储后端 %s 未就绪（health_check=%s）",
                 type(self._storage).__name__, self._storage.health_check(),
-                redis_host, redis_port,
             )
             return
 
@@ -1629,7 +1558,7 @@ class KeepsakeProvider(MemoryProvider):
 
         import time as _time
 
-        # 检查工作流锁（后端无关探测：Redis 读 keepsake:workflow_lock key；
+        # 检查工作流锁（后端无关探测：fragment_exists('keepsake:workflow_lock')
         # PG 后端没有这张「全局开关表」⇒ 恒 False = 锁不存在，放行检索）
         try:
             if self._storage.fragment_exists("keepsake:workflow_lock"):
@@ -2203,7 +2132,7 @@ class KeepsakeProvider(MemoryProvider):
     def _fragment_key_for(text: str) -> str:
         """碎片 key = `memory:frag:{sha256(text)[:12]}`。
 
-        三个后端的 `store()` 用的是同一套算法（Redis / SQLite 内联，
+        两个后端的 `store()` 用的是同一套算法（SQLite 内联，
         PG 抽成了 `PgStorage._fragment_key_for`），这里为了让 `add()` 能把
         key 交回给调用方而复刻一行。⚠️ 改任一后端的算法必须同步改这里 ——
         `tests/contract/test_provider_protocol.py` 用真 SqliteStorage
@@ -2288,7 +2217,7 @@ class KeepsakeProvider(MemoryProvider):
         """本 provider 的存储后端**是否留删除墓碑**。
 
         PG / SQLite = True（删一条 ⇒ 同事务留一行：删过、何时删、当时第几版）；
-        Redis = False（该后端删除不留痕 ⇒ 能力声明里如实说 False，
+        （历史：Redis = False，该后端删除不留痕；2026-11 已随之后端移除，
         **绝不假装「删了可查证」**）。
         """
         storage = getattr(self, "_storage", None)
@@ -2308,7 +2237,7 @@ class KeepsakeProvider(MemoryProvider):
           * 调用方是 **primary** ⇒ 全量可见；
           * 其余 ⇒ **不可见**（回 None ⇒ 上层按「不存在」回）。
 
-        🔴 **后端不留痕**（Redis）⇒ 这里回 None（**没有墓碑这回事**），
+        （历史：Redis 后端不留痕 ⇒ 回 None；2.0.0 起两后端都留痕）
            不抛错 —— 读路径不该因为一张附属表把「取不到条目」变成硬失败；
            「这个后端做不了」由**能力声明**（`tombstone=false`）与存储层的
            `backend_unsupported` 显式说清楚。
@@ -2616,7 +2545,7 @@ class KeepsakeProvider(MemoryProvider):
     # 薄方法：MCP 层**只经这三个方法**碰幂等表，**不直捅 storage**
     # （分层纪律：provider 才是「拿存储」的那一层，走它内部的 `_require_storage`）。
     #
-    # 后端不支持（Redis）时，`storage.idem_lookup` 抛 `BackendUnsupportedError`
+    # （历史：Redis 后端不支持幂等 ⇒ `BackendUnsupportedError`；2.0.0 起移除）
     # —— **原样上抛**，由 MCP 层转成人话 ToolError（绝不静默降级成「照写不误」：
     # 调用方以为重试安全、其实重试会落第二条，正是本单要治的病）。
 
@@ -2703,7 +2632,7 @@ class KeepsakeProvider(MemoryProvider):
             return {"error": "error", "message": str(e)}
         # 🔴 **后端不支持 CAS ⇒ 立刻显式失败**（不先读一遍再报 not_found）：
         #    那会把「这个后端做不了」说成「这条不存在」—— 调用方会一直往错的方向
-        #    重试。Redis 是只读兜底后端，生产 = PG / SQLite。
+        #    重试。生产 = PG / SQLite（2.0.0：Redis 兜底档已移除）。
         if not getattr(storage, "supports_rev_cas", False):
             raise BackendUnsupportedError(
                 "backend_unsupported: rev CAS 需 PG/SQLite 后端"
@@ -2732,7 +2661,7 @@ class KeepsakeProvider(MemoryProvider):
         try:
             status, payload = storage.cas_update(key, fields, expected_rev)
         except Exception as e:      # noqa: BLE001
-            # 🔴 `backend_unsupported`（Redis）**原样上抛**：那不是「失败」，
+            # 🔴 `backend_unsupported` **原样上抛**：那不是「失败」，
             #    是「这个后端做不了」—— 调用方必须显式知道，不许被吞成假成功。
             logger.warning("keepsake: update(%s) CAS 失败: %s: %s", key, type(e).__name__, e)
             raise
@@ -2795,7 +2724,7 @@ class KeepsakeProvider(MemoryProvider):
           （行还在，**不是** not_found）。
 
         🔴 **删除不留痕 ⇒ 显式拒**（2026-11 ks_tombstone）：后端**不留墓碑**
-           （Redis）时删除会**彻底查不到「删过」** ⇒ 这里**显式拒绝**
+           （历史：Redis）时删除会**彻底查不到「删过」** ⇒ 显式拒绝
            （`backend_unsupported`）—— **宁可删不掉，不可删无痕**。
            PG / SQLite 有墓碑 ⇒ 照常删（删与留碑**同事务**）。
         """
@@ -2878,7 +2807,7 @@ class KeepsakeProvider(MemoryProvider):
         决定（缺省空 ⇒ 零外呼）。
 
         `idempotent_write` **按存储后端探测**（2026-10 ks_idem）：PG / SQLite
-        有幂等登记表 ⇒ True；Redis 没有 ⇒ False（调用方据此知道
+        有幂等登记表 ⇒ True（2.0.0：两后端都有；历史 Redis ⇒ False，调用方据此知道
         「带幂等键重试」在当前后端不被支持，**不会**静默降级）。
         """
         storage = self._storage

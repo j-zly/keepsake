@@ -136,7 +136,7 @@ def visible_agent_ids(
 def fragment_owner(tags: Any) -> str:
     """碎片的**归属代理 id**（`tags` 里的 `agent:<id>`；没有 ⇒ 空串）。
 
-    判据是**逗号边界的完整标签相等**（与存储层 `tag_match_sql` / Redis 的
+    判据是**逗号边界的完整标签相等**（与存储层 `tag_match_sql` / 历史 Redis 的
     TAG 语义同口径）：`agent:win` 不会命中 `agent:win-desktop`。
     """
     if not tags:

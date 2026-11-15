@@ -1,6 +1,6 @@
 """`python -m keepsake.jobs` —— 定时任务统一入口（2026-10 ks_perf_stdlib）。
 
-宿主 cron 原本散着三个各写各的入口（`memory_distill_cron.sh` / `dedup-memory.sh` /
+宿主 cron 原本散着三个各写各的入口（`memory_distill_cron.sh` /
 `tiering_cron.sh`），配置来源、路径、sys.path hack 各一份。本包把入口收进包内：
 
     python -m keepsake.jobs distill --dry-run
@@ -12,8 +12,8 @@
   * **唯一配置源**：默认读 `~/.config/keepsake/config.json`（与线上服务**同一份**），
     `--config PATH` 可指另一份；**不新增任何环境变量开关**（`KEEPSAKE_CONFIG` 是
     既有的、provider 也在用的那个）。
-  * **薄壳**：只做「读整份 config → 调**既有**的 distill/dedup/tiering 入口函数 →
-    打印与现有 shell 脚本等价的汇总行」。**既有函数一行不改**（distill/dedup 的
+  * **薄壳**：只做「读整份 config → 调**既有**的 distill/tiering 入口函数 →
+    打印与现有 shell 脚本等价的汇总行」。**既有函数一行不改**（distill 的
     入口脚本在仓库的 `cron/` 与 `scripts/` 下，按文件路径加载，不搬家不重写）。
   * **不裸 traceback**：配置坏了 / 任务跑不动 ⇒ 一行人话错误 + 明确退出码
     （2 = 配置/用法错，1 = 任务跑失败）。
@@ -43,11 +43,10 @@ DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 #: 既有入口脚本的位置（相对仓库根）—— **只加载，不搬家、不改写**。
 _ENTRY_SCRIPTS = {
     "distill": ("cron", "memory_distill.py"),
-    "dedup": ("scripts", "dedup_memory.py"),
 }
 
 app = typer.Typer(
-    help="keepsake 定时任务统一入口（distill / dedup / tiering）",
+    help="keepsake 定时任务统一入口（distill / tiering）",
     no_args_is_help=True,
 )
 
@@ -94,34 +93,16 @@ def _config_env(path: Path, cfg: Dict[str, Any]) -> Iterator[None]:
 
     * `KEEPSAKE_CONFIG` —— `provider.config_path()` 与 consolidator 的通道解析
       都读它 ⇒ 全进程指向同一份文件（唯一配置源纪律）。
-    * `KEEPSAKE_REDIS_*` —— `scripts/dedup_memory.py` 在 **import 时**读一次连接
-      配置（它自己的老口径）⇒ 这里把 config.json 的 redis 节喂给它，
-      否则 `--config` 指了别的文件、它还在连默认那份。
 
-    🔴 已知边界：那个脚本在 host == "127.0.0.1" 时**还会**回落读
-    `~/.config/keepsake/config.json`，那份会盖掉这里的 env 值（脚本本单不改）。
-    本单能做的都做了（把 `--config` 的 redis 节喂成 env）；真要统一口径，
-    得改那个脚本 —— 留给主脑收口。
+    （2026-11：`KEEPSAKE_REDIS_*` 喂给已随 Redis 后端一起移除 —— 它唯一的读者
+    `scripts/dedup_memory.py` 已删。）
 
     退出时**原样恢复**环境变量（不许污染调用方的进程环境）。
     """
-    keys = ("KEEPSAKE_CONFIG", "KEEPSAKE_REDIS_HOST", "KEEPSAKE_REDIS_PORT",
-            "KEEPSAKE_REDIS_PASSWORD")
+    keys = ("KEEPSAKE_CONFIG",)
     saved = {k: os.environ.get(k) for k in keys}
     try:
         os.environ["KEEPSAKE_CONFIG"] = str(path)
-        for env_key, cfg_key, cast in (
-            ("KEEPSAKE_REDIS_HOST", "redis_host", str),
-            ("KEEPSAKE_REDIS_PORT", "redis_port", int),
-            ("KEEPSAKE_REDIS_PASSWORD", "redis_password", str),
-        ):
-            value = cfg.get(cfg_key)
-            if value in (None, ""):
-                continue
-            try:
-                os.environ[env_key] = cast(value)
-            except (TypeError, ValueError):
-                pass                      # 脏配置不连累任务（连接按老口径回落）
         yield
     finally:
         for key, old in saved.items():
@@ -214,55 +195,8 @@ def distill(
     typer.echo(f"distill: done (dry_run={dry_run})")
 
 
-@app.command()
-def dedup(
-    config: Optional[str] = typer.Option(
-        None, "--config", help="config.json 路径（缺省 ~/.config/keepsake/config.json）"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="只标记不写（预演）"),
-    threshold: float = typer.Option(0.65, "--threshold", help="融合阈值（默认 0.65）"),
-    batch_size: int = typer.Option(500, "--batch-size", help="单批扫描条数（默认 500）"),
-) -> None:
-    """碎片去重：多信号融合判重 → 把旧碎片标记过期。
-
-    壳：读整份 config → 调既有入口 `scripts/dedup_memory.py:run_dedup()` →
-    打印与既有脚本同格式的汇总行（**既有函数一行未改**）。
-    """
-    path = _resolve_config_path(config)
-    try:
-        cfg = _load_config(path)
-    except _ConfigError as e:
-        typer.echo(f"错误: {e}")
-        raise typer.Exit(2)
-
-    with _config_env(path, cfg):
-        try:
-            module = _load_entry_module("dedup")
-        except RuntimeError as e:
-            typer.echo(f"错误: {e}")
-            raise typer.Exit(2)
-        try:
-            stats = module.run_dedup(threshold=threshold, batch_size=batch_size,
-                                     dry_run=dry_run)
-        except Exception as e:
-            # 后端不可达（Redis 挂了 / 连不上）：预演不报红（cron 绿），
-            # 实跑报错（cron 红）—— 与既有脚本「连不上就抛」的语义对齐，
-            # 只是把裸 traceback 换成一行人话。
-            if dry_run:
-                typer.echo(f"dedup: 跳过（{type(e).__name__}: {e}）")
-                typer.echo("Done: checked=0, matched=0, marked=0, skipped=0")
-                return
-            typer.echo(f"错误: dedup 失败（{type(e).__name__}: {e}）")
-            raise typer.Exit(1)
-
-    typer.echo(
-        "Done: checked={checked}, matched={matched}, marked={marked}, "
-        "skipped={skipped}".format(
-            checked=int(stats.get("checked", 0)),
-            matched=int(stats.get("matched", 0)),
-            marked=int(stats.get("marked", 0)),
-            skipped=int(stats.get("skipped", 0)),
-        )
-    )
+# 2026-11：`dedup` 子命令随 scripts/dedup_memory.py（Redis 专用）整体移除。
+# SQL 侧的重复治理由维护引擎（consolidator/forgetter）与 `tiering` 班车负责。
 
 
 @app.command()

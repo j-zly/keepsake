@@ -41,7 +41,6 @@ from keepsake.core.pipeline import (
 )
 from keepsake.core.shared import META_COGNITIVE_TAGS, sanitize_distill_tags
 from keepsake.core.sqlite import SqliteStorage
-from keepsake.core.redis import RedisStorage
 from keepsake.core.pg import PgStorage
 
 
@@ -526,8 +525,8 @@ class TestInterfaceSignaturesTightened:
         assert extra in params, f"{method} 接口必须声明 {extra}"
         assert params[extra].default == ""
 
-    @pytest.mark.parametrize("backend", [RedisStorage, PgStorage, SqliteStorage],
-                             ids=["redis", "pg", "sqlite"])
+    @pytest.mark.parametrize("backend", [PgStorage, SqliteStorage],
+                             ids=["pg", "sqlite"])
     def test_backends_expose_contract_v2_params(self, backend):
         store_p = inspect.signature(backend.store).parameters
         sup_p = inspect.signature(backend.supersede_fragment).parameters

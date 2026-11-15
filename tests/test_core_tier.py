@@ -371,74 +371,15 @@ def test_unimplemented_backend_raises_instead_of_empty():
         OnlySearch().list_by_tag("core")
 
 
-def test_all_three_backends_implement_list_by_tag():
-    """三个后端都必须真实现（漏一个 ⇒ 该后端上核心层恒空）。"""
-    from keepsake.storage import RedisStorage
+def test_all_backends_implement_list_by_tag():
+    """两个后端都必须真实现（漏一个 ⇒ 该后端上核心层恒空）。"""
     from keepsake.storage_pg import PgStorage
 
-    for cls in (RedisStorage, PgStorage, SqliteStorage):
+    for cls in (PgStorage, SqliteStorage):
         assert "list_by_tag" in cls.__dict__, f"{cls.__name__} 未实现 list_by_tag"
 
 
 # ---------------------------------------------------------------------------
-# 七、Redis 侧 list_by_tag：假 client（不连真 Redis），锁 SCAN 多页 + 边界 + 排序
-# ---------------------------------------------------------------------------
-
-def test_redis_list_by_tag_scans_all_pages(tmp_path, monkeypatch):
-    """🔴 SCAN 游标必须真走多页 —— 只扫第一页 = 核心层随库增大静默漏条目。
-
-    假 client 吐**两页不相交**的 key（真 SCAN 保证不重复吐同一 key），
-    顺带验边界（`xcore`/`core-x` 不命中）与排序（`updated_at` 升序）。
-    """
-    from keepsake.storage import RedisStorage
-
-    hashes = {
-        "memory:frag:a": {"content": b"core-A", "tags": b"core,memory",
-                          "updated_at": b"2026-01-02"},
-        "memory:frag:b": {"content": b"core-B", "tags": b"memory,core",
-                          "created": b"2026-01-01"},
-        "memory:frag:c": {"content": b"xcore-D", "tags": b"xcore"},
-        "memory:frag:d": {"content": b"core-x-E", "tags": b"core-x"},
-        "memory:frag:e": {"content": b"core-F", "tags": b"c, core"},   # 迁移行
-        "memory:frag:z": {"content": b"normal", "tags": b"conversation"},
-    }
-    all_keys = [k.encode() for k in hashes]
-    half = len(all_keys) // 2
-
-    class FakeClient:
-        def __init__(self):
-            self.calls = 0
-
-        def scan(self, cursor=0, match=None, count=None):
-            self.calls += 1
-            return (0, all_keys[half:]) if self.calls > 1 else (7, all_keys[:half])
-
-        def pipeline(self):
-            class P:
-                def __init__(self):
-                    self.q = []
-
-                def hmget(self, key, *fields):
-                    self.q.append((key, fields))
-
-                def execute(self):
-                    out = [[hashes.get(k, {}).get(f) for f in fs] for k, fs in self.q]
-                    self.q = []
-                    return out
-            return P()
-
-    client = FakeClient()
-    monkeypatch.setattr(RedisStorage, "_get_client", lambda self: client)
-    rows = RedisStorage.list_by_tag(object.__new__(RedisStorage), "core")
-
-    assert client.calls == 2, "SCAN 游标没走到第二页"
-    assert [r["content"] for r in rows] == ["core-F", "core-B", "core-A"]
-    assert "xcore-D" not in [r["content"] for r in rows]
-    assert "core-x-E" not in [r["content"] for r in rows]
-    # 缺 updated_at 的老记忆条目回落到 created ⇒ 排序键恒存在（None/str 混排会抛 TypeError）
-    assert rows[1]["updated_at"] == "2026-01-01"
-
-
 # ---------------------------------------------------------------------------
 # 六、SQLite 真库：list_by_tag 的落库形态与排序（hermetic，tmp_path 临时库）
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 3. **旧静态 token 兼容**：见 `deps.require_session` —— 老脚本/MCP 继续可用。
 4. **登录限速**：同 IP + 同用户名 60 秒内 5 次失败，第 6 次 429。
    进程内计数（不引第三方库）：单进程 uvicorn 部署够用；
-   多进程部署请把 `_FAILS` 换成 Redis 计数 —— 升级路径就这一处。
+   多进程部署请把 `_FAILS` 换成共享存储计数 —— 升级路径就这一处。
 
 🔴 **路径全部可用环境变量改**（`KEEPSAKE_CONSOLE_ADMIN_FILE` /
 `KEEPSAKE_CONSOLE_SESSION_FILE` / `KEEPSAKE_CONSOLE_SESSION_TTL`），

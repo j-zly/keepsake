@@ -166,16 +166,6 @@ def write_watermark(mid):
         pass
 
 
-def get_redis_password():
-    """从 Keepsake 配置 (~/.config/keepsake/config.json) 读 Redis 连接（不硬编码）"""
-    try:
-        with open(os.path.expanduser("~/.config/keepsake/config.json")) as f:
-            cfg = json.load(f)
-        return cfg.get("redis_password", ""), cfg.get("redis_host", "127.0.0.1"), cfg.get("redis_port", 6379)
-    except Exception:
-        return "", "127.0.0.1", 6379
-
-
 def _sanitize_llm_tags(raw: str) -> str:
     """剥掉 LLM 自造的保留/治理标签（2026-10-14 拍板）。
 
@@ -195,10 +185,8 @@ def _sanitize_llm_tags(raw: str) -> str:
 
 
 def store_to_keepsake(items, dry_run):
-    """写入 Keepsake (RedisStorage 直连)"""
+    """写入 Keepsake（统一走 storage_from_config）"""
     sys.path.insert(0, "/opt/fragmented-memory/src")
-    from keepsake.storage import RedisStorage
-    pwd, r_host, r_port = get_redis_password()
     # 2026-09-15：统一走 storage_from_config() —— 原实现漏传 embedder，
     # 导致每小时提炼写入的记忆没有 embed_bin（KNN 永远搜不到它）。
     from keepsake.storage import storage_from_config

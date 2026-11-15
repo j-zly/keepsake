@@ -20,7 +20,7 @@ from ..schemas import FragmentDetail, FragmentItem, FragmentList
 
 router = APIRouter(tags=["fragments"])
 
-#: `updated_at` 在各后端字段名不同（sqlite/redis=updated、PG=updated_at），
+#: `updated_at` 在各后端字段名不同（sqlite=updated、PG=updated_at），
 #: 检索结果里还可能只有 created —— 按优先级取，取不到就空串。
 _UPDATED_KEYS = ("updated_at", "updated", "created")
 

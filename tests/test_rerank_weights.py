@@ -5,9 +5,9 @@
 1. `storage_shared.rerank_with_decay()` 的热门话题权重直接读模块常量
    `HOT_TOPIC_BOOST`，从不看 `storage._hot_topic_boost` ⇒ `hot_topic_boost`
    配成 1.0 和 1.6，输出**逐字相同**。现在读实例值，常量仅作兜底。
-2. `scripts/eval_compare_backends.py` 的 `build_redis()` / `build_pg()` 只传
-   连接与 embedder，七个权重键一个没传 ⇒ 「按权重调参做 A/B」恒等于
-   两份默认配置的对照，得出的任何「加权无影响」都是假阴性。
+2. （历史）`scripts/eval_compare_backends.py` 的旋钮透传断言随该脚本与 Redis
+   后端一起移除（2026-11）—— 接线口径现在由 `core/factory.py` 的
+   `_resolve_knobs` 单点 + tests/test_storage_pg_knobs.py 钉住。
 
 零网络零数据库：storage 类在测试里被打桩，只验接线，不连真库。
 """
@@ -20,14 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from keepsake import storage, storage_pg, storage_shared
-
-# storage 的实现搬到 core/redis.py 后深了一层（2026-10 keepsake_p0_layout_v1）：
-# <repo>/src/keepsake/core/redis.py ⇒ parents[3] 才是仓库根。
-ROOT = Path(storage.__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "scripts"))
-
-import eval_compare_backends as ecb  # noqa: E402
+from keepsake import storage_shared
 
 
 # ---------------------------------------------------------------- 桩
@@ -93,87 +86,3 @@ def test_hot_topic_boost_partial_hits_scale():
 
 
 # ---------------------------------------------------------------- 缺陷二
-
-class _Recorder:
-    """打桩用：只记住构造 kwargs，供断言「键真的传进去了」。"""
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-
-@pytest.fixture()
-def redis_recorder(monkeypatch):
-    monkeypatch.setattr(storage, "RedisStorage", _Recorder)
-    return storage
-
-
-@pytest.fixture()
-def pg_recorder(monkeypatch):
-    monkeypatch.setattr(storage_pg, "PgStorage", _Recorder)
-    return storage_pg
-
-
-#: 旋钮键 → 后端实例上的属性名
-KNOB_ATTRS = {
-    "decay_half_days": "_decay_half_days",
-    "hot_topic_boost": "_hot_topic_boost",
-    "hot_topic_decay_half_days": "_hot_topic_decay_half_days",
-    "attention_boost_max": "_attention_boost_max",
-    "emotion_intensity_factor": "_emotion_intensity_factor",
-    "feedback_positive_boost": "_feedback_positive_boost",
-    "feedback_negative_penalty": "_feedback_negative_penalty",
-}
-
-
-@pytest.mark.parametrize("key,attr", sorted(KNOB_ATTRS.items()))
-def test_eval_script_forwards_every_knob(redis_recorder, pg_recorder, key, attr):
-    """配置里有的每个旋钮，两个 build 函数都必须原样透传。"""
-    want = {"decay_half_days": 90, "hot_topic_decay_half_days": 45,
-            "attention_boost_max": 2.0, "emotion_intensity_factor": 0.9,
-            "feedback_positive_boost": 1.7, "feedback_negative_penalty": 0.2,
-            "hot_topic_boost": 1.6}[key]
-    cfg = {key: want}
-    for build in (ecb.build_redis, ecb.build_pg):
-        assert build(cfg).kwargs[key] == want
-
-
-def test_eval_script_omits_absent_knobs(redis_recorder, pg_recorder):
-    """键不存在就不传 —— 后端落回自己的构造默认值，默认行为不变。"""
-    for build in (ecb.build_redis, ecb.build_pg):
-        assert ecb.rank_knobs({}) == {}
-        assert not (set(build({}).kwargs) & set(KNOB_ATTRS))
-
-
-def test_eval_script_knob_change_is_observable(redis_recorder, pg_recorder):
-    """🔴 核心红线：改一个键 ⇒ 必须能观测到重排结果变化。
-
-    把 build_redis 实际透传的 kwargs 灌进桩 storage 再跑 rerank ——
-    「没接线」的旋钮在这里必然表现为两组输出逐字相同，测试转红。
-    """
-    def weights_with(cfg, fb=2.0):
-        st = _StubStorage(**{KNOB_ATTRS[k]: v for k, v in
-                             ecb.build_redis(cfg).kwargs.items()
-                             if k in KNOB_ATTRS})
-        return _rerank(st, fb=fb)
-
-    pairs = [
-        ({"hot_topic_boost": 1.0}, {"hot_topic_boost": 1.6}, 2.0),
-        ({"emotion_intensity_factor": 0.0}, {"emotion_intensity_factor": 0.9}, 2.0),
-        ({"feedback_positive_boost": 1.0}, {"feedback_positive_boost": 2.0}, 2.0),
-        ({"feedback_negative_penalty": 1.0}, {"feedback_negative_penalty": 0.2}, -2.0),
-        ({"attention_boost_max": 1.0}, {"attention_boost_max": 3.0}, 2.0),
-        ({"decay_half_days": 1}, {"decay_half_days": 365}, 2.0),
-    ]
-    for lo, hi, fb in pairs:
-        w_lo, w_hi = weights_with(lo, fb), weights_with(hi, fb)
-        assert w_lo != w_hi, f"{list(lo)[0]} 改了也没变化 → 没接线"
-
-
-def test_eval_script_default_matches_backend_defaults():
-    """空配置 ⇒ 七个旋钮全都不传 ⇒ 与后端 `__init__` 默认值逐字相同。"""
-    import inspect
-    sig_r = inspect.signature(storage.RedisStorage.__init__)
-    sig_p = inspect.signature(storage_pg.PgStorage.__init__)
-    for key, _ in ecb.RERANK_KNOBS:
-        assert sig_r.parameters[key].default == sig_p.parameters[key].default, key
-    assert sig_r.parameters["hot_topic_boost"].default == 1.2

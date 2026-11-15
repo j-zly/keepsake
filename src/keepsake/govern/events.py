@@ -18,7 +18,7 @@
    **跨进程投递**（2026-10 ks_nudge_xproc）：控制台 POST 内部端点
    `POST /internal/publish`（MCP 进程侧，见 `mcp_server/internal.py`），
    由**那台进程里的总线**推帧，回包带 `delivered`（BUS 真实有无订阅者）。
-   `ponytail:` 真要更通用的跨进程（不止 nudge），把这一层换成 Redis pub/sub
+   `ponytail:` 真要更通用的跨进程（不止 nudge），把这一层换成外部消息中间件
    即可 —— 订阅端还是 `asyncio.Queue`，换的只是「谁把帧送进来」。
 3. **静默丢弃**：没有挂着的连接 = 这一帧直接丢（不重试、不轰炸）。
    补偿在下一层（重连追帧 + `unread_dm` 水位），不在这一层做。

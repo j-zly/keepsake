@@ -39,7 +39,6 @@ import pytest
 
 from keepsake.adapters.hermes.provider import KeepsakeProvider
 from keepsake.core.base import BackendUnsupportedError, IDEM_TTL_DAYS
-from keepsake.core.redis import RedisStorage
 from keepsake.core.sqlite import SqliteStorage
 
 ENV_PATH = Path.home() / ".keepsake_pg_test.env"
@@ -297,7 +296,7 @@ def test_pg_三后端都声明幂等原语且签名一致():
 
     from keepsake.core.pg import PgStorage
 
-    for cls in (PgStorage, SqliteStorage, RedisStorage):
+    for cls in (PgStorage, SqliteStorage):
         for name in ("idem_lookup", "idem_record"):
             fn = getattr(cls, name, None)
             assert callable(fn), f"{cls.__name__}.{name} 缺失"
@@ -310,45 +309,6 @@ def test_pg_三后端都声明幂等原语且签名一致():
             == "older_than_iso", cls.__name__
     assert PgStorage.supports_idempotency is True
     assert SqliteStorage.supports_idempotency is True
-    assert RedisStorage.supports_idempotency is False
-
-
-# ---------------------------------------------------------------------------
-# ③ Redis 后端：显式不支持（**禁止静默降级**）
-#
-# ⚠️ 空键路径**禁用 `RedisStorage` 直调**：本机 Redis 可达时那次调用会**真的
-# 写进真实 redis**（不可达时又只是「写失败」假象通过）⇒ 两种机器表现不一致。
-# 空键路径改用 sqlite 夹具（本文件既有的 `provider` 夹具）—— 用例意图与 Redis 无关。
-# ---------------------------------------------------------------------------
-
-def test_redis后端幂等原语抛backend_unsupported():
-    """Redis 不做幂等登记 ⇒ **明确抛错**，绝不静默忽略 idempotency_key。"""
-    storage = RedisStorage()
-    with pytest.raises(RuntimeError) as excinfo:
-        storage.idem_lookup("agent-a", "K1")
-    assert "backend_unsupported" in str(excinfo.value)
-    with pytest.raises(RuntimeError) as excinfo:
-        storage.idem_record("agent-a", "K1", "memory:frag:x")
-    assert "backend_unsupported" in str(excinfo.value)
-    with pytest.raises(RuntimeError) as excinfo:
-        storage.idem_purge("2999-01-01T00:00:00.000000+00:00")
-    assert "backend_unsupported" in str(excinfo.value)
-
-
-def test_redis后端带幂等键在MCP层明确报错():
-    """MCP 层：带了幂等键 + 后端不支持 ⇒ **ToolError 人话**（不静默降级）。"""
-    from keepsake.mcp_server.tools import ToolError, memory_add
-
-    p = KeepsakeProvider()
-    p._storage = RedisStorage()
-    with pytest.raises(ToolError) as exc:
-        memory_add(p, "Redis 后端不该写进去", "",
-                   caller_agent_id="agent-a", caller_role="sub",
-                   idempotency_key="K1")
-    assert "backend_unsupported" in str(exc.value)
-    assert "idempotency_key" in str(exc.value)
-
-
 def test_空幂等键不进幂等分支_返回形状不变(provider):
     """空键 ⇒ **不进幂等分支**：不抛错、返回值里**不多 `duplicated` 字段**。
 
@@ -513,15 +473,6 @@ def test_mcp_能力声明带idempotent_write(provider):
 
     caps = memory_capabilities(provider)
     assert caps["idempotent_write"] is True, caps
-
-
-def test_redis后端能力声明idempotent_write为False():
-    from keepsake.mcp_server.tools import memory_capabilities
-
-    p = KeepsakeProvider()
-    p._storage = RedisStorage()
-    caps = memory_capabilities(p)
-    assert caps["idempotent_write"] is False, caps
 
 
 def test_provider_幂等owner按实际打标判定(provider):

@@ -1,6 +1,6 @@
 name: keepsake
-version: 1.1.1
-description: "Keepsake — full-entry memory system for Hermes Agent. Complete memories stored as-is, per-turn semantic recall injected into context: BM25 out of the box, optional vector KNN, time decay, feedback ranking, three storage backends (Redis / PostgreSQL / SQLite), multi-agent governance."
+version: 2.0.0
+description: "Keepsake — full-entry memory system for Hermes Agent. Complete memories stored as-is, per-turn semantic recall injected into context: BM25 out of the box, optional vector KNN, time decay, feedback ranking, two storage backends (PostgreSQL / SQLite), multi-agent governance."
 author: "j-zly"
 license: "MIT"
 repository: "https://github.com/j-zly/keepsake"
@@ -11,11 +11,10 @@ requires_hermes: ">=0.21"
 min_python_version: "3.10"
 
 python_dependencies:
-  - "keepsake-memory>=1.1.1,<2"
+  - "keepsake-memory>=2.0.0"
 
 external_services:
-  - redis>=5.0        # default backend (RediSearch for BM25/vector)
-  - postgresql>=14    # optional backend (storage.backend = "postgres")
+  - postgresql>=14    # storage.backend = "postgres"
   # sqlite needs nothing extra — it ships with Python.
 
 capabilities:
@@ -27,13 +26,6 @@ capabilities:
 optional_env:
   - name: KEEPSAKE_CONFIG
     description: Path to the JSON config file (default ~/.config/keepsake/config.json).
-  - name: KEEPSAKE_REDIS_HOST
-    description: Override the Redis host from the config file.
-  - name: KEEPSAKE_REDIS_PORT
-    description: Override the Redis port.
-  - name: KEEPSAKE_REDIS_PASSWORD
-    description: Redis password, when the server requires AUTH.
-    secret: true
   - name: KEEPSAKE_AGENT_ID
     description: Multi-agent deployments — identity of this agent (stored memories are tagged with it).
   - name: KEEPSAKE_IS_PRIMARY
@@ -45,14 +37,13 @@ features:
   - bm25_fulltext_search
   - optional_vector_knn
   - time_decay_and_feedback_ranking
-  - multi_backend_redis_postgres_sqlite
+  - multi_backend_postgres_sqlite
   - multi_agent_governance
   - knowledge_base_tools
   - memory_tiering_review_pipeline
 
 tags:
   - memory
-  - redis
   - postgresql
   - rag
   - multi-agent
@@ -62,5 +53,5 @@ supported_platforms:
   - macos
 
 warnings:
-  - "Requires a storage backend you run yourself: Redis with RediSearch is the default; PostgreSQL or SQLite are also supported."
+  - "Requires a storage backend you run yourself: PostgreSQL (with pgvector for KNN) or the embedded SQLite file. There is no default backend — storage.backend must be set explicitly. The Redis backend was removed in 2.0.0."
   - "Optional vector search needs an embedding endpoint (OpenAI-compatible API or local Ollama). BM25 recall works with no external API at all."

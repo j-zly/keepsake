@@ -66,7 +66,7 @@ def rows_by_agent_tags(storage: Any, agent_ids: Iterable[str]) -> List[Dict[str,
     `list_by_tag` 的判据就是 `storage_shared.tag_match_sql` 的逗号边界完整标签相等
     —— 与「归属标签」同一把尺子；并集 = 多个 agent 选中时的 OR。
 
-    ponytail: 每个 agent 一次全表扫（PG/SQLite 各一次，Redis 一次 SCAN）。
+    ponytail: 每个 agent 一次全表扫（PG / SQLite 各一次）。
     代理数量是个位数 ⇒ 可接受；要更省就加一个 `list_by_tags`（一条 OR 的 SQL），
     届时只换这个函数，调用方（路由层）不用动。
     """

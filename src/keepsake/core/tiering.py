@@ -609,7 +609,7 @@ def _hits_by_key(storage: Any, keys: List[str], window_days: Optional[int] = Non
     """一批 key 的窗口命中数 / 最近命中时刻 → `({key: hits}, {key: last_hit})`。
 
     🔴 **分块问存储层**：三个后端的 `hits_stats(keys=...)` 都把 keys 摊成一条
-    `IN (?,?,…)`，而 SQLite 的参数上限是 999（PG/Redis 同理有上限）。一次把上千个
+    `IN (?,?,…)`，而 SQLite 的参数上限是 999（PG 同理有上限）。一次把上千个
     常驻条目的 key 丢过去 ⇒ 查询直接炸 ⇒ 班车一整个跑不起来。常驻层上百条时
     平时不炸，正是「平时没事、攒够就整轮挂掉」的那种坏，所以这里固定分块。
 
@@ -670,8 +670,7 @@ def backfill_nominate_hits(storage: Any, key: str, count: int) -> int:
     """提名基数：给 `key` 补 `count` 条命中事件，返回实际写入条数。
 
     🔴 **批量写，不逐条 insert**：`storage.record_hits_repeat` 一次落
-    N 行（PG 走多行 INSERT 并按参数上限分块，SQLite 同款，Redis 一次
-    HINCRBY）。逐条 insert 3000 次 = 3000 次往返，班车一轮 50 条提名
+    N 行（PG 走多行 INSERT 并按参数上限分块，SQLite 同款）。逐条 insert 3000 次 = 3000 次往返，班车一轮 50 条提名
     就是 15 万次往返 —— 那不是「慢」，那是把定时任务变成事故。
 
     **fail-open**：后端不可达 / 未实现该原语 ⇒ warning + 返回 0，
@@ -786,7 +785,7 @@ def _rule_nominate(storage: Any, t: Dict[str, Any], now: datetime, *,
             # 🔴 孤儿命中（2026-10-23 案）：条目已删、命中事件还留着 ⇒
             #   **静默跳过**：不进提名、**不计 failed**（否则次日班车无谓地红）。
             #   存在性判据用 `get_fragments_batch` 的同一份读（契约：缺失的 key
-            #   不出现在结果里）⇒ PG / SQLite / Redis 三个后端一处改好。
+            #   不出现在结果里）⇒ PG / SQLite 两个后端一处改好。
             #   数据层已清过 3312 条孤儿命中，本条防的是**未来**「删条目 →
             #   命中残留 → 次日班车红」重现。
             orphaned += 1

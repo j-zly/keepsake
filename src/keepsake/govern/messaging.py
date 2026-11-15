@@ -8,12 +8,11 @@
 * PG / SQLite：`ks_message` 行表，DDL 由 **本模块唯一定义**
   （`KS_MESSAGE_DDL_PG` / `KS_MESSAGE_DDL_SQLITE`），两个后端各 import 自己的那一份
   —— 建表语句复制两份必然漂，而漂的后果是「信箱在换后端时静默消失」。
-* Redis：`keepsake:msg` LIST（全部消息，元素是 JSON）+ 每收件人
-  `keepsake:msg:to:<agent>` LIST（**该收件人的未读队列**），发送时**双写**。
+* （2026-11）Redis 的 LIST 双写兼容形态随该后端整体移除；只剩 SQL 行表。
 
-对外形状（`fetch_inbox` / `recent_between` 的返回）三后端逐字段相同：
+对外形状（`fetch_inbox` / `recent_between` 的返回）两后端逐字段相同：
 `{seq, from_id, to_id, content, thread_id, created, read_at}`，时刻一律 **ISO 字符串**
-（PG 的 `timestamptz` 读出来是 datetime ⇒ 规范化时转 ISO；SQLite/Redis 本来就是字符串）。
+（PG 的 `timestamptz` 读出来是 datetime ⇒ 规范化时转 ISO；SQLite 本来就是字符串）。
 
 ## 🔴 三条语义纪律
 
@@ -21,20 +20,10 @@
    反查**得来，见 `mcp_server/tools.py`），**不认任何调用侧自带的 from**。
 2. **fetch 即标读**：`fetch_inbox` 收走的行当场标 `read_at`（收信 = 消费）。
    `recent_between` **不动** `read_at`（看历史不该把对方的消息吃掉）。
-3. **老数据兼容**：Redis 侧没有 `read_at` 列这回事（已读状态存在 hash 里），
+3. **老数据兼容**：（历史：Redis 侧没有 `read_at` 列，该后端已移除。）
    PG/SQLite 的 `read_at` 允许 NULL（= 未读）。
 
-## Redis 侧的取舍（说清楚，别让人以为它与 SQL 等价）
-
-* **未读队列 = 每收件人那个 LIST 本身**（发送双写进去，读信 `LREM` 消费掉）。
-  ⇒ `unread_count` = `LLEN`（O(1)），代价是**已读消息不在队列里**，
-  「按未读筛历史」这种查询在 Redis 侧要走全表扫（`recent_between` 就是这么做的）。
-* **已读时刻存在 hash** `keepsake:msg:read`（`seq → read_at`）——
-  Redis 的 LIST 元素不能就地改字段（要 `LSET` 按下标改，O(n) 且易错），
-  用一个 hash 记已读时刻是**更省事也更稳**的写法。
-* `keepsake:msg` 是**只增不减**的全量 LIST（与 SQL 表同款）⇒ `recent_between`
-  在 Redis 侧是 O(全量) 扫。信箱量级是「代理之间几十条对话」，可接受；
-  真要上量再换 ZSET（按 seq 排序 + `ZRANGE` 窗口）。
+（2026-11：Redis 侧取舍段整体退场 —— 该后端已移除。）
 
 `ponytail:` 现在这三套（全局 LIST + 每收件人 LIST + 已读 hash）够用；
 升级路径 = 把 `keepsake:msg` 换成 ZSET（`ZRANGE by score` 取最近 N 条），
@@ -54,7 +43,6 @@ from .events import publish_dm
 from .registry import (
     _SqlBase,
     _backend_of,
-    _text,
 )
 
 logger = logging.getLogger("keepsake.govern.messaging")
@@ -66,7 +54,7 @@ logger = logging.getLogger("keepsake.govern.messaging")
 TABLE = "ks_message"
 INDEX = "idx_ks_message_to_read"
 
-#: 列 / 字段名（SQL 行与 Redis JSON 共用同一份名字 ⇒ 规范化只有一处）
+#: 列名（行表唯一形态 ⇒ 规范化只有一处）
 MESSAGE_FIELDS: Tuple[str, ...] = (
     "seq", "from_id", "to_id", "content", "thread_id", "created", "read_at",
 )
@@ -115,7 +103,7 @@ KS_MESSAGE_INDEX_SQL = (
 )
 
 # --------------------------------------------------------------------------
-# Redis 侧的 key 布局（与本库其余 key 同命名空间 `keepsake:*`）
+# （2026-11）Redis key 布局随该后端移除
 # --------------------------------------------------------------------------
 
 #: 全部消息（只增不减，与 SQL 表同款）
@@ -142,7 +130,7 @@ def _iso(value: Any) -> str:
 
 
 def _norm_row(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """一行（SQL tuple→dict 或 Redis JSON→dict）→ 规范 dict（缺项补缺省）。"""
+    """一行（SQL tuple→dict）→ 规范 dict（缺项补缺省）。"""
     row: Dict[str, Any] = {f: raw.get(f) for f in MESSAGE_FIELDS}
     try:
         row["seq"] = int(row.get("seq") or 0)
@@ -368,197 +356,18 @@ class _MsgSqlBackend(_SqlBase):
         return at
 
 
-class _RedisBackend:
-    """Redis：全局 LIST + 每收件人未读 LIST + 已读 hash（取舍见模块 docstring）。"""
-
-    kind = "redis"
-
-    def __init__(self, storage: Any) -> None:
-        self._st = storage
-
-    @staticmethod
-    def inbox_key(agent_id: str) -> str:
-        return f"{REDIS_KEY_INBOX}{agent_id}"
-
-    def _client(self) -> Any:
-        client = self._st._get_client()      # noqa: SLF001 —— 复用既有连线
-        if client is None:
-            raise RuntimeError("messaging: Redis 不可达（_get_client 返回 None）")
-        return client
-
-    def ensure_schema(self) -> bool:
-        return True          # LIST / hash 形态没有 schema
-
-    def send(self, from_id: str, to_id: str, content: str, thread_id: str) -> int:
-        client = self._client()
-        seq = int(client.incr(REDIS_KEY_SEQ))
-        msg = {
-            "seq": seq, "from_id": from_id, "to_id": to_id, "content": content,
-            "thread_id": thread_id, "created": _now_iso(), "read_at": "",
-        }
-        blob = json.dumps(msg, ensure_ascii=False)
-        client.rpush(REDIS_KEY_GLOBAL, blob)        # 双写：全量 + 收件人未读队列
-        client.rpush(self.inbox_key(to_id), blob)
-        return seq
-
-    def _all_blobs(self) -> List[str]:
-        return [_text(b) for b in self._client().lrange(REDIS_KEY_GLOBAL, 0, -1)]
-
-    def _mark_read(self, agent_id: str, blobs: List[str]) -> None:
-        """标读：记已读时刻（hash）+ 从收件人未读队列里消费掉（`LREM`）。"""
-        if not blobs:
-            return
-        client = self._client()
-        at = _now_iso()
-        for blob in blobs:
-            try:
-                seq = int(json.loads(blob).get("seq") or 0)
-            except (TypeError, ValueError):
-                continue
-            if seq:
-                client.hset(REDIS_KEY_READ, str(seq), at)
-            client.lrem(self.inbox_key(agent_id), 1, blob)
-
-    def _fill_read_at(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """把已读时刻从 hash 里补回行里（LIST 元素不能就地改字段，见模块 docstring）。"""
-        if not rows:
-            return rows
-        client = self._client()
-        for row in rows:
-            if row.get("read_at"):
-                continue
-            raw = client.hget(REDIS_KEY_READ, str(row.get("seq")))
-            at = _text(raw)
-            if at:
-                row["read_at"] = at
-        return rows
-
-    def fetch_inbox(self, agent_id: str, unread_only: bool, limit: int) -> List[Dict[str, Any]]:
-        client = self._client()
-        if unread_only:
-            # 未读队列的**尾部**才是最近的（与 SQL 的 `ORDER BY seq DESC LIMIT n` 同口径）
-            blobs = [_text(b) for b in client.lrange(self.inbox_key(agent_id), -limit, -1)]
-        else:
-            mine = [b for b in self._all_blobs()
-                    if str(json.loads(b).get("to_id") or "") == agent_id]
-            blobs = mine[-limit:]
-        rows = [_norm_row(json.loads(b)) for b in blobs]
-        rows.sort(key=lambda r: r["seq"])
-        self._mark_read(agent_id, blobs)
-        return self._fill_read_at(rows)
-
-    def recent_between(self, a: str, b: str, limit: int) -> List[Dict[str, Any]]:
-        picked: List[Dict[str, Any]] = []
-        for blob in self._all_blobs():
-            try:
-                row = _norm_row(json.loads(blob))
-            except (TypeError, ValueError):
-                continue
-            if ((row["from_id"] == a and row["to_id"] == b)
-                    or (row["from_id"] == b and row["to_id"] == a)):
-                picked.append(row)
-        picked.sort(key=lambda r: r["seq"])
-        return self._fill_read_at(picked[-limit:])
-
-    def unread_summary(self, agent_id: str, sender_limit: int = 0) -> Dict[str, Any]:
-        client = self._client()
-        count = int(client.llen(self.inbox_key(agent_id)) or 0)
-        senders: List[str] = []
-        if count > 0 and sender_limit > 0:
-            seen = set()
-            for blob in client.lrange(self.inbox_key(agent_id), 0, -1):
-                try:
-                    fid = str(json.loads(_text(blob)).get("from_id") or "")
-                except (TypeError, ValueError):
-                    continue
-                if fid and fid not in seen:
-                    seen.add(fid)
-                    senders.append(fid)
-                    if len(senders) >= sender_limit:
-                        break
-        return {"count": count, "senders": senders}
-
-    def unread_snapshot(self, agent_id: str) -> Dict[str, Any]:
-        """未读私信的水位快照（条数 + 最大 seq + 最近发件人）。
-
-        Redis 侧的**未读队列本身就是未读集合**（见模块 docstring 的取舍），
-        所以条数 = `LLEN`，最近那条 = 队尾（`LINDEX -1`）。
-        """
-        client = self._client()
-        key = self.inbox_key(agent_id)
-        count = int(client.llen(key) or 0)
-        max_seq = 0
-        last_from = ""
-        if count > 0:
-            try:
-                row = _norm_row(json.loads(_text(client.lindex(key, -1))))
-                max_seq = int(row.get("seq") or 0)
-                last_from = str(row.get("from_id") or "")
-            except (TypeError, ValueError):
-                pass
-        return {"count": count, "max_seq": max_seq, "last_from": last_from}
-
-    def unread_by_agent(self) -> Dict[str, int]:
-        """每个收件人的未读条数（`{agent_id: count}`）—— 控制台「按收件代理分组」用。"""
-        client = self._client()
-        out: Dict[str, int] = {}
-        for key in client.scan_iter(match=f"{REDIS_KEY_INBOX}*"):
-            name = _text(key)
-            if not name.startswith(REDIS_KEY_INBOX):
-                continue
-            agent_id = name[len(REDIS_KEY_INBOX):]
-            if agent_id:
-                out[agent_id] = int(client.llen(key) or 0)
-        return out
-
-    # -- 治理面只读列表 -------------------------------------------------
-    def list_messages(self, agent: str, thread: str, q: str,
-                      page: int, size: int) -> Tuple[List[Dict[str, Any]], int]:
-        """全库消息的一页（按 seq **倒序** = 新的在前）+ 过滤后的总数。
-
-        🔴 **只读**：不动 `read_at`（Redis 侧已读时刻在 hash 里，本方法只读不写）。
-
-        `ponytail:` Redis 侧是 O(全量) 扫 —— 与 `recent_between` 同一取舍
-        （全量 LIST 是只增不减的，没有索引可走）。信箱量级是「代理之间几十条
-        对话」，可接受；真要上量就把 `keepsake:msg` 换成 ZSET
-        （`ZRANGE by score` 取最近 N 条），已读状态那套不动。
-        """
-        needle = (q or "").strip().lower()
-        picked: List[Dict[str, Any]] = []
-        for blob in self._all_blobs():
-            try:
-                row = _norm_row(json.loads(blob))
-            except (TypeError, ValueError):
-                continue
-            if agent and row["from_id"] != agent and row["to_id"] != agent:
-                continue
-            if thread and row["thread_id"] != thread:
-                continue
-            if needle and needle not in row["content"].lower():
-                continue
-            picked.append(row)
-        picked.sort(key=lambda r: r["seq"], reverse=True)
-        total = len(picked)
-        start = (page - 1) * size
-        return self._fill_read_at(picked[start:start + size]), total
-
-
-# --------------------------------------------------------------------------
-# 信箱本体
-# --------------------------------------------------------------------------
-
 class Messaging:
     """代理互聊信箱。`Messaging(storage)` 一份，三后端同一语义。
 
     **不自拼连接、不另开进程**：与 `Registry` 同款 —— PG / SQLite 走存储后端
-    自己的事务游标，Redis 走 `_get_client()` 的既有连线。
+    自己的事务游标。
     """
 
     def __init__(self, storage: Any) -> None:
         kind = _backend_of(storage)
         self.backend = kind
-        self._be: Any = (_MsgSqlBackend(storage, kind) if kind != "redis"
-                         else _RedisBackend(storage))
+        # 2026-11：Redis 兼容类随该后端移除，只剩 SQL 形态（PG/SQLite 共用）。
+        self._be: Any = _MsgSqlBackend(storage, kind)
         self._ensured = False
         self._ensure_lock = threading.Lock()
         #: 建表失败后的**重试冷却**截止时刻（单调钟）。见 `ensure_schema`。

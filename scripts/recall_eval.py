@@ -66,8 +66,8 @@ def _force_readonly(storage: Any, backend: str) -> List[str]:
     * postgres：libpq `options='-c default_transaction_read_only=on'` 是**会话级**
       只读（`SET` 写在事务里会随 commit 失效，所以只能走 conninfo）。
       `_conninfo()` 里 `_dsn` 非空即优先 ⇒ 直接补一条 options 即可覆盖 host/port 拼法。
-    * redis：`storage.py` 没有只读连接开关，退化为「只调只读方法」的纪律，
-      在说明里**明确写出来**（不假装有数据库级保证）。
+    （2026-11：redis 档随该后端移除 —— 它没有数据库级只读开关，只剩调用纪律，
+    评测器不保留「假装有数据库级保证」的档位。）
     """
     notes: List[str] = []
     if backend == "sqlite":
@@ -84,7 +84,7 @@ def _force_readonly(storage: Any, backend: str) -> List[str]:
             storage._conn = None                      # noqa: SLF001 — 强制按新 conninfo 建连
         notes.append("postgres: default_transaction_read_only=on（PG 服务端拒写）")
     else:
-        notes.append("redis: 仅调用只读方法（无数据库级只读开关）")
+        raise ValueError(f"recall_eval: 不认识的后端 {backend!r}（只剩 postgres / sqlite）")
     return notes
 
 
@@ -179,16 +179,13 @@ def main() -> int:
     if Path(cfg_path).expanduser().exists():
         cfg = json.loads(Path(cfg_path).expanduser().read_text(encoding="utf-8"))
     else:
-        print(f"[warn] 配置 {cfg_path} 不存在 —— 用库默认值（backend=redis）", file=sys.stderr)
+        print(f"[warn] 配置 {cfg_path} 不存在 —— resolve_backend 将要求显式 storage.backend", file=sys.stderr)
 
     backend = resolve_backend(cfg)
     # 只覆盖两个键：top_k 取最深档（否则 Recall@50 会被 final_limit 截断成 Recall@top_k），
     # bm25_limit 不配就用模块默认（本单放大后的候选池）。其余键（filter/权重）原样透传。
     cfg["top_k"] = max(ks)
     cfg.setdefault("bm25_limit", DEFAULT_BM25_LIMIT)
-    if backend == "redis":       # redis 后端需要 host/port 在顶层；sqlite/pg 在 storage.* 节
-        cfg.setdefault("redis_host", "127.0.0.1")
-        cfg.setdefault("redis_port", 6379)
 
     storage = storage_from_config(config=cfg)
     ro_notes = _force_readonly(storage, backend)

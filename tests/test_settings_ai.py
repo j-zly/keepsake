@@ -1,8 +1,9 @@
-"""「AI 配置」页后端（`/api/v1/settings/ai`）—— 五节集中配置 + 连通检测。
+"""「AI 配置」页后端（`/api/v1/settings/ai`）—— 四节集中配置 + 连通检测。
 
 本文件钉死六件最容易悄悄坏掉的事：
 
-  1. **GET 回五节**（llm / embedder / screening / query_expansion / tiering_review），
+  1. **GET 回四节**（llm / embedder / screening / tiering_review），
+     （2026-11：「查询扩展」节随 Redis 后端移除 —— 只在 Redis 有实现的开关不留页面。）
      字段与数值**全部来自 config.json**（前端零写死）。
   2. **凭据真值永不下发**：secret 字段只回 `{"set": …}`（路径型另带 `path`），
      响应体里**搜不到** key 原文。
@@ -44,7 +45,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 json_dumps = json.dumps
 
 GET = "/api/v1/settings/ai"
-SECTION_IDS = ["llm", "embedder", "screening", "query_expansion", "tiering_review"]
+SECTION_IDS = ["llm", "embedder", "screening", "tiering_review"]
 
 #: 假凭据（**只存在于测试里**：断言它绝不出现在响应体 / 审计里）。
 FAKE_KEY = "sk-fake-key-do-not-leak-123456"
@@ -134,7 +135,7 @@ def test_GET要token(client):
     assert client.get(GET).status_code == 401
 
 
-def test_GET回五节且顺序固定(client):
+def test_GET回四节且顺序固定(client):
     body = client.get(GET, headers=AUTH).json()
     assert [s["id"] for s in body["sections"]] == SECTION_IDS
     for s in body["sections"]:
@@ -149,7 +150,7 @@ def test_GET_两节无独立配置_只读说明卡(client, cfg_path):
     write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m",
                                  "key_file": "/tmp/k"}})
     secs = sections_of(client)
-    for sid in ("query_expansion", "tiering_review"):
+    for sid in ("tiering_review",):
         assert secs[sid]["fields"] == [], sid
         assert secs[sid]["editable"] is False
         assert secs[sid]["note"], "要写清复用哪一节"
@@ -230,9 +231,9 @@ def test_PUT_未知节400(client, cfg_path):
     assert r.json()["detail"]["error"] == "ai_section_unknown"
 
 
-@pytest.mark.parametrize("sid", ["query_expansion", "tiering_review"])
-def test_PUT_无独立配置的两节400_指引到llm(client, cfg_path, sid):
-    """这两节复用 llm 节 ⇒ 不许在这里写（写了也是写到 llm 节去）。"""
+@pytest.mark.parametrize("sid", ["tiering_review"])
+def test_PUT_无独立配置的一节400_指引到llm(client, cfg_path, sid):
+    """这一节复用 llm 节 ⇒ 不许在这里写（写了也是写到 llm 节去）。"""
     r = client.put(f"{GET}/{sid}", json={"confirm": True, "model": "m"}, headers=AUTH)
     assert r.status_code == 400, r.text
     detail = r.json()["detail"]
@@ -519,7 +520,7 @@ def test_probe_计入审计(client, cfg_path, audit_dir):
     assert lines[-1]["ok"] is False
 
 
-def test_probe_无独立配置的两节400(client, cfg_path):
-    r = client.post(f"{GET}/query_expansion/probe", headers=AUTH)
+def test_probe_无独立配置的一节400(client, cfg_path):
+    r = client.post(f"{GET}/tiering_review/probe", headers=AUTH)
     assert r.status_code == 400, r.text
     assert r.json()["detail"]["error"] == "ai_section_not_editable"

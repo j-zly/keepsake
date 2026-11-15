@@ -635,9 +635,6 @@ class TestSanitizeLlmTags:
         stor = MagicMock()
         stor.store.return_value = True
         monkeypatch.setattr(ks_storage, "storage_from_config", lambda *a, **kw: stor)
-        monkeypatch.setattr(
-            memory_distill, "get_redis_password", lambda: ("", "127.0.0.1", 6379)
-        )
 
         items = [{"category": "fact", "content": "x", "tags": "core_candidate,foo"}]
         saved = memory_distill.store_to_keepsake(items, dry_run=False)

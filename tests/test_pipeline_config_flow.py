@@ -101,8 +101,8 @@ class _FakePipeline:
 
 @pytest.fixture
 def fake_storage(monkeypatch):
-    """monkeypatch RedisStorage 构造 —— 让 initialize() 不连真实 Redis。"""
-    monkeypatch.setattr("keepsake.RedisStorage", lambda *a, **kw: _FakeStorage(*a, **kw))
+    """monkeypatch 存储装配 —— 让 initialize() 不连真实后端（2026-11：工厂入口）。"""
+    monkeypatch.setattr("keepsake.storage_from_config", lambda *a, **kw: _FakeStorage(*a, **kw))
     monkeypatch.setattr(
         "keepsake.create_embedder",
         lambda **kw: _FakeEmbedder(),

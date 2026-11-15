@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepsake-memory"
-version = "1.1.1"
+version = "2.0.0"
 description = "Keepsake — full-entry memory system for Hermes Agent. On-demand storage of complete memories with semantic search."
 readme = "README.md"
 license = {text = "MIT"}
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [
     {name = "j-zly"},
 ]
-keywords = ["hermes-agent", "memory", "rag", "redisearch", "llm"]
+keywords = ["hermes-agent", "memory", "rag", "llm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "redis>=5.0",
+    # 2026-11 v2.0.0：redis 依赖随 Redis 后端整体移除（见 README「从 Redis 迁移」）。
     "jieba>=0.42",
     # 英文词干化（Porter2）—— 纯 Python 实现，无模型下载、无外部服务。
     # 索引侧与查询侧共用同一个归一函数（见 keepsake/domain/splitter.py 的对称铁律）。
@@ -41,7 +41,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PostgreSQL 后端（可选）。默认后端是 Redis —— 不用 PG 就别装，装了也不影响。
+# PostgreSQL 后端（可选）。2026-11 起**没有默认后端**：`storage.backend` 必须
+# 显式 `postgres` / `sqlite`（sqlite 零第三方依赖，不装本 extra 也能跑）。
 # 用法: pip install 'keepsake-memory[postgres]' + 配置 storage.backend = "postgres"
 # 2026-10 ks_pg_pool：`pool` extra 是**连接池**（psycopg_pool）——
 #   PG 后端现在用官方连接池（健康探测 / 空闲回收 / 死连接重建），

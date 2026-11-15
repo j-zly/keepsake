@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
-"""同义词自动发现 — 给 cron 调用用。"""
-import sys
+"""同义词自动发现 — 给 cron 调用用。
+
+2026-11：改走 `storage_from_config()` 统一入口（Redis 后端已移除）。
+同义词阈值等参数由工厂从同一份 config.json 读取，不再手搓构造。
+"""
 import json
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from keepsake.storage import RedisStorage
+from keepsake.core.factory import storage_from_config
 
-config_path = Path("~/.config/keepsake/config.json").expanduser()
-if config_path.exists():
-    with open(config_path) as f:
-        cfg = json.load(f)
-else:
-    cfg = {}
-
-storage = RedisStorage(
-    host=cfg.get("redis_host", "127.0.0.1"),
-    port=int(cfg.get("redis_port", 6379)),
-    password=cfg.get("redis_password") or None,
-    synonym_min_word_freq=int(cfg.get("synonym_min_word_freq", 10)),
-    synonym_jaccard_threshold=float(cfg.get("synonym_jaccard_threshold", 0.5)),
-    synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
-)
+storage = storage_from_config()
 result = storage.discover_synonyms()
 storage.close()
 print(json.dumps(result, ensure_ascii=False))

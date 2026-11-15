@@ -1,5 +1,5 @@
 """
-与后端无关的检索共用逻辑 —— Redis / PostgreSQL 两个后端**共用同一份实现**。
+与后端无关的检索共用逻辑 —— PostgreSQL / SQLite 两个后端**共用同一份实现**。
 
 🔴 **这是批 2 的架构重点**：检索后处理（RRF 融合 / v2 过滤 / 综合重排 / 批量载入）
 与「排序权重公式」都是纯函数逻辑，只跟候选 dict 的形状有关，与后端怎么把候选取出来
@@ -9,12 +9,12 @@
 因此这里以**普通模块函数**（不是 mixin / 不是基类）存在，两个后端在类体里直接
 绑定同一个函数对象：
 
-    class RedisStorage(StorageBase):
+    class PgStorage(StorageBase):
         _rrf_fuse = rrf_fuse            # ← 不是 def，是别名
     class PgStorage(StorageBase):
         _rrf_fuse = rrf_fuse            # ← 同一个对象
 
-好处：`RedisStorage._rrf_fuse is PgStorage._rrf_fuse` 恒为 True（测试直接断言对象
+好处：`PgStorage._rrf_fuse is SqliteStorage._rrf_fuse` 恒为 True（测试直接断言对象
 身份），且 AST 里全仓只有一处 `def`（不���能出现「同名两份实现」）。
 
 每个函数以 `storage`（self）为第一参，因为它们要读 `self._final_limit` /
@@ -28,7 +28,7 @@
 两者之间**不互相 import**（storage_pg 只在文档里说明它对齐 storage 的语义）。
 
 历史上这些函数是 `RedisStorage` 的私有方法（2026-09 引入），本模块只是把它们搬到
-一起，函数体逐行未改 —— Redis 侧行为零变化由 tests/test_v2_search.py 全绿兜底。
+一起，函数体逐行未改（历史：当年由 Redis 侧行为不变兜底；Redis 后端已于 2026-11 移除）。
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ logger = logging.getLogger("keepsake.storage_shared")
 #    长度惩罚**不另加权重**：交给 BM25 自身的文档长度归一（b=0.75），
 #    打分链路（BM25 / RRF / rerank）零触碰。
 #
-#    三后端**同一把尺**：PG 的 WHERE 谓词、SQLite 的 WHERE 谓词、Redis 的
+#    两后端**同一把尺**：PG 的 WHERE 谓词、SQLite 的 WHERE 谓词、（历史）Redis 的
 #    Python 侧 `continue` —— 判据只有一句「超了就是噪音」，但**必须单点**：
 #    三处各写一遍必然漂移（改了一边忘了另一边 ⇒ 两库召回面不一致）。
 #
@@ -79,7 +79,7 @@ _LENFLOOR_WARNED: set = set()
 def is_noise_length(content_len: int, max_len: int) -> bool:
     """正文长度是否超过检索面地板（超过 ⇒ 视为噪音，**不进检索面**）。
 
-    **三后端唯一判据**：PG/SQLite 的 SQL 谓词与 Redis 的 `continue` 都吃它。
+    **唯一判据**：两后端的 SQL 谓词与（历史）Redis 的 `continue` 都吃它。
     """
     return int(content_len) > int(max_len)
 
@@ -294,7 +294,7 @@ FEEDBACK_NEGATIVE_PENALTY = 0.5         # 负反馈 ×0.5
 HOT_TOPIC_BOOST = 1.2                   # 命中热门话题 ×1.2
 HOT_TOPIC_DECAY_HALF_DAYS = 30          # 热门话题时间衰减半衰期（天）
 
-# 检索产出的 fragment 里固定会出现的字段（Redis / PG 共用的结果形状）。
+# 检索产出的 fragment 里固定会出现的字段（后端共用的结果形状）。
 # 🔴 上层 `_rrf_fuse` / `_apply_v2_filters` 按同样的键取值，增删字段必须同步改这里。
 FRAGMENT_FIELDS = (
     "content", "tags", "category", "source", "created",
@@ -320,7 +320,7 @@ SEARCH_FIELDS = (
 # 改的是什么：原来「顶掉」只有单向的 `superseded_by`，检索侧只能靠它**逐条剔除**，
 # 既排不出链身也回溯不了「谁顶了谁」。这里补齐双向 + 链头 + 作废原因 + 适用条件。
 #
-# 四根列三后端同款（PG/SQLite 是列，Redis 是 hash 字段）：
+# 四根列两后端同款（PG / SQLite 都是真列）：
 #   is_latest         链头标记。'1'/1 = 链头（当前有效），'0' = 链身（已被顶掉）。
 #                     **老行 NULL 视为链头**（迁移前写的行没人知道它是链头还是链身，
 #                     猜成「链身」会把存量记忆整批从检索里抹掉 ⇒ 宁多不少）。
@@ -420,7 +420,7 @@ def is_chain_head(value: Any) -> bool:
 #   让代理自己重新读、合并后再提交。
 #   思路来源：HTTP 的 ETag / If-Match、CouchDB 的 _rev。
 #
-#: rev 列名（三后端同名：PG / SQLite 是列，Redis 是 hash 字段）。
+#: rev 列名（两后端同名：PG / SQLite 都是真列）。
 REV_COLUMN = "rev"
 
 #: 存量行的 rev：ALTER 补列时统一落 '1' ⇒ 迁移后行为与迁移前逐字一致。
@@ -606,7 +606,7 @@ def frozen_scoring_now(ts: Optional[datetime] = None):
 
 
 # ---------------------------------------------------------------------------
-# 纯计算：tag 过滤的 SQL 片段（PG / SQLite 共用同一份；Redis 侧靠索引的 TAG 字段）
+# 纯计算：tag 过滤的 SQL 片段（PG / SQLite 共用同一份）
 # ---------------------------------------------------------------------------
 
 #: `tags` 列的**真实落库形态**是**逗号串**（`a,b` / `x,agent:worker`；PG 与 SQLite
@@ -899,7 +899,7 @@ def row_visible_to_non_primary(tags: Any, visible_owners: Iterable[str]) -> bool
 
 
 def row_visible_after_core_narrow(tags: Any, visible_owners: Iterable[str]) -> bool:
-    """**core 那一档**的归属收窄（Redis 侧专用 —— 判据就是
+    """**core 那一档**的归属收窄（历史：Redis 侧专用 —— 判据就是
     `row_visible_to_non_primary`，不多不少）。
 
     🔴 为什么只收 core 那一档：RediSearch 的查询语言只能做「标签并集」，
@@ -948,7 +948,7 @@ def attention_boost_from_topics(
     公式（与 2026-09 起线上一直跑的那份逐字相同）：
         命中话题的 score 之和 / 全部话题 score 之和 = ratio（封顶 1.0）
         → 1.0 + (boost_max - 1.0) * ratio
-    两者都调用它：`attention.match_attention_boost`（Redis）与 `PgStorage.match_attention`。
+    两个后端（PgStorage / SqliteStorage）的 match_attention 都调它。
     """
     if not rows or not content:
         return 1.0
@@ -979,7 +979,7 @@ def hot_topic_weighted_hits(
         topics:    热门话题词（已按热度降序、未过期）
         last_seen: {话题: 最后提及时间戳}；缺项按 0.5 折半
     公式：命中且有 last_seen → 2^(-天数/半衰期)；命中但无 last_seen → 0.5
-    RedisStorage.match_hot_topics 与 PgStorage.match_hot_topics 都调它。
+    PgStorage / SqliteStorage 的 match_hot_topics 都调它。
     """
     if not topics or not text:
         return 0.0
@@ -1141,7 +1141,7 @@ def apply_v2_filters(storage: Any, fragments: List[Dict[str, Any]]) -> List[Dict
       3. min_score 地板：sim 阈值 = storage._v2_min_score（默认 0.05）。
 
     读 superseded_by 走后端钩子 `storage._fetch_superseded_by(keys)`；载入新版候选
-    走共用 `load_fragments_by_keys`。本函数不含任何 Redis/PG 专属语句。
+    走共用 `load_fragments_by_keys`。本函数不含任何后端专属语句。
     """
     if not fragments:
         return fragments
@@ -1432,7 +1432,7 @@ def rerank_with_decay(
 # 同一语料两次运行结果不同）是**已知的历史行为**，改成与另两侧一致属于
 # 改 Redis 既有行为，任务书明确禁止（见本次 verdict）。
 
-#: 同义词发现的降噪黑名单（与 `RedisStorage.discover_synonyms` 的局部常量逐条同源：
+#: 同义词发现的降噪黑名单（与历史 `RedisStorage.discover_synonyms` 的局部常量逐条同源：
 #: 2 字母高频虚词 + jieba 切英文常见碎块）。
 DENOISE_STOPWORDS = frozenset({
     "eg", "us", "ok", "no", "of", "to", "in", "an", "be", "by",
@@ -1641,7 +1641,7 @@ def jieba_dict_keep(word: str) -> bool:
     中英混排（"Redis缓存"）**留**（`isascii()` 为假）—— 那种词 jieba 切不开，
     正是词典该管的事。
 
-    判据单点在这里（PG / SQLite / Redis 三个 `generate_jieba_dict` 都调它），
+    判据单点在这里（PG / SQLite 两个 `generate_jieba_dict` 都调它），
     别处再抄一份就会漂。
     """
     return not str(word).isascii()
@@ -1691,3 +1691,73 @@ def maintenance_client(storage: Any) -> Any:
         return getter()
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------
+# 查询式构造助手（2026-11 从 core/redis.py 搬入，随 Redis 后端退役）
+# --------------------------------------------------------------------------
+# 为什么放这里：这两个函数是**后端无关**的查询词处理（同义词展开 + 拆子词清洗），
+# 此前寄居在 redis.py 里、由 pg/sqlite `from .redis import` 反向借用 —— Redis 后端
+# 删除后借用链断掉，搬进共用层是唯一去处（口径逐字未变，测试不许被搬家行为改变）。
+
+def _sanitize_terms(terms: List[str], limit: int = 40) -> List[str]:
+    """清理查询词，专治「扩展把查询式拼坏」这一类静默空召回。
+
+    为什么需要（2026-09-14 定位）：同义词/共现/LLM 扩展会把「通过 验证」这类带空格的
+    短语、`--` / `&&` 这类纯符号、`ge` / `br` 这类 jieba 英文碎渣一并拼进全文检索
+    查询式 → 引擎报 Syntax error → 查询被拒 → BM25 返回空列表（异常还被
+    logger.debug 吞掉）。症状=整类查询召回为 0 而看不出原因。
+
+    规则：按空白拆开（短语拆成词）→ 丢纯符号 → 丢小写英文短碎渣 → 去重 → 限数。
+    另外（2026-09-15）：含路径/连接符的词（`/home/claude_user/x`、`agent-worker`）也要按
+    `/-_.` 再拆成子词——索引里的内容是按这些符号切开的，整串当一个 token 查必然 0 命中
+    （实测 `'/home/claude_user/trade-platform/'` 查询返回 0 条，而 `claude_user` 能命中）。
+    """
+    out: List[str] = []
+    seen = set()
+    for t in terms or []:
+        for piece in str(t).split():
+            piece = piece.strip()
+            if not piece:
+                continue
+            # 含路径/连接符：拆成子词（原串不可能与索引 token 对齐）
+            candidates = [p for p in re.split(r"[/\-_.]+", piece) if p] \
+                if re.search(r"[/\-_.]", piece) else [piece]
+            for piece in candidates:
+                if not piece or piece in seen:
+                    continue
+                # 至少含一个字母/数字/汉字，否则是纯符号（--、&&、###）
+                if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in piece):
+                    continue
+                # 小写英文且 <=2 字符 = jieba 切英文的碎渣（ge/br/an/rm/io…），
+                # 大写短词（IP/PVE）和纯数字（88）保留
+                if len(piece) <= 2 and piece.isascii() and piece.islower():
+                    continue
+                seen.add(piece)
+                out.append(piece)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
+    """用同义词表展开搜索词列表。
+
+    🔴 2026-10 ks_en_stem：同义词表里的英文词条**按词干存储**
+    （`stem_synonym_map`），所以查表**原形与词干各试一次** ——
+    老表（原形键）与新表（词干键）都能命中，不会出现「扩不出来 ⇒ 这条召回面
+    静默失效」。扩出来的词已是词干，查询侧再词干化一次是幂等的（不变）。
+    """
+    if not synonym_map:
+        return terms
+    from ..domain.splitter import stem_english   # noqa: PLC0415 — 避免加载期环
+    expanded = list(terms)
+    for t in terms:
+        tl = t.lower()
+        for key in (tl, stem_english(tl)):
+            if key not in synonym_map:
+                continue
+            for syn in synonym_map[key]:
+                if syn not in expanded:
+                    expanded.append(syn)
+    return expanded

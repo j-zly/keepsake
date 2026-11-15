@@ -18,7 +18,7 @@
     实测同批 2819 条碎片，真并占比 53.1%（阈值 2）→ 13.2%（阈值 3）→ 2.1%（阈值 4）
   * `consolidate_min_group` / `consolidate_min_overlap` 两个顶层键接进
     resolve_consolidate_config()（与 forget_* 顶层键同一读法）；非法值回落默认 + 告警
-  * 阈值挂在 Consolidator 实例上 ⇒ Redis 与 PG 两后端同一判据（无后端特异分支）
+  * 阈值挂在 Consolidator 实例上 ⇒ PG / SQLite 两后端同一判据（无后端特异分支）
 
 2026-09 重大变更（任务 ks_noqwen）：
   * 移除硬编码 base_url / 默认 model 兜底 —— 无 llm 节 = 无 LLM 通道
@@ -513,7 +513,7 @@ class Consolidator:
 
     def __init__(
         self,
-        storage: Any,  # RedisStorage instance (avoid circular import)
+        storage: Any,  # 存储后端实例（避免循环 import，不认具体类）
         min_group_size: Optional[int] = None,
         max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
         llm_model: str = "",  # 2026-09 移除硬编码模型兜底；须由 channel 解析提供
@@ -525,7 +525,7 @@ class Consolidator:
         """两个阈值的三级优先级（高→低）：显式构造参数 > config 顶层键 > 模块默认值。
 
         `config` 传 None 或键缺失 → 走默认；传了非法值 → 回落默认 + logger.warning
-        （见 resolve_consolidate_config）。两个阈值都在实例上 ⇒ Redis/PG 两后端同一判据。
+        （见 resolve_consolidate_config）。两个阈值都在实例上 ⇒ 两后端同一判据。
         """
         cfg_res = resolve_consolidate_config(config)
         self._storage = storage
@@ -547,7 +547,7 @@ class Consolidator:
 
         2026-10 ks_pmn：改为**只通过 StorageBase 的维护原语**访问存储
         （`scan_fragment_keys` / `get_fragments_batch` / `write_fragments_batch` /
-        `update_fragment_fields`），Redis 与 PG 两个后端语义等价，不再有 unsupported。
+        `update_fragment_fields`），PG / SQLite 两个后端语义等价，不再有 unsupported。
         """
         stats = {
             "scanned": 0, "groups_found": 0, "merged": 0, "skipped": 0,
@@ -597,7 +597,7 @@ class Consolidator:
           - 创建时间 > max_age_hours（给新碎片时间积累）
           - 已合并的（consolidated）也参与扫描，实现多级提炼
 
-        分页由后端负责：Redis 是 SCAN 游标，PG 是 keyset 分页（`key > :last`）。
+        分页由后端负责：PG / SQLite 都是 keyset 分页（`key > :last`）。
         """
         try:
             cutoff = (datetime.now(timezone.utc).timestamp() - self._max_age_hours * 3600)
@@ -611,7 +611,7 @@ class Consolidator:
                     prefix="memory:frag:",
                 )
 
-                # 批量读一页（Redis=pipeline HMGETALL，PG=`key = ANY` 一条 SQL）
+                # 批量读一页（PG=`key = ANY`、SQLite=`IN (...)` 一条 SQL）
                 docs = self._storage.get_fragments_batch(keys) if keys else {}
 
                 for key in keys:

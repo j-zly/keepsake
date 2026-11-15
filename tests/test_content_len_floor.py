@@ -37,7 +37,7 @@ from keepsake.core.shared import (
     max_content_len_from_config,
     resolve_max_content_len,
 )
-from keepsake.storage import RedisStorage, storage_from_config
+from keepsake.storage import storage_from_config
 from keepsake.storage_pg import PgStorage
 from keepsake.storage_sqlite import SqliteStorage
 
@@ -68,24 +68,22 @@ def _make_content(token: str, length: int) -> str:
 # 1. 缺省值与「不再有第二处写死的 600」
 # ---------------------------------------------------------------------------
 
-def test_default_floor_is_5000_and_shared_by_three_backends():
-    """缺省地板 5000，三后端**同一个类级默认**（单点常量，不各写一份）。"""
+def test_default_floor_is_5000_and_shared_by_two_backends():
+    """缺省地板 5000，两后端**同一个类级默认**（单点常量，不各写一份）。"""
     assert DEFAULT_MAX_CONTENT_LEN == 5000
     assert PgStorage.MAX_CONTENT_LEN == 5000
     assert SqliteStorage.MAX_CONTENT_LEN == 5000
-    assert RedisStorage.MAX_CONTENT_LEN == 5000
     assert PgStorage.MAX_CONTENT_LEN is DEFAULT_MAX_CONTENT_LEN
     assert SqliteStorage.MAX_CONTENT_LEN is DEFAULT_MAX_CONTENT_LEN
-    assert RedisStorage.MAX_CONTENT_LEN is DEFAULT_MAX_CONTENT_LEN
 
 
 def test_no_literal_600_left_in_retrieval_predicates():
-    """三后端源码里**不许**再出现写死的长度阈值（`> 600` / `<= 600`）。
+    """两后端源码里**不许**再出现写死的长度阈值（`> 600` / `<= 600`）。
 
     长度谓词只允许存在于 `core/shared.py` 一处（`content_len_clause`）——
-    三处各写一份必然漂移。
+    两处各写一份必然漂移。
     """
-    for name in ("pg.py", "sqlite.py", "redis.py"):
+    for name in ("pg.py", "sqlite.py"):
         src = (CORE_DIR / name).read_text(encoding="utf-8")
         assert "> 600" not in src, f"{name} 仍写死「> 600」"
         assert "<= 600" not in src, f"{name} 仍写死「<= 600」"
@@ -95,16 +93,15 @@ def test_no_literal_600_left_in_retrieval_predicates():
         "长度谓词的 SQL 片段必须只在 shared.py 一处")
 
 
-def test_helper_is_single_point_for_three_backends():
-    """判据单点：三个后端引用的是**同一个函数对象**（不是各抄一份）。"""
+def test_helper_is_single_point_for_two_backends():
+    """判据单点：两个后端引用的是**同一个函数对象**（不是各抄一份）。"""
     from keepsake.core import pg as pg_mod
-    from keepsake.core import redis as redis_mod
     from keepsake.core import sqlite as sqlite_mod
 
     assert pg_mod.content_len_clause is content_len_clause
     assert sqlite_mod.content_len_clause is content_len_clause
-    assert redis_mod.is_noise_length is is_noise_length
-    assert redis_mod.resolve_max_content_len is resolve_max_content_len
+    assert pg_mod.resolve_max_content_len is resolve_max_content_len
+    assert sqlite_mod.content_len_clause is pg_mod.content_len_clause
 
 
 # ---------------------------------------------------------------------------
@@ -325,83 +322,6 @@ def test_pg_real_db_700_char_entry_recall_and_floor_override(pg_storage):
 
 # ---------------------------------------------------------------------------
 # 5. Redis：假 client（仓库没有真 Redis 测试库，见 tests/test_storage_redis.py 惯例）
-# ---------------------------------------------------------------------------
-
-class _FakeDoc:
-    """RediSearch 文档的最小替身（属性名与 redis-py 返回的 doc 一致）。"""
-
-    def __init__(self, key: str, content: str, score: float = 1.0) -> None:
-        self.id = key
-        self.content = content
-        self.tags = "lenfloor"
-        self.score = score
-        self.created = "2026-10-01T00:00:00+00:00"
-        self.invalid_at = ""
-        self.valid_until = ""
-
-
-class _FakeFt:
-    def __init__(self, docs: List[_FakeDoc]) -> None:
-        self._docs = docs
-
-    def search(self, query: Any) -> Any:
-        # 假 client **不解析查询式**：一律返回全部候选 —— 长度过滤因此可被单独观察
-        class _Result:
-            docs = self._docs
-        return _Result()
-
-
-class _FakeRedis:
-    """只实现 search_bm25 走到的命令；其余一律抛（调用点自带 fail-open）。"""
-
-    def __init__(self, docs: List[_FakeDoc]) -> None:
-        self._docs = docs
-
-    def ping(self) -> bool:
-        return True
-
-    def ft(self, _index: str) -> _FakeFt:
-        return _FakeFt(self._docs)
-
-    def zscan(self, *_a: Any, **_kw: Any):
-        return 0, []
-
-    def zscore(self, *_a: Any, **_kw: Any):
-        return None
-
-
-def _redis_storage(monkeypatch, docs: List[_FakeDoc], **kw: Any) -> RedisStorage:
-    client = _FakeRedis(docs)
-    monkeypatch.setattr(RedisStorage, "_get_client", lambda self: client)
-    st = RedisStorage(query_expansion_enabled=False, final_limit=10,
-                       is_primary=True, **kw)
-    st._load_synonym_map = lambda: {}      # noqa: SLF001 — 不连真 Redis 拉同义词表
-    st._fire_hits = lambda fragments: None  # noqa: SLF001 — 侧写打点不参与本用例
-    return st
-
-
-def test_redis_search_bm25_applies_instance_floor(monkeypatch):
-    """Redis 侧判据同源：缺省地板放行 700 字条目、挡掉 5200 字条目。"""
-    docs = [_FakeDoc("k-mid", _make_content(PROBE, LEN_MID)),
-            _FakeDoc("k-huge", _make_content(HUGE_PROBE, LEN_HUGE))]
-    st = _redis_storage(monkeypatch, docs)
-    hits = st.search_bm25(PROBE) or []
-    contents = [str(h.get("content", "")) for h in hits]
-    assert any(PROBE in c for c in contents), "700 字条目应当放行"
-    assert not any(HUGE_PROBE in c for c in contents), "超地板条目应当被挡掉"
-
-
-def test_redis_explicit_floor_600_hides_700_char_entry(monkeypatch):
-    """Redis 侧显式地板 600 ⇒ 700 字条目也隐身（配置真的到了使用点）。"""
-    docs = [_FakeDoc("k-mid", _make_content(PROBE, LEN_MID))]
-    st = _redis_storage(monkeypatch, docs, max_content_len=600)
-    assert st._max_content_len == 600      # noqa: SLF001
-    hits = st.search_bm25(PROBE) or []
-    assert not any(PROBE in str(h.get("content", "")) for h in hits)
-
-
-# ---------------------------------------------------------------------------
-# 6. 配置 → 实例的接线（storage_from_config 是唯一配置装配入口）
 # ---------------------------------------------------------------------------
 
 def _sqlite_cfg(tmp_path: Path, **extra: Any) -> Dict[str, Any]:

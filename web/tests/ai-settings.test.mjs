@@ -3,7 +3,7 @@
  *
  * 盯的是**接线**与**红线**（盯不住的：后端返回什么形状 —— 那由
  * tests/test_settings_ai.py 钉）：
- *   1) **五张卡**：五节各一张；后两张（query_expansion / tiering_review）
+ *   1) **卡数 = 后端节数**：每节一张；只读卡（tiering_review）
  *      没有独立配置 ⇒ 只读说明卡，**不摆编辑入口**（不许出现保存/检测按钮）；
  *   2) **secret 字段**：只显示「已设置 / 未设置」徽标 + 路径，
  *      **凭据真值永不回显**（输入框是空的，留空 = 不改）；
@@ -50,16 +50,16 @@ test('api/index.js 三条方法都在，且都走 http 实例（不硬编码 fet
 })
 
 // ---------------------------------------------------------------------------
-// 五张卡
+// 卡片遍历后端节
 // ---------------------------------------------------------------------------
 
-test('五张卡：每节一张（v-for 遍历后端给的 sections）', () => {
+test('每节一张卡：v-for 遍历后端给的 sections（节数增减前端零改动）', () => {
   assert.match(VIEW, /v-for="card in cards"/)
   assert.match(VIEW, /function buildCards\(sections\)/)
   assert.match(VIEW, /cards\.value = buildCards\(data\.sections\)/)
 })
 
-test('后两张只读卡：不摆编辑入口（保存/检测按钮都挂在 v-if="card.editable" 上）', () => {
+test('只读卡：不摆编辑入口（保存/检测按钮都挂在 v-if="card.editable" 上）', () => {
   // 卡底的按钮区整体挂在 editable 上 —— 只读卡连按钮都不渲染
   assert.match(VIEW, /<div v-if="card\.editable" class="ops">/)
   // 只读卡有明确的说明文案（指向 llm 节）

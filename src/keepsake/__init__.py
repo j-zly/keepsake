@@ -19,7 +19,7 @@ keepsake — Keepsake记忆系统 for Hermes Agent.
 实现本体已按三层搬走，本文件**只做对外门面**：
 
     domain/    纯逻辑、零 IO（emotion / splitter / types）
-    core/      存储与检索（redis / pg / sqlite / shared / pipeline / ops）
+    core/      存储与检索（factory / pg / sqlite / shared / pipeline / ops）
     adapters/  hermes/provider.py（实现）、generic/（与宿主无关的契约）
 
 兼容层：`storage` / `storage_pg` / `storage_sqlite` / `storage_shared` /
@@ -28,7 +28,7 @@ keepsake — Keepsake记忆系统 for Hermes Agent.
 
 本文件不做普通的 `from .adapters.hermes.provider import *` re-export，
 而是把 `sys.modules["keepsake"]` **指向 provider 模块本身**（模块别名）：
-别名共享同一份 globals，于是 `keepsake.RedisStorage`、`keepsake._CORE_CACHE`、
+别名共享同一份 globals，于是 `keepsake.storage_from_config`、`keepsake._CORE_CACHE`、
 `keepsake._has_tag` 这些名字原封不动，而 monkeypatch("keepsake.X") 也仍然
 打在 provider 真正使用的那份 globals 上 —— 拷贝式 re-export 会让 patch 打空，
 那才是真正的行为变化。`__path__` 显式带过来、子包属性补挂、模块级 `__getattr__`

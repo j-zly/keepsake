@@ -81,6 +81,13 @@ SQLite 存储后端 — keepsake 第三个存储实现（批 1：读写原语 + 
   float32 blob（与 Redis/PG 同一 `struct.pack` 小端格式）—— 否则切到 sqlite 后端
   的历史记忆会全部无向量，回头得补一次全量 backfill。`embedding` 列与
   `sqlite-vec` 留到第 3 批（**可选懒加载**，不是硬依赖）。
+
+
+> **2026-11 校准**：Redis 后端已整体移除（2.0.0）。本文件里大量「与 Redis / PG 侧对齐 /
+> 同源 / 逐字一致」的行文是**设计出处记录**（列名、blob 布局、判据口径的历史来源），
+> 指向 1.1.x 的实现，不是现行后端清单 —— 现行后端只有 PG / SQLite，共用实现看
+> `core/shared.py` 与 `core/factory.py`。
+
 """
 
 from __future__ import annotations
@@ -169,7 +176,7 @@ from .shared import (
     resolve_max_content_len,
 )
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 拆子词的 sanitize），同 PG 侧口径。
-from .redis import _expand_terms, _sanitize_terms
+from .shared import _expand_terms, _sanitize_terms
 # 列集真相与 TTL 口径复用 PG 版同一份常量（不复制 —— 复制必漂移）。
 from .pg import (
     DEFAULT_BM25_LIMIT,
@@ -287,6 +294,7 @@ _DDL_TABLES: Tuple[Tuple[str, str], ...] = (
     ("ks_fragment", _CREATE_FRAGMENT),
     # 对齐 keepsake:entity_timeline:<实体> ZSET（member=碎片 key，score=时间戳）
     ("ks_entity_timeline", """
+    
     CREATE TABLE IF NOT EXISTS ks_entity_timeline (
         entity   TEXT NOT NULL,
         frag_key TEXT NOT NULL,

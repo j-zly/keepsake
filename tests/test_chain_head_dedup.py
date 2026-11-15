@@ -159,13 +159,3 @@ class TestSingleSourceOfTruth:
 
     防止哪天又有人写了第三份 `_is_chain_body` 或 `WHERE is_latest != '0'`。
     """
-
-    def test_chain_head_predicate_in_redis_uses_shared(self):
-        """Redis 侧 `_is_chain_body` 已经废弃，新代码统一走 `is_chain_head`。
-        若有人恢复 `_is_chain_body`，本测试立即红。
-        """
-        from keepsake.core import redis as redis_mod
-        assert not hasattr(redis_mod, "_is_chain_body"), (
-            "Redis 侧恢复了 `_is_chain_body`：链头判据已经有两个出口，"
-            "请改用 storage_shared.is_chain_head 并删掉旧实现。"
-        )

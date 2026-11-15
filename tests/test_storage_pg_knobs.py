@@ -1,4 +1,4 @@
-"""storage_from_config：postgres 分支的排序权重键必须与 redis 分支同源生效。
+"""storage_from_config：postgres 分支的排序权重键必须真正生效（口径同 provider）。
 
 修前这 10 个键（decay_half_days / hot_topic_boost / v2_min_score …）在 PG 分支
 被整体忽略 —— config.json 里配了也不生效（PgStorage 吃形参默认值）。
@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 import pytest
 
-from keepsake.storage import RedisStorage, storage_from_config
+from keepsake.storage import storage_from_config
 from keepsake.storage_shared import (
     DECAY_HALF_DAYS,
     FEEDBACK_NEGATIVE_PENALTY,
@@ -75,49 +75,8 @@ def test_pg_hot_topic_boost_reverts_to_constant_when_key_absent() -> None:
     assert storage_from_config(config=lo)._hot_topic_boost == 1.0
     assert storage_from_config(config=hi)._hot_topic_boost == 1.6
     assert storage_from_config(config=_pg_cfg({}))._hot_topic_boost == HOT_TOPIC_BOOST
-
-
-def test_redis_branch_untouched() -> None:
-    """redis 分支行为不变：provider 口径的 kwargs 仍逐键落到 RedisStorage。
-
-    2026-10 ks_lenfloor：多了一根 `max_content_len`（检索面长度地板，**从 cfg 读**，
-    不在 provider 的 kwargs 里）—— 其余键仍逐字原样落地。
-    """
-    got = {}
-    storage_from_config(
-        config={"storage": {"backend": "redis"}},
-        redis_cls=lambda **kw: got.update(kw),
-        **CFG,
-    )
-    assert {k: v for k, v in got.items() if k != "max_content_len"} == CFG
-    assert got["max_content_len"] == 5000
-    real = RedisStorage(**CFG)
-    for key, attr, _const in KNOBS:
-        assert getattr(real, attr) == CFG[key]
-
-# ---- 2026-10 ks_knob_unify：两支统一「kwargs > cfg > 常量」，redis 无 kwargs 也要吃 cfg ----
-
-def _redis_cfg(extra: Dict[str, Any]) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {"storage": {"backend": "redis"}}
-    cfg.update(extra)
-    return cfg
-
-
 @pytest.mark.parametrize("key,attr,const", KNOBS)
-def test_redis_knob_from_config_effective(key: str, attr: str, const: Any) -> None:
-    """redis 分支**不带 kwargs** 时 cfg 也要生效（修前恒等于 const = 死配置）。"""
-    assert getattr(storage_from_config(config=_redis_cfg(CFG)), attr) == CFG[key]
-
-
-@pytest.mark.parametrize("key,attr,const", KNOBS)
-def test_redis_knob_default_is_module_constant(key: str, attr: str, const: Any) -> None:
-    """redis 分支不配 = 模块常量（与 PG 分支同口径）。"""
-    assert getattr(storage_from_config(config=_redis_cfg({})), attr) == const
-
-
-@pytest.mark.parametrize("wrap", [_redis_cfg, _pg_cfg])
-@pytest.mark.parametrize("key,attr,const", KNOBS)
-def test_kwargs_beat_cfg(wrap: Any, key: str, attr: str, const: Any) -> None:
+def test_kwargs_beat_cfg(key: str, attr: str, const: Any) -> None:
     """优先级最高的一档：显式 kwargs 覆盖 cfg（生产 provider 口径不许被重读覆盖）。"""
-    inst = storage_from_config(config=wrap(CFG), **{key: 999})
+    inst = storage_from_config(config=_pg_cfg(CFG), **{key: 999})
     assert getattr(inst, attr) == 999

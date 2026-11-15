@@ -21,7 +21,6 @@ from collections import deque
 
 import pytest
 
-from keepsake.storage import RedisStorage
 from keepsake.pipeline import (
     Pipeline,
     Turn,
@@ -38,31 +37,8 @@ from keepsake.pipeline import (
 # 测试用 fake storage —— 与 pipeline 期望的接口一致
 # ===========================================================================
 
-class _FakeRedisClient:
-    """Pipeline 期望 _get_client() 返回一个含 exists() 和 hset() 的对象。
-
-    exists(key) 默认返回 key 是否在 FakeStorage.fragments 里（0/1）；
-    额外支持 not_exists 集合强制某 key 返回 0（测「search_bm25 命中但库
-    里实际不存在」的场景）；hset(key, field, value) 仅记录调用，不写半壳键。
-    """
-
-    def __init__(self, storage: "FakeStorage"):
-        self._storage = storage
-        self.not_exists: set = set()  # 强制 exists()=0 的 key 集合
-
-    def exists(self, key: str) -> int:
-        if key in self.not_exists:
-            return 0
-        return 1 if key in self._storage.fragments else 0
-
-    def hset(self, key: str, field: str, value=None) -> int:
-        # 仅记录调用，不实际写入（防止半壳键）
-        self._storage.hset_calls.append((key, field, value))
-        return 1
-
-
 class FakeStorage:
-    """Pipeline 不需要真实 Redis —— 只要 search_bm25/store/supersede_fragment/_get_client。"""
+    """Pipeline 不需要真实后端 —— 只要 search_bm25/store/supersede_fragment/fragment_exists/set_supersedes。"""
 
     def __init__(self):
         self.stored: List[Dict[str, Any]] = []      # store() 调用记录
@@ -74,7 +50,7 @@ class FakeStorage:
         self.search_index: Dict[str, List[str]] = {}  # token -> [frag_keys]
         # 模拟 hset 调用记录（防止幻觉 key 产生半壳键）
         self.hset_calls: List[Tuple[str, str, Any]] = []
-        self._client = _FakeRedisClient(self)
+        self.not_exists: set = set()   # 强制 exists=False 的 key（「检索命中但库里实际不存在」场景）
 
     # --- 模拟 store(): 写一个记忆条目，记录 key + 内容 ---
     def store(self, text: str, tags: str = "", category: str = "",
@@ -171,16 +147,25 @@ class FakeStorage:
                     new_frag["supersede_reason"] = reason
         return True
 
-    def _get_client(self):
-        """返回含 exists()/hset() 的 fake redis client，供 _key_exists + hset 校验用。"""
-        return self._client
+    # 2026-11：Redis 后端移除后不再「绑真实 RedisStorage 实现 + fake client」。
+    # 契约口径（与 SQL 后端逐条一致）：exists 查 fragments；set_supersedes 只给
+    # **已存在**的 key 追加反向链 —— 「幻觉 key 不得产生半壳键」正是靠这条拒写。
+    def fragment_exists(self, key: str) -> bool:
+        if key in self.not_exists:
+            return False
+        return key in self.fragments
 
-    # 2026-10 ks_pcli：pipeline 不再摸 `_get_client()`，改调 StorageBase 的
-    # `fragment_exists` / `set_supersedes`。这里把**真实的** RedisStorage 实现
-    # 绑过来、只把 `_get_client` 换成上面那个 fake client —— 于是下面「幻觉 key
-    # 必须被拒」的断言验的仍是 Redis 侧真实行为，而不是 fake 自己写的同名方法。
-    fragment_exists = RedisStorage.fragment_exists
-    set_supersedes = RedisStorage.set_supersedes
+    def set_supersedes(self, new_key: str, old_key: str) -> bool:
+        if not new_key or not old_key:
+            return False
+        frag = self.fragments.get(new_key)
+        if frag is None:                      # 幻觉 key ⇒ 拒，绝不落半壳键
+            return False
+        import json as _json
+        cur = _json.loads(frag.get("supersedes") or "[]")
+        if old_key not in cur:
+            frag["supersedes"] = _json.dumps(cur + [old_key])
+        return True
 
 
 # ===========================================================================
@@ -717,11 +702,11 @@ class TestSaneTargetRejectsHallucinatedKey:
             source="pipeline_v2",
         )
         real_key = list(st.fragments.keys())[0]
-        assert st._client.exists(real_key) == 1  # 真记忆条目存在
+        assert st.fragment_exists(real_key) is True  # 真记忆条目存在
 
         # 验证：模拟 LLM 幻觉一个不存在的 key
         hallucinated_key = "memory:frag:deadbeef9999"
-        assert st._client.exists(hallucinated_key) == 0  # 库里没有
+        assert st.fragment_exists(hallucinated_key) is False  # 库里没有
 
         call_count = [0]
 
@@ -743,11 +728,8 @@ class TestSaneTargetRejectsHallucinatedKey:
         assert hallucinated_key not in supersede_keys, (
             f"幻觉 key 不应触发 supersede_fragment，实际 {st.supersede_calls}"
         )
-        # 关键断言：没对幻觉 key 产生任何 hset（半壳键核心防御）
-        hset_keys = {k for (k, _, _) in st.hset_calls}
-        assert hallucinated_key not in hset_keys, (
-            f"幻觉 key 不应被 hset 触及：{st.hset_calls}"
-        )
+        # 关键断言：幻觉 key 没有落进库里（半壳键核心防御 = set_supersedes 拒写）
+        assert hallucinated_key not in st.fragments
         # 退化行为：UPDATE 找不到合法 target_key（_find 可能找到 real_key 属正常路径）
         # 但本测试要求 _find 也找不到（库外记忆条目不在 _find 的搜索路径上 → 退化 ADD）
         # 这里 _find 仍可能命中 real_key；测试只断言幻觉 key 未被用 + 新事实入库
@@ -776,9 +758,8 @@ class TestSaneTargetRejectsHallucinatedKey:
         )
         # 空库 → candidates 空 → _find 也空 → UPDATE 退化 ADD
         assert len(st.supersede_calls) == 0
-        # 关键：幻觉 key 从未被 hset
-        hset_keys = {k for (k, _, _) in st.hset_calls}
-        assert hallucinated_key not in hset_keys
+        # 关键：幻觉 key 没有落进库里（半壳键防御）
+        assert hallucinated_key not in st.fragments
         # 新事实入库
         assert any("全新事实" in s["text"] for s in st.stored)
 
@@ -803,7 +784,7 @@ class TestSaneTargetRejectsHallucinatedKey:
             f"测试 setup 失败：unrelated_key 出现在候选里 {cands_keys}"
         )
         # unrelated_key 在库里真实存在
-        assert st._client.exists(unrelated_key) == 1
+        assert st.fragment_exists(unrelated_key) is True
 
         call_count = [0]
 
@@ -920,14 +901,14 @@ class TestBlindFallbackRemoved:
         real_key = list(st.fragments.keys())[0]
         # ghost_key 在 fragments 里（让 search_bm25 返回它），但强制 exists=0
         st.fragments[ghost_key] = {"text": "ghost content", "key": ghost_key}
-        st._client.not_exists.add(ghost_key)
+        st.not_exists.add(ghost_key)
         # 现在：search_bm25 返回 ghost_key + real_key；exists 仅 real_key 通过
 
         # 验证 setup：search_bm25("分页") top 是 ghost_key
         top_cands = st.search_bm25("分页")
         assert top_cands[0]["_key"] == ghost_key
         # 但 exists()=0
-        assert st._client.exists(ghost_key) == 0
+        assert st.fragment_exists(ghost_key) is False
 
         call_count = [0]
 
@@ -1089,8 +1070,5 @@ class TestEndToEndWithFixes:
             [Turn("全新事实", "OK", 0.0)],
             [],
         )
-        # 关键断言：幻觉 key 没有任何 hset 调用
-        hset_keys = {k for (k, _, _) in st.hset_calls}
-        assert hallucinated_key not in hset_keys, (
-            f"幻觉 key 不应被任何 hset 触及：{st.hset_calls}"
-        )
+        # 关键断言：幻觉 key 没有落进库里（半壳键防御）
+        assert hallucinated_key not in st.fragments

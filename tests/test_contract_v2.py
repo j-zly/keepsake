@@ -11,7 +11,7 @@ supersede_reason（作废原因）/ applicability（适用条件）。语义单�
   3. 缺列降级：读省略键 / 写报人话 500（带迁移 SQL）
   4. 老行 is_latest 为 NULL/空 ⇒ 仍视为链头（迁移前写的行不许被整批抹掉）
 
-后端可达性说明：PG / Redis 在本机**没有**真服务（无 psycopg、无 redis-server），
+后端可达性说明：PG 在本机**可能没有**真服务（无 psycopg / 无凭据则 skip），
 所以这两侧用假游标/假客户端断言「发出的 SQL / HSET 是什么」—— 契约本身
 （写什么字段、检索过滤在哪一层、老数据怎么兜）才是这三后端真正要一致的东西，
 而那正是假件能钉住的。SQLite 侧是**真库真跑**（tmp_path），红绿闭环。
@@ -25,7 +25,6 @@ from typing import Any, List
 
 import pytest
 
-from keepsake.storage import RedisStorage
 from keepsake.storage_pg import FRAGMENT_COLUMNS, PgStorage
 from keepsake.storage_shared import (
     CHAIN_HEAD_SQL,
@@ -253,73 +252,6 @@ def test_pg_旧调用方默认参数_落库值逐字不变():
 # 1c. Redis：supersede 链（假客户端，看 HSET）
 # =============================================================================
 
-class _FakePipe:
-    def __init__(self, sink):
-        self.sink = sink
-
-    def hset(self, key, field, value):
-        self.sink.append(("hset", key, field, value))
-
-    def execute(self):
-        pass
-
-
-class _FakeRedis:
-    """够 supersede_fragment / set_supersedes 用的最小 Redis 替身。"""
-
-    def __init__(self, sink, store=None):
-        self.sink, self.store = sink, (store if store is not None else {})
-
-    def hset(self, key, field, value):
-        self.sink.append(("hset", key, field, value))
-        self.store.setdefault(key, {})[field] = value
-
-    def hget(self, key, field):
-        return self.store.get(key, {}).get(field)
-
-    def pipeline(self):
-        return _FakePipe(self.sink)
-
-
-def test_redis_supersede_旧条转链身_新条回填反向链():
-    """Redis 侧 supersede 链：hash 侧同口径。"""
-    sink: List[Any] = []
-    redis = _FakeRedis(sink, {"memory:frag:new": {"supersedes": json.dumps(["old2"])}})
-    st = RedisStorage.__new__(RedisStorage)
-    st._get_client = lambda: redis
-
-    assert st.supersede_fragment("memory:frag:old", "memory:frag:new",
-                                 reason="换了迁移工具") is True
-    sets = {(k, f): v for kind, k, f, v in sink if kind == "hset"}
-    assert sets[("memory:frag:old", "is_latest")] == "0", "旧条必须打成链身"
-    assert sets[("memory:frag:old", "superseded_by")] == "memory:frag:new"
-    assert sets[("memory:frag:new", "is_latest")] == "1"
-    assert sets[("memory:frag:new", "supersede_reason")] == "换了迁移工具"
-    # 反向链是**追加**：库里已有的 old2 不能被抹掉
-    assert json.loads(sets[("memory:frag:new", "supersedes")]) == ["old2", "memory:frag:old"]
-
-
-def test_redis_链身判据_老数据当链头():
-    """`is_chain_head`：字段缺失/空/'1' 一律链头，只有 '0' 是链身。
-
-    2026-10 ks_retrieval_v3：Redis 侧的 `_is_chain_body` 已删，本判据与
-    PG `CHAIN_HEAD_SQL` 同走 storage_shared.is_chain_head 单点。语义反过来：
-    `is_chain_head(v)` 为 True ⇒ 不是链身（即 `_is_chain_body(v)` 为 False）。
-    「判错方向只有一侧有灾难：老数据当成链身 = 一次升级把存量记忆整批从检索里抹掉」。
-    """
-    from keepsake.core.shared import is_chain_head
-    assert is_chain_head(None) is True            # 字段压根没有 ⇒ 链头
-    assert is_chain_head("") is True              # 空串 ⇒ 链头
-    assert is_chain_head("1") is True             # 链头
-    assert is_chain_head(b"0") is False           # 链身（bytes 未解码的旧配置）
-    assert is_chain_head("0") is False
-    assert is_chain_head(" 0 ") is False
-
-
-# =============================================================================
-# 2. applicability 落库读回往返
-# =============================================================================
-
 def test_sqlite_applicability_落库读回往返(store):
     """适用条件：store 写进去 → get_fragment 读出来 → 检索结果里也带着。"""
     text = f"{TOKEN} 数据库迁移用 Alembic"
@@ -339,10 +271,10 @@ def test_sqlite_applicability_落库读回往返(store):
     assert "applicability" not in store.get_fragment(plain)
 
 
-def test_三后端_store_都接_applicability_可选入参():
+def test_两后端_store_都接_applicability_可选入参():
     """三后端 store 签名一致，且默认空串 ⇒ 老调用方逐字不受影响。"""
     import inspect
-    for cls in (PgStorage, SqliteStorage, RedisStorage):
+    for cls in (PgStorage, SqliteStorage):
         sig = inspect.signature(cls.store)
         assert sig.parameters["applicability"].default == "", cls.__name__
         # 同样的可选入参在 supersede_fragment 上（reason）

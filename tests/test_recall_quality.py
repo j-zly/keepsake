@@ -184,7 +184,7 @@ def test_same_query_three_runs_give_identical_key_sequence(corpus):
 
 def test_tiebreak_is_shared_by_all_backends():
     """三后端的 tiebreaker 必须走**同一份实现**（同一语义，不会各自漂移）。"""
-    from keepsake import storage, storage_pg, storage_shared, storage_sqlite
+    from keepsake import storage_pg, storage_shared, storage_sqlite
 
     rows = [{"_key": "b", "_combined_score": 1.0}, {"_key": "a", "_combined_score": 1.0},
             {"_key": "c", "_combined_score": 2.0}, {"_combined_score": 1.0}]
@@ -194,7 +194,6 @@ def test_tiebreak_is_shared_by_all_backends():
     # 两个后端的静态方法只是薄转发，输出必须与共用实现逐条一致
     assert [f.get("_key") for f in storage_pg.PgStorage._tiebreak(rows)] == want
     assert [f.get("_key") for f in storage_sqlite.SqliteStorage._tiebreak(rows)] == want
-    assert storage.tiebreak_by_key is storage_shared.tiebreak_by_key
 
 
 # ---------------------------------------------------------------------------

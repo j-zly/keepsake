@@ -1,5 +1,5 @@
 """
-存储后端抽象层 — Redis 与 PostgreSQL 两个后端共用的接口定义。
+存储后端抽象层 — PostgreSQL 与 SQLite 两个后端共用的接口定义。
 
 **本模块只抽签名层，不放任何共用实现。**
 共用逻辑（_rrf_fuse / _apply_v2_filters / _rerank_with_decay / match_* 等）
@@ -46,7 +46,7 @@ class BackendUnsupportedError(RuntimeError):
 
     🔴 **消息里必须带 `backend_unsupported` 字样**：那是本仓库对「显式降级」的
        统一标记（控制台 / MCP 层按它区分「不支持」与「失败」）。改文案前先看
-       `mcp_server/tools.py` 与 `core/redis.py` 里的判据。
+       `mcp_server/tools.py` 里的判据（2026-11：`core/redis.py` 随该后端移除）。
     """
 
     def __init__(self, message: str = "backend_unsupported: 该后端不支持此能力") -> None:
@@ -57,11 +57,10 @@ class StorageBase(ABC):
     """存储后端抽象基类。
 
     实现方：
-      - `keepsake.storage.RedisStorage`（默认后端，Redis + RediSearch）
       - `keepsake.storage_pg.PgStorage`（可选后端，PostgreSQL）
 
     约定：
-      - 读写类方法在「后端不可用」时行为由实现方自定（Redis 侧沿用既有
+      - 读写类方法在「后端不可用」时行为由实现方自定（历史：Redis 侧沿用既有
         falsy 返回；PG 侧故意抛错 —— 详见 storage_pg 模块注释）
       - 检索类方法若后端尚未实现，**必须抛 NotImplementedError**，
         绝不允许静默返回空列表（静默空 = 记忆搜不到且无告警，最危险的失败形态）
@@ -77,7 +76,7 @@ class StorageBase(ABC):
     #: 本后端**是否支持幂等键**（2026-10 ks_idem）。
     #:
     #: 🔴 **默认 False（不支持）**，与 `supports_rev_cas` 同一套纪律：
-    #:    没实现 `idem_lookup` / `idem_record` 的后端（Redis）必须**显式报错**，
+    #:    没实现 `idem_lookup` / `idem_record` 的后端必须**显式报错**，
     #:    绝不静默降级成「照写不误」—— 调用方传了幂等键却拿到「写成功」的
     #:    回执 ⇒ 它以为重试安全，其实重试会落第二条（正是本单要治的病）。
     supports_idempotency: bool = False
@@ -87,7 +86,7 @@ class StorageBase(ABC):
     #: 墓碑 = 「这条删过、何时删、当时什么版本」的**留痕**。没有它，
     #: `memory_get` 对已删条目回「不存在」⇒ 与**从未存在**无法区分。
     #:
-    #: 🔴 **默认 False（不留痕）**，与上面两个开关同一套纪律：Redis 后端删除
+    #: 🔴 **默认 False（不留痕）**，与上面两个开关同一套纪律：（历史：Redis 后端删除
     #:    **不留痕** ⇒ 它**必须显式说明**（能力声明里 `tombstone=false` +
     #:    `tombstone_lookup` 抛 `backend_unsupported`），**不许让调用方以为
     #:    「删了可查证」**。真留痕的后端（PG / SQLite）必须显式改成 True。
@@ -109,7 +108,7 @@ class StorageBase(ABC):
 
     @abstractmethod
     def health_check(self) -> bool:
-        """后端中立的后端存活探针（替代直接摸 Redis client 的泄漏写法）。
+        """后端中立的后端存活探针（替代直接摸后端连接对象的泄漏写法）。
 
         返回 True = 后端可达。调用方（如插件/健康检查）应只用这个方法，
         不要直接拿后端专属连接对象。
@@ -176,7 +175,7 @@ class StorageBase(ABC):
     #      写：声明 `expected_rev`，对不上 ⇒ **拒绝并回最新内容**（不覆盖）。
     #
     #    🔴 **刻意不是 `@abstractmethod`**（与 `daily_counts` 同款纪律）：
-    #       只有 PG / SQLite 支持真 CAS，Redis 明确不支持 ⇒ 默认实现直接抛
+    #       PG / SQLite 都支持真 CAS（2026-11：Redis 的「明确不支持」档退场）
     #       `BackendUnsupportedError`，**禁止静默降级成「无条件覆盖」**。
     #       抽象方法会让漏实现的后端在**构造期**就炸（波及既有测试），
     #       默认抛错则每个后端必须自己表态「支持」还是「不支持」。
@@ -238,7 +237,7 @@ class StorageBase(ABC):
     #    （owner 取本次实际打标的 `agent:<id>`）。
     #
     # 🔴 **默认实现 = 不支持**（抛 `BackendUnsupportedError`），与
-    #    `cas_update` / `cas_remove` 同一套纪律：Redis 侧不做这层，
+    #    `cas_update` / `cas_remove` 同一套纪律：（历史：Redis 侧不做这层，
     #    调用方传了幂等键必须**显式知道**，不许被静默降级成「照写不误」。
     #
     # ⚠️ **局限（写进注释与 README，别让人误读成互斥锁）**：幂等表只在
@@ -301,7 +300,7 @@ class StorageBase(ABC):
     #    **承诺**，承诺兑现不了就别删。
     #
     # 🔴 **默认实现 = 不支持**（抛 `BackendUnsupportedError`），与
-    #    `cas_update` / `idem_lookup` 同一套纪律：Redis 后端不留痕 ⇒
+    #    `cas_update` / `idem_lookup` 同一套纪律：（历史：Redis 后端不留痕）⇒
     #    **显式说「这个后端做不了」**，绝不静默假装「没删过」。
     # ------------------------------------------------------------------
 
@@ -362,7 +361,7 @@ class StorageBase(ABC):
     def touch_fragment(self, key: str) -> bool:
         """R6 命中后刷新「最近命中」状态；**绝不覆盖 content**。
 
-        Redis 侧逐字保留原实现（pipeline 里 hincrby touch_count + hset updated_at）。
+        （历史：Redis 侧原实现是 pipeline 里 hincrby touch_count + hset updated_at。）
         PG 侧 ks_fragment 无这两列 ⇒ 返回 False 并打日志说明（见 storage_pg 实现）。
         """
 
@@ -371,7 +370,7 @@ class StorageBase(ABC):
         """给新碎片打单向 `supersedes=<old_key>` 留痕（替代 `client.hset`）。
 
         注意与 `supersede_fragment(old, new)` 方向相反：后者是反向封边，两后端都有；
-        本方法只是单向元数据，Redis 侧至今无任何读取方。
+        本方法只是单向元数据（历史：Redis 侧无读取方）。
         """
 
     # ------------------------------------------------------------------
@@ -447,15 +446,15 @@ class StorageBase(ABC):
     # 的 SCAN 游标 + pipeline，于是 PG 后端整体 unsupported。这里给出**后端无关
     # 的四个原语**，两个后端各实现一份：
     #
-    #   * `scan_fragment_keys`  分页扫描（Redis=SCAN 游标；PG=keyset 分页
+    #   * `scan_fragment_keys`  分页扫描（历史 Redis=SCAN 游标；PG=keyset 分页
     #     `WHERE key > :cursor ORDER BY key LIMIT n`，**禁止大 OFFSET**）
-    #   * `get_fragments_batch` 批量读（已在上面声明，Redis=HMGETALL、PG=ANY）
+    #   * `get_fragments_batch` 批量读（已在上面声明；PG=ANY、SQLite=IN）
     #   * `write_fragments_batch` 批量写（新碎片；PG 侧要重算 content_tsv/embedding）
     #   * `update_fragment_fields` 局部更新（标记 consumed 用，不动 content）
     #   * `delete_fragments_batch` 批量删
     #
     # 游标约定：`cursor` 是**不透明字符串**，`""` = 从头开始；
-    # 返回的 `next_cursor` 为 `""` 表示**已扫完**（Redis 的游标 0 = PG 的空串）。
+    # 返回的 `next_cursor` 为 `""` 表示**已扫完**（历史：Redis 的游标 0 = PG 的空串）。
     # ------------------------------------------------------------------
 
     @abstractmethod
@@ -467,10 +466,10 @@ class StorageBase(ABC):
     ) -> Tuple[str, List[str]]:
         """分页扫描碎片 key。返回 `(next_cursor, keys)`。
 
-        `prefix` 是**前缀**（不带 `*`），Redis 侧转成 `SCAN MATCH prefix*`，
+        `prefix` 是**前缀**（不带 `*`；历史：Redis 侧转成 `SCAN MATCH prefix*`），
         PG 侧转成 `key LIKE prefix%`。两个后端对同一 prefix 必须给出等价 key 集
         —— 调用方（合并/遗忘）按 `prefix="memory:full:"` 扫描时，
-        Redis 若无该 keyspace 就返回空，PG 侧 ks_fragment 里没有这些 key 也返回空。
+        PG / SQLite 侧表里没有这些 key 就返回空。
         """
         ...
 
@@ -521,7 +520,7 @@ class StorageBase(ABC):
           某个代理写的，也不把它摊到别人头上。
 
         `d` 是 `YYYY-MM-DD`；行序 = 日期升序、同日按代理升序（回包好对账）。
-        中性实现走 `scan_fragment_keys` + `get_fragments_batch`（Redis / SQLite
+        中性实现走 `scan_fragment_keys` + `get_fragments_batch`（SQLite
         用这条）；PG 侧覆写成一条 `GROUP BY 日期, 归属` 的 SQL（`core/pg.py`）。
         """
         n = max(1, int(days))
@@ -576,10 +575,10 @@ class StorageBase(ABC):
         无需各自实现：
           * `SqliteStorage`：改了 content/entities/tags 就**就地重算
             `content_tsv` 并同步 FTS**（见其实现注释）；
-          * `RedisStorage`：索引是 `FT.CREATE ... ON HASH PREFIX 1 memory:frag:`
+          * （历史）`RedisStorage`：索引是 `FT.CREATE ... ON HASH PREFIX 1 memory:frag:`
             （无 `NOINDEX`/`SKIPINITIALSCAN` 排除），RediSearch 对命中前缀的
             hash **每次写都自动维护索引** ⇒ HSET 新正文后 BM25/KNN 立即跟随，
-            且 Redis 没有 `content_tsv` 列，本就无第二份索引要同步。
+            （历史：Redis 没有 `content_tsv` 列，本就无第二份索引要同步。）
           * `PgStorage`：**覆写**本方法（同事务内重算 `content_tsv`，A=正文
             / B=实体+标签，参数与拼接口径复用 `store()` 的同一份函数）。
 
@@ -611,7 +610,7 @@ class StorageBase(ABC):
 
         tag 匹配必须是**分隔符边界上的完整标签相等**（与检索侧
         `storage_shared.tag_match_sql` 同一判据）：`core` 不许命中 `core-x`。
-        Redis 侧 `tags` 落库形态是逗号串，按逗号切分比对。
+        （历史）Redis 侧 `tags` 落库形态是逗号串，按逗号切分比对。
 
         🔴 **只返回未归档条目**：已归档（`is_archived='1'` + `valid_until=now`，
         见 `archive_fragment`）的一律不返回 —— 归档是版本化失效的同款语义，
@@ -727,7 +726,7 @@ class StorageBase(ABC):
 #
 # 三条纪律（下一单 core_tiering 直接依赖，别改）：
 #   1. **绝不阻塞检索热路径**：默认执行器是 daemon 后台线程（与
-#      `query_expansion.schedule_background_expansion` 同一件做法）。
+#      daemon 线程、不 join（与已移除的 query_expansion 后台线程同一件做法）。
 #   2. **fail-open**：打点抛错只 debug 日志，检索结果一个字都不许变。
 #   3. **限频 300 秒**：同 key 五分钟内只记一次 —— 窗口统计因此有 ±5 分钟误差，
 #      这是**有意接受**的口径（不是 bug）。

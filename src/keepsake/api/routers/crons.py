@@ -50,7 +50,7 @@ def _memory_keys() -> Tuple[Set[str], Set[str]]:
         pass
     if not names:
         names = {"记忆提炼", "记忆维护", "记忆去重"}
-        scripts = {"memory_distill.py", "memory-maintenance.py", "dedup-memory.sh"}
+        scripts = {"memory_distill.py", "memory-maintenance.py"}
     return names, scripts
 
 

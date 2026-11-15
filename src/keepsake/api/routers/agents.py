@@ -70,7 +70,6 @@ from pydantic import BaseModel, Field
 from keepsake.govern.registry import (
     ALREADY_APPROVED_NOTE,
     AlreadyApprovedError,
-    SingleCredentialBackend,
     ROLE_PRIMARY,
     ROLES,
     STATUS_APPROVED,
@@ -116,7 +115,7 @@ ROLE_PRIMARY_NOTE = "全库唯一 primary：原 primary 已自动降为 sub（�
 
 #: 手工登记的 agent_id 形态：小写字母 / 数字开头，其余是字母数字或连字符，
 #: 总长 2~40（`^[a-z0-9][a-z0-9-]{1,39}$`）。
-#: 🔴 这个串同时是**文件系统路径与 Redis key 的一部分**，也进日志与审计的
+#: 🔴 这个串同时是**文件系统路径与注册表主键**的一部分，也进日志与审计的
 #: target 字段 —— 放开大小写与特殊字符就等于给审计目录开口子，所以只收这一档。
 AGENT_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{1,39}$"
 
@@ -269,7 +268,7 @@ def _registry(storage: Any) -> Registry:
     """按控制台的存储后端装配注册表（并确保 `ks_agent` 在）。
 
     `ensure_schema()` 对 SQL 后端就是各后端自己的 `ensure_index()`（幂等），
-    对 Redis 是 no-op —— 控制台进程与主脑进程各自构造存储、各自 ensure，
+    控制台进程与主脑进程各自构造存储、各自 ensure，
     这正是既有 `get_storage()` 的口径，不另开连接、不另配 DSN。
     """
     registry = Registry(storage)
@@ -638,13 +637,7 @@ def add_agent_credential(agent_id: str, body: AgentCredentialAddBody,
     if str((row or {}).get("status") or "") != STATUS_APPROVED:
         _reject(409, "not_approved",
                 "只给**已批准**的代理加凭据（这行现在不是 approved）", action, agent_id)
-    try:
-        credential = registry.add_credential(agent_id, body.label)
-    except SingleCredentialBackend:
-        _reject(409, "single_credential_backend",
-                "当前存储后端（Redis）一把代理只放得下一把凭据 —— "
-                "多凭据请用 PG / SQLite 后端（生产已在 PG）", action, agent_id)
-        return {}     # 不可达：_reject 抛 HTTPException
+    credential = registry.add_credential(agent_id, body.label)
     if not credential:
         _reject(409, "not_approved", "这个代理现在不可签发凭据（未批准 / 不在册）",
                 action, agent_id)
@@ -943,7 +936,7 @@ def register_agent(body: AgentRegisterBody,
     registry = _registry(storage)
     agent_id = (body.agent_id or "").strip()
     # 🔴 形态先判（不碰存储）：不合规的 agent_id 会进审计目录的文件名与
-    # Redis key，挡住比事后清理便宜。理由给的是人话，不是「正则不匹配」。
+    # 注册表主键，挡住比事后清理便宜。理由给的是人话，不是「正则不匹配」。
     if not _valid_agent_id(agent_id):
         _reject(400, "bad_agent_id",
                 f"agent_id 不合规：只允许小写字母、数字与连字符，"
@@ -1000,7 +993,7 @@ def set_agent_id(agent_id: str, body: AgentSetIdBody,
     registry = _registry(storage)
     old_id = (agent_id or "").strip()
     new_id = (body.new_id or "").strip()
-    # 🔴 形态先判（不碰存储）：新 id 会进审计目录的文件名与 Redis key。
+    # 🔴 形态先判（不碰存储）：新 id 会进审计目录的文件名与注册表主键。
     if not _valid_agent_id(new_id):
         _reject(400, "bad_agent_id",
                 f"新 agent_id 不合规：只允许小写字母、数字与连字符，"

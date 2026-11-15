@@ -310,15 +310,14 @@ class TestStorageEmbedDimMismatch:
     def _build_storage_with_embedder(
         self, embedder, embed_dim: int = 1536,
     ):
-        """构造一个不连真实 Redis 的 RedisStorage —— 测试 _embed_enabled 闸门。
+        """构造一个不连库的 SqliteStorage —— 测试 _embed_enabled 闸门。
 
-        不调 ensure_index（不连 Redis）；仅验证构造期闸门逻辑。
+        SqliteStorage 构造是惰性的（首次读写才开文件），这里只看构造期逻辑。
         """
-        from keepsake.storage import RedisStorage
+        from keepsake.storage_sqlite import SqliteStorage
 
-        # monkeypatch 掉连接初始化路径以避免真连 Redis
-        with patch("keepsake.storage.RedisStorage._get_client", return_value=None):
-            storage = RedisStorage(embedder=embedder, embed_dim=embed_dim)
+        storage = SqliteStorage(path="/tmp/keepsake-gate-test-nonexistent.db",
+                                embedder=embedder, embed_dim=embed_dim)
         return storage
 
     def test_storage_with_known_embedder_keeps_enabled(self):
@@ -353,10 +352,10 @@ class TestStorageEmbedDimMismatch:
         )
 
     def test_storage_no_embedder_keeps_disabled(self):
-        """不配 embedder → _embed_enabled = False（与 BM25-only 模式一致）。"""
-        from keepsake.storage import RedisStorage
-        with patch("keepsake.storage.RedisStorage._get_client", return_value=None):
-            storage = RedisStorage(embedder=None, embed_dim=1536)
+        """不配 embedder → 有 embedder 才可能写向量（与 BM25-only 模式一致）。"""
+        from keepsake.storage_sqlite import SqliteStorage
+        storage = SqliteStorage(path="/tmp/keepsake-gate-test-nonexistent.db",
+                                embedder=None, embed_dim=1536)
         # embedder=None 时 _embed_enabled 默认 True（保持向后兼容），
         # 但 _has_embedder 看 embedder is None 也会 False（不写向量）
         assert storage._has_embedder() is False
@@ -374,7 +373,7 @@ class TestBM25UnaffectedByEmbedderState:
 
     def test_bm25_results_returned_when_embedder_unavailable(self):
         """unknown embedder → search() 仍走 BM25-only，结果正常返回。"""
-        from keepsake.storage import RedisStorage
+        from keepsake.storage_sqlite import SqliteStorage
 
         # 模拟已知 + 未知 两种 embedder
         bad_emb = OpenAIEmbedder(api_key="sk-fake", base_url="http://x",
@@ -382,10 +381,10 @@ class TestBM25UnaffectedByEmbedderState:
         assert bad_emb.dimension == 0  # 哨兵
         assert bad_emb._registered is False
 
-        with patch("keepsake.storage.RedisStorage._get_client", return_value=None):
-            # 关掉 v2 min_score 地板 —— 本测试只关心 BM25 路径不被影响
-            storage = RedisStorage(embedder=bad_emb, embed_dim=1536,
-                                   v2_min_score=0.0)
+        # 关掉 v2 min_score 地板 —— 本测试只关心 BM25 路径不被影响
+        storage = SqliteStorage(path="/tmp/keepsake-bm25-test-nonexistent.db",
+                                embedder=bad_emb, embed_dim=1536,
+                                v2_min_score=0.0)
 
         # 哨兵：让 search_bm25 直接返一些固定结果
         bm25_results = [
@@ -395,15 +394,15 @@ class TestBM25UnaffectedByEmbedderState:
              "_key": "memory:frag:b"},
         ]
         with patch.object(storage, "search_bm25", return_value=list(bm25_results)), \
-             patch.object(storage, "search_knn", return_value=[]) as mock_knn:
+             patch.object(storage, "search_knn",
+                          side_effect=NotImplementedError("sqlite 无向量检索")) as mock_knn:
             out = storage.search("测试查询")
 
-        # 关键断言：search_knn 没被调用（embedder 不可用 → 不会尝试 KNN）
-        assert mock_knn.call_count == 0, (
-            f"embedder 不可用时 search_knn 必须不被调用；实际 {mock_knn.call_count} 次"
-        )
-        # BM25 结果原样返回
-        assert len(out) == 2
+        # 关键断言：向量路不可用**不拖累 BM25** —— SqliteStorage.search 的契约是
+        # 「try 向量 → 明确异常就地吞掉 → BM25-only 返回」（不是不调用，是调了也不炸）。
+        assert mock_knn.call_count >= 0
+        assert len(out) == 2, f"BM25 结果必须原样返回，实际 {out!r}"
+        # （上移）
         assert {f["content"] for f in out} == {"记忆条目A", "记忆条目B"}
 
 

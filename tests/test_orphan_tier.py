@@ -215,15 +215,14 @@ def test_pg侧两处断链分支都回orphan():
 
 
 # ---------------------------------------------------------------------------
-# ⑥ 三后端状态枚举对齐（provider 层不漏）
+# ⑥ 两后端状态枚举对齐（provider 层不漏）
 # ---------------------------------------------------------------------------
 
-def test_三后端cas方法签名与状态枚举一致():
-    """PG / SQLite 真实现、Redis 显式抛「不支持」—— 方法与签名必须齐。"""
+def test_两后端cas方法签名与状态枚举一致():
+    """PG / SQLite 真实现 —— 方法与签名必须齐。"""
     from keepsake.core.pg import PgStorage
-    from keepsake.core.redis import RedisStorage
 
-    for cls in (PgStorage, SqliteStorage, RedisStorage):
+    for cls in (PgStorage, SqliteStorage):
         for name in ("cas_update", "cas_remove"):
             fn = getattr(cls, name, None)
             assert callable(fn), f"{cls.__name__}.{name} 缺失"

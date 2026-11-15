@@ -27,7 +27,6 @@ import pytest
 
 from keepsake.adapters.hermes.provider import KeepsakeProvider
 from keepsake.core.base import BackendUnsupportedError
-from keepsake.core.redis import RedisStorage
 from keepsake.core.sqlite import SqliteStorage
 
 #: 两条并发分支各自要写的内容（**故意不同** ⇒ 两条哈希不同 ⇒ 真能分叉）
@@ -273,37 +272,6 @@ def test_非归属代理不能改别人的碎片(db_path):
         assert out.get("ok") is True, out
     finally:
         p._storage.close()
-
-
-# ---------------------------------------------------------------------------
-# ⑦ Redis 后端：显式不支持（**禁止静默降级**）
-# ---------------------------------------------------------------------------
-
-def test_redis后端改写抛backend_unsupported():
-    """Redis 不做真 CAS ⇒ **明确抛错**，绝不静默忽略 expected_rev。
-
-    🔴 静默降级（当成无条件覆盖）比报错坏得多：调用方会拿到「成功」回执，
-    而并发写照样分叉 —— 报错时代理至少知道要重试。
-    """
-    storage = RedisStorage()
-    with pytest.raises(RuntimeError) as excinfo:
-        storage.cas_update("memory:frag:任意", {"content": "改写"}, "1")
-    assert "backend_unsupported" in str(excinfo.value)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        storage.cas_remove("memory:frag:任意", "1")
-    assert "backend_unsupported" in str(excinfo.value)
-
-
-def test_redis后端在provider层同样抛错():
-    """provider 走 Redis 时**原样上抛**（不被吞成假成功/假冲突）。"""
-    p = KeepsakeProvider()
-    p._storage = RedisStorage()
-    with pytest.raises(BackendUnsupportedError) as excinfo:
-        p.update("memory:frag:任意", "改写内容", "1")
-    assert "backend_unsupported" in str(excinfo.value)
-
-
 # ---------------------------------------------------------------------------
 # ⑧ MCP 工具面：memory_update / memory_remove 的 expected_rev
 # ---------------------------------------------------------------------------
@@ -370,7 +338,7 @@ def test_三后端都声明cas方法且签名一致():
 
     from keepsake.core.pg import PgStorage
 
-    for cls in (PgStorage, SqliteStorage, RedisStorage):
+    for cls in (PgStorage, SqliteStorage):
         for name in ("cas_update", "cas_remove"):
             fn = getattr(cls, name, None)
             assert callable(fn), f"{cls.__name__}.{name} 缺失"

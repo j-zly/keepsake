@@ -527,9 +527,9 @@ def _export_rows(storage: Any, q: str, tag: str, limit: int,
 def _export_line(row: Dict[str, Any], fmt: str) -> bytes:
     """一行导出记录（JSONL 行 或 CSV 行），UTF-8 字节。"""
     rec = {f: str(row.get(f, "") or "") for f in EXPORT_FIELDS}
-    # `updated_at` 各后端字段名不同（sqlite/redis=updated、PG 没有 updated_at，
+    # `updated_at` 各后端字段名不同（sqlite=updated、PG 早期没有 updated_at，
     # 回落到 created）—— 与 `routers/fragments._UPDATED_KEYS` 同一套回退顺序，
-    # 否则导出的时间列在 sqlite/redis 库上整列空（同一份数据、两种口径）。
+    # 否则导出的时间列在 sqlite 库上整列空（同一份数据、两种口径）。
     if not rec["updated_at"]:
         for k in ("updated", "created"):
             if row.get(k):
@@ -1204,16 +1204,16 @@ def set_screening(body: ScreeningBody) -> Dict[str, Any]:
 # 迁移是人的决定：页面给一行提示，人填了新值再保存，那次保存才把旧明文摘掉。
 # --------------------------------------------------------------------------
 
-#: 五节（顺序 = 页面上的卡片顺序）。
-AI_SECTIONS: Tuple[str, ...] = ("llm", "embedder", "screening",
-                                "query_expansion", "tiering_review")
+#: 四节（顺序 = 页面上的卡片顺序）。
+#: 2026-11：query_expansion 节随 Redis 后端移除（其 LLM 扩展只在 Redis 后端有实现，
+#: PG/SQLite 从未接线 —— 页面上留着只会是一个骗人的开关）。
+AI_SECTIONS: Tuple[str, ...] = ("llm", "embedder", "screening", "tiering_review")
 
 #: **可写**的三节（各有自己的 AI 配置）。
 AI_EDITABLE_SECTIONS: Tuple[str, ...] = ("llm", "embedder", "screening")
 
-#: 复用 llm 节、**没有自己的 AI 配置**的两节 —— 对它们写 ⇒ 400，指引到 llm 节。
+#: 复用 llm 节、**没有自己的 AI 配置**的一节 —— 对它写 ⇒ 400，指引到 llm 节。
 AI_REUSE_SECTIONS: Dict[str, str] = {
-    "query_expansion": "查询扩展",
     "tiering_review": "分级班车复核",
 }
 
@@ -1366,7 +1366,7 @@ def _ai_reject_unknown(fields: Dict[str, Any], allowed: set,
 # --------------------------------------------------------------------------
 
 def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """llm 节（提炼 / 合并 / 查询扩展 / 班车复核共用这一条通道）。"""
+    """llm 节（提炼 / 合并 / 班车复核共用这一条通道；2026-11 起查询扩展已随 Redis 移除）。"""
     cfg = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
     base_url = str(cfg.get("base_url") or "").strip()
     model = str(cfg.get("model") or "").strip()
@@ -1476,19 +1476,11 @@ def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
                       llm_ok: bool) -> Dict[str, Any]:
-    """两节「只读说明卡」：没有自己的 AI 配置，全部复用 llm 节。"""
-    if section_id == "query_expansion":
-        ret = raw.get("retrieval") if isinstance(raw.get("retrieval"), dict) else {}
-        qe = ret.get("query_expansion") if isinstance(ret.get("query_expansion"), dict) else {}
-        on = bool(qe.get("enabled", True))
-        label = "查询扩展"
-        note = ("复用 llm 节（同一接口、同一模型、同一凭据）；"
-                "调用开关在 config.json 的 retrieval.query_expansion.enabled（缺省开）。")
-    else:
-        from keepsake.core import tiering as tiering_mod
-        on = bool(tiering_mod.resolve_tiering(raw).get("enabled"))
-        label = "分级班车复核"
-        note = "复用 llm 节 + 班车开关（tiering.enabled）：班车关着时没有复核。"
+    """「只读说明卡」：没有自己的 AI 配置，全部复用 llm 节。"""
+    from keepsake.core import tiering as tiering_mod
+    on = bool(tiering_mod.resolve_tiering(raw).get("enabled"))
+    label = "分级班车复核"
+    note = "复用 llm 节 + 班车开关（tiering.enabled）：班车关着时没有复核。"
     return {
         "id": section_id,
         "label": label,
@@ -1502,7 +1494,7 @@ def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
 
 @router.get("/api/v1/settings/ai", dependencies=[Depends(require_session)])
 def get_ai_settings() -> Dict[str, Any]:
-    """AI 配置页的**五节快照**（只读端点：不挂 write_guard，绝不碰 config.json）。
+    """AI 配置页的**四节快照**（只读端点：不挂 write_guard，绝不碰 config.json）。
 
     🔴 **凭据真值永不下发**：secret 字段只回 `{"set": true/false}`（路径型另带
     `path`）—— 页面显示「已设置 / 未设置」徽标，不回显 key 内容。
@@ -1516,7 +1508,6 @@ def get_ai_settings() -> Dict[str, Any]:
         llm,
         _ai_embedder_section(raw),
         _ai_screening_section(raw),
-        _ai_reuse_section("query_expansion", raw, bool(llm["enabled"])),
         _ai_reuse_section("tiering_review", raw, bool(llm["enabled"])),
     ]
     return {"sections": sections,
@@ -1548,7 +1539,7 @@ def set_ai_settings(section_id: str,
 
     越界 / 空串 ⇒ 400 带人话（控制台提交是机器输入，半截值绝不许落盘）。
 
-    `query_expansion` / `tiering_review` 两节**没有独立配置** ⇒ 400，
+    `tiering_review` 一节**没有独立配置** ⇒ 400，
     指引去改 llm 节。
     """
     action, target = f"settings.ai.{section_id}", section_id
@@ -2064,7 +2055,7 @@ def review_counts(storage: Any = Depends(get_storage)) -> Dict[str, Any]:
         🔴 单点失败不许把记忆侧的徽标也拖没（侧栏常驻指望的是 promote/demote
         那两个数，知识库挂就挂知识库那颗）。
 
-    复用 `storage.list_by_tag` 这一个原语：三后端（PG / SQLite / Redis）的标签
+    复用 `storage.list_by_tag` 这一个原语：两后端（PG / SQLite）的标签
     计数就是它，不在 ops 层另发明 SQL 方言分支。
     """
     from keepsake.core import tiering as tiering_mod

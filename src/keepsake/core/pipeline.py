@@ -1028,7 +1028,7 @@ class Pipeline:
 
     @staticmethod
     def _key_for_content(text: str) -> str:
-        """根据文本推 Redis key（与 storage.store 一致的 sha256[:12] 算法）。"""
+        """根据文本推碎片 key（与 storage.store 一致的 sha256[:12] 算法）。"""
         import hashlib
         return f"memory:frag:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
 

@@ -1,11 +1,11 @@
-"""共用逻辑「单一实现」测试 —— Redis 与 PG 必须走同一份代码。
+"""共用逻辑「单一实现」测试 —— PG 与 SQLite 必须走同一份代码。
 
 背景（批 2 的架构要求）：检索后处理（RRF 融合 / v2 过滤 / 综合重排 / 批量载入）
 与注意力、热词的加权公式都跟后端无关。两个后端各抄一份必然漂移，而上层按同样的
 键取值 —— 一漂移就是**静默错排**（不报错，只是排出来的东西不对）。
 
 本文件用三种手段交叉证明「只有一份实现」：
-  1. **对象身份**：`RedisStorage._rrf_fuse is PgStorage._rrf_fuse`（最强证据：
+  1. **对象身份**：`PgStorage._rrf_fuse is SqliteStorage._rrf_fuse`（最强证据：
      不是「代码长得像」，是同一个函数对象）
   2. **AST 全仓扫描**：全仓 `src/keepsake` 里 `rrf_fuse` 等名字**只允许有一处 def**
   3. **行为等价**：同一个桩 storage 经两个后端类调用，结果逐字相等
@@ -20,11 +20,11 @@ from pathlib import Path
 
 import pytest
 
-from keepsake import storage, storage_pg, storage_shared
-from keepsake.storage import RedisStorage
+from keepsake import storage_shared
 from keepsake.storage_pg import PgStorage
+from keepsake.storage_sqlite import SqliteStorage
 
-SRC = Path(storage.__file__).resolve().parent
+SRC = Path(storage_shared.__file__).resolve().parent
 
 # 抽取到 storage_shared 的检索后处理：函数名 → 它在两个后端类体里绑定的私有名
 SHARED_METHODS = {
@@ -33,7 +33,7 @@ SHARED_METHODS = {
     "rerank_with_decay": "_rerank_with_decay",
     "load_fragments_by_keys": "_load_fragments_by_keys",
 }
-BACKENDS = {"RedisStorage": RedisStorage, "PgStorage": PgStorage}
+BACKENDS = {"PgStorage": PgStorage, "SqliteStorage": SqliteStorage}
 
 
 # ---------------------------------------------------------------- 二、同一个函数对象
@@ -49,7 +49,7 @@ def test_both_backends_bind_the_very_same_function_object(func_name):
             f"{backend_name}.{attr} 不是 storage_shared.{func_name} 本身 —— "
             f"说明该后端另抄了一份实现，共用逻辑已经分叉"
         )
-    assert RedisStorage.__dict__[attr] is PgStorage.__dict__[attr]
+    assert PgStorage.__dict__[attr] is SqliteStorage.__dict__[attr]
 
 
 def test_shared_functions_live_only_in_storage_shared_module():
@@ -134,7 +134,7 @@ def _round_floats(obj, nd: int = 7):
 
 @pytest.mark.parametrize("func_name", sorted(SHARED_METHODS))
 def test_shared_function_yields_identical_result_through_either_backend(func_name):
-    """同一个桩 storage，经 RedisStorage 与 PgStorage 两条入口调用结果逐字相同。"""
+    """同一个桩 storage，经 PgStorage 与 SqliteStorage 两条入口调用结果逐字相同。"""
     attr = SHARED_METHODS[func_name]
     # 每次都新建 —— 共用实现会就地写 _combined_score / _sim，复用同一批 dict
     # 会让「第二个后端」跑在被第一个后端改过的输入上，比较就失去意义了。
@@ -153,7 +153,7 @@ def test_shared_function_yields_identical_result_through_either_backend(func_nam
             out[backend_name] = cls.__dict__[attr](stub, *make_args(), **kwargs)
     # rerank 里带 `datetime.now()` 的时间衰减，两次调用相差几微秒 ⇒ 综合分末位会差。
     # 比到 7 位小数：足以证明「同一份算法」，又不把时钟抖动误判成分叉。
-    assert _round_floats(out["RedisStorage"]) == _round_floats(out["PgStorage"])
+    assert _round_floats(out["PgStorage"]) == _round_floats(out["SqliteStorage"])
 
 
 def test_rrf_fuse_puts_cross_validated_content_first():
@@ -191,8 +191,8 @@ def test_rerank_with_decay_knn_distance_semantics():
 # ---------------------------------------------------------------- 加权公式唯一实现
 
 @pytest.mark.parametrize("func_name, users", [
-    ("attention_boost_from_topics", ["keepsake.core.redis", "keepsake.core.pg"]),
-    ("hot_topic_weighted_hits", ["keepsake.core.redis", "keepsake.core.pg"]),
+    ("attention_boost_from_topics", ["keepsake.core.pg", "keepsake.core.sqlite"]),
+    ("hot_topic_weighted_hits", ["keepsake.core.pg", "keepsake.core.sqlite"]),
 ])
 def test_weight_formula_has_one_definition_and_is_used_by_both_backends(func_name, users):
     """注意力/热词加权：只有一处定义，且两个后端的调用点都引用它。
@@ -212,24 +212,26 @@ def test_weight_formula_has_one_definition_and_is_used_by_both_backends(func_nam
 
 def test_both_backends_reference_shared_weight_helpers():
     """两个后端都必须引用两个共用加权函数（双向都查，不漏一边）。"""
-    for path in (SRC / "pg.py", SRC / "redis.py"):
+    for path in (SRC / "pg.py", SRC / "sqlite.py"):
         src = path.read_text(encoding="utf-8")
         assert "attention_boost_from_topics" in src, f"{path.name} 未引用共用注意力公式"
-    for path in (SRC / "pg.py", SRC / "redis.py"):
+    for path in (SRC / "pg.py", SRC / "sqlite.py"):
         src = path.read_text(encoding="utf-8")
         assert "hot_topic_weighted_hits" in src, f"{path.name} 未引用共用热词衰减公式"
 
 
 # ---------------------------------------------------------------- 上游函数仍在原处
 
-@pytest.mark.parametrize("name", ["_hot_topic_snapshot", "_tag_safe", "_sanitize_terms"])
-def test_upstream_query_helpers_still_defined_in_storage(name):
-    """上游 58bf19c/d00b7eb 修过的查询词构造必须**留在 storage.py**
-    （PG 侧 import 复用，而不是搬走或各写一份）。"""
-    tree = ast.parse(Path(storage.__file__).read_text(encoding="utf-8"))
+@pytest.mark.parametrize("name", ["_sanitize_terms", "_expand_terms"])
+def test_query_helpers_have_one_definition_in_shared(name):
+    """查询式构造助手唯一实现在 core/shared.py。
+
+    2026-11：这两支历史上寄居 redis.py、被 pg/sqlite 反向借用；Redis 后端移除后
+    搬进共用层。这里钉「只有一处 def」—— 后端另抄一份就是分叉起点。"""
+    tree = ast.parse((SRC / "shared.py").read_text(encoding="utf-8"))
     defs = [n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
-    assert len(defs) == 1, f"{name} 必须仍在 storage.py 且只有一处，实得 {len(defs)}"
+    assert len(defs) == 1, f"{name} 必须只在 shared.py 定义一次，实得 {len(defs)}"
 
 
 def test_pg_backend_reuses_sanitize_terms_instead_of_copying():
@@ -254,118 +256,22 @@ def test_storage_pg_is_actually_using_the_module():
         assert name in used, f"storage_pg.py import 了 {name} 却没真正使用"
     # 2026-10 ks_lenfloor：长度地板**可配置**了 ⇒ 模块级 `MAX_CONTENT_LEN = 600`
     # 退役为**类级默认**（缺省 5000，三后端同一个值，见 storage_shared 的长度地板一节）。
-    assert storage_pg.PgStorage.MAX_CONTENT_LEN == 5000
-    assert storage_pg.PgStorage.MAX_CONTENT_LEN is storage_shared.DEFAULT_MAX_CONTENT_LEN
+    assert PgStorage.MAX_CONTENT_LEN == 5000
+    assert PgStorage.MAX_CONTENT_LEN is storage_shared.DEFAULT_MAX_CONTENT_LEN
 
 
 # ---------------------------------------------------------------- 迁移脚本的只读红线
 
-import importlib.util  # noqa: E402
+# ---------------------------------------------------------------- pg 侧注意力公式接线
 
-MIGRATE_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "migrate_redis_to_pg.py"
-
-
-def _load_migrate_module():
-    spec = importlib.util.spec_from_file_location("ks_migrate", MIGRATE_SCRIPT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@pytest.fixture(scope="module")
-def migrate():
-    return _load_migrate_module()
-
-
-def test_migrate_script_has_no_redis_writes(migrate):
-    """🔴 迁移脚本对 Redis **只读**：源码里只准出现下面这些**读**命令。
-
-    白名单（而不是只靠脚本自己的黑名单）：脚本里的 `FORBIDDEN_REDIS_COMMANDS`
-    是「碰了就拒跑」的黑名单，这里是「**只准**有这些」的正面清单 —— 脚本将来
-    引入一个既不在黑名单、也不在白名单里的调用（比如某个新的客户端方法），
-    这条测试会当场红，而不是等它真的写进去。
-
-    2026-10-10 ks_pg_aux_migrate 扩充：迁辅助结构新增 4 个**只读**命令
-        exists  —— 判断某结构在 Redis 侧到底存不存在（区分「结构缺失」与「结构为空」）
-        zrange  —— 读三榜 ZSET / entity_timeline / entity_cooc 的全部成员与分值
-        type   —— 时间线前缀下按 type 筛掉非 zset 的键
-        ttl    —— Redis「整集 TTL」换算成 PG 逐行 expire_ts
-    四个都是纯读，不改任何状态；`scan` 本来就在白名单里。
-    """
-    called = migrate.assert_no_redis_writes(MIGRATE_SCRIPT)
-    assert set(called) <= {"scan", "hgetall", "ping", "pipeline", "execute",
-                           "exists", "zrange", "type", "ttl"}, called
-
-
-@pytest.mark.parametrize("injected", [
-    "    client.set('k', 'v')",
-    "    client.hset('k', 'f', 'v')",
-    "    client.delete('k')",
-    "    client.unlink('k')",
-    "    client.zadd('z', {'m': 1})",
-    "    client.flushdb()",
-    "    client.execute_command('DEL', 'k')",
-    "    execute_command('SET', 'k', 'v')",
-])
-def test_redis_readonly_guard_is_not_vacuous(migrate, tmp_path, injected):
-    """探针：往脚本里注入一行写操作 → 红线必须真的报出来。
-
-    没有这条，上面那条「没写」就可能是因为检查逻辑写错了而恒真。
-    """
-    src = MIGRATE_SCRIPT.read_text(encoding="utf-8") + injected + "\n"
-    probe = tmp_path / "probe.py"
-    probe.write_text(src, encoding="utf-8")
-    with pytest.raises(SystemExit) as exc:
-        migrate.assert_no_redis_writes(probe)
-    assert "只读红线" in str(exc.value)
-
-
-def test_redis_readonly_guard_does_not_flag_pure_python(tmp_path):
-    """反向探针：普通的 `list.append` / 内置 `set` **不该**被判成写 Redis。
-
-    误报的红线等于没有红线 —— 有人天天被误报打断，红线当天就会被注释掉。
-    """
-    src = MIGRATE_SCRIPT.read_text(encoding="utf-8") + (
-        "\n    rows.append(1)\n    x = set([1, 2])\n"
-    )
-    probe = tmp_path / "probe_clean.py"
-    probe.write_text(src, encoding="utf-8")
-    migrate = _load_migrate_module()
-    migrate.assert_no_redis_writes(probe)      # 不抛异常即通过
-
-
-def test_eval_compare_reuses_spotcheck_question_set():
-    """对照评测必须复用 eval_spotcheck 的题集与计分，**不另造一套**。"""
-    import sys
-    # scripts/ 不是包，conftest 也不管它（改 conftest 会越出本单声明路径）
-    scripts_dir = str(MIGRATE_SCRIPT.parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import eval_compare_backends as ecb   # noqa: PLC0415 — 路径就绪后才能 import
-
-    assert len(ecb.SPOTCHECK_PATH.read_text(encoding="utf-8")) > 0
-    spotcheck_path = Path(ecb.SPOTCHECK_PATH)
-    src = spotcheck_path.read_text(encoding="utf-8")
-    # 题集与计分函数确实定义在 eval_spotcheck.py 里（不是复制到 eval_compare_backends）
-    for name in ("SPOTCHECK", "def hits", "def first_rank"):
-        assert name in src, f"eval_spotcheck.py 应含 {name}"
-    # eval_compare_backends 自己没有另写一份题集/指标
-    own = Path(ecb.__file__).read_text(encoding="utf-8")
-    assert "SPOTCHECK = [" not in own, "eval_compare_backends 不得另造题集"
-    assert "def hits(" not in own and "def first_rank(" not in own, "不得另造指标"
-
-
-def test_redis_match_attention_does_not_call_the_legacy_formula():
-    """🔴 RedisStorage.match_attention 必须走共用实现，不能退回
-    `attention.match_attention_boost`（那份是上游历史副本，有自己的一套循环）。"""
-    import ast
-
-    tree = ast.parse(Path(storage.__file__).read_text(encoding="utf-8"))
+def test_pg_match_attention_uses_shared_formula():
+    """🔴 PgStorage.match_attention 必须走共用公式，不得退回历史副本
+    （`attention.match_attention_boost` 那份是上游独立实现，有自己一套循环）。"""
+    tree = ast.parse((SRC / "pg.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body
-               if isinstance(n, ast.ClassDef) and n.name == "RedisStorage")
+               if isinstance(n, ast.ClassDef) and n.name == "PgStorage")
     fn = next(n for n in cls.body
               if isinstance(n, ast.FunctionDef) and n.name == "match_attention")
-    # 裸函数调用（attention_boost_from_topics(...)）和属性调用都要看
     called = set()
     for c in ast.walk(fn):
         if not isinstance(c, ast.Call):
@@ -375,11 +281,15 @@ def test_redis_match_attention_does_not_call_the_legacy_formula():
         elif isinstance(c.func, ast.Name):
             called.add(c.func.id)
     assert "attention_boost_from_topics" in called, (
-        f"RedisStorage.match_attention 没调共用公式，实际调了 {called}"
+        f"PgStorage.match_attention 没调共用公式，实际调了 {called}"
     )
     assert "match_attention_boost" not in called, (
         "match_attention 仍在调上游那份独立公式 —— 共用没真正生效"
     )
+
+
+# 2026-11：`scripts/migrate_redis_to_pg.py` / `eval_compare_backends.py` 的只读红线
+# 与题集复用测试随 Redis 后端一起移除（脚本在 git 历史里，1.1.x 仍可用）。
 
 
 # ------------------------------------------------ 语料维护判定链（批 3）唯一实现

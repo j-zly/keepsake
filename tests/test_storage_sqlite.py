@@ -527,9 +527,14 @@ def test_storage_from_config_sqlite_backend(tmp_path):
         assert "keepsake" in s2._path
     finally:
         s2.close()
-    # 默认后端逐字不变（缺行 / 非法值仍回 redis）
-    assert resolve_backend(None) == "redis"
-    assert resolve_backend({"storage": {"backend": "瞎写的"}}) == "redis"
+    # 2026-11：没有默认后端 —— 缺行 / 非法值 / 写 redis 一律显式报错（不许猜）
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        resolve_backend(None)
+    with _pt.raises(ValueError):
+        resolve_backend({"storage": {"backend": "瞎写的"}})
+    with _pt.raises(ValueError):
+        resolve_backend({"storage": {"backend": "redis"}})
 
 
 def test_storage_from_config_sqlite_reads_synonym_thresholds(tmp_path):
@@ -1219,7 +1224,7 @@ def _tsv_lexemes(store: SqliteStorage) -> dict:
 def _expected_order(store: SqliteStorage, query: str, depth: int) -> list:
     """按 **PG 的公式与 tiebreak** 独立算出的期望 key 序（测试内重算一遍）。"""
     from keepsake.splitter import segment_query
-    from keepsake.storage import _expand_terms, _sanitize_terms
+    from keepsake.core.shared import _expand_terms, _sanitize_terms
     from keepsake.storage_pg import bm25_score
 
     terms = [t.lower() for t in _sanitize_terms(_expand_terms(segment_query(query), {}))]
@@ -1281,7 +1286,7 @@ def test_bm25_score_and_order_follow_pg_formula(tmp_path):
 def test_bm25_score_equals_pg_formula_value(tmp_path):
     """分数**数值**本身也要等于 PG 公式（不只是顺序巧合）。"""
     from keepsake.splitter import segment_query
-    from keepsake.storage import _expand_terms, _sanitize_terms
+    from keepsake.core.shared import _expand_terms, _sanitize_terms
     from keepsake.storage_pg import bm25_score
 
     rows = [{"key": f"memory:frag:{i:012x}", "tags": "ops,shared",

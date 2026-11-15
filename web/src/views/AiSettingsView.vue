@@ -1,9 +1,10 @@
 <!--
   AI 配置页（2026-10 ai_settings_page）。
 
-  五处模型调用的**唯一配置源都是 config.json** —— 这一页把它集中到五张卡：
-    llm / embedder / screening 可写；query_expansion / tiering_review
+  模型调用的**唯一配置源都是 config.json** —— 这一页把它集中成卡（节由后端给）：
+    llm / embedder / screening 可写；tiering_review
     没有独立配置（复用 llm 节）⇒ 只读说明卡，**不摆编辑入口**。
+    （2026-11：query_expansion 卡随 Redis 后端移除。）
 
   三条纪律：
     1. **数字全部来自 GET**（连输入框的上下限都是后端给的 min/max）—— 前端零写死；
@@ -213,7 +214,7 @@ const confirmOpen = ref(false)
 const saveTarget = ref(null)
 const saving = ref(false)
 
-/** GET 的五节 → 页面卡片（字段/数值/上下限**全部来自后端**，前端零写死）。 */
+/** GET 的各节 → 页面卡片（字段/数值/上下限**全部来自后端**，前端零写死）。 */
 function buildCards(sections) {
   return (sections || []).map((s) => {
     const draft = {}

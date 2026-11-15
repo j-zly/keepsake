@@ -38,23 +38,20 @@ def load_config() -> dict:
 
 def main():
     cfg = load_config()
-    redis_host = cfg.get("redis_host", "127.0.0.1")
-    redis_port = int(cfg.get("redis_port", 6379))
 
     try:
         from keepsake import KeepsakeProvider
 
-        provider = KeepsakeProvider(keepsake={
-            "redis_host": redis_host,
-            "redis_port": redis_port,
-        })
+        # 2026-11：Redis 移除后不再有连接参数可传 —— provider 自己按
+        # storage.backend 装配（postgres / sqlite），这里只透传配置。
+        provider = KeepsakeProvider(keepsake=cfg)
         if not provider.is_available():
             print("[memory-maintenance] keepsake provider not available")
             sys.exit(1)
 
         provider.initialize(session_id="cron-maintenance")
         if not provider._initialized:
-            print("[memory-maintenance] initialization failed (Redis down?)")
+            print("[memory-maintenance] initialization failed (存储后端未就绪?)")
             sys.exit(1)
 
         stats = provider.maintenance()

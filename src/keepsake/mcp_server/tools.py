@@ -363,7 +363,7 @@ def memory_capabilities(provider: Any) -> Dict[str, Any]:
         "idempotent_write": bool(getattr(caps, "idempotent_write", False)),
         # 🔴 删除墓碑（2026-11 ks_tombstone）：删除**留痕**（可查证「这条删过、
         #    何时删、当时第几版」；同正文重 add 复活时 rev 从墓碑**接续**）。
-        #    PG / SQLite = True；Redis = False（该后端删除不留痕 ⇒ 如实说 False，
+        #    PG / SQLite = True（历史：Redis = False，该后端删除不留痕，
         #    **绝不假装「删了可查证」**）。
         "tombstone": bool(getattr(provider, "supports_tombstone", False)),
         # 🔴 归属语义（2026-10 ks_owner_stamp）：写入方身份 = **凭据反查**的调用方

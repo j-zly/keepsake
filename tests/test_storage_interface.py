@@ -1,4 +1,4 @@
-"""存储接口一致性测试 —— RedisStorage / PgStorage 共用 StorageBase。
+"""存储接口一致性测试 —— PgStorage / SqliteStorage 共用 StorageBase。
 
 覆盖：
   1. 两个后端都实现了接口的**全部**方法（缺一个就能检出）
@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from keepsake.storage import RedisStorage
 from keepsake.storage_base import StorageBase
 from keepsake.storage_pg import PgStorage
 from keepsake.storage_sqlite import SqliteStorage
@@ -53,8 +52,7 @@ REQUIRED_METHODS = (
     "generate_jieba_dict",
 )
 
-BACKENDS = {"RedisStorage": RedisStorage, "PgStorage": PgStorage,
-            "SqliteStorage": SqliteStorage}   # 2026-10 ks_sqlite_p1：第三后端纳入同一套接口检查
+BACKENDS = {"PgStorage": PgStorage, "SqliteStorage": SqliteStorage}   # 2026-11：RedisStorage 随该后端移除
 
 
 def _missing_methods(cls) -> list:
@@ -219,9 +217,9 @@ def test_pg_search_methods_never_silently_return_empty_on_backend_failure():
         pytest.fail(f"{name}() 在后端不可达时返回了 {got!r}，必须抛错而不是静默空")
 
 
-def test_pg_search_knn_without_embedder_returns_empty_like_redis():
-    """无 embedder 时 search_knn 返回 [] —— 这是与 Redis 侧一致的合法契约
-    （向量路不可用），且会打 WARNING，不是静默。"""
+def test_pg_search_knn_without_embedder_returns_empty():
+    """无 embedder 时 search_knn 返回 [] —— 合法契约（向量路不可用），
+    且会打 WARNING，不是静默。"""
     pg = PgStorage(dsn=_BAD_DSN)
     assert pg.search_knn("测试查询") == []
 

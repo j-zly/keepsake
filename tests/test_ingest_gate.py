@@ -18,7 +18,7 @@ from keepsake.ingest_gate import (
     decide,
     update_state_only,
 )
-from keepsake.storage import RedisStorage
+from keepsake.storage_sqlite import SqliteStorage
 
 
 # ===========================================================================
@@ -358,76 +358,44 @@ class TestGateConfig:
 
 
 # ===========================================================================
-# update_state_only 行为（不连 Redis，靠 fake 验证 client 调用面）
+# update_state_only 行为（用真 SqliteStorage 读回效果，不连后端专属命令面）
 # ===========================================================================
-
-class _FakePipeline:
-    def __init__(self, calls):
-        self.calls = calls
-
-    def hincrby(self, key, field, n):
-        self.calls.append(("hincrby", key, field, n))
-
-    def hset(self, key, field, value):
-        self.calls.append(("hset", key, field, value))
-
-    def execute(self):
-        return []
-
-
-class _FakeClient:
-    def __init__(self):
-        self.calls = []  # list of ("hincrby"|"hset", key, field, value)
-
-    def pipeline(self):
-        return _FakePipeline(self.calls)
-
-
-class _FakeStorage:
-    """2026-10 ks_pcli：update_state_only 改走 StorageBase 的 `touch_fragment`。
-
-    这里把**真实的** `RedisStorage.touch_fragment` 绑过来、只把 `_get_client`
-    换成 fake client —— 这样下面那条断言验的仍是 Redis 侧真实发出的
-    hincrby/hset 两行（而不是 fake 自己实现的同名方法，验了等于没验）。
-    """
-
-    def __init__(self):
-        self.client = _FakeClient()
-
-    def _get_client(self):
-        return self.client
-
-    touch_fragment = RedisStorage.touch_fragment
 
 
 class TestUpdateStateOnlyHelper:
-    """update_state_only 是 R6 的执行函数，验证其对 storage 的调用面。
-    不连 Redis —— 用 fake 记录 hset/hincrby 调用次数与键。
+    """update_state_only 是 R6 的执行函数，验证 `StorageBase.touch_fragment` 的效果。
+
+    2026-11：原实现是「把真实的 RedisStorage.touch_fragment 绑到 fake client 上、
+    断言 hincrby/hset 两行调用」——验的是 Redis 命令形态。Redis 后端移除后改为
+    **真 SqliteStorage 读回**：验行为（touch_count +1、updated 刷新、content 不动），
+    命令形态不再是契约。
     """
 
-    def test_update_state_bumps_touch_count_and_updated_at(self):
-        st = _FakeStorage()
-        meta = {"key": "memory:frag:abc"}
-        ok = update_state_only(st, meta)
-        assert ok is True
-        # 必有 hincrby(touch_count, 1) 和 hset(updated_at, <iso>)
-        ops = st.client.calls
-        assert ("hincrby", "memory:frag:abc", "touch_count", 1) in ops
-        hset_updated = [c for c in ops if c[0] == "hset" and c[2] == "updated_at"]
-        assert len(hset_updated) == 1
-        # ISO 格式验证
-        from datetime import datetime
-        datetime.fromisoformat(hset_updated[0][3])
+    def _storage_with_fragment(self, tmp_path):
+        st = SqliteStorage(path=str(tmp_path / "gate.db"), is_primary=True)
+        assert st.ensure_index() is True
+        assert st.store("写闸门状态刷新测试", tags="memory") is True
+        key = st._fragment_key_for("写闸门状态刷新测试")  # noqa: SLF001
+        return st, key
 
-    def test_update_state_returns_false_when_no_meta(self):
-        st = _FakeStorage()
+    def test_update_state_bumps_touch_count_and_updated_at(self, tmp_path):
+        st, key = self._storage_with_fragment(tmp_path)
+        before = st.get_fragment(key) or {}
+        ok = update_state_only(st, {"key": key})
+        assert ok is True
+        after = st.get_fragment(key) or {}
+        assert int(after.get("touch_count") or 0) == int(before.get("touch_count") or 0) + 1
+        updated = after.get("updated") or after.get("updated_at")
+        assert updated, f"updated 必须被刷新：{after}"
+        from datetime import datetime
+        datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+        assert after.get("content") == before.get("content"), "touch 绝不覆盖 content"
+
+    def test_update_state_returns_false_when_no_meta(self, tmp_path):
+        st, _key = self._storage_with_fragment(tmp_path)
         assert update_state_only(st, None) is False
         assert update_state_only(st, {}) is False
-        assert st.client.calls == []
 
-    def test_update_state_returns_false_when_no_client(self):
-        class _Empty:
-            def _get_client(self):
-                return None
-
-        assert update_state_only(_Empty(), {"key": "memory:frag:abc"}) is False
+    def test_update_state_returns_false_when_row_missing(self, tmp_path):
+        st, _key = self._storage_with_fragment(tmp_path)
+        assert update_state_only(st, {"key": "memory:frag:不存在"}) is False

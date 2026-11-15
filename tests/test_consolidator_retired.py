@@ -48,7 +48,7 @@ class _FakeEmbedder:
 
 
 class _FakeStorage:
-    """替代 RedisStorage —— 仅 initialize() 触达 ensure_index / _get_client / close。"""
+    """替代真实后端存储 —— 仅 initialize() 触达 ensure_index / health_check / close。"""
 
     def __init__(self, *args, **kwargs):
         self._client = _FakeRedisClient()
@@ -67,13 +67,16 @@ class _FakeStorage:
 
 
 @pytest.fixture
-def fake_redis_storage(monkeypatch):
-    """monkeypatch RedisStorage 构造 —— 让 initialize() 不连真实 Redis。"""
+def fake_storage(monkeypatch):
+    """monkeypatch 存储装配 —— 让 initialize() 不连真实后端。
+
+    2026-11：provider 现在经 `storage_from_config` 取后端（工厂在 core/factory），
+    patch 这一个名字即可拦下全部构造路径。"""
 
     def _factory(*args, **kwargs):
         return _FakeStorage(*args, **kwargs)
 
-    monkeypatch.setattr("keepsake.RedisStorage", _factory)
+    monkeypatch.setattr("keepsake.storage_from_config", _factory)
 
     def _embedder_factory(**kwargs):
         return _FakeEmbedder()
@@ -101,7 +104,7 @@ def fake_pipeline(monkeypatch):
 
 
 @pytest.fixture
-def provider_initialized(fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path):
+def provider_initialized(fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path):
     """构造一个走完 initialize() 但未连 Redis 的 provider。"""
     # agent_id 必填 → 用 monkeypatch env
     monkeypatch.setenv("KEEPSAKE_AGENT_ID", "test_agent_retired")
@@ -123,7 +126,7 @@ class TestConsolidatorWiringRemoved:
     """KeepsakeProvider.initialize 路径里 Consolidator 的接线已被摘除。"""
 
     def test_initialize_does_not_construct_consolidator(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """initialize() 走完后，self._consolidator 属性不应再被设置。
 
@@ -164,7 +167,7 @@ class TestMaintenanceStatsRetired:
     """maintenance() 不再触发 Consolidator 执行，stats["consolidator"] = retired。"""
 
     def test_maintenance_consolidator_field_is_retired(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """provider.maintenance() 返回 stats["consolidator"]["status"] == "retired"。"""
         monkeypatch.setenv("KEEPSAKE_AGENT_ID", "test_agent_retired")
@@ -195,7 +198,7 @@ class TestMaintenanceStatsRetired:
         )
 
     def test_maintenance_does_not_call_consolidator_consolidate(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """maintenance() 路径里不应再出现 Consolidator.consolidate 调用。
 
@@ -239,7 +242,7 @@ class TestMaintenanceStatsRetired:
         assert stats["consolidator"]["status"] == "retired"
 
     def test_forgetter_still_runs_in_maintenance(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """Forgetter 不应被一并摘掉 —— maintenance() 中 forgetter 应有结果。"""
         monkeypatch.setenv("KEEPSAKE_AGENT_ID", "test_agent_retired")
@@ -297,7 +300,7 @@ class TestResolveLLMChannelStillImportable:
         )
 
     def test_resolve_llm_channel_used_by_initialize_pipeline(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """initialize() 路径里的 resolve_llm_channel 单独 import 应无副作用。"""
         monkeypatch.setenv("KEEPSAKE_AGENT_ID", "test_agent_retired")
@@ -333,7 +336,7 @@ class TestNoConsolidatorAttributeOnProvider:
     """Provider 实例上不应残留 _consolidator 属性（包括默认值类变量）。"""
 
     def test_class_level_no_consolidator_annotation(
-        self, fake_redis_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
+        self, fake_storage, fake_cron_dir, fake_pipeline, monkeypatch, tmp_path,
     ):
         """KeepsakeProvider 类层面不应再声明 _consolidator 类属性。"""
         from keepsake import KeepsakeProvider

@@ -31,7 +31,7 @@ from keepsake.jobs import app
 
 runner = CliRunner()
 
-COMMANDS = ("distill", "dedup", "tiering")
+COMMANDS = ("distill", "tiering")
 
 
 @pytest.fixture(autouse=True)
@@ -84,19 +84,6 @@ class TestDryRunCommands:
         assert result.exit_code == 0, result.output
         assert "unconfigured" in result.output
         assert "skip" in result.output
-
-    def test_dedup_dry_run_exits_zero(self, tmp_path):
-        """dedup --dry-run：Redis 指一个没人听的端口 ⇒ 跳过 + 既有汇总行。"""
-        cfg = _write_config(tmp_path / "config.json", {
-            "agent_id": "main-brain",
-            "redis_host": "127.0.0.1",
-            "redis_port": 1,
-        })
-        result = runner.invoke(app, ["dedup", "--config", str(cfg), "--dry-run"])
-        assert result.exit_code == 0, result.output
-        # 与既有脚本同格式的汇总行
-        assert "Done: checked=" in result.output
-        assert "matched=" in result.output
 
     @pytest.mark.parametrize("command", COMMANDS)
     def test_dry_run_never_raises(self, command, tmp_path):

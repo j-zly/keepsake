@@ -67,7 +67,7 @@ class Forgetter:
 
         2026-10 ks_pmn：改为**只通过 StorageBase 的维护原语**访问存储
         （`scan_fragment_keys` / `get_fragments_batch` / `delete_fragments_batch`），
-        Redis 与 PG 两个后端语义等价，不再有 unsupported。
+        PG / SQLite 两个后端语义等价，不再有 unsupported。
         """
         stats = {
             "scanned": 0,
@@ -125,7 +125,7 @@ class Forgetter:
             )
 
             if keys:
-                # 批量读一页（Redis=pipeline HGETALL，PG=`key = ANY` 一条 SQL）
+                # 批量读一页（PG=`key = ANY`、SQLite=`IN (...)` 一条 SQL）
                 docs = self._storage.get_fragments_batch(keys)
 
                 for key in keys:

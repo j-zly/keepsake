@@ -26,7 +26,6 @@ import pytest
 
 from keepsake.adapters.hermes.provider import KeepsakeProvider
 from keepsake.core.base import BackendUnsupportedError
-from keepsake.core.redis import RedisStorage
 from keepsake.core.sqlite import SqliteStorage
 from keepsake.mcp_server.tools import ToolError, memory_capabilities, memory_get
 
@@ -306,45 +305,14 @@ def test_留碑失败则cas删除抛错_行还在(provider, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# ⑧ 能力声明：PG / SQLite = True；Redis = False（**不留静默**）
+# ⑧ 能力声明：PG / SQLite = True（2026-11：Redis 后端已移除，False 档随之退场）
 # ---------------------------------------------------------------------------
 
 def test_能力声明_sqlite为true(provider):
     caps = memory_capabilities(provider)
     assert caps["tombstone"] is True, caps
-
-
-def test_能力声明_redis为false():
-    """Redis 后端删除不留痕 ⇒ 能力声明**如实说 False**（不假装「删了可查证」）。"""
-    p = KeepsakeProvider()
-    p._storage = RedisStorage()
-    caps = memory_capabilities(p)
-    assert caps["tombstone"] is False, caps
-
-
-def test_redis后端查墓碑显式拒(provider):
-    """Redis 后端查墓碑 ⇒ 存储层**显式拒**（backend_unsupported），不静默假装。"""
-    with pytest.raises(BackendUnsupportedError) as excinfo:
-        RedisStorage().tombstone_lookup("memory:frag:任意")
-    assert "backend_unsupported" in str(excinfo.value)
-
-
-def test_redis后端删除显式拒():
-    """🔴 Redis 后端删除**不留痕** ⇒ `provider.remove` **显式拒**（不留静默）。
-
-    宁可删不掉，不可删无痕 —— 删完再也查不到「这条删过」的历史，
-    调用方却以为删干净了。
-    """
-    p = KeepsakeProvider()
-    p._storage = RedisStorage()
-    with pytest.raises(BackendUnsupportedError) as excinfo:
-        p.remove("memory:frag:任意")
-    assert "backend_unsupported" in str(excinfo.value)
-    assert "tombstone" in str(excinfo.value), str(excinfo.value)
-
-
-def test_存储层三后端都声明墓碑方法():
-    """三个后端都必须**有** `tombstone_lookup` 这个方法（签名逐字对齐）。
+def test_存储层两后端都声明墓碑方法():
+    """两个后端都必须**有** `tombstone_lookup` 这个方法（签名逐字对齐）。
 
     🔴 漏实现的后端会让调用方拿到 AttributeError（而不是一句人话）⇒
     这里钉住「方法存在 + 参数名一致」。
@@ -353,14 +321,14 @@ def test_存储层三后端都声明墓碑方法():
 
     from keepsake.core.pg import PgStorage
 
-    for cls in (PgStorage, SqliteStorage, RedisStorage):
+    for cls in (PgStorage, SqliteStorage):
         fn = getattr(cls, "tombstone_lookup", None)
         assert callable(fn), f"{cls.__name__}.tombstone_lookup 缺失"
         params = list(inspect.signature(fn).parameters.values())[1:]
         assert params[0].name == "key", (cls.__name__, fn)
     assert PgStorage.supports_tombstone is True
     assert SqliteStorage.supports_tombstone is True
-    assert RedisStorage.supports_tombstone is False
+    # 2026-11：Redis（False 档）随该后端移除；两后端都留痕
 
 
 # ---------------------------------------------------------------------------

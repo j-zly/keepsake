@@ -134,48 +134,6 @@ def test_content_hash_versioning_untouched(lite):
 
 
 # ---------------------------------------------------------------------------
-# 二、Redis：假 client（不连真 Redis），锁 HMGET 多取的那根字段 + 判据
-# ---------------------------------------------------------------------------
-
-def test_redis_archived_excluded_and_legacy_pass(monkeypatch):
-    from keepsake.storage import RedisStorage
-
-    hashes = {
-        "memory:frag:a": {"content": b"core-A", "tags": b"core"},
-        "memory:frag:b": {"content": b"core-B", "tags": b"core", "is_archived": b"1"},
-        # 历史形态：压根没这根字段 ⇒ HMGET 返回 None ⇒ 放行
-        "memory:frag:c": {"content": b"core-C", "tags": b"core"},
-        # 未归档但显式写空串 ⇒ 放行（不能写 `== ""` 判归档）
-        "memory:frag:d": {"content": b"core-D", "tags": b"core", "is_archived": b""},
-    }
-    keys = [k.encode() for k in hashes]
-
-    class FakeClient:
-        def scan(self, cursor=0, match=None, count=None):
-            return (0, keys)
-
-        def pipeline(self):
-            class P:
-                def __init__(self):
-                    self.q = []
-
-                def hmget(self, key, *fields):
-                    self.q.append((key, fields))
-
-                def execute(self):
-                    out = [[hashes.get(k, {}).get(f) for f in fs] for k, fs in self.q]
-                    self.q = []
-                    return out
-            return P()
-
-    monkeypatch.setattr(RedisStorage, "_get_client", lambda self: FakeClient())
-    rows = RedisStorage.list_by_tag(object.__new__(RedisStorage), "core")
-    contents = sorted(r["content"] for r in rows)
-
-    assert contents == ["core-A", "core-C", "core-D"], contents
-    assert "core-B" not in contents, "归档条目仍在 list_by_tag 结果里"
-
-
 # ---------------------------------------------------------------------------
 # 三、PG 真库（无凭据则 skip）
 # ---------------------------------------------------------------------------

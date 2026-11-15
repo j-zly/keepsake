@@ -13,30 +13,23 @@
 | 进不进主脑上下文 | 全局 `retrieval.exclude_tags` | 每个代理身上的 `exclude_from_primary` |
 | 凭据 | 无 | 批准时生成一次 `ksk_…`，库里只存 sha256 |
 
-## 三后端一份语义
+## 两后端一份语义
 
 * PG / SQLite：`ks_agent` 行表，DDL 由 **本模块唯一定义**（`KS_AGENT_DDL`），
   两后端各自 `import` 它进自己的 `ensure_index` 建表机制 —— 建表语句复制两份
   必然漂，而漂的后果是「注册表在一侧永远不存在」。
-* Redis：`keepsake:agent:<id>` hash（同库惯例，见 `core/redis.py` 的
-  `keepsake:*` 各 key 常量），字段名与行表的列名一一对应。
+* （2026-11）Redis 后端及其 hash 兼容层整体移除；`_backend_of` 认不出 SQL
+  后端即报错，不再有「兜底成键值形态」的可能。
 
-对外形状（`list_agents()` / `get()` 的返回）三后端逐字段相同 —— 否则「换了
+对外形状（`list_agents()` / `get()` 的返回）两后端逐字段相同 —— 否则「换了
 后端治理就失效」。
 
 ## 🔴 `set_role` 的「唯一 primary」怎么保证
 
-PG / SQLite 是**真事务**（SQL 后端自带事务边界），两条 UPDATE 在同一事务内，
-并发下也只有一个赢家。Redis **没有跨 key 事务**（本模块刻意不引 WATCH/MULTI：
-那要求客户端支持 pipeline 语义，而本库对 Redis 的用法一律走简单命令 + 现有
-假 client 测试也按简单命令编排）。取舍：改成**「先把全库 primary 降成 sub，
-再把这一个提上来」的顺序写**（`REDIS_SET_ROLE_MODE = "demote-all-then-promote"`，
-见 `set_role` 的 docstring）。后果要说清：并发两个进程同时置 primary 时，
-可能出现**两个都是 sub**（先降的赢了、后者又把自己的降掉了）—— 但绝不可能
-出现**两个 primary**。对治理来说「暂时没人是主脑」（多拦一次 core 写入、
-fail-closed 可接受）远比「两个主脑同时写常驻」安全，方向选对即可。
-`ponytail:` 真要严格唯一可换 Redis 的 `WATCH/MULTI/EXEC` 乐观事务
-（代价：客户端要支持 pipeline 语义，本库的 Redis 假 client 测试按简单命令编排）。
+PG / SQLite 是**真事务**（SQL 后端自带事务边界），「降旧主 + 提新主」两条
+UPDATE 在同一事务内，并发下也只有一个赢家 —— 全库唯一 primary 是硬保证。
+（2026-11：随 Redis 后端移除，旧的「无跨 key 事务 ⇒ 顺序写、可能暂时没主脑」
+妥协整体退场。）
 
 ## 🔴 凭据纪律
 
@@ -99,13 +92,9 @@ TOUCH_MIN_INTERVAL_S = 60.0
 
 TABLE = "ks_agent"
 
-#: Redis 侧 key 前缀（`keepsake:agent:<id>`，与本库其余 key 同命名空间）
-REDIS_KEY_PREFIX = "keepsake:agent:"
 
-#: Redis `set_role` 的唯一性方案（写进 `set_role` 的日志与返回，便于事后审计）
-REDIS_SET_ROLE_MODE = "demote-all-then-promote"
 
-#: 列 / 字段名（SQL 行与 Redis hash 共用同一份名字 ⇒ 规范化只有一处）
+#: 列名（行表唯一形态 ⇒ 规范化只有一处）
 AGENT_FIELDS: Tuple[str, ...] = (
     "agent_id", "name", "role", "status", "credential_hash", "credential_hint",
     "first_seen_at", "last_seen_at", "reads", "writes", "exclude_from_primary",
@@ -115,7 +104,7 @@ AGENT_FIELDS: Tuple[str, ...] = (
     "credential_enc",
 )
 
-#: `dm_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: `dm_enabled` 的**开**值（列是 text）。
 #: 关掉的值一律认这几种（大小写都收）；其余（含空 / 缺列）都当**开**——
 #: 「新增字段必须兼容旧数据」：老行没有这一列 ⇒ 默认开。
 DM_ENABLED_ON = "1"
@@ -125,7 +114,7 @@ DM_DISABLED_VALUES: Tuple[str, ...] = ("0", "false", "False", "no", "off")
 DM_COLUMN = "dm_enabled"
 DM_COLUMN_DECL = "text NOT NULL DEFAULT '1'"
 
-#: `share_memory` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: `share_memory` 的**开**值（列是 text）。
 #: 🔴 与 `dm_enabled` **相反**：缺省是**关**（'0'）——「记忆共享」是**放宽**权限的
 #: 开关，缺省必须是最严的那一档（老行没有这一列 ⇒ 一律当关，语义不变）。
 SHARE_ENABLED_ON = "1"
@@ -305,18 +294,13 @@ CRED_INDEX_DDL = (f"CREATE UNIQUE INDEX IF NOT EXISTS {CRED_INDEX_NAME} "
                   f"ON {TABLE_CREDENTIAL} (credential_hash)")
 
 
-class SingleCredentialBackend(RuntimeError):
-    """这个存储后端只能放一把凭据（Redis 侧没有表结构）⇒ 调用方给**人话**，
-    不许静默少发一把（静默少发比报错难查十倍）。"""
-
-
 def new_credential_id() -> str:
     """凭据编号（不是秘密，见 `CRED_ID_HEX_LEN` 的说明）。"""
     return secrets.token_hex(CRED_ID_HEX_LEN // 2)
 
 
 def _legacy_cred_id(credential_hash: str) -> str:
-    """Redis 后端没有 `cred_id` 列 ⇒ 由哈希派生一个**稳定**编号
+    """老三列迁账时没有 `cred_id` 列 ⇒ 由哈希派生一个**稳定**编号
     （同一把凭据两次拿到的 id 必须一致，否则界面上的按钮会点到别把上）。"""
     return hashlib.sha256(str(credential_hash or "").encode("utf-8")).hexdigest()[:CRED_ID_HEX_LEN]
 
@@ -352,7 +336,7 @@ def _cred_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "scopes": list(_parse_scopes(row.get(SCOPES_COLUMN))),
     }
 
-#: `push_enabled` 的**开**值（列是 text，Redis hash 字段也存字符串）。
+#: `push_enabled` 的**开**值（列是 text）。
 #: 🔴 与 `share_memory` 同一档：**缺省是关**（'0'）——「实时推送」是**往外放行**
 #: 的开关（别人能连上来推事件给你），缺省必须是最严的那一档（老行没有这一列
 #: ⇒ 一律当关，语义不变）。
@@ -372,7 +356,7 @@ PUSH_COLUMN_DECL = "text NOT NULL DEFAULT '0'"
 BUDGET_COLUMN = "core_budget_chars"
 BUDGET_COLUMN_DECL = "integer NULL"
 
-#: 计数与布尔列（SQL 里是 integer，Redis hash 里存字符串 —— 规范化时统一成 int/bool）
+#: 计数与布尔列（SQLite 侧以 TEXT 落列 —— 规范化时统一成 int/bool）
 _INT_FIELDS = ("reads", "writes")
 _FLAG_FIELDS = ("exclude_from_primary",)
 
@@ -487,7 +471,7 @@ def credential_hint(credential: str) -> str:
 # --------------------------------------------------------------------------
 
 def _norm(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """一行（SQL tuple→dict 或 Redis hash→dict）→ 规范 dict；缺列补缺省。"""
+    """一行（SQL tuple→dict）→ 规范 dict；缺列补缺省。"""
     if raw is None:
         return None
     row: Dict[str, Any] = {f: raw.get(f) for f in AGENT_FIELDS}
@@ -651,13 +635,16 @@ def _backend_of(storage: Any) -> str:
 
     * 有 `_tx` / `_ro`（psycopg 事务游标）→ postgres
     * 有 `_write` / `_db`（sqlite3）      → sqlite
-    * 其余（只有 `_get_client`）           → redis
+    * 其余 ⇒ **报错**。2026-11 前这里兜底回 redis（键值后端只认 `_get_client`）；
+      Redis 后端移除后没有「兜底后端」可回，认不出来就是接线事故，必须炸。
     """
     if callable(getattr(storage, "_tx", None)) and callable(getattr(storage, "_ro", None)):
         return "postgres"
     if callable(getattr(storage, "_write", None)) and callable(getattr(storage, "_db", None)):
         return "sqlite"
-    return "redis"
+    raise ValueError(
+        "registry: 无法识别存储后端（只支持 postgres / sqlite；"
+        "Redis 后端已于 2026-11 移除）")
 
 
 class _SqlBase:
@@ -1041,242 +1028,6 @@ class _CredSqlBackend(_SqlBase):
         return moved
 
 
-class _CredRedisBackend:
-    """Redis 后端的**单把**凭据账 —— 老三列就是它的存储，不造假表。
-
-    🔴 为什么不做多把：Redis 侧只有 `keepsake:agent:<id>` 一个 hash，塞一列 JSON
-    装多把就等于在同一份语义上写两套实现（PG/SQLite 走 SQL、Redis 走 JSON 解析），
-    漂了就是「换了个后端凭据行为不一样」的故障。生产早已在 PG（Redis 是备胎），
-    所以这里只做**兼容映射**：读、校验、作废、回填照常；**加第二把**直接抛
-    `SingleCredentialBackend` ⇒ 调用方拿到人话，而不是静默少发一把。
-    """
-
-    kind = "redis"
-
-    def __init__(self, backend: Any) -> None:
-        self._be = backend
-
-    def _row(self, agent: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        stored = str(agent.get("credential_hash") or "")
-        if not stored:
-            return None
-        return {
-            "cred_id": _legacy_cred_id(stored),
-            "agent_id": agent["agent_id"],
-            "label": CRED_LABEL_DEFAULT,
-            "credential_hash": stored,
-            "credential_hint": str(agent.get("credential_hint") or ""),
-            ENC_COLUMN: str(agent.get(ENC_COLUMN) or ""),
-            "status": CRED_STATUS_ON,
-            "created_at": str(agent.get("first_seen_at") or ""),
-            "used_at": str(agent.get("last_seen_at") or ""),
-            # 计数沿用代理行的（单把 = 同一批活动）；不去重复加，也不假装分得开。
-            "reads": int(agent.get("reads") or 0),
-            "writes": int(agent.get("writes") or 0),
-            # 同上：这一档后端不支持逐把限制 ⇒ 如实给全授权，不假装能收紧。
-            SCOPES_COLUMN: SCOPES_DEFAULT,
-        }
-
-    def list(self, agent_id: str = "") -> List[Dict[str, Any]]:
-        if agent_id:
-            row = self._be.load(agent_id)
-            got = self._row(row) if row else None
-            return [got] if got else []
-        out = []
-        for agent in self._be.all_rows():
-            got = self._row(agent)
-            if got:
-                out.append(got)
-        return out
-
-    def get(self, cred_id: str) -> Optional[Dict[str, Any]]:
-        return next((r for r in self.list() if r["cred_id"] == cred_id), None)
-
-    def by_hash(self, credential_hash: str) -> Optional[Dict[str, Any]]:
-        if not credential_hash:
-            return None
-        return next((r for r in self.list()
-                     if hmac.compare_digest(credential_hash, r["credential_hash"])), None)
-
-    def insert(self, row: Dict[str, Any]) -> None:
-        """写入 = 落到老三列（只有一个位置）。已有凭据 ⇒ 明确拒绝第二把。"""
-        aid = row["agent_id"]
-        current = self._row(self._be.load(aid) or {})
-        if current and current["credential_hash"] != row["credential_hash"]:
-            raise SingleCredentialBackend(aid)
-        self._be.update(aid, {
-            "credential_hash": row["credential_hash"],
-            "credential_hint": row["credential_hint"],
-            ENC_COLUMN: row.get(ENC_COLUMN) or "",
-        })
-
-    def set_fields(self, cred_id: str, fields: Dict[str, Any]) -> bool:
-        row = self.get(cred_id)
-        if not row:
-            return False
-        aid = row["agent_id"]
-        merged = {**row, **fields}
-        self._be.update(aid, {
-            "credential_hash": merged["credential_hash"],
-            "credential_hint": merged["credential_hint"],
-            ENC_COLUMN: merged.get(ENC_COLUMN) or "",
-        })
-        return True
-
-    def bump(self, cred_id: str, column: str) -> None:
-        """逐把计数在这里是 no-op：单把后端的活动已经记在代理行上，
-        两处都加会把同一件事数两遍。"""
-
-    def revoke_all(self, agent_id: str) -> int:
-        had = self._row(self._be.load(agent_id) or {})
-        self._be.update(agent_id, {"credential_hash": "", "credential_hint": "",
-                                   ENC_COLUMN: ""})
-        return 1 if had else 0
-
-    def delete_agent(self, agent_id: str) -> int:
-        return self.revoke_all(agent_id)
-
-    def rename_agent(self, old_id: str, new_id: str) -> int:
-        return 1 if self._row(self._be.load(old_id) or {}) else 0
-
-    def set_scopes(self, cred_id: str, scopes: str) -> bool:
-        """Redis 后端没有这一列 ⇒ **明确拒绝**，不静默当成"改好了"。
-
-        静默改不动比报错恶劣得多：界面上勾了"只授知识库"，实际两档都还能用。
-        """
-        raise SingleCredentialBackend("scopes")
-
-    def summaries(self, rows: Optional[List[Dict[str, Any]]] = None
-                  ) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        for row in (rows if rows is not None else self.list()):
-            out[row["agent_id"]] = {
-                "credential_count": 1, "credential_active": 1,
-                "last_used_at": row["used_at"], "credential_hint": row["credential_hint"],
-                "recoverable": bool(str(row.get(ENC_COLUMN) or "")),
-                # 单把后端的存储里没有这一列 ⇒ 如实报"全授权"（与它的实际行为一致：
-                # 这一档后端上闸永远放行，见 _CredRedisBackend 的说明）。
-                "scopes": SCOPES_ALL,
-            }
-        return out
-
-    def migrate_from_agents(self, agents: List[Dict[str, Any]]) -> int:
-        return 0      # 老三列就是它的存储，没有可迁的东西
-
-
-class _RedisBackend:
-    """Redis：`keepsake:agent:<id>` hash。字段名与 `AGENT_FIELDS` 同名。"""
-
-    kind = "redis"
-
-    def __init__(self, storage: Any) -> None:
-        self._st = storage
-
-    @staticmethod
-    def key(agent_id: str) -> str:
-        return f"{REDIS_KEY_PREFIX}{agent_id}"
-
-    def _client(self) -> Any:
-        client = self._st._get_client()      # noqa: SLF001 —— 复用既有连线（不可达返回 None）
-        if client is None:
-            raise RuntimeError("registry: Redis 不可达（_get_client 返回 None）")
-        return client
-
-    def _decode(self, raw: Dict[Any, Any]) -> Dict[str, Any]:
-        return {_text(k): _text(v) for k, v in (raw or {}).items()}
-
-    def ensure_schema(self) -> bool:
-        return True          # hash 形态没有 schema；Redis 不可达也不在这里拦（读时自然报错）
-
-    def load(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        raw = self._client().hgetall(self.key(agent_id))
-        return _norm(self._decode(raw)) if raw else None
-
-    def all_rows(self) -> List[Dict[str, Any]]:
-        client = self._client()
-        out: List[Dict[str, Any]] = []
-        for k in client.scan_iter(match=f"{REDIS_KEY_PREFIX}*"):
-            raw = client.hgetall(_text(k))
-            row = _norm(self._decode(raw))
-            if row:
-                out.append(row)
-        return out
-
-    def insert(self, row: Dict[str, Any]) -> None:
-        client = self._client()
-        if client.exists(self.key(row["agent_id"])):
-            return                       # 幂等：已存在就一个字段都不动（不碰 status）
-        client.hset(self.key(row["agent_id"]),
-                    mapping={f: _hash_field(row[f]) for f in AGENT_FIELDS})
-
-    def update(self, agent_id: str, fields: Dict[str, Any]) -> None:
-        if not fields:
-            return
-        self._client().hset(self.key(agent_id),
-                            mapping={f: _hash_field(v) for f, v in fields.items()})
-
-    def set_role_unique(self, agent_id: str, role: str) -> None:
-        """「先降全库、再提一个」的**顺序写**（Redis 无跨 key 事务，取舍见模块 docstring）。
-
-        🟡 并发下可能两个都是 sub，但绝不可能两个都是 primary —— 治理要的是后者绝不许发生。
-        """
-        client = self._client()
-        for row in self.all_rows():
-            if row["role"] == ROLE_PRIMARY and row["agent_id"] != agent_id:
-                client.hset(self.key(row["agent_id"]), "role", ROLE_SUB)
-        client.hset(self.key(agent_id), "role", role)
-
-    def bump(self, agent_id: str, kind: str) -> None:
-        client = self._client()
-        client.hincrby(self.key(agent_id), kind, 1)
-        client.hset(self.key(agent_id), "last_seen_at", _now_iso())
-
-    def rename_id(self, old_id: str, new_id: str) -> bool:
-        """换主键：`keepsake:agent:<old>` 这个 hash 整个搬到 `<new>` 下。
-
-        🔴 **用 Redis 原生的 `RENAMENX`**（原子：新 key 已存在就返回 0，不覆盖）：
-        「HGETALL → HSET 新键 → DEL 旧键」这种三步写法，中间崩一次就会留下
-        **两行同凭据**（新键已写、旧键未删）—— 那正是本模块要防的形态；
-        `RENAMENX` 一步到位，key 布局与 hash 字段一个字节都不改。
-
-        `RENAMENX` 只搬 key，不改 hash **字段** ⇒ 搬完补一次 `agent_id` 字段
-        （读面是从字段取 id 的，字段不补就会读出旧 id）。
-        """
-        client = self._client()
-        if not client.exists(self.key(old_id)):
-            return False
-        if not client.renamenx(self.key(old_id), self.key(new_id)):
-            return False          # 新 id 已被占用 ⇒ 换名失败，绝不覆盖
-        client.hset(self.key(new_id), "agent_id", new_id)
-        return True
-
-    def delete(self, agent_id: str) -> bool:
-        """**整行删除**（`DEL keepsake:agent:<id>`：整个 hash 连凭据哈希一起没）。
-
-        行不存在 ⇒ False（调用方 404）。🔴 Redis 的 `DEL` 不看 role ——
-        「primary 不许删」那道闸在 `Registry.delete` 里（语义层），不在这层。
-        """
-        return bool(self._client().delete(self.key(agent_id)))
-
-
-def _text(value: Any) -> str:
-    """bytes/str → str（Redis 客户端 `decode_responses=False`，读出来是 bytes）。"""
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value).decode("utf-8", "replace")
-    return "" if value is None else str(value)
-
-
-def _hash_field(value: Any) -> Any:
-    """写进 Redis hash 的值形态（int / bool / dict 统一成字符串，读时 `_norm` 再转回来）。"""
-    if value is None:
-        return ""            # NULL 列在 Redis 上落空串（读回时 `_norm_budget` 判成 None）
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
-
-
 def _sql_value(field: str, value: Any) -> Any:
     """写进 `ks_agent` 行表的列值（`meta` 落 JSON 文本；其余都是标量）。"""
     if field == "meta":
@@ -1319,7 +1070,7 @@ class AlreadyApprovedError(Exception):
 class Registry:
     """代理注册表。`Registry(storage)` 一份，三后端同一语义（同步、经后端原连线）。
 
-    **不自拼连接、不另开进程**：PG / SQLite 走存储后端自己的事务游标，Redis 走
+    **不自拼连接、不另开进程**：PG / SQLite 走存储后端自己的事务游标。
     `_get_client()` 的既有连线 —— 这样「控制台进程改了角色、主脑进程下一次写闸
     就收敛」不需要任何跨进程协议。
     """
@@ -1330,18 +1081,17 @@ class Registry:
         #: 底层存储句柄（**只读用途**）：`govern/messaging.py` 的信箱要经它连同一个库，
         #: 不另开连接、不另拼 DSN。
         self.storage = storage
-        self._be: Any = _SqlBackend(storage, kind) if kind != "redis" else _RedisBackend(storage)
-        # 🔴 凭据账与代理账**同后端不同实现**：SQL 走 `ks_credential` 表，
-        # Redis 走老三列的单把兼容映射（`add_credential` 在那边会明确拒绝）。
-        self._cred: Any = (_CredSqlBackend(storage, kind) if kind != "redis"
-                           else _CredRedisBackend(self._be))
+        # 2026-11：只剩 SQL 形态（PG / SQLite 共用实现）。旧 Redis 兼容类随
+        # Redis 后端移除 —— 代理账与凭据账分别在 `ks_agent` / `ks_credential`。
+        self._be: Any = _SqlBackend(storage, kind)
+        self._cred: Any = _CredSqlBackend(storage, kind)
         # `touch()` 的限频表按实例存（进程内遥测，重启归零是正常的）
         self._last_touch: Dict[str, float] = {}
         self._touch_lock = threading.Lock()
 
     # ---- 生命周期 ----------------------------------------------------
     def ensure_schema(self) -> bool:
-        """确保 `ks_agent` 在（SQL 后端经**自己的** ensure 机制建表；Redis 无 schema）。"""
+        """确保 `ks_agent` 在（SQL 后端经**自己的** ensure 机制建表）。"""
         try:
             return self._be.ensure_schema()
         except Exception as e:      # noqa: BLE001 —— 返回 False，不抛（调用方决定降级）
@@ -1428,7 +1178,6 @@ class Registry:
         与 `approve(reissue=True)` 的分界：这里**不作废任何旧钥匙** —— 多把并存，
         正是这个功能存在的理由（换机器时新旧同时在线，切完再掐旧的）。
         代理不在册 / 没批准 ⇒ None（调用方 404 / 409）。
-        🔴 Redis 后端已有凭据 ⇒ 抛 `SingleCredentialBackend`（宁可报错也不静默少发）。
         """
         aid = (agent_id or "").strip()
         row = self._be.load(aid)
@@ -2039,7 +1788,7 @@ class Registry:
                 return False
             self._last_touch[throttle_key] = now
         if cid:
-            self._cred.bump(cid, column)      # Redis 后端是 no-op（单把 = 活动已在代理行）
+            self._cred.bump(cid, column)
         self._be.bump(aid, column)
         return True
 

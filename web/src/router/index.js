@@ -42,7 +42,7 @@ const routes = [
   // 挤在别页里既看不清也翻不动；侧栏位置在「审核」之前（业务页在前、审核收尾）。
   { path: '/todos', name: 'todos', component: TodosView, meta: { title: '待办' } },
   // AI 配置（2026-10 ai_settings_page）：所有模型调用点的集中配置页
-  // （llm / embedder / screening 可写，query_expansion / tiering_review 只读说明）
+  // （llm / embedder / screening 可写，tiering_review 只读说明）
   { path: '/ai-settings', name: 'ai-settings', component: AiSettingsView, meta: { title: 'AI 配置' } },
   { path: '/stats', name: 'stats', component: StatsView, meta: { title: '看板' } },
 ]

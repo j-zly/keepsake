@@ -8,8 +8,7 @@
 * PG / SQLite：`ks_todo` 行表，DDL 由 **本模块唯一定义**
   （`KS_TODO_DDL_PG` / `KS_TODO_DDL_SQLITE`），两个后端各 import 自己的那一份
   —— 建表语句复制两份必然漂，而漂的后果是「待办在换后端时静默消失」。
-* Redis：`keepsake:todo:<id>` hash（一条待办一个 hash）+ `keepsake:todo:ids`
-  LIST（全部待办的 id，插入序）+ `keepsake:todo:seq` 计数器（发号）。
+* （2026-11）Redis 的 hash + LIST + 计数器兼容形态随该后端整体移除；只剩 SQL 行表。
 
 对外形状逐字段相同：`{id, title, detail, owner, creator, status, due,
 created, updated, done_at, due_state}`，时刻一律 **ISO 字符串**。
@@ -25,8 +24,7 @@ created, updated, done_at, due_state}`，时刻一律 **ISO 字符串**。
    （none / soon / overdue，基准日 = UTC 今天）—— 前端只翻译它，不自己算日期。
 4. **老数据兼容**：`due` / `detail` / `done_at` 都可空，老行缺字段一律回落缺省值。
 
-`ponytail:` Redis 侧是 hash + 全量 LIST（O(全量) 扫），待办量级是「几十条」，
-够用；升级路径 = 把 LIST 换成 ZSET（`ZRANGE by score` 取最近 N 条）。
+`ponytail:` 待办量级是「几十条」，SQL 全表扫够用；真要大了按 owner+status 加索引。
 """
 
 from __future__ import annotations
@@ -40,7 +38,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from .registry import (
     _SqlBase,
     _backend_of,
-    _text,
 )
 
 logger = logging.getLogger("keepsake.govern.todo")
@@ -52,7 +49,7 @@ logger = logging.getLogger("keepsake.govern.todo")
 TABLE = "ks_todo"
 INDEX = "idx_ks_todo_owner_status"
 
-#: 列 / 字段名（SQL 行与 Redis hash 共用同一份名字 ⇒ 规范化只有一处）
+#: 列名（行表唯一形态 ⇒ 规范化只有一处）
 TODO_FIELDS: Tuple[str, ...] = (
     "id", "title", "detail", "owner", "creator", "status", "due",
     "created", "updated", "done_at",
@@ -87,7 +84,6 @@ LIMIT_MAX = 200
 #: 建表失败后的**重试冷却**（秒）—— 同一款纪律见 `govern/messaging.py`。
 SCHEMA_RETRY_COOLDOWN_S = 60.0
 
-#: Redis 键
 REDIS_KEY_GLOBAL = "keepsake:todo:ids"
 REDIS_KEY_ITEM = "keepsake:todo:"
 REDIS_KEY_SEQ = "keepsake:todo:seq"
@@ -279,7 +275,7 @@ def _iso(value: Any) -> str:
 
 
 def _norm_row(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """一行（SQL tuple→dict 或 Redis hash→dict）→ 规范 dict（缺项补缺省）。"""
+    """一行（SQL tuple→dict）→ 规范 dict（缺项补缺省）。"""
     row: Dict[str, Any] = {f: raw.get(f) for f in TODO_FIELDS}
     try:
         row["id"] = int(row.get("id") or 0)
@@ -459,7 +455,7 @@ class _TodoSqlBackend(_SqlBase):
         return _norm_row(dict(zip(TODO_FIELDS, rows[0]))) if rows else None
 
     def all_rows(self, owner: str = "", visible_to: str = "") -> List[Dict[str, Any]]:
-        """全量行（Redis 侧同款语义；owner 非空 ⇒ 只看那个 owner）。"""
+        """全量行（owner 非空 ⇒ 只看那个 owner）。"""
         where, params = self._where(owner, "", visible_to)
         cols = ", ".join(TODO_FIELDS)
         rows = self.read(f"SELECT {cols} FROM {TABLE}{where} ORDER BY id ASC", params)
@@ -482,142 +478,18 @@ class _TodoSqlBackend(_SqlBase):
                 for r in rows]
 
 
-class _RedisBackend:
-    """Redis：每条待办一个 hash + 全量 id LIST + 发号计数器。
-
-    🔴 **取舍说清楚**（别让人以为它与 SQL 等价）：LIST 元素不能就地改字段
-    ⇒ 改状态是「改那个 id 的 hash」（O(1)）；但「按 owner / 状态筛」只能
-    **全量扫**（O(全量)）。待办量级是「几十条」，够用。
-    `ponytail:` 升级路径 = 把 LIST 换成 ZSET（`ZRANGE by score` 取最近 N 条）。
-    """
-
-    kind = "redis"
-
-    def __init__(self, storage: Any) -> None:
-        self._st = storage
-
-    @staticmethod
-    def item_key(todo_id: Any) -> str:
-        return f"{REDIS_KEY_ITEM}{todo_id}"
-
-    def _client(self) -> Any:
-        client = self._st._get_client()      # noqa: SLF001 —— 复用既有连线
-        if client is None:
-            raise RuntimeError("todo: Redis 不可达（_get_client 返回 None）")
-        return client
-
-    def ensure_schema(self) -> bool:
-        return True          # hash / LIST 形态没有 schema
-
-    def add(self, title: str, detail: str, owner: str, creator: str,
-            due: str) -> int:
-        client = self._client()
-        todo_id = int(client.incr(REDIS_KEY_SEQ))
-        now = _now_iso()
-        row = {
-            "id": str(todo_id), "title": title, "detail": detail,
-            "owner": owner, "creator": creator, "status": STATUS_OPEN,
-            "due": due, "created": now, "updated": now, "done_at": "",
-        }
-        client.hset(self.item_key(todo_id), mapping=row)
-        client.rpush(REDIS_KEY_GLOBAL, str(todo_id))
-        return todo_id
-
-    def _raw(self, todo_id: int) -> Dict[str, Any]:
-        client = self._client()
-        raw = client.hgetall(self.item_key(todo_id)) or {}
-        out: Dict[str, Any] = {}
-        for k, v in (raw or {}).items():
-            key = _text(k)
-            val = _text(v)
-            out[key] = val
-        return out
-
-    def get(self, todo_id: int) -> Optional[Dict[str, Any]]:
-        raw = self._raw(todo_id)
-        return _norm_row(raw) if raw else None
-
-    def set_status(self, todo_id: int, status: str) -> bool:
-        raw = self._raw(todo_id)
-        if not raw:
-            return False
-        client = self._client()
-        now = _now_iso()
-        client.hset(self.item_key(todo_id), "status", status)
-        client.hset(self.item_key(todo_id), "updated", now)
-        client.hset(self.item_key(todo_id), "done_at",
-                    now if status == STATUS_DONE else "")
-        return True
-
-    def delete(self, todo_id: int) -> bool:
-        client = self._client()
-        raw = self._raw(todo_id)
-        if not raw:
-            return False
-        client.delete(self.item_key(todo_id))
-        client.lrem(REDIS_KEY_GLOBAL, 1, str(todo_id))
-        return True
-
-    def all_rows(self, owner: str = "", visible_to: str = "") -> List[Dict[str, Any]]:
-        client = self._client()
-        ids = [_text(i) for i in client.lrange(REDIS_KEY_GLOBAL, 0, -1)]
-        out: List[Dict[str, Any]] = []
-        for raw_id in ids:
-            try:
-                todo_id = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            row = self.get(todo_id)
-            if not row:
-                continue
-            if owner and row.get("owner") != owner:
-                continue
-            if visible_to and visible_to not in (row.get("owner") or "",
-                                                row.get("creator") or ""):
-                continue
-            out.append(row)
-        return out
-
-    def list_rows(self, owner: str, status: str, page: int, size: int,
-                  visible_to: str = "") -> Tuple[List[Dict[str, Any]], int]:
-        rows = self.all_rows(owner, visible_to)
-        if status:
-            rows = [r for r in rows if r.get("status") == status]
-        rows.sort(key=lambda r: int(r.get("id") or 0), reverse=True)
-        total = len(rows)
-        start = (page - 1) * size
-        return rows[start:start + size], total
-
-    def group_by_owner(self, owner: str = "") -> List[Dict[str, Any]]:
-        """按 owner + status 分组计数（Redis 侧**内存分组**）。
-
-        🔴 与 SQL 侧**同一份语义**（同样的 `{owner, status, n}` 行）——
-        Redis 没有 GROUP BY，只能扫一遍全量 LIST（待办量级「几十条」，够用；
-        与本模块其它 Redis 原语同一取舍）。
-        """
-        out: Dict[Tuple[str, str], int] = {}
-        for row in self.all_rows(owner):
-            key = (str(row.get("owner") or ""), str(row.get("status") or ""))
-            out[key] = out.get(key, 0) + 1
-        return [{"owner": o, "status": s, "n": n} for (o, s), n in out.items()]
-
-
-# --------------------------------------------------------------------------
-# 对外：一份语义，三后端
-# --------------------------------------------------------------------------
-
 class TodoStore:
     """待办存储。`TodoStore(storage)` 一份，三后端同一语义。
 
     **不自拼连接、不另开进程**：与 `Registry` / `Messaging` 同款 —— PG / SQLite
-    走存储后端自己的事务游标，Redis 走 `_get_client()` 的既有连线。
+    走存储后端自己的事务游标。
     """
 
     def __init__(self, storage: Any) -> None:
         kind = _backend_of(storage)
         self.backend = kind
-        self._be: Any = (_TodoSqlBackend(storage, kind) if kind != "redis"
-                         else _RedisBackend(storage))
+        # 2026-11：Redis 兼容类随该后端移除，只剩 SQL 形态（PG/SQLite 共用）。
+        self._be: Any = _TodoSqlBackend(storage, kind)
         self._ensured = False
         self._ensure_lock = threading.Lock()
         #: 建表失败后的**重试冷却**截止时刻（单调钟）。
@@ -730,7 +602,7 @@ class TodoStore:
     def summary_by_owner(self, owner: str = "") -> List[Dict[str, Any]]:
         """**按归属代理**分列的计数：`[{owner, open, done, obsolete, total}]`。
 
-        🔴 **只读聚合**（SQL 侧一条 `GROUP BY owner, status`；Redis 侧内存分组）——
+        🔴 **只读聚合**（SQL 侧一条 `GROUP BY owner, status`）——
         与 `summary()` 的口径一致，只是**按 owner 拆开**（看板「待办完成率按代理看」
         用；`owner` 参数与 `summary()` 同义：空 = 全部）。
 

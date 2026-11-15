@@ -62,6 +62,13 @@ Python 侧用仓库既有的 jieba 做（`splitter.segment_query` → 同义词�
 ponytail: 检索后处理（RRF / v2 过滤 / 综合重排 / 批量载入）与注意力、热词的
 加权公式**不在本文件**，全在 `storage_shared.py`，Redis 与 PG 绑定的是同一批
 函数对象；本文件只写「怎么把候选取出来」的 SQL。
+
+
+> **2026-11 校准**：Redis 后端已整体移除（2.0.0）。本文件里大量「与 Redis 侧对齐 /
+> 同源 / 逐字一致」的行文是**设计出处记录**（列名、blob 布局、判据口径的历史来源），
+> 指向 1.1.x 的实现，不是现行后端清单 —— 现行后端只有 PG / SQLite，共用实现看
+> `core/shared.py` 与 `core/factory.py`。
+
 """
 
 from __future__ import annotations
@@ -154,7 +161,7 @@ from .shared import (          # 与 Redis 共用的检索后处理（同一批�
 # 查询式构造复用 Redis 侧的同一套（同义词扩展 + 路径/连字符拆子词的 sanitize）。
 # 复用而不是重抄：上游 58bf19c/d00b7eb 修过这套的坑，两边各写一份必漂移。
 # storage.py 只在函数体内延迟 import storage_pg，模块级不反向依赖 ⇒ 无循环。
-from .redis import _expand_terms, _sanitize_terms
+from .shared import _expand_terms, _sanitize_terms
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
