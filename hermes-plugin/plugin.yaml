@@ -1,5 +1,5 @@
 name: keepsake
-version: 2.0.0
+version: "2.1.0"
 description: "Keepsake — full-entry memory system for Hermes Agent. Complete memories stored as-is, per-turn semantic recall injected into context: BM25 out of the box, optional vector KNN, time decay, feedback ranking, two storage backends (PostgreSQL / SQLite), multi-agent governance."
 author: "j-zly"
 license: "MIT"
