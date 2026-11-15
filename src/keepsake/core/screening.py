@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import httpx
 
 from .http import get_client
+from .llm_http import LlmHttpStatusError, chat_completion, resolve_api_key
 # 配置路径与文件指纹**复用 consolidator 的同一份**（`KEEPSAKE_CONFIG` > 默认路径）：
 # 同一份 config.json、同一套 mtime 口径 —— 再写一份路径规则迟早漂成「读的不是同一个文件」。
 from .ops.consolidator import _config_path, _stat_fingerprint
@@ -64,6 +65,9 @@ DEFAULTS: Dict[str, Any] = {
     "default_on": False,
     "model": "MiniMax-M3.1-Flash",
     "base_url": "https://api.minimax.cn/v1",
+    # 🆕 protocol（2026-11 ai_protocol_key_input）：openai 兼容 / anthropic。
+    # 缺省 = openai（**行为与引入前逐字一致**）；非法值运行时回落 openai。
+    "protocol": "openai",
     "api_key_file": "/root/.config/keepsake/screen_key",
     "max_pick": 10,
     "timeout_s": 90,
@@ -152,6 +156,10 @@ def resolve_screening(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         "model": _parse_str(raw.get("model"), "model", DEFAULTS["model"]),
         "base_url": _parse_str(raw.get("base_url"), "base_url",
                                DEFAULTS["base_url"]).rstrip("/"),
+        # 协议（openai / anthropic）：非法值**不在这里**回落 —— 保留原值，
+        # 让适配层回落 openai 并把告警带进检测回包（看得见比悄悄跑更重要）。
+        "protocol": _parse_str(raw.get("protocol"), "protocol",
+                               DEFAULTS["protocol"]),
         "api_key_file": _parse_str(raw.get("api_key_file"), "api_key_file",
                                    DEFAULTS["api_key_file"]),
         "max_pick": _parse_num(raw.get("max_pick"), "max_pick",
@@ -274,24 +282,6 @@ def _safe_num(value: Any, default: Any, cast: Any) -> Any:
         return default
 
 
-def _read_api_key(cfg: Dict[str, Any]) -> str:
-    """读 api_key 文件（**唯一来源**：配置里那个独立小文件）。
-
-    缺文件 / 读不动 ⇒ 空串 ⇒ 上层降级 `skipped:no_key`。
-    🔴 **不许环境变量兜底**：key 的来源只有一个，写死在 config.json 指的那条路径上。
-    """
-    path = str(cfg.get("api_key_file") or "").strip()
-    if not path:
-        return ""
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except (OSError, IOError) as e:
-        logger.warning("keepsake: screening key 文件读不到（%s: %s）—— 按无 key 降级",
-                       path, type(e).__name__)
-        return ""
-
-
 def _strip_fences(text: str) -> str:
     """去掉模型偶尔加的 ```json 代码围栏（只去围栏，不动内容）。"""
     out = (text or "").strip()
@@ -350,7 +340,9 @@ def pick_relevant(query: str, candidates: Sequence[Dict[str, Any]],
     if not cands:
         return [], "skipped:empty"
 
-    api_key = _read_api_key(cfg)
+    # 凭据：统一由适配层读（内联 api_key 优先，其次 api_key_file 指向的文件）——
+    # 🔴 不许环境变量兜底：来源只有 config.json 指的那一处。
+    api_key = resolve_api_key(cfg)
     if not api_key:
         return [], "skipped:no_key"
 
@@ -359,40 +351,41 @@ def pick_relevant(query: str, candidates: Sequence[Dict[str, Any]],
     if not base_url or not model:
         return [], "skipped:unconfigured"
 
-    body = {
+    # 🆕 协议适配层（2026-11 ai_protocol_key_input）：请求怎么拼、响应怎么读
+    # 都在 core/llm_http.py 一处；这里只给「要发什么」（模型 / 凭据 / 采样 / 协议）。
+    call_cfg = {
+        "base_url": base_url,
         "model": model,
-        "messages": [
-            {"role": "system", "content": "你是检索结果筛选器，只输出 JSON。"},
-            {"role": "user", "content": build_prompt(query, cands)},
-        ],
+        "protocol": cfg.get("protocol"),
+        "api_key": api_key,
         "temperature": 0,
         "max_tokens": _safe_num(cfg.get("max_tokens"), DEFAULTS["max_tokens"], int),
     }
-    headers = {"Authorization": f"Bearer {api_key}"}
+    messages = [
+        {"role": "system", "content": "你是检索结果筛选器，只输出 JSON。"},
+        {"role": "user", "content": build_prompt(query, cands)},
+    ]
 
     try:
-        client = get_client(base_url, _safe_num(cfg.get("timeout_s"),
-                                                DEFAULTS["timeout_s"], float))
-        resp = client.post(f"{base_url}/chat/completions", json=body, headers=headers)
+        timeout = _safe_num(cfg.get("timeout_s"), DEFAULTS["timeout_s"], float)
+        client = get_client(base_url, timeout)
+        content = chat_completion(call_cfg, messages, timeout=timeout, client=client)
     except httpx.TimeoutException:
         return [], "skipped:timeout"
+    except LlmHttpStatusError as e:
+        if e.status_code == 429:
+            return [], "skipped:rate_limited"
+        logger.warning("keepsake: screening 请求失败（HTTP %s）", e.status_code)
+        return [], f"skipped:http_{e.status_code}"
+    except ValueError:
+        # 坏 JSON / 响应形状不对（`LlmBadResponseError` 也是 ValueError）
+        return [], "skipped:bad_json"
     except httpx.HTTPError as e:
         logger.warning("keepsake: screening 请求失败（%s: %s）", type(e).__name__, e)
         return [], "skipped:http_error"
     except Exception as e:      # noqa: BLE001 —— 筛选坏不许掀翻检索
         logger.warning("keepsake: screening 请求异常（%s: %s）", type(e).__name__, e)
         return [], "skipped:error"
-
-    if resp.status_code == 429:
-        return [], "skipped:rate_limited"
-    if resp.status_code >= 400:
-        return [], f"skipped:http_{resp.status_code}"
-
-    try:
-        payload = resp.json()
-        content = payload["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError):
-        return [], "skipped:bad_json"
 
     ids, err = _parse_keep(str(content or ""))
     if err:

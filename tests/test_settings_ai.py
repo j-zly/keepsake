@@ -151,9 +151,12 @@ def test_GET_两节无独立配置_只读说明卡(client, cfg_path):
                                  "key_file": "/tmp/k"}})
     secs = sections_of(client)
     for sid in ("tiering_review",):
-        assert secs[sid]["fields"] == [], sid
         assert secs[sid]["editable"] is False
         assert secs[sid]["note"], "要写清复用哪一节"
+        # 协议 / 凭据状态**跟随 llm 节**显示，但**只读**（不给编辑入口）
+        for f in secs[sid]["fields"]:
+            assert f.get("readonly") is True, f"{sid} 的 {f['key']} 必须只读"
+            assert f["type"] != "secret_value", "只读卡不许出现可填的凭据框"
 
 
 def test_GET_数值字段自带上下限_前端零写死(client, cfg_path):
@@ -179,10 +182,12 @@ def test_GET_凭据真值永不下发(client, cfg_path, tmp_path):
     assert r.status_code == 200, r.text
     assert FAKE_KEY not in r.text
     secs = sections_of(client)
-    # 路径型 secret：只回 {set, path}
+    # 路径型 secret：**只回 {set}**（= 有没有凭据），**路径不再下发**
+    # （路径由系统自动管理，页面看不见 —— 用户只填 key）。
     kf = field_of(secs["llm"], "key_file")
     assert kf["secret"] is True
-    assert kf["value"] == {"set": True, "path": str(key_file)}
+    assert kf["value"] == {"set": True}
+    assert str(key_file) not in r.text
     # 内联型 secret：只回 {set}
     ak = field_of(secs["embedder"], "api_key")
     assert ak["secret"] is True
@@ -364,6 +369,131 @@ def test_PUT_改完下一轮就生效(client, cfg_path):
     screening.invalidate_cfg_cache()
     assert screening.load_cfg()["enabled"] is True
     assert screening.load_cfg()["max_pick"] == 5
+
+
+# ------------------------------------------------------- 协议 + 凭据填写化
+# （2026-11 ai_protocol_key_input：每张 LLM 类卡独立选协议；凭据只填 key，
+#   路径由系统自动管理、页面看不见）
+
+def test_GET_协议下拉_选项与缺省由后端给(client, cfg_path):
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m"},
+                         "screening": {"base_url": "https://x/v1", "model": "m"}})
+    secs = sections_of(client)
+    for sid in ("llm", "screening"):
+        f = field_of(secs[sid], "protocol")
+        assert f["type"] == "select", sid
+        assert f["value"] == "openai", "缺省 = openai（老配置零变化）"
+        assert [o["value"] for o in f["options"]] == ["openai", "anthropic"], sid
+
+
+def test_PUT_协议保存回读(client, cfg_path):
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m"}})
+    r = client.put(f"{GET}/llm", json={"confirm": True, "protocol": "anthropic"},
+                   headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert read_cfg(cfg_path)["llm"]["protocol"] == "anthropic"
+    assert field_of(sections_of(client)["llm"], "protocol")["value"] == "anthropic"
+
+
+def test_PUT_筛选协议保存回读(client, cfg_path):
+    write_cfg(cfg_path, {"screening": {"base_url": "https://x/v1", "model": "m"}})
+    r = client.put(f"{GET}/screening", json={"confirm": True, "protocol": "anthropic"},
+                   headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert read_cfg(cfg_path)["screening"]["protocol"] == "anthropic"
+
+
+def test_PUT_协议非法值400_半截值不许落盘(client, cfg_path):
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m"}})
+    r = client.put(f"{GET}/llm", json={"confirm": True, "protocol": "bogus"},
+                   headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == "ai_invalid"
+    assert "protocol" not in read_cfg(cfg_path)["llm"]
+
+
+def test_GET_embedder协议行只读固定文案(client, cfg_path):
+    write_cfg(cfg_path, {"embedder": {"provider": "openai", "model": "m"}})
+    f = field_of(sections_of(client)["embedder"], "protocol")
+    assert f.get("readonly") is True
+    assert f["display"] == "OpenAI 兼容（Embeddings）"
+
+
+def test_GET_只读卡跟随llm的协议与凭据状态(client, cfg_path, tmp_path):
+    key_file = tmp_path / "llm.key"
+    key_file.write_text(FAKE_KEY, encoding="utf-8")
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m",
+                                 "protocol": "anthropic", "key_file": str(key_file)}})
+    sec = sections_of(client)["tiering_review"]
+    assert sec["editable"] is False
+    assert sec["protocol"] == "anthropic"
+    assert sec["has_key"] is True
+    assert field_of(sec, "protocol").get("readonly") is True
+    assert field_of(sec, "api_key").get("readonly") is True
+    assert field_of(sec, "api_key")["display"] == "已设置"
+
+
+def test_GET_响应里搜不到key原文也搜不到路径(client, cfg_path, tmp_path):
+    """🔴 凭据真值与密钥文件路径**都不下发**（路径由系统自动管理）。"""
+    key_file = tmp_path / "llm.key"
+    key_file.write_text(FAKE_KEY, encoding="utf-8")
+    write_cfg(cfg_path, {
+        "llm": {"base_url": "https://x/v1", "model": "m",
+                "key_file": str(key_file), "api_key": FAKE_KEY},
+        "screening": {"base_url": "https://x/v1", "model": "m",
+                      "api_key_file": str(key_file)},
+    })
+    r = client.get(GET, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert FAKE_KEY not in r.text
+    assert str(key_file) not in r.text
+    # 只回「有没有」
+    assert sections_of(client)["llm"]["has_key"] is True
+
+
+def test_PUT_新凭据写进固定密钥文件_路径不再手填(client, cfg_path, keys_dir):
+    """凭据只填 key ⇒ 落 `ai_keys/<节>.key`（600），config 只留路径。"""
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m"}})
+    r = client.put(f"{GET}/llm", json={"confirm": True, "api_key": FAKE_KEY},
+                   headers=AUTH)
+    assert r.status_code == 200, r.text
+    after = read_cfg(cfg_path)["llm"]
+    assert after["key_file"] == str(keys_dir / "llm.key")
+    assert FAKE_KEY not in cfg_path.read_text(encoding="utf-8")
+    assert (keys_dir / "llm.key").read_text(encoding="utf-8").strip() == FAKE_KEY
+
+
+def test_PUT_留空凭据不动已有的(client, cfg_path, keys_dir):
+    """留空 = 保持现有凭据不变（不写文件、不改路径）。"""
+    keys_dir.mkdir(parents=True, exist_ok=True)
+    (keys_dir / "llm.key").write_text("old-key", encoding="utf-8")
+    write_cfg(cfg_path, {"llm": {"base_url": "https://x/v1", "model": "m",
+                                 "key_file": str(keys_dir / "llm.key")}})
+    r = client.put(f"{GET}/llm", json={"confirm": True, "api_key": "   ",
+                                       "model": "m2"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert (keys_dir / "llm.key").read_text(encoding="utf-8").strip() == "old-key"
+    assert read_cfg(cfg_path)["llm"]["key_file"] == str(keys_dir / "llm.key")
+
+
+def test_probe_协议非法值回落openai并带告警(client, cfg_path, tmp_path, monkeypatch):
+    """手改 config.json 写错协议名 ⇒ 按 openai 跑，但**看得见**告警。"""
+    key_file = tmp_path / "llm.key"
+    key_file.write_text(FAKE_KEY, encoding="utf-8")
+    write_cfg(cfg_path, {"llm": {"base_url": "https://example.invalid/v1",
+                                 "model": "m-x", "protocol": "bogus",
+                                 "key_file": str(key_file)}})
+    fake = _FakeClient(_FakeResp(200, {"choices": [{"message": {"content": "pong"}}]}))
+    monkeypatch.setattr(ops_router, "get_client", lambda base_url, timeout: fake)
+
+    r = client.post(f"{GET}/llm/probe", headers=AUTH)
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["ok"] is True
+    assert b["protocol"] == "openai"
+    assert "不是合法值" in b["warning"]
+    # 仍然按 openai 的路径发
+    assert fake.calls[0]["url"] == "https://example.invalid/v1/chat/completions"
 
 
 # ---------------------------------------------------------------- probe

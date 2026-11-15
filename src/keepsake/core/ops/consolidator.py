@@ -40,6 +40,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..http import get_client, retrying
+from ..llm_http import (LlmBadResponseError, LlmHttpError, LlmHttpStatusError,
+                        chat_completion)
 
 # 日志名**钉在搬家前的模块名上**：logger 名是对外可观测行为（外部 log 配置、
 # caplog 过滤都按名找），搬目录不改名，否则等于悄悄改行为。
@@ -166,7 +168,8 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
       3. key_file 读失败 → api_key="" 但其它字段保留；source 反映读文件失败
       4. 配置文件中途损坏（非法 JSON） → 本窗按 unconfigured 处理，不抛穿
 
-    返回 dict 字段: base_url, model, api_key, source, key_file, valid, request_extra。
+    返回 dict 字段: base_url, model, api_key, source, key_file, valid, request_extra,
+    protocol（协议：openai / anthropic；缺省空串 = openai）。
     日志安全：logger 只允许出现 key_file 路径 / 端点 host，绝不打印 key 内容。
 
     request_extra（r3 起新增）:
@@ -194,6 +197,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": "",
             "valid": False,
+            "protocol": str(llm_cfg.get("protocol") or "").strip(),
             "request_extra": _resolve_request_extra(llm_cfg),
         }
 
@@ -208,6 +212,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": llm_cfg.get("key_file") or "",
             "valid": False,
+            "protocol": str(llm_cfg.get("protocol") or "").strip(),
             "request_extra": _resolve_request_extra(llm_cfg),
         }
 
@@ -221,6 +226,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "source": "unconfigured",
             "key_file": llm_cfg.get("key_file") or "",
             "valid": False,
+            "protocol": str(llm_cfg.get("protocol") or "").strip(),
             "request_extra": _resolve_request_extra(llm_cfg),
         }
 
@@ -263,6 +269,7 @@ def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "source": source,
         "key_file": key_file_path,
         "valid": bool(api_key) and not key_file_failed,
+        "protocol": str(llm_cfg.get("protocol") or "").strip(),
         "request_extra": _resolve_request_extra(llm_cfg),
     }
 
@@ -398,7 +405,8 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
               max_retries: int = 3) -> Optional[str]:
     """调用 chat API 获取 LLM 回复。带重试。
 
-    channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key/request_extra）；
+    channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key/
+             request_extra/protocol）；
              None → 仅查 OPENAI_API_KEY env（无任何付费模型硬编码兜底）。
     channel['model'] 优先于入参 model；二者都缺 → 返回 None（不静默用付费模型）。
     channel['request_extra']（r3 起消费）: 非空 dict → 合并进请求 body，厂商特异字段
@@ -443,22 +451,18 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
             channel.get("source", "?"),
         )
         return None
-    url = f"{base_url}/chat/completions"
-    # r3：构造 body 后合并 channel.request_extra（厂商特异字段走 config 注入，
-    # 与 cron/memory_distill.build_chat_request 语义一致 —— extra 可覆盖默认参数）。
-    body_dict = {
+    # 🆕 协议适配层（2026-11 ai_protocol_key_input）：请求怎么拼、响应怎么读
+    # 都在 core/llm_http.py 一处（openai / anthropic 分叉）；这里只给「要发什么」。
+    # request_extra（厂商特异字段）由适配层合并在最后 —— 可覆盖默认参数，
+    # 与 cron/memory_distill.build_chat_request 语义一致。
+    call_cfg = {
+        "base_url": base_url,
         "model": actual_model,
-        "messages": messages,
+        "protocol": channel.get("protocol"),
+        "api_key": api_key,
         "max_tokens": 512,
         "temperature": 0.3,
-    }
-    request_extra = channel.get("request_extra")
-    if isinstance(request_extra, dict) and request_extra:
-        body_dict.update(request_extra)
-    payload = json.dumps(body_dict).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "request_extra": channel.get("request_extra"),
     }
 
     # 2026-10 ks_perf_stdlib：httpx.Client（连接池复用）+ tenacity 重试。
@@ -476,15 +480,13 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
 
     def _attempt() -> Optional[str]:
         attempts["n"] += 1
-        resp = client.post(url, content=payload, headers=headers)
-        resp.raise_for_status()
-        data = json.loads(resp.content)
-        choices = data.get("choices", [])
-        if choices:
-            return choices[0].get("message", {}).get("content", "").strip()
-        # Got response but no choices — don't retry
-        logger.warning("consolidator: LLM returned no choices (attempt %d)", attempts["n"])
-        return None
+        try:
+            return chat_completion(call_cfg, messages, timeout=LLM_TIMEOUT,
+                                   client=client, body_bytes=True).strip()
+        except LlmBadResponseError:
+            # Got response but no choices — don't retry
+            logger.warning("consolidator: LLM returned no choices (attempt %d)", attempts["n"])
+            return None
 
     def _log_retry(retry_state) -> None:
         # 留痕与改造前逐字对齐：先「这次失败了」（带原因），再「多久之后重试」。
@@ -499,10 +501,12 @@ def _call_llm(messages: List[Dict[str, str]], model: str = "",
     try:
         return retrying(
             retries=max_retries,
-            extra_retryable=lambda e: isinstance(e, json.JSONDecodeError),
+            # 429（限流）与坏 JSON 值得重试 —— 与改造前逐字一致。
+            extra_retryable=lambda e: isinstance(e, json.JSONDecodeError)
+            or (isinstance(e, LlmHttpStatusError) and e.status_code == 429),
             before_sleep=_log_retry,
         )(_attempt)
-    except (httpx.HTTPError, json.JSONDecodeError, OSError) as e:
+    except (LlmHttpError, httpx.HTTPError, json.JSONDecodeError, OSError) as e:
         logger.warning("consolidator: LLM call failed after %d attempts: %s",
                        attempts["n"], e)
         return None

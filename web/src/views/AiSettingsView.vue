@@ -8,10 +8,14 @@
 
   三条纪律：
     1. **数字全部来自 GET**（连输入框的上下限都是后端给的 min/max）—— 前端零写死；
-    2. **凭据不显示**：secret 字段只显示「已设置 / 未设置」徽标 + 路径，
-       输入框留空 = 不改（新凭据由后端写进 600 权限的密钥文件）；
+    2. **凭据不显示**：secret 字段只显示「已设置 / 未设置」徽标（**路径与真值都不回显**），
+       密码框留空 = 不改（新凭据由后端写进 600 权限的密钥文件）；
     3. **一张卡一个保存 + 一个检测**：保存走既有重确认件（后果逐条列明），
        检测即时调 probe，结果显示在卡内状态行（绿 = 通，红 = 失败 + 原因摘要）。
+
+  2026-11 ai_protocol_key_input：llm / screening 两卡多了**协议下拉**
+  （openai 兼容 / anthropic，选项由后端给）；embedder 的协议行是只读固定文案；
+  「凭据文件路径」输入框**整个删掉** —— 用户只填 key，路径由系统自动管理。
 
   2026-10-24 视觉层级重做（**纯样式层**）：卡头（节名大字 + 右侧开关位 +
   一行用途副标）、卡内 label-in 字段栅格、数值三件一行三列、凭据做成整行
@@ -39,7 +43,7 @@
 
     <p class="src foot-note">
       配置写在 {{ meta.path || 'config.json' }}；写前整份备份到 {{ meta.backup_dir || '备份目录' }}；
-      新凭据写进 {{ meta.keys_dir || '密钥目录' }}（600 权限，明文不落 config.json）。
+      新凭据写进 600 权限的密钥文件（路径由系统管理，明文不落 config.json）。
     </p>
 
     <div
@@ -85,27 +89,19 @@
             <span class="ai-label">{{ labelOf(card, f) }}</span>
             <!-- 布尔 -->
             <el-switch v-if="f.type === 'bool'" v-model="card.draft[f.key]" />
-            <!-- 凭据文件路径：状态条（默认收起，点开才出输入框） -->
-            <details v-else-if="f.type === 'secret_path'" class="ai-secret">
-              <summary class="ai-secret-bar">
-                <code v-if="f.value && f.value.path" class="ai-path">{{ f.value.path }}</code>
-                <span class="ai-secret-side">
-                  <span class="chip" :class="f.value && f.value.set ? 'ai-chip--ok' : 'chip--warn'">
-                    <i v-if="f.value && f.value.set" class="dot-ok"></i>
-                    {{ f.value && f.value.set ? '已设置' : '未设置' }}
-                  </span>
-                  <span class="ai-link">修改</span>
-                </span>
-              </summary>
-              <div class="ai-secret-body">
-                <el-input
-                  v-model="card.draft[f.key]"
-                  :placeholder="f.placeholder"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-              </div>
-            </details>
+            <!-- 协议下拉：选项**全部由后端给**（前端零硬编码） -->
+            <el-select
+              v-else-if="f.type === 'select'"
+              v-model="card.draft[f.key]"
+              :placeholder="f.placeholder"
+            >
+              <el-option
+                v-for="o in f.options || []"
+                :key="o.value"
+                :label="o.label"
+                :value="o.value"
+              />
+            </el-select>
             <!-- 内联凭据：只显示「有没有」，真值永不回显；留空 = 不改 -->
             <details v-else-if="f.type === 'secret_value'" class="ai-secret">
               <summary class="ai-secret-bar">
@@ -157,8 +153,9 @@
           </div>
         </div>
       </div>
-      <p v-else class="src ai-ro-note">
-        这里不编辑 —— 这一节没有独立配置，通道、模型、凭据都在上面那张「记忆提炼/合并」卡里。
+      <p v-if="!card.editable" class="src ai-ro-note">
+        这里不编辑 —— 这一节没有独立配置，通道、模型、凭据都在上面那张「记忆提炼/合并」卡里
+        （下面的协议与凭据状态跟随它，只读）。
       </p>
 
       <!-- probe 结果：空 = 不占位；通 = 绿边浅底，失败 = 红边浅底（可展开看全） -->
@@ -208,7 +205,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { showError, showToast } from '../utils/dialog'
 
 const cards = ref([])
-const meta = ref({ path: '', backup_dir: '', keys_dir: '' })
+const meta = ref({ path: '', backup_dir: '' })
 const error = ref('')
 const confirmOpen = ref(false)
 const saveTarget = ref(null)
@@ -219,13 +216,12 @@ function buildCards(sections) {
   return (sections || []).map((s) => {
     const draft = {}
     const secret = {}
-    for (const f of s.fields || []) {
+    // 路径型 secret 字段（凭据文件路径）**整条丢掉**：路径由系统自动管理，
+    // 页面既不显示也不提交 —— 凭据只从 api_key 那一个密码框填。
+    const fields = (s.fields || []).filter((f) => f.type !== 'secret_path')
+    for (const f of fields) {
       if (f.type === 'secret_value') {
         secret[f.key] = ''          // 留空 = 不改
-        continue
-      }
-      if (f.type === 'secret_path') {
-        draft[f.key] = (f.value && f.value.path) || ''
         continue
       }
       if (f.readonly) continue      // 只读展示项：不进 draft（保存时不回写它）
@@ -240,7 +236,7 @@ function buildCards(sections) {
       enabled: !!s.enabled,
       enabled_editable: !!s.enabled_editable,
       editable: !!s.editable,
-      fields: orderFields(s.fields),
+      fields: orderFields(fields),
       draft,
       secret,
       saving: false,
@@ -252,10 +248,10 @@ function buildCards(sections) {
 
 /**
  * 字段展示顺序（**三卡统一口径**，2026-10 embedder_provider_hygiene）：
- *   接口地址 → 模型 → 凭据（状态条）→ 其它（数值参数另走下方数字网格，永远最后）。
+ *   接口地址 → 模型 → 协议 → 凭据（状态条）→ 其它（数值参数另走下方数字网格，永远最后）。
  * 后端 GET 也按同一顺序给；这里再兜一层，纯展示排序，**不动数据流**。
  */
-const FIELD_ORDER = ['base_url', 'model', 'key_file', 'api_key_file', 'api_key',
+const FIELD_ORDER = ['base_url', 'model', 'protocol', 'api_key',
   'default_on', 'provider']
 
 function orderFields(fields) {
@@ -274,7 +270,6 @@ async function load() {
     meta.value = {
       path: data.path || '',
       backup_dir: data.backup_dir || '',
-      keys_dir: data.keys_dir || '',
     }
   } catch (e) {
     error.value = `读取 AI 配置失败：${e.message}`
@@ -285,9 +280,8 @@ async function load() {
 const LABELS = {
   base_url: '接口地址',
   model: '模型',
+  protocol: '协议',
   provider: '协议（只读展示）',
-  key_file: '凭据文件路径',
-  api_key_file: '凭据文件路径',
   api_key: '凭据',
   default_on: '默认开（调用方没显式传 screen 时按筛处理）',
   max_pick: '最多保留条数',
@@ -358,6 +352,7 @@ function okText(r) {
   if (r.finish_reason) bits.push(`finish_reason=${r.finish_reason}`)
   if (r.dimension !== undefined && r.dimension !== null) bits.push(`维度 ${r.dimension}`)
   if (r.picked) bits.push(`选中 ${r.picked.length}/${r.of}`)
+  if (r.warning) bits.push(r.warning)
   return `连通正常${bits.length ? ' · ' + bits.join(' · ') : ''}`
 }
 
@@ -367,6 +362,7 @@ function failText(r) {
   if (r.status) bits.push(`HTTP ${r.status}`)
   if (r.error) bits.push(r.error)
   if (r.message) bits.push(r.message)
+  if (r.warning) bits.push(r.warning)
   return `失败${bits.length ? ' · ' + bits.join(' · ') : ''}`
 }
 
@@ -548,13 +544,6 @@ onMounted(load)
   gap: 8px;
   align-items: center;
   margin-left: auto;
-}
-.ai-path {
-  min-width: 0;
-  color: var(--text-faint);
-  font-family: var(--mono);
-  font-size: 12px;
-  word-break: break-all;
 }
 .ai-secret-body {
   padding: 10px 12px 12px;

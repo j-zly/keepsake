@@ -41,6 +41,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from keepsake.core import llm_http
 from keepsake.core.http import get_client
 from keepsake.core.shared import fragment_key_for, sanitize_reserved_tags
 
@@ -179,6 +180,8 @@ class ScreeningBody(BaseModel):
     model: str = ""
     base_url: str = ""
     api_key_file: str = ""
+    #: 协议（openai / anthropic）；留空 = 保持现有值不变（老配置没这一项 = openai）。
+    protocol: str = ""
     max_pick: int = 10
     timeout_s: int = 90
     max_tokens: int = 4096
@@ -1088,6 +1091,9 @@ def _screening_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         "default_on": bool(resolved["default_on"]),
         "model": resolved["model"],
         "base_url": resolved["base_url"],
+        # 协议（openai / anthropic）：缺省 openai；非法值保留原样，
+        # 由适配层回落 openai 并把告警带进检测回包。
+        "protocol": resolved.get("protocol") or "openai",
         "api_key_file": resolved["api_key_file"],
         "max_pick": int(resolved["max_pick"]),
         "timeout_s": int(resolved["timeout_s"]),
@@ -1163,12 +1169,24 @@ def set_screening(body: ScreeningBody) -> Dict[str, Any]:
     raw = _read_config_or_reject(action, target)
     backup = audit.backup_json(f"config.screening.{audit.stamp()}.json", raw)
 
+    old = raw.get("screening") if isinstance(raw.get("screening"), dict) else {}
+    # 协议：body 给了就校验后写；没给 ⇒ 保持原值（老配置没这一项 = openai）。
+    protocol = str(body.protocol or "").strip().lower()
+    if protocol:
+        if protocol not in AI_PROTOCOL_VALUES:
+            _reject(400, "screening_invalid",
+                    f"协议只能是 {' 或 '.join(AI_PROTOCOL_VALUES)}：{protocol[:40]}",
+                    action, target)
+    else:
+        protocol = str(old.get("protocol") or "").strip().lower() or "openai"
+
     section = {
         "enabled": bool(body.enabled),
         "default_on": bool(body.default_on),
         "model": model,
         # 尾斜杠去掉：筛选侧拼的是 `{base_url}/chat/completions`
         "base_url": base_url.rstrip("/"),
+        "protocol": protocol,
         "api_key_file": key_file,
         "max_pick": int(body.max_pick),
         "timeout_s": int(body.timeout_s),
@@ -1218,11 +1236,24 @@ AI_REUSE_SECTIONS: Dict[str, str] = {
 }
 
 #: 同族说明文案（**只在后端写一次**，前端零硬编码）：
-#: llm / screening 两节走的是同一条 OpenAI 兼容 chat 通道。
-AI_CHAT_FAMILY_NOTE = "OpenAI 兼容 chat 接口。"
+#: llm / screening 两节走的是同一条 chat 通道（协议各自可选）。
+AI_CHAT_FAMILY_NOTE = "chat 接口（协议可选：OpenAI 兼容 / Anthropic）。"
 
 #: embedder 卡里 provider 这个**只读展示项**的文案（协议说明；provider 本身可配置）。
 AI_EMBEDDER_PROVIDER_DISPLAY = "OpenAI 兼容协议"
+
+#: embedder 的**协议行**固定文案（只读）：向量接口只有一种协议。
+AI_EMBEDDER_PROTOCOL_DISPLAY = "OpenAI 兼容（Embeddings）"
+
+#: LLM 协议取值域（2026-11 ai_protocol_key_input）：每张 LLM 类卡独立选。
+#: 下拉的选项与文案**由后端给**，前端零硬编码。
+AI_PROTOCOL_OPTIONS: Tuple[Dict[str, str], ...] = (
+    {"value": "openai", "label": "OpenAI 兼容（chat/completions）"},
+    {"value": "anthropic", "label": "Anthropic（messages）"},
+)
+
+#: 协议合法值（保存时校验；运行时的非法值由适配层回落 openai）。
+AI_PROTOCOL_VALUES: Tuple[str, ...] = tuple(o["value"] for o in AI_PROTOCOL_OPTIONS)
 
 #: 密钥文件目录（env 可改：测试指临时目录；默认 ~/.config/keepsake/ai_keys）。
 AI_KEYS_DIR_ENV = "KEEPSAKE_AI_KEYS_DIR"
@@ -1290,14 +1321,6 @@ def _read_key_file(path: Any) -> str:
         return ""
 
 
-def _key_file_present(path: Any) -> bool:
-    """密钥文件在不在（**只看文件在不在，绝不读内容**）。"""
-    try:
-        return Path(str(path or "")).expanduser().is_file()
-    except OSError:
-        return False
-
-
 def _llm_secret(llm_cfg: Dict[str, Any]) -> str:
     """llm 节的凭据：内联 `api_key` 优先，其次 `key_file` 指向的文件。
 
@@ -1351,6 +1374,28 @@ def _ai_field(key: str, ftype: str, value: Any, placeholder: str = "",
     return out
 
 
+def _ai_protocol_field(raw_value: Any) -> Dict[str, Any]:
+    """协议字段（下拉）：**选项与取值域由后端给**，前端零硬编码。
+
+    缺省 / 空 ⇒ openai（**与引入前逐字一致**：没配协议的老配置照旧走
+    OpenAI 兼容通道）。
+    """
+    value = str(raw_value or "").strip().lower()
+    if value not in AI_PROTOCOL_VALUES:
+        value = "openai"
+    return _ai_field("protocol", "select", value, "协议",
+                     options=[dict(o) for o in AI_PROTOCOL_OPTIONS])
+
+
+def _ai_protocol_label(raw_value: Any) -> str:
+    """协议的中文名（只读展示用；非法值按 openai 显示）。"""
+    value = str(raw_value or "").strip().lower()
+    for o in AI_PROTOCOL_OPTIONS:
+        if o["value"] == value:
+            return o["label"]
+    return AI_PROTOCOL_OPTIONS[0]["label"]
+
+
 def _ai_reject_unknown(fields: Dict[str, Any], allowed: set,
                        action: str, target: str) -> None:
     """未知字段 ⇒ 400（机器输入：字段名打错就该当场红，不许静默忽略）。"""
@@ -1370,8 +1415,9 @@ def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     cfg = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
     base_url = str(cfg.get("base_url") or "").strip()
     model = str(cfg.get("model") or "").strip()
-    key_file = str(cfg.get("key_file") or "").strip()
+    protocol = str(cfg.get("protocol") or "").strip()
     inline = bool(str(cfg.get("api_key") or "").strip())
+    has_key = bool(_llm_secret(cfg))
     note = AI_CHAT_FAMILY_NOTE
     if inline:
         note += ("config.json 里的 llm.api_key 是明文内联：运行时优先用它，"
@@ -1380,18 +1426,25 @@ def _ai_llm_section(raw: Dict[str, Any]) -> Dict[str, Any]:
         "id": "llm",
         "label": "记忆提炼/合并",
         "note": note,
-        "enabled": bool(base_url and model and _llm_secret(cfg)),
+        "enabled": bool(base_url and model and has_key),
         "enabled_editable": False,
         "editable": True,
+        # 🔴 凭据**真值永不下发**：只有「有没有」这一个位（路径由系统自动管理，
+        # 页面看不见 —— 用户只填 key，不碰路径）。
+        "has_key": has_key,
+        "protocol": protocol.lower() if protocol.lower() in AI_PROTOCOL_VALUES
+        else "openai",
         "fields": [
-            # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）
+            # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 协议 → 凭据 → 其它）
             _ai_field("base_url", "text", base_url, "如 https://api.minimax.cn/v1"),
             _ai_field("model", "text", model, "如 MiniMax-M3.1-Flash"),
-            _ai_field("key_file", "secret_path",
-                      {"set": _key_file_present(key_file), "path": key_file},
-                      "凭据文件路径（留空 = 不改）", secret=True),
-            _ai_field("api_key", "secret_value", {"set": bool(_llm_secret(cfg))},
-                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+            _ai_protocol_field(protocol),
+            # 路径型 secret 字段：**保留 key 名只为兼容既有消费方**（值只剩
+            # 「有没有」，**路径不再下发**）；页面不渲染它（前端按 secret_path
+            # 过滤）—— 凭据只从 api_key 那一个密码框填。
+            _ai_field("key_file", "secret_path", {"set": has_key}, "", secret=True),
+            _ai_field("api_key", "secret_value", {"set": has_key},
+                      "留空 = 保持现有凭据不变", secret=True),
         ],
     }
 
@@ -1402,8 +1455,8 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     provider = str(cfg.get("provider") or "").strip()
     base_url = str(cfg.get("base_url") or "").strip()
     model = str(cfg.get("model") or "").strip()
-    key_file = str(cfg.get("api_key_file") or "").strip()
     inline = bool(str(cfg.get("api_key") or "").strip())
+    has_key = bool(_embedder_secret(cfg))
     migrate = ""
     if inline:
         migrate = ("embedder.api_key 目前是明文内联：在下面填一次新凭据并保存，"
@@ -1416,19 +1469,24 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
                  "provider 是只读展示项（要改请改 config.json）。"),
         "migrate_hint": migrate,
         "enabled": bool(provider.lower() not in ("", "default", "none")
-                        and model and _embedder_secret(cfg)),
+                        and model and has_key),
         "enabled_editable": False,
         "editable": True,
-        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）：
-        #   接口地址 / 模型 / 凭据（状态条）→ provider（只读展示项，最后）
+        "has_key": has_key,
+        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 协议 → 凭据 → 其它）：
+        #   接口地址 / 模型 / 协议（只读）/ 凭据（状态条）→ provider（只读展示项，最后）
         "fields": [
             _ai_field("base_url", "text", base_url, "如 https://api.openai.com/v1"),
             _ai_field("model", "text", model, "如 text-embedding-3-small"),
-            _ai_field("api_key_file", "secret_path",
-                      {"set": _key_file_present(key_file), "path": key_file},
-                      "凭据文件路径（留空 = 不改）", secret=True),
-            _ai_field("api_key", "secret_value", {"set": bool(_embedder_secret(cfg))},
-                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+            # 协议：**只读固定文案**（向量接口只有 OpenAI 兼容一种）。
+            _ai_field("protocol", "text", "openai", "", readonly=True,
+                      display=AI_EMBEDDER_PROTOCOL_DISPLAY),
+            # 路径型 secret 字段：同 llm 节（**只留「有没有」，路径不下发**，
+            # 页面按 secret_path 过滤掉）。
+            _ai_field("api_key_file", "secret_path", {"set": has_key}, "",
+                      secret=True),
+            _ai_field("api_key", "secret_value", {"set": has_key},
+                      "留空 = 保持现有凭据不变", secret=True),
             # provider：**只读展示项**（2026-10 embedder_provider_hygiene）——
             # 页面不再给「可选值输入框」（llm / screening 两卡都没这个字段，
             # 口径统一）；显示文案由后端给，前端零硬编码。
@@ -1442,6 +1500,7 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
 def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
     """screening 节（检索结果筛选）—— 字段口径与 `settings/screening` **同源**。"""
     p = _screening_payload(raw)
+    protocol = str(p.get("protocol") or "").strip()
     return {
         "id": "screening",
         "label": "检索结果筛选",
@@ -1450,16 +1509,21 @@ def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": bool(p["enabled"]),
         "enabled_editable": True,
         "editable": True,
-        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 凭据 → 其它）：
-        #   接口地址 / 模型 / 凭据（状态条）→ 独有开关 → 数值参数（最后）
+        "has_key": bool(p["key_present"]),
+        "protocol": protocol.lower() if protocol.lower() in AI_PROTOCOL_VALUES
+        else "openai",
+        # 字段顺序（**三卡统一口径**：接口地址 → 模型 → 协议 → 凭据 → 其它）：
+        #   接口地址 / 模型 / 协议 / 凭据（状态条）→ 独有开关 → 数值参数（最后）
         "fields": [
             _ai_field("base_url", "text", p["base_url"], "如 https://api.minimax.cn/v1"),
             _ai_field("model", "text", p["model"], "如 MiniMax-M3.1-Flash"),
+            _ai_protocol_field(protocol),
+            # 路径型 secret 字段：同 llm 节（**只留「有没有」，路径不下发**，
+            # 页面按 secret_path 过滤掉）。
             _ai_field("api_key_file", "secret_path",
-                      {"set": bool(p["key_present"]), "path": p["api_key_file"]},
-                      "凭据文件路径（留空 = 不改）", secret=True),
+                      {"set": bool(p["key_present"])}, "", secret=True),
             _ai_field("api_key", "secret_value", {"set": bool(p["key_present"])},
-                      "新凭据（留空 = 不改；写进 600 权限的密钥文件）", secret=True),
+                      "留空 = 保持现有凭据不变", secret=True),
             _ai_field("default_on", "bool", bool(p["default_on"])),
             _ai_field("max_pick", "number", int(p["max_pick"]), "",
                       min=SCREENING_BOUNDS["max_pick"][0],
@@ -1475,12 +1539,18 @@ def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
-                      llm_ok: bool) -> Dict[str, Any]:
-    """「只读说明卡」：没有自己的 AI 配置，全部复用 llm 节。"""
+                      llm_ok: bool, llm_has_key: bool = False,
+                      llm_protocol: str = "") -> Dict[str, Any]:
+    """「只读说明卡」：没有自己的 AI 配置，全部复用 llm 节。
+
+    协议与凭据状态**跟着 llm 节显示**（只读）：用户一眼能看出班车复核
+    用的是哪条通道、有没有凭据 —— 但改要去 llm 节改。
+    """
     from keepsake.core import tiering as tiering_mod
     on = bool(tiering_mod.resolve_tiering(raw).get("enabled"))
     label = "分级班车复核"
-    note = "复用 llm 节 + 班车开关（tiering.enabled）：班车关着时没有复核。"
+    note = ("复用 llm 节 + 班车开关（tiering.enabled）：班车关着时没有复核。"
+            "下面的协议与凭据状态跟随 llm 节（只读）。")
     return {
         "id": section_id,
         "label": label,
@@ -1488,7 +1558,14 @@ def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
         "enabled": bool(llm_ok and on),
         "enabled_editable": False,
         "editable": False,
-        "fields": [],
+        "has_key": bool(llm_has_key),
+        "protocol": llm_protocol or "openai",
+        "fields": [
+            _ai_field("protocol", "text", llm_protocol or "openai", "",
+                      readonly=True, display=_ai_protocol_label(llm_protocol)),
+            _ai_field("api_key", "text", "", "", readonly=True,
+                      display="已设置" if llm_has_key else "未设置"),
+        ],
     }
 
 
@@ -1496,8 +1573,9 @@ def _ai_reuse_section(section_id: str, raw: Dict[str, Any],
 def get_ai_settings() -> Dict[str, Any]:
     """AI 配置页的**四节快照**（只读端点：不挂 write_guard，绝不碰 config.json）。
 
-    🔴 **凭据真值永不下发**：secret 字段只回 `{"set": true/false}`（路径型另带
-    `path`）—— 页面显示「已设置 / 未设置」徽标，不回显 key 内容。
+    🔴 **凭据真值永不下发**：secret 字段只回 `{"set": true/false}`（= 有没有凭据），
+    **不回显 key 内容、也不回显密钥文件路径**（路径由系统自动管理，页面看不见）；
+    页面显示「已设置 / 未设置」徽标。
 
     🔴 只读端点**绝不因为配置坏了就 500**：config 读不出来时按缺省回
     （页面照常显示「没配」）。
@@ -1508,12 +1586,12 @@ def get_ai_settings() -> Dict[str, Any]:
         llm,
         _ai_embedder_section(raw),
         _ai_screening_section(raw),
-        _ai_reuse_section("tiering_review", raw, bool(llm["enabled"])),
+        _ai_reuse_section("tiering_review", raw, bool(llm["enabled"]),
+                          bool(llm.get("has_key")), str(llm.get("protocol") or "")),
     ]
     return {"sections": sections,
             "path": str(config.keepsake_config_file()),
-            "backup_dir": str(audit.backup_dir()),
-            "keys_dir": str(_ai_keys_dir())}
+            "backup_dir": str(audit.backup_dir())}
 
 
 # --------------------------------------------------------------------------
@@ -1561,7 +1639,8 @@ def set_ai_settings(section_id: str,
     key_file: str = ""      # 本次写入的密钥文件路径（没写凭据 ⇒ 空串）
 
     if section_id == "llm":
-        _ai_reject_unknown(fields, {"base_url", "model", "key_file", "api_key"},
+        _ai_reject_unknown(fields, {"base_url", "model", "key_file", "api_key",
+                                    "protocol"},
                            action, target)
         if "base_url" in fields:
             v = str(fields["base_url"] or "").strip()
@@ -1577,6 +1656,13 @@ def set_ai_settings(section_id: str,
             if not v:
                 _reject(400, "ai_invalid", "模型名不能为空", action, target)
             section["model"] = v
+        if "protocol" in fields:
+            v = str(fields["protocol"] or "").strip().lower()
+            if v not in AI_PROTOCOL_VALUES:
+                _reject(400, "ai_invalid",
+                        f"协议只能是 {' 或 '.join(AI_PROTOCOL_VALUES)}：{v[:40]}",
+                        action, target)
+            section["protocol"] = v
         if "key_file" in fields:
             v = str(fields["key_file"] or "").strip()
             if v:
@@ -1589,7 +1675,7 @@ def set_ai_settings(section_id: str,
                 section["key_file"] = key_file
                 if section.pop("api_key", None):
                     notes.append("旧的内联明文已从 config.json 移除（凭据改走密钥文件）")
-                notes.append(f"新凭据已写入 {path}（600 权限）")
+                notes.append("新凭据已写入密钥文件（600 权限，路径由系统管理）")
 
     elif section_id == "embedder":
         _ai_reject_unknown(fields, {"provider", "base_url", "model",
@@ -1612,11 +1698,11 @@ def set_ai_settings(section_id: str,
                 section["api_key_file"] = key_file
                 if section.pop("api_key", None):
                     notes.append("旧的内联明文已从 config.json 移除（凭据改走密钥文件）")
-                notes.append(f"新凭据已写入 {path}（600 权限）")
+                notes.append("新凭据已写入密钥文件（600 权限，路径由系统管理）")
 
     else:   # screening
         _ai_reject_unknown(fields, {"enabled", "default_on", "model", "base_url",
-                                    "api_key_file", "api_key",
+                                    "api_key_file", "api_key", "protocol",
                                     "max_pick", "timeout_s", "max_tokens"},
                            action, target)
         if "enabled" in fields:
@@ -1635,6 +1721,13 @@ def set_ai_settings(section_id: str,
                 _reject(400, "screening_invalid",
                         "接口地址不能为空（要带 /v1 这样的完整前缀）", action, target)
             section["base_url"] = v.rstrip("/")
+        if "protocol" in fields:
+            v = str(fields["protocol"] or "").strip().lower()
+            if v not in AI_PROTOCOL_VALUES:
+                _reject(400, "ai_invalid",
+                        f"协议只能是 {' 或 '.join(AI_PROTOCOL_VALUES)}：{v[:40]}",
+                        action, target)
+            section["protocol"] = v
         if "api_key_file" in fields:
             v = str(fields["api_key_file"] or "").strip()
             if v:
@@ -1645,7 +1738,7 @@ def set_ai_settings(section_id: str,
                 path = _write_ai_key("screening", v)
                 key_file = str(path)
                 section["api_key_file"] = key_file
-                notes.append(f"新凭据已写入 {path}（600 权限）")
+                notes.append("新凭据已写入密钥文件（600 权限，路径由系统管理）")
         for name, (lo, hi) in SCREENING_BOUNDS.items():
             if name not in fields:
                 continue
@@ -1695,6 +1788,9 @@ def _probe_llm(raw: Dict[str, Any]) -> Dict[str, Any]:
     """llm 连通检测：真发一条最小 chat completion（prompt=ping）。
 
     🔴 `max_tokens` 给足 512：思考型模型给小 token 会「想不完就腰斩」。
+    🆕 协议（2026-11 ai_protocol_key_input）：请求构造/响应解析统一走
+    `core.llm_http`（openai / anthropic 分叉）；**非法协议值回落 openai
+    并在回包里带告警**（手改 config.json 写错协议名要看得见）。
     """
     from keepsake.core.ops.consolidator import LLM_TIMEOUT, resolve_llm_channel
 
@@ -1706,35 +1802,53 @@ def _probe_llm(raw: Dict[str, Any]) -> Dict[str, Any]:
     if not base_url or not model or not key:
         return {"ok": False, "section": "llm", "error": "not_configured",
                 "message": "llm 节没配全（接口地址 / 模型 / 凭据缺一不可）"}
-    body = {"model": model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": PROBE_MAX_TOKENS, "temperature": 0}
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    protocol = str(cfg.get("protocol") or "").strip()
+    warning = llm_http.protocol_warning(protocol)
+    call_cfg = {
+        "base_url": base_url,
+        "model": model,
+        "protocol": protocol,
+        "api_key": key,
+        "max_tokens": PROBE_MAX_TOKENS,
+        "temperature": 0,
+    }
     timeout = min(float(LLM_TIMEOUT), float(PROBE_TIMEOUT_CAP_S))
     started = time.monotonic()
     try:
-        resp = get_client(base_url, timeout).post(f"{base_url}/chat/completions",
-                                                  json=body, headers=headers)
+        detail = llm_http.chat_completion_detail(
+            call_cfg, [{"role": "user", "content": "ping"}],
+            timeout=timeout, client=get_client(base_url, timeout))
     except httpx.TimeoutException:
         return {"ok": False, "section": "llm", "error": "timeout",
                 "message": f"请求超时（{timeout:.0f}s 上限）"}
+    except llm_http.LlmHttpStatusError as e:
+        latency = int((time.monotonic() - started) * 1000)
+        out: Dict[str, Any] = {"ok": False, "section": "llm",
+                               "status": e.status_code,
+                               "error": f"http_{e.status_code}",
+                               "latency_ms": latency,
+                               "message": _scrub(e.body, key)[:200]}
+        if warning:
+            out["warning"] = warning
+        return out
+    except (ValueError, KeyError, IndexError, TypeError):
+        latency = int((time.monotonic() - started) * 1000)
+        out = {"ok": False, "section": "llm",
+               "error": "bad_response", "latency_ms": latency,
+               "message": "响应不是合法的 chat completion（choices 为空或不是 JSON）"}
+        if warning:
+            out["warning"] = warning
+        return out
     except Exception as e:      # noqa: BLE001 —— 探测不许抛穿
         return {"ok": False, "section": "llm", "error": "http_error",
                 "message": _scrub(f"{type(e).__name__}: {e}", key)[:200]}
     latency = int((time.monotonic() - started) * 1000)
-    if resp.status_code >= 400:
-        return {"ok": False, "section": "llm", "status": int(resp.status_code),
-                "error": f"http_{resp.status_code}", "latency_ms": latency,
-                "message": _scrub(_probe_body_summary(resp), key)[:200]}
-    try:
-        choice = resp.json()["choices"][0]
-        finish = str(choice.get("finish_reason") or "")
-    except (ValueError, KeyError, IndexError, TypeError):
-        return {"ok": False, "section": "llm", "status": int(resp.status_code),
-                "error": "bad_response", "latency_ms": latency,
-                "message": "响应不是合法的 chat completion（choices 为空或不是 JSON）"}
-    return {"ok": True, "section": "llm", "latency_ms": latency,
-            "finish_reason": finish, "model": model}
+    out = {"ok": True, "section": "llm", "latency_ms": latency,
+           "finish_reason": detail["finish_reason"], "model": model,
+           "protocol": detail["protocol"]}
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 def _probe_embedder(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -1790,6 +1904,7 @@ def _probe_screening(raw: Dict[str, Any]) -> Dict[str, Any]:
     probe_cfg = dict(cfg)
     probe_cfg["enabled"] = True
     probe_cfg["timeout_s"] = min(int(cfg["timeout_s"]), PROBE_TIMEOUT_CAP_S)
+    warning = llm_http.protocol_warning(cfg.get("protocol"))
     candidates = [
         {"content": "Keepsake 是跑在本机的记忆库，记忆只留在本地。"},
         {"content": "北京今天的天气是晴。"},
@@ -1798,11 +1913,18 @@ def _probe_screening(raw: Dict[str, Any]) -> Dict[str, Any]:
     picked, status = screening_mod.pick_relevant("Keepsake 是什么？", candidates, probe_cfg)
     latency = int((time.monotonic() - started) * 1000)
     if status != "ok":
-        return {"ok": False, "section": "screening", "error": status,
-                "latency_ms": latency,
-                "message": _SCREENING_SKIP_REASON.get(status, "筛选请求没成功")}
-    return {"ok": True, "section": "screening", "latency_ms": latency,
-            "picked": list(picked), "of": len(candidates), "status": status}
+        out: Dict[str, Any] = {"ok": False, "section": "screening", "error": status,
+                               "latency_ms": latency,
+                               "message": _SCREENING_SKIP_REASON.get(status,
+                                                                   "筛选请求没成功")}
+        if warning:
+            out["warning"] = warning
+        return out
+    out = {"ok": True, "section": "screening", "latency_ms": latency,
+           "picked": list(picked), "of": len(candidates), "status": status}
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 @router.post("/api/v1/settings/ai/{section_id}/probe",

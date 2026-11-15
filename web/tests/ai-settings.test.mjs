@@ -78,19 +78,23 @@ test('enabled 开关在卡头（screening 是真开关，其余是派生状态�
 // secret 字段
 // ---------------------------------------------------------------------------
 
-test('secret 字段：只显示徽标 + 路径，凭据真值永不回显', () => {
-  // 两种 secret 形态各有分支
-  assert.match(VIEW, /f\.type === 'secret_path'/)
+test('secret 字段：只显示徽标，凭据真值永不回显', () => {
+  // 凭据填写框：password 型 + 空 = 不改（走后端）
   assert.match(VIEW, /f\.type === 'secret_value'/)
-  // 徽标文案
-  assert.match(VIEW, /'已设置' : '未设置'/)
-  // 路径型显示路径
-  assert.match(VIEW, /\{\{ f\.value\.path \}\}/)
-  // 内联凭据的输入框是空的（留空 = 不改），且是密码框
   assert.match(VIEW, /v-model="card\.secret\[f\.key\]"/)
   assert.match(VIEW, /type="password"/)
+  // 徽标文案
+  assert.match(VIEW, /'已设置' : '未设置'/)
   // 🔴 页面里不许出现「把凭据回显出来」的写法
   assert.doesNotMatch(VIEW, /f\.value\.key|f\.value\.api_key/)
+})
+
+test('凭据文件路径输入框已移除：路径由系统自动管理，页面看不见', () => {
+  // 模板里没有路径型分支（**没有路径输入框**）
+  assert.doesNotMatch(VIEW, /f\.type === 'secret_path'/)
+  assert.doesNotMatch(VIEW, /f\.value\.path/)
+  // 数据层把路径型字段整条丢掉（既不渲染、也不提交）
+  assert.match(VIEW, /filter\(\(f\) => f\.type !== 'secret_path'\)/)
 })
 
 // ---------------------------------------------------------------------------
@@ -150,7 +154,7 @@ test('embedder 的 provider 是只读展示项：有只读文本、没有输入�
   assert.doesNotMatch(VIEW, /card\.draft\[f\.key\][\s\S]{0,80}provider/)
 })
 
-test('三卡字段顺序统一：接口地址 → 模型 → 凭据（状态条）→ 其它', () => {
+test('三卡字段顺序统一：接口地址 → 模型 → 协议 → 凭据（状态条）→ 其它', () => {
   // 顺序表在前端一处（展示排序，纯模板层，不动数据流）
   const m = VIEW.match(/const FIELD_ORDER = \[([^\]]+)\]/)
   assert.ok(m, '要有 FIELD_ORDER 顺序表')
@@ -159,14 +163,17 @@ test('三卡字段顺序统一：接口地址 → 模型 → 凭据（状态条�
     .map((x) => x.trim().replace(/['"]/g, ''))
     .filter(Boolean)
   assert.ok(order.indexOf('base_url') < order.indexOf('model'), '接口地址先于模型')
-  assert.ok(order.indexOf('model') < order.indexOf('api_key_file'), '模型先于凭据')
-  assert.ok(order.indexOf('api_key_file') < order.indexOf('api_key'), '凭据路径先于凭据值')
+  assert.ok(order.indexOf('model') < order.indexOf('protocol'), '模型先于协议')
+  assert.ok(order.indexOf('protocol') < order.indexOf('api_key'), '协议先于凭据')
+  // 🔴 凭据文件路径**不在页面顺序表里**（路径由系统管理，页面看不见）
+  assert.equal(order.includes('api_key_file'), false)
+  assert.equal(order.includes('key_file'), false)
   // 数值参数不在顺序表里（它们走下方数字网格，永远最后）
   assert.equal(order.includes('max_pick'), false)
   assert.equal(order.includes('timeout_s'), false)
   // 排序真的用上了
   assert.match(VIEW, /function orderFields\(fields\)/)
-  assert.match(VIEW, /fields: orderFields\(s\.fields\)/)
+  assert.match(VIEW, /fields: orderFields\(fields\)/)
 })
 
 // ---------------------------------------------------------------------------
@@ -206,11 +213,33 @@ test('probe 成功/失败两态各有样式类，空状态不占位', () => {
 })
 
 test('凭据字段是整行状态条，输入框默认收起（原生 details，无新增 JS 状态）', () => {
-  // 状态条：左路径 + 右「已设置 / 未设置」chip
-  assert.match(VIEW, /<details v-else-if="f\.type === 'secret_path'" class="ai-secret">/)
+  // 状态条：右「已设置 / 未设置」chip（**左边的路径没有了** —— 路径由系统管理）
+  assert.match(VIEW, /<details v-else-if="f\.type === 'secret_value'" class="ai-secret">/)
   assert.match(VIEW, /<summary class="ai-secret-bar">/)
   // 默认收起 = 没有 open 属性
   assert.doesNotMatch(VIEW, /<details[^>]*\bopen\b/)
   // 没有为了展开新增 ref / 状态变量
   assert.doesNotMatch(VIEW, /openMap|expanded|toggleOpen/)
+})
+
+// ---------------------------------------------------------------------------
+// 协议（2026-11 ai_protocol_key_input）：每张 LLM 类卡独立选协议
+// ---------------------------------------------------------------------------
+
+test('协议下拉在场：选项由后端给（前端零硬编码）', () => {
+  assert.match(VIEW, /f\.type === 'select'/)
+  assert.match(VIEW, /<el-select/)
+  assert.match(VIEW, /<el-option/)
+  assert.match(VIEW, /f\.options \|\| \[\]/)
+  // 🔴 选项值不许在前端写死（协议清单是后端说了算）
+  assert.doesNotMatch(VIEW, /value="anthropic"/)
+  assert.doesNotMatch(VIEW, /value="openai"/)
+})
+
+test('embedder 的协议行是只读固定文案（前端不写死）', () => {
+  // 只读分支渲染静态文本（显示文案由后端给）
+  assert.match(VIEW, /v-else-if="f\.readonly" class="ai-readonly"/)
+  assert.match(VIEW, /\{\{ f\.display \|\| f\.value \}\}/)
+  // 固定文案不许出现在前端源码里
+  assert.doesNotMatch(VIEW, /OpenAI 兼容（Embeddings）/)
 })
