@@ -86,12 +86,8 @@ def fake_storage(monkeypatch):
 
 
 @pytest.fixture
-def fake_cron_dir(tmp_path, monkeypatch):
-    """monkeypatch _ensure_cron_jobs 不读 ~/.hermes/cron/jobs.json。"""
-    monkeypatch.setattr(
-        "keepsake.KeepsakeProvider._ensure_cron_jobs",
-        staticmethod(lambda: None),
-    )
+def fake_cron_dir():
+    """已退役桩子：provider 侧 cron 自动注册随 v2.2.0 一起删除，无需再拦。"""
 
 
 @pytest.fixture

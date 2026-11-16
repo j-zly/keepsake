@@ -40,11 +40,27 @@ def _error(status_code: int, error: str, message: str) -> JSONResponse:
                         content={"detail": {"error": error, "message": message}})
 
 
+def _bus_lifespan(app: FastAPI):
+    """班车调度器随 console 起停（v2.2.0 方案 C）：启动即幂等拉起 APScheduler，
+    退出时干净 shutdown。调度器起不来不拦 console（core/bus.py 降级铁律 3）。"""
+    from contextlib import asynccontextmanager
+    from ..core import bus
+
+    @asynccontextmanager
+    async def lifespan(app_):
+        bus.get_scheduler()
+        yield
+        bus.shutdown()
+
+    return lifespan
+
+
 def create_app() -> FastAPI:
     """造一个 FastAPI 实例：挂只读路由 → 挂写路由 → 挂静态文件 → 全局异常处理。"""
     app = FastAPI(
         title="Keepsake Console",
-        version="1.2.0",
+        version="2.2.0",
+        lifespan=_bus_lifespan(None),
         description="记忆可视化后台 · 账号登录（会话 token）+ 只读查询 + 带二次确认的写操作",
     )
 

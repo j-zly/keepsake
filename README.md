@@ -1345,3 +1345,22 @@ Practical consequences:
   from a **v1.1.x checkout** (see [Migrating from 1.x (Redis)](#migrating-from-1x-redis)),
   then upgrade and point `storage.backend` at `postgres`.
 
+
+## 2.2.0 (2026-11) — Memory buses now scheduled in-process (APScheduler + PG jobstore)
+
+The maintenance buses (distill / maintenance / tiering / synonym discovery) no longer
+depend on an external agent host's scheduler. `keepsake.core.bus` runs an
+APScheduler 3.x `BackgroundScheduler` inside the console service with a **PostgreSQL
+jobstore** (same database, same config section — no new connection to manage); run
+results land in `ks_bus_state`, and the console's cron panel reads/writes this
+scheduler directly. Requirements: `apscheduler>=3.11,<4` and `SQLAlchemy>=2.0`
+(4.x was skipped deliberately: its last release was an alpha in 2025-04 and the line
+has been dormant since).
+
+Ops notes:
+- Bus definitions live in code (`BUS_JOBS`), by design — adding/removing a bus is a
+  reviewed change, not a runtime button. The panel can pause / resume / reschedule.
+- The scheduler dies with the console service: keep it under a supervisor
+  (`Restart=always`). Missed ticks coalesce into one run within a 1 h grace window.
+- Nothing else changed in the public API surface; the old host-cron bridge and the
+  provider-side auto-registration were retired together.

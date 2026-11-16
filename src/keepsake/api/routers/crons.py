@@ -1,92 +1,73 @@
-"""记忆类定时任务接口：读 Hermes 的 `~/.hermes/cron/jobs.json`，管理走 `hermes cron` CLI。
+"""记忆类定时任务接口（v2.2.0 起）：读本包 ``core.bus`` 的 APScheduler + PG 状态表。
 
-判据沿用 provider 自动注册的三条记忆任务（`KeepsakeProvider.CRON_JOBS`
-的 name + script）—— 同一份「什么叫记忆类任务」口径，不在这里另起一套。
+历史：2026-11 之前这里是「读 Hermes jobs.json + subprocess 调 hermes cron CLI」，
+班车的命挂在网关安装树上，升级事故实锤打断过（见 core/bus.py 头注）。方案 C 把
+调度真值源迁进 keepsake 自己的 PG 后，**对外契约逐字不变**：``/api/v1/crons`` 的
+字段形状、pause/resume/edit 的 confirm 纪律、非法输入的 400/503 口径全部保留，
+前端零改动。
 
-🔴 **不直接写 jobs.json**：暂停 / 恢复 / 改调度一律 subprocess 调官方
-`hermes cron {pause,resume,edit}`（网关支持的外部变更通道，调度器自会跟上）。
-argv 永远以**列表**传给 `subprocess.run`，**绝不拼 shell 字符串**：
-job_id 只从 12 位十六进制里放行，schedule 另过一遍 cron 校验，两道闸门之外
-不进子进程。本期不做 create / remove（删任务风险大，留给对话里人工）。
+管理动作是对调度器对象的直接调用（``pause_job / resume_job / reschedule_job``），
+不再有子进程 —— 原来的 argv 注入闸门随之退役，但 **job_id 形状闸保留**（挡住拿
+别的系统 id 来戳的旧书签），edit 的表达式仍必须先过 ``valid_schedule``：宁可拒掉
+冷门写法，不让错表达式进调度器。
+
+本期不做 create / remove：班车表是代码里的 BUS_JOBS（评审过的 argv），页面上增删
+任务 = 在服务器执行任意命令的入口，不开。
 """
 
 from __future__ import annotations
 
-import json
 import re
-import subprocess
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import audit, config
+from .. import audit
 from ..deps import require_session
-from ..schemas import CronActionBody, CronJob, CronList
+from ..schemas import CronActionBody, CronJob, CronList, SchedulerStatus
 from .ops import _need_flag, _reject, write_guard
+from keepsake.core import bus
 
 router = APIRouter(tags=["crons"])
 
-#: 兜底的「记忆类」关键词（provider 不可导入时用；与 CRON_JOBS 同源口径）
-#: 「班车」/「tiering」覆盖分级班车：主脑手挂的「分级班车 dry 观察」不在
-#: CRON_JOBS 里（**故意不登记**——provider 的 _ensure_cron_jobs 会在启动时把
-#: CRON_JOBS 里不存在的任务**写进** jobs.json，而本包没有 src/keepsake/cron/
-#: 脚本目录，登记只会在别的节点凭空注册一个指向空脚本的死任务），但它确实是
-#: 记忆体系的一环，面板必须看得见。见 tasks: keepsake_cron_panel。
-_FALLBACK_KEYS = ("memory", "记忆", "distill", "dedup", "synonym", "班车", "tiering")
-
-
-def _memory_keys() -> Tuple[Set[str], Set[str]]:
-    """记忆类任务的 (name 集合, script 集合)。"""
-    names: Set[str] = set()
-    scripts: Set[str] = set()
-    try:
-        from keepsake.adapters.hermes.provider import KeepsakeProvider
-
-        for jdef in KeepsakeProvider.CRON_JOBS:
-            names.add(str(jdef.get("name", "")))
-            scripts.add(str(jdef.get("script", "")))
-    except Exception:            # noqa: BLE001 —— provider 不可导入不致命，退关键词
-        pass
-    if not names:
-        names = {"记忆提炼", "记忆维护", "记忆去重"}
-        scripts = {"memory_distill.py", "memory-maintenance.py"}
-    return names, scripts
-
-
-def _is_memory_job(job: Dict[str, Any], names: Set[str], scripts: Set[str]) -> bool:
-    name = str(job.get("name", ""))
-    script = str(job.get("script", "") or "")
-    if name in names or script in scripts:
-        return True
-    hay = f"{name} {script}".lower()
-    return any(k.lower() in hay for k in _FALLBACK_KEYS)
-
-
-def _schedule_text(job: Dict[str, Any]) -> str:
-    sch = job.get("schedule")
-    if isinstance(sch, dict):
-        return str(sch.get("display") or sch.get("expr") or "")
-    return str(sch or job.get("schedule_display") or "")
-
-
-# --------------------------------------------------------------------------
-# hermes cron CLI（唯一的管理通道）
-# --------------------------------------------------------------------------
-
-#: job_id 只放行 12 位十六进制 —— jobs.json 里的任务 id 形状，也挡住路径 / 引号
-#: 一类的手滑与注入（argv 是列表，但子进程仍可能把 id 当选项解析）。
-_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-
-_CLI = "hermes"
-_CLI_TIMEOUT = 20          # 秒；CLI 卡住不许把控制台请求一起吊住
-_CLI_OUT_MAX = 400         # 回给前端的 stdout 截断长度
+#: 本包班车 id 的形状（core/bus.py 的 BUS_JOBS 用同一形状）；同时挡掉
+#: 「拿 Hermes 的 12 位十六进制 id 来戳新后端」的旧书签 / 脚本残留。
+_JOB_ID_RE = re.compile(r"^ks-[a-z][a-z0-9-]{1,30}$")
 
 #: 五段 cron 的字段取值范围（分 时 日 月 周；周日 0 与 7 都合法）
 _CRON_FIELDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 _CRON_ALIASES = {"@hourly", "@daily", "@midnight", "@weekly", "@monthly",
-                 "@yearly", "@annually", "@reboot"}
+                 "@yearly", "@annually"}
 _SCHEDULE_EXAMPLE = "30 4 * * *"
+
+#: `@daily` 这类别名 → 五段正身（APScheduler 的 from_crontab 只吃五段，
+#: 而 valid_schedule 沿用旧口径放行别名 —— 在进调度器前由我们翻译）。
+_ALIAS_5F = {
+    "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 1 1 * *",
+    "@weekly": "0 0 * * 0", "@daily": "0 0 * * *", "@midnight": "0 0 * * *",
+    "@hourly": "0 * * * *",
+}
+
+
+def _to_aps_expr(s: str) -> str:
+    """把过了 valid_schedule 的表达式归一成 APScheduler 3.x 能吃的形态。
+
+    两条归一：① 别名展开成五段；② 周字段**单独一个 7**（周日）换成 0 ——
+    3.x 的 parser 顶格 6，而 crontab 传统里 0 和 7 都是周日。`5-7` 这种
+    含 7 的区间/列表它两边都不肯老实认，**保守 400 指路用 0-6 或 sun**，
+    不猜语义（宁拒冷门写法，不放行一个会被调度器静默改写的）。
+    """
+    s = s.strip()
+    if s.lower() in _ALIAS_5F:
+        return _ALIAS_5F[s.lower()]
+    parts = s.split()
+    if len(parts) == 5 and "7" in parts[4]:
+        if parts[4] == "7":
+            parts[4] = "0"
+        else:
+            raise ValueError("周字段里的 7 只认单独一个（=周日）；"
+                             "区间/列表请用 0-6 或 sun/mon 这类名字")
+    return " ".join(parts)
 
 
 def _valid_cron_field(tok: str, lo: int, hi: int) -> bool:
@@ -109,12 +90,7 @@ def _valid_cron_field(tok: str, lo: int, hi: int) -> bool:
 
 
 def valid_schedule(s: str) -> bool:
-    """五段 cron 表达式（或 `@daily` 这类别名）校验。
-
-    仓库里没有现成的 cron 校验器，也不值得为它引一个依赖：只认数字 / `*` /
-    区间 / 步长 / 逗号列表，`0-7` 之外一律 400 回显 example。**宁可拒掉一个
-    冷门写法，也不放行一个 CLI 会当成选项的东西**。
-    """
+    """五段 cron 表达式（或 `@daily` 这类别名）校验，口径与旧版逐字一致。"""
     s = (s or "").strip()
     if not s:
         return False
@@ -129,197 +105,141 @@ def valid_schedule(s: str) -> bool:
     return True
 
 
-def _last_line(text: str) -> str:
-    """CLI 报错的人话来源：取最后一行非空输出（hermes 的错误都在末行）。"""
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
-
-
-def run_cli(args: List[str]) -> Tuple[int, str, str]:
-    """跑 `hermes <args...>`，返回 (rc, stdout, stderr)。
-
-    🔴 **argv 一律列表、`shell=False`**：job_id / schedule 是外部输入，拼成
-    字符串过一次 shell 就等于给了对方 `;`、`$()`、`--flag` 三条路。
-    找不到 CLI ⇒ 503（人话：控制台这台机器管不了定时任务），超时 ⇒ 504。
-    """
-    try:
-        p = subprocess.run([_CLI] + list(args), capture_output=True, text=True,
-                           timeout=_CLI_TIMEOUT, shell=False)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail={
-            "error": "hermes_cli_missing",
-            "message": "本机无 hermes CLI，控制台无法管理定时任务"}) from e
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(status_code=504, detail={
-            "error": "cron_cli_timeout",
-            "message": f"hermes cron 超时（>{_CLI_TIMEOUT}s），没敢替它决定成功与否"}) from e
-    except OSError as e:
-        raise HTTPException(status_code=503, detail={
-            "error": "hermes_cli_failed",
-            "message": f"起 hermes CLI 失败：{getattr(e, 'strerror', None) or e.__class__.__name__}"}) from e
-    return p.returncode, p.stdout or "", p.stderr or ""
-
-
 def _need_job_id(job_id: str, action: str) -> str:
-    """job_id 过 12 位十六进制闸；不合规 ⇒ 400 + 留痕（审计里截断，防伪造行）。"""
+    """job_id 过形状闸；不合规 ⇒ 400 + 留痕（审计里截断，防伪造行）。"""
     got = (job_id or "").strip().lower()
     if not _JOB_ID_RE.match(got):
         _reject(400, "bad_job_id",
-                "job_id 应是 12 位十六进制（例：a1b2c3d4e5f6）", action, got[:64])
+                "job_id 应是本包班车 id（形如 ks-distill；不是 Hermes 任务的 12 位十六进制）",
+                action, got[:64])
     return got
 
 
-def _job_id_of(job: Dict[str, Any]) -> str:
-    """读面：从 jobs.json 里取任务 id。认不出 / 不合规 ⇒ 空串（该行保持只读）。"""
-    for key in ("id", "job_id"):
-        v = job.get(key)
-        if isinstance(v, str) and _JOB_ID_RE.match(v.strip().lower()):
-            return v.strip().lower()
-    return ""
+def _live_scheduler(action: str):
+    """管理动作必须有活调度器；起不来 ⇒ 503 带原因，不装成操作成功。"""
+    sch = bus.get_scheduler()
+    if sch is None:
+        raise HTTPException(status_code=503, detail={
+            "error": "bus_scheduler_down",
+            "message": f"班车调度器不可用（{bus.broken_reason() or '未启动'}），"
+                       f"没敢替你做 {action}"})
+    return sch
 
 
-#: `hermes cron status` 末行里的「下次执行」段，形如
-#: `Next run: 2026-10-17T04:30:00.123456+08:00`。
-#:
-#: hermes 的字样还没钉死，两种都认：`Next run|next_run`（英文标签 / snake 风格），
-#: 冒号半角全角、带不带冒号也一律放过 —— 这两个字样是本文件的静态闸眼
-#: （`grep -qE 'Next run\|next_run' crons.py`），谁把这段判据删了闸就红。
-_NEXT_RUN_RE = re.compile(r"(?:Next\s*run|next_run)\s*[:：]?\s*(\S+)")
-
-
-def _parse_scheduler_status(line: str) -> Optional[Dict[str, str]]:
-    """把 CLI 末行拆成「人话 + 下次执行时间」两段，不让机器串原样过界面。
-
-    病灶（主脑真机复验）：末行原样透传，前端拼成「调度器：下次 X · Next run:」，
-    同一件事说两遍且第二遍悬空。这次**连源一起修**：时间戳摘出来交给前端的
-    toLocal 显示成本地时间，剩下的说明文字当 text。认不出上面那两个字样 ⇒
-    text 原样、next_run 空串 —— 保守不猜，猜错比丑更糟。
-    """
-    line = (line or "").strip()
-    if not line:
-        return None
-    m = _NEXT_RUN_RE.search(line)
-    if not m:
-        return {"text": line[:200], "next_run": ""}
-    # 连 "Next run:" 这段标签一起去掉；剩下的分隔符（· , ;）收干净，别留尾巴
-    rest = (line[:m.start()] + line[m.end():]).strip(" ·|,;:-")
-    return {"text": rest[:200], "next_run": m.group(1).rstrip(".,;")}
-
-
-def _scheduler_status() -> Optional[Dict[str, str]]:
-    """面板顶上一行的调度器状态。CLI 不可用 / 超时 ⇒ **None**，不许把读面拖成 500。"""
-    try:
-        rc, out, err = run_cli(["cron", "status"])
-    except HTTPException:
-        return None
-    text = out if rc == 0 else (err or out)
-    return _parse_scheduler_status(_last_line(text))
-
-
-def _cron_action(job_id: str, body: CronActionBody, action: str,
-                 schedule: str = "") -> Dict[str, Any]:
-    """pause / resume / edit 的共同出口：闸门 → CLI → 审计 → 回包。
-
-    `hermes cron edit` 的调度参数名按 `--schedule <expr>` 写死（任务书口径）。
-    🟡 **88 上没有 hermes CLI，这三条命令的真实行为未经实测** —— 参数名不符时
-    CLI 会 rc≠0，错误原文透传在 message 里，便于主脑照着改这一个常量。
-    """
-    act = f"cron.{action}"
-    jid = _need_job_id(job_id, act)
-    _need_flag(body.confirm, act, jid, f'必须显式传 {{"confirm": true}} 才{action}')
-
-    argv = ["cron", action, jid]
-    if action == "edit":
-        argv += ["--schedule", schedule]
-    try:
-        rc, out, err = run_cli(argv)
-    except HTTPException as e:
-        # CLI 起不来也是「试图改了但没改成」，按 ops 的纪律留一行 ok=false
-        audit.record(act, jid, ok=False, reason=str(e.detail.get("error", "")))
-        raise
-
-    if rc != 0:
-        message = _last_line(err) or _last_line(out) or f"hermes cron {action} 退出码 {rc}"
-        audit.record(act, jid, ok=False, reason=f"rc={rc}")
-        raise HTTPException(status_code=500,
-                            detail={"error": "cron_cli_failed", "message": message})
-    # 改的是网关那份 jobs.json，本端点拿不到备份也改不了它 —— 只留操作账
-    audit.record(act, jid, ok=True, reason=f"schedule={schedule}" if schedule else "")
-    return {"ok": True, "job_id": jid, "action": action,
-            "cli_output": out[:_CLI_OUT_MAX]}
+def _job_def(job_id: str, action: str) -> Dict[str, Any]:
+    """班车必须在 BUS_JOBS 表内；查不到 ⇒ 404（配合 _sync_jobs 语义：表外无任务）。"""
+    for jd in bus.BUS_JOBS:
+        if jd["id"] == job_id:
+            return jd
+    _reject(404, "unknown_job",
+            "班车表里没有这个 id（可管：ks-distill / ks-maintenance / "
+            "ks-tiering / ks-synonyms）", action, job_id[:64])
+    raise AssertionError  # _reject 恒抛，此行不可达
 
 
 @router.get("/api/v1/crons", response_model=CronList, dependencies=[Depends(require_session)])
 def list_crons(
-    all_jobs: bool = Query(False, description="true=不过滤，返回 jobs.json 里的全部任务"),
+    all_jobs: bool = Query(False, description="已废弃的兼容参数（班车表本来就全量）"),
 ) -> CronList:
-    """记忆类定时任务（name / last_run_at / next_run / last_status）。
+    """记忆类定时任务：定义（BUS_JOBS）× 调度态（APScheduler）× 上次结果（PG 状态表）。
 
-    文件不存在 ⇒ 返回空列表（并回显 source 路径，便于定位「是没配还是没读到」）；
-    文件存在但解析失败 / 读不了 ⇒ **500 + 结构化 detail**（不许装成「没有任务」）。
+    读面纪律不变：调度器 / 状态表读不到 ⇒ 相应字段留空并把「为什么」放进
+    scheduler_status；**绝不把读失败装成「没有任务」**，也不许把读面拖成 500。
     """
-    path = Path(config.cron_jobs_path())
-    if not path.exists():
-        return CronList(jobs=[], count=0, source=str(path))
+    sch = bus.get_scheduler()
+    states = bus.recent_state([jd["id"] for jd in bus.BUS_JOBS])
 
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise HTTPException(status_code=500,
-                            detail={"error": "cron_read_failed",
-                                    "message": f"读 {path} 失败：{e.__class__.__name__}"}) from e
-    if not isinstance(data, dict) or not isinstance(data.get("jobs", []), list):
-        raise HTTPException(status_code=500,
-                            detail={"error": "cron_bad_shape",
-                                    "message": f"{path} 结构不是 {{jobs: [...]}}"})
+    jobs: List[CronJob] = []
+    nexts: List[str] = []
+    for jd in bus.BUS_JOBS:
+        job = sch.get_job(jd["id"]) if sch is not None else None
+        nxt = ""
+        enabled = False
+        if job is not None:
+            enabled = getattr(job, "next_run_time", None) is not None
+            if enabled:
+                nxt = job.next_run_time.isoformat()
+                nexts.append(nxt)
+        st = states.get(jd["id"]) or {}
+        jobs.append(CronJob(
+            name=jd["name"],
+            script=str(jd["cmd"][-1]),
+            schedule=jd["schedule"],
+            enabled=enabled,
+            last_run_at=st.get("ran_at"),
+            last_status=("ok" if st.get("ok") else f"failed(rc={st.get('rc')})")
+                        if st else None,
+            next_run=nxt,
+            job_id=jd["id"],
+        ))
 
-    names, scripts = _memory_keys()
-    raw: List[Dict[str, Any]] = [j for j in data.get("jobs", []) if isinstance(j, dict)]
-    picked = raw if all_jobs else [j for j in raw if _is_memory_job(j, names, scripts)]
-    jobs = [
-        CronJob(
-            name=str(j.get("name", "")),
-            script=str(j.get("script", "") or ""),
-            schedule=_schedule_text(j),
-            enabled=bool(j.get("enabled", True)),
-            last_run_at=(str(j["last_run_at"]) if j.get("last_run_at") else None),
-            last_status=(str(j["last_status"]) if j.get("last_status") else None),
-            # jobs.json 里有 next_run_at；缺键 / 非标量都退空串，前端 toLocal 出「—」
-            next_run=(str(j["next_run_at"])
-                      if isinstance(j.get("next_run_at"), (str, int, float)) else ""),
-            job_id=_job_id_of(j),
-        )
-        for j in picked
-    ]
-    return CronList(jobs=jobs, count=len(jobs), source=str(path),
-                    scheduler_status=_scheduler_status())
+    if sch is not None:
+        sched_text = "APScheduler 运行中（console 进程内，PG jobstore）"
+    else:
+        sched_text = f"调度器停止：{bus.broken_reason() or '未启动'}"
+    status = SchedulerStatus(text=sched_text, next_run=min(nexts) if nexts else "")
+
+    return CronList(jobs=jobs, count=len(jobs),
+                    source="keepsake.core.bus (PG jobstore)",
+                    scheduler_status=status)
 
 
 # --------------------------------------------------------------------------
-# 管理（pause / resume / edit）—— 走 hermes cron CLI，不碰 jobs.json
+# 管理（pause / resume / edit）—— 直接操作调度器对象
 # --------------------------------------------------------------------------
 
 @router.post("/api/v1/crons/{job_id}/pause",
              dependencies=[Depends(require_session), Depends(write_guard)])
 def pause_cron(job_id: str, body: CronActionBody) -> Dict[str, Any]:
-    """暂停任务（`hermes cron pause <id>`）：不再按计划执行，随时可恢复。"""
-    return _cron_action(job_id, body, "pause")
+    """暂停班车（``pause_job``）：不再按计划执行，jobstore 里保留、随时可恢复。"""
+    act = "cron.pause"
+    jid = _need_job_id(job_id, act)
+    _need_flag(body.confirm, act, jid, '必须显式传 {"confirm": true} 才pause')
+    _job_def(jid, act)
+    sch = _live_scheduler(act)
+    try:
+        sch.pause_job(jid)
+    except HTTPException:
+        raise
+    except Exception as e:            # noqa: BLE001
+        audit.record(act, jid, ok=False, reason=type(e).__name__)
+        raise HTTPException(status_code=500, detail={
+            "error": "cron_pause_failed", "message": f"{e.__class__.__name__}: {e}"})
+    audit.record(act, jid, ok=True)
+    return {"ok": True, "job_id": jid, "action": "pause",
+            "cli_output": f"班车 {jid} 已暂停（jobstore 保留，恢复即续）。"}
 
 
 @router.post("/api/v1/crons/{job_id}/resume",
              dependencies=[Depends(require_session), Depends(write_guard)])
 def resume_cron(job_id: str, body: CronActionBody) -> Dict[str, Any]:
-    """恢复任务（`hermes cron resume <id>`）：按当前调度继续执行。"""
-    return _cron_action(job_id, body, "resume")
+    """恢复班车（``resume_job``）：按当前调度继续；错过窗口由 coalesce 只补一次。"""
+    act = "cron.resume"
+    jid = _need_job_id(job_id, act)
+    _need_flag(body.confirm, act, jid, '必须显式传 {"confirm": true} 才resume')
+    _job_def(jid, act)
+    sch = _live_scheduler(act)
+    try:
+        sch.resume_job(jid)
+    except HTTPException:
+        raise
+    except Exception as e:            # noqa: BLE001
+        audit.record(act, jid, ok=False, reason=type(e).__name__)
+        raise HTTPException(status_code=500, detail={
+            "error": "cron_resume_failed", "message": f"{e.__class__.__name__}: {e}"})
+    audit.record(act, jid, ok=True)
+    return {"ok": True, "job_id": jid, "action": "resume",
+            "cli_output": f"班车 {jid} 已恢复调度。"}
 
 
 @router.post("/api/v1/crons/{job_id}/edit",
              dependencies=[Depends(require_session), Depends(write_guard)])
 def edit_cron(job_id: str, body: CronActionBody) -> Dict[str, Any]:
-    """改调度（`hermes cron edit <id> --schedule <expr>`）。
+    """改调度（``reschedule_job``）。
 
-    表达式先过 `valid_schedule`，非法 400 并回显 example —— 错表达式进 CLI
-    只会被它自己拒，用户拿到的却是一句 CLI 错误原文；在这儿拦能直接给例子。
+    表达式先过 `valid_schedule`，非法 400 并回显 example —— 在这儿拦能直接给例子，
+    不用把调度器的报错原文透传给界面。改成功同步更新 BUS_JOBS 定义字典：读面立即
+    反映新表达式，console 重启后 _sync_jobs 也不会把旧表达式冲回来。
     """
     act = "cron.edit"
     jid = _need_job_id(job_id, act)
@@ -328,5 +248,24 @@ def edit_cron(job_id: str, body: CronActionBody) -> Dict[str, Any]:
         _reject(400, "bad_schedule",
                 f"调度表达式不合法，例：{_SCHEDULE_EXAMPLE}（五段 cron 或 @daily 这类别名）",
                 act, jid)
-    return _cron_action(job_id, body, "edit", schedule=schedule)
-
+    jd = _job_def(jid, act)
+    _need_flag(body.confirm, act, jid, '必须显式传 {"confirm": true} 才edit')
+    sch = _live_scheduler(act)
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        aps_expr = _to_aps_expr(schedule)
+    except ValueError as e:
+        _reject(400, "bad_schedule", f"{e}（例：{_SCHEDULE_EXAMPLE}）", act, jid)
+        return {}                      # _reject 恒抛，此行不可达
+    try:
+        sch.reschedule_job(jid, trigger=CronTrigger.from_crontab(aps_expr))
+    except HTTPException:
+        raise
+    except Exception as e:            # noqa: BLE001
+        audit.record(act, jid, ok=False, reason=type(e).__name__)
+        raise HTTPException(status_code=500, detail={
+            "error": "cron_edit_failed", "message": f"{e.__class__.__name__}: {e}"})
+    jd["schedule"] = schedule          # 定义面与调度面同一本账（进程内）
+    audit.record(act, jid, ok=True, reason=f"schedule={schedule}")
+    return {"ok": True, "job_id": jid, "action": "edit",
+            "cli_output": f"班车 {jid} 调度已改为：{schedule}"}

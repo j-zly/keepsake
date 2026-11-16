@@ -118,14 +118,6 @@ def fake_pipeline_class(monkeypatch):
     monkeypatch.setattr("keepsake.pipeline.Pipeline", _FakePipeline)
 
 
-@pytest.fixture
-def fake_cron(monkeypatch):
-    monkeypatch.setattr(
-        "keepsake.KeepsakeProvider._ensure_cron_jobs",
-        staticmethod(lambda: None),
-    )
-
-
 def _make_provider_with_file_config(
     monkeypatch,
     tmp_path,
@@ -151,10 +143,6 @@ def _make_provider_with_file_config(
     return p
 
 
-# ===========================================================================
-# 回归 1: inline={} + 文件含有效 llm 节 → pipeline 必须启动且 channel=bigmodel
-# ===========================================================================
-
 class TestPipelineUsesMergedConfig:
     """核心回归：_init_pipeline 必须读合并后的 self._resolved_config。
 
@@ -164,7 +152,7 @@ class TestPipelineUsesMergedConfig:
     """
 
     def test_inline_empty_file_has_llm_starts_pipeline_bigmodel(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path,
     ):
         """inline={} + 文件 llm 节完整 → pipeline 必启 + source=bigmodel。"""
         file_cfg = {
@@ -230,7 +218,7 @@ class TestPipelineUsesMergedConfig:
         assert "qwen-plus" not in channel_blob
 
     def test_inline_empty_file_llm_missing_keeps_pipeline_none(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path,
     ):
         """inline={} + 文件无 llm 节 → pipeline=None（unconfigured 语义保持）。
 
@@ -273,7 +261,7 @@ class TestPipelineMergingChainStillWorks:
     """验证修复未破坏既有合并链：inline 优先 + 文件兜底。"""
 
     def test_inline_llm_wins_over_file_when_both_present(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path,
     ):
         """inline 含 llm 节 + 文件含 llm 节 → 合并后 inline 胜出。
 
@@ -306,7 +294,7 @@ class TestPipelineMergingChainStillWorks:
         )
 
     def test_key_file_path_in_file_cfg_resolves_via_merged_cfg(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path,
     ):
         """inline={} + 文件 llm.key_file → 应读到 key 文件内容（验证 _resolved_config 真被用）。"""
         key_file = tmp_path / "glm.pass"
@@ -338,7 +326,7 @@ class TestNoUnconfiguredWarningWhenFileHasLLM:
     """修复后若 file 有 llm 节，绝不允许再触发 unconfigured warning。"""
 
     def test_no_unconfigured_warning_when_file_llm_valid(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path, caplog,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path, caplog,
     ):
         """inline={} + 文件含有效 llm 节 → 日志里不应再出现「v2 pipeline disabled」。"""
         import logging as _logging
@@ -374,7 +362,7 @@ class TestResolvedConfigNoKeyLeak:
     """_resolved_config 持有合并后 cfg（带 key）→ logger 必须不打 key 值。"""
 
     def test_no_api_key_value_in_any_log(
-        self, fake_storage, fake_pipeline_class, fake_cron, monkeypatch, tmp_path, caplog,
+        self, fake_storage, fake_pipeline_class, monkeypatch, tmp_path, caplog,
     ):
         import logging as _logging
         fake_key = "fake-key-PIPEFIX-NOLEAK-007"

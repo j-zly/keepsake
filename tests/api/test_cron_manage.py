@@ -1,47 +1,35 @@
-"""定时任务管理端点（pause / resume / edit）测试（keepsake_cron_manage）。
+"""记忆班车管理端点测试（v2.2.0 方案 C：APScheduler 内核，契约不变）。
 
-🔴 **绝不碰真实 jobs.json / 真实 hermes**：`subprocess.run` 在每个用例里被
-monkeypatch 成假执行器，既不派进程也不读文件 —— 88 上本来也没有 hermes。
+🔴 **绝不碰真实 PG / 真实班车**：调度器用 tmp_path 里的 sqlite jobstore；
+BUS_JOBS 被换成 echo/false 假命令；状态表写入用假 connect 捕获。
+上一代测试的 FakeCLI / argv 纪律系列随 subprocess 管理通道一起退役 ——
+但 argv 注入的担心并没有消失，只是搬进 core/bus.py 的执行体：那里同样
+有静态红线（shell=True 不许出现），本文件一并把关。
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import List
 
 import pytest
 from fastapi.testclient import TestClient
 
 from keepsake.api.app import create_app
 from keepsake.api.routers import crons as cron_router
+from keepsake.core import bus
 
-TOKEN = "cron-test-token-not-a-real-secret"
+TOKEN = "bus-test-token-not-a-real-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-JOB_ID = "a1b2c3d4e5f6"
 
 
-class FakeCLI:
-    """`subprocess.run` 替身：记录 argv，按剧本回 (rc, stdout, stderr)。"""
-
-    def __init__(self, rc: int = 0, stdout: str = "ok", stderr: str = "",
-                 raise_exc: Exception = None) -> None:
-        self.rc, self.stdout, self.stderr, self.raise_exc = rc, stdout, stderr, raise_exc
-        self.calls: List[Tuple[Any, ...]] = []
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((argv, kwargs))
-        if self.raise_exc is not None:
-            raise self.raise_exc
-        return subprocess.CompletedProcess(argv, self.rc, self.stdout, self.stderr)
-
-    @property
-    def argvs(self) -> List[Any]:
-        return [c[0] for c in self.calls]
-
-    @property
-    def kwargs0(self) -> Dict[str, Any]:
-        return self.calls[0][1]
+def _fake_jobs(tmp_path) -> List[dict]:
+    return [
+        {"id": "ks-distill", "name": "记忆提炼", "schedule": "15 * * * *",
+         "cmd": ["/bin/echo", "distilled"], "timeout": 10},
+        {"id": "ks-maintenance", "name": "memory-maintenance",
+         "schedule": "0 */2 * * *", "cmd": ["/bin/false"], "timeout": 10},
+    ]
 
 
 @pytest.fixture()
@@ -52,21 +40,34 @@ def audit_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def client(monkeypatch, tmp_path, audit_dir):
-    monkeypatch.setenv("CONSOLE_TOKEN", TOKEN)
-    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(tmp_path / "jobs.json"))
-    app = create_app()
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+def live_sched(tmp_path, monkeypatch):
+    """真 APScheduler + sqlite jobstore：调度语义（pause/resume/reschedule）全真跑。"""
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+    monkeypatch.setattr(bus, "BUS_JOBS", _fake_jobs(tmp_path))
+    monkeypatch.setattr(bus, "_broken", "")
+    sch = BackgroundScheduler(
+        jobstores={"default": SQLAlchemyJobStore(url=f"sqlite:///{tmp_path}/sched.db")},
+        timezone="Asia/Shanghai")
+    sch.start(paused=True)          # 注册任务但不真发车（测试不睡等 cron）
+    bus._sync_jobs(sch)
+    monkeypatch.setattr(bus, "_sched", sch)
+    yield sch
+    try:
+        sch.shutdown(wait=False)   # lifespan 的 bus.shutdown 可能已关过（幂等收口）
+    except Exception:              # noqa: BLE001
+        pass
+    monkeypatch.setattr(bus, "_sched", None)
 
 
 @pytest.fixture()
-def cli(monkeypatch):
-    """默认剧本：CLI 成功。返回假执行器，用例要失败就改它的 rc/stderr。"""
-    fake = FakeCLI()
-    monkeypatch.setattr(cron_router.subprocess, "run", fake)
-    return fake
+def client(monkeypatch, tmp_path, audit_dir, live_sched):
+    monkeypatch.setenv("CONSOLE_TOKEN", TOKEN)
+    app = create_app()
+    with TestClient(app) as c:      # 进 lifespan：get_scheduler() 见 _sched 已在 ⇒ 不碰真 PG
+        yield c
+    app.dependency_overrides.clear()
 
 
 def audit_lines(audit_dir) -> List[dict]:
@@ -78,218 +79,181 @@ def audit_lines(audit_dir) -> List[dict]:
 
 # ---------------------------------------------------------------- 认证 / 闸门
 
-def test_三个管理端点都要token(client, cli):
-    """漏挂 require_session 就是裸奔写面 —— 逐条打一遍（401，不是 400/500）。"""
-    cases = [("pause", {}), ("resume", {}), ("edit", {"schedule": "30 4 * * *"})]
-    for act, extra in cases:
-        r = client.post(f"/api/v1/crons/{JOB_ID}/{act}",
-                        json={"confirm": True, **extra})
+def test_三个管理端点都要token(client):
+    for act, extra in [("pause", {}), ("resume", {}), ("edit", {"schedule": "30 4 * * *"})]:
+        r = client.post(f"/api/v1/crons/ks-distill/{act}", json={"confirm": True, **extra})
         assert r.status_code == 401, (act, r.status_code)
         assert r.json()["detail"]["error"] == "missing_token"
         assert TOKEN not in r.text
-    assert cli.calls == []          # 401 早于任何子进程
 
 
-def test_缺confirm_400且不起子进程(client, cli, audit_dir):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/pause", json={}, headers=AUTH)
+def test_缺confirm_400且调度器原样(client, live_sched):
+    r = client.post("/api/v1/crons/ks-distill/pause", json={}, headers=AUTH)
     assert r.status_code == 400
     assert r.json()["detail"]["error"] == "confirm_required"
-    assert cli.calls == []
-    assert [l for l in audit_lines(audit_dir) if l["action"] == "cron.pause"
-            and l["ok"] is False]
+    job = live_sched.get_job("ks-distill")
+    assert job.next_run_time is not None      # paused=True 下未发车，但任务仍是「在排」态
 
 
-def test_job_id不合法_400且不起子进程(client, cli, audit_dir):
-    # 带 `/` 的形状连路由都匹配不上（%/ 编码同理，httpx 先解码），测不到闸门；
-    # 真正要挡的是「像 id 但不是 id」的：位数不对、含非十六进制、含分隔符。
-    for bad in ("a1b2c3d4e5", "a1b2c3d4e5f6f", "A1B2C3D4E5F7X",
-                "a1b2c3d4e5f6;rm", "zzzzzzzzzzzz", "-a1b2c3d4e5f"):
+def test_旧Hermes_id形状被拒_400(client, live_sched, audit_dir):
+    """12 位十六进制是上一代 Hermes 任务的形状 —— 新闸门必须拒（旧书签不串门）。"""
+    for bad in ("a1b2c3d4e5f6", "ks-", "ks-distill;rm", "distill"):
         r = client.post(f"/api/v1/crons/{bad}/pause", json={"confirm": True}, headers=AUTH)
         assert r.status_code == 400, bad
         assert r.json()["detail"]["error"] == "bad_job_id"
-    assert cli.calls == []
-    assert audit_lines(audit_dir)     # 被拒的写也要留痕
+    # 大写归一后形状合法但表里没有 ⇒ 404（不是 400：闸门只管形状）
+    r = client.post("/api/v1/crons/ks-UPPER/pause", json={"confirm": True}, headers=AUTH)
+    assert r.status_code == 404 and r.json()["detail"]["error"] == "unknown_job"
+    assert audit_lines(audit_dir)
 
 
-# ---------------------------------------------------------------- argv 纪律
+def test_形状合法但表里没有_404(client, live_sched):
+    r = client.post("/api/v1/crons/ks-nonexist/pause", json={"confirm": True}, headers=AUTH)
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "unknown_job"
 
-def test_pause_走argv列表不经shell(client, cli, audit_dir):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/pause", json={"confirm": True}, headers=AUTH)
+
+# ---------------------------------------------------------------- 管理语义（真调度器）
+
+def test_pause_后读面enabled假_next_run空(client, live_sched):
+    r = client.post("/api/v1/crons/ks-distill/pause", json={"confirm": True}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["action"] == "pause"
+    body = client.get("/api/v1/crons", headers=AUTH).json()
+    row = [j for j in body["jobs"] if j["job_id"] == "ks-distill"][0]
+    assert row["enabled"] is False and row["next_run"] == ""
+
+
+def test_pause再resume_调度恢复且audit两笔(client, live_sched, audit_dir):
+    client.post("/api/v1/crons/ks-distill/pause", json={"confirm": True}, headers=AUTH)
+    assert live_sched.get_job("ks-distill").next_run_time is None
+    r = client.post("/api/v1/crons/ks-distill/resume", json={"confirm": True}, headers=AUTH)
     assert r.status_code == 200
-    body = r.json()
-    assert body == {"ok": True, "job_id": JOB_ID, "action": "pause", "cli_output": "ok"}
-    argv, kwargs = cli.calls[0]
-    assert argv == ["hermes", "cron", "pause", JOB_ID]     # 列表形态
-    assert isinstance(argv, list)
-    assert kwargs.get("shell") is not True
-    assert [l for l in audit_lines(audit_dir)
-            if l["action"] == "cron.pause" and l["ok"] is True and l["target"] == JOB_ID]
+    assert live_sched.get_job("ks-distill").next_run_time is not None
+    acts = [(l["action"], l["ok"]) for l in audit_lines(audit_dir) if l["action"].startswith("cron.")]
+    assert ("cron.pause", True) in acts and ("cron.resume", True) in acts
 
 
-def test_resume_走argv列表(client, cli):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/resume", json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 200 and r.json()["action"] == "resume"
-    assert cli.argvs[0] == ["hermes", "cron", "resume", JOB_ID]
-
-
-def test_edit_改调度带schedule参数(client, cli, audit_dir):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/edit",
-                    json={"confirm": True, "schedule": "30 4 * * *"}, headers=AUTH)
+def test_edit_改表达式_调度器与定义面同账(client, live_sched, audit_dir):
+    r = client.post("/api/v1/crons/ks-distill/edit",
+                    json={"confirm": True, "schedule": "0 5 * * 1"}, headers=AUTH)
     assert r.status_code == 200
-    assert cli.argvs[0] == ["hermes", "cron", "edit", JOB_ID, "--schedule", "30 4 * * *"]
+    job = live_sched.get_job("ks-distill")
+    assert job.next_run_time.minute == 0 and job.next_run_time.hour == 5
+    assert bus.BUS_JOBS[0]["schedule"] == "0 5 * * 1"     # 定义面同步（重启不冲回）
     line = [l for l in audit_lines(audit_dir) if l["action"] == "cron.edit"][-1]
-    assert line["ok"] is True and line["reason"] == "schedule=30 4 * * *"
-
-
-def test_注入串被job_id闸挡住_不进子进程(client, cli):
-    """`a1b2c3d4e5f6; rm` 这类：闸门挡住，且永远不会拼成 shell 字符串。"""
-    r = client.post("/api/v1/crons/a1b2c3d4e5f6%3B%20rm%20-rf/pause",
-                    json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 400
-    assert r.json()["detail"]["error"] == "bad_job_id"
-    assert cli.calls == []
-
-
-# ---------------------------------------------------------------- CLI 失败 / 缺失
-
-def test_CLI非零退出_500带stderr末行(client, monkeypatch, audit_dir):
-    monkeypatch.setattr(cron_router.subprocess, "run",
-                        FakeCLI(rc=2, stderr="noise\njob not found: a1b2c3d4e5f6\n"))
-    r = client.post(f"/api/v1/crons/{JOB_ID}/resume", json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 500
-    d = r.json()["detail"]
-    assert d["error"] == "cron_cli_failed"
-    assert d["message"] == "job not found: a1b2c3d4e5f6"      # stderr 末行透传
-    assert [l for l in audit_lines(audit_dir)
-            if l["action"] == "cron.resume" and l["ok"] is False]
-
-
-def test_本机无hermes_CLI_503人话(client, monkeypatch):
-    monkeypatch.setattr(cron_router.subprocess, "run",
-                        FakeCLI(raise_exc=FileNotFoundError(2, "No such file")))
-    r = client.post(f"/api/v1/crons/{JOB_ID}/pause", json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 503
-    d = r.json()["detail"]
-    assert d["error"] == "hermes_cli_missing"
-    assert d["message"] == "本机无 hermes CLI，控制台无法管理定时任务"
-
-
-def test_CLI超时_504(client, monkeypatch):
-    monkeypatch.setattr(cron_router.subprocess, "run",
-                        FakeCLI(raise_exc=subprocess.TimeoutExpired("hermes", 20)))
-    r = client.post(f"/api/v1/crons/{JOB_ID}/pause", json={"confirm": True}, headers=AUTH)
-    assert r.status_code == 504 and r.json()["detail"]["error"] == "cron_cli_timeout"
-
-
-# ---------------------------------------------------------------- schedule 校验
-
-@pytest.mark.parametrize("expr", [
-    "30 4 * * *", "*/15 * * * *", "0 0 1,15 * *", "0 9-18 * * 1-5", "@daily",
-])
-def test_合法schedule(client, cli, expr):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/edit", json={"confirm": True, "schedule": expr}, headers=AUTH)
-    assert r.status_code == 200, expr
-    assert cli.argvs[0][-1] == expr
+    assert line["ok"] is True and line["reason"] == "schedule=0 5 * * 1"
 
 
 @pytest.mark.parametrize("expr", [
-    "", "30 4 * *", "30 4 * * * *", "60 4 * * *", "30 24 * * *",
-    "30 4 32 * *", "30 4 * 13 *", "30 4 * * 8", "abc", "* * * * * ; rm -rf /",
-    "--schedule", "@daily @daily",
+    "", "30 4 * *", "30 4 * * * *", "60 4 * * *", "30 24 * * *", "30 4 32 * *",
+    "30 4 * 13 *", "30 4 * * 8", "abc", "* * * * * ; rm -rf /", "0 0 * * */0",
 ])
-def test_非法schedule_400带example且不起子进程(client, cli, audit_dir, expr):
-    r = client.post(f"/api/v1/crons/{JOB_ID}/edit", json={"confirm": True, "schedule": expr}, headers=AUTH)
+def test_非法schedule_400带example(client, live_sched, expr):
+    r = client.post("/api/v1/crons/ks-distill/edit",
+                    json={"confirm": True, "schedule": expr}, headers=AUTH)
     assert r.status_code == 400, expr
     d = r.json()["detail"]
-    assert d["error"] == "bad_schedule"
-    assert "30 4 * * *" in d["message"]          # 回显 example
-    assert cli.calls == []
+    assert d["error"] == "bad_schedule" and "30 4 * * *" in d["message"]
 
 
-def test_schedule校验函数_边界():
-    assert cron_router.valid_schedule("0 0 * * 0")
-    assert cron_router.valid_schedule("0 0 * * 7")        # 周日 0 与 7 都行
-    assert not cron_router.valid_schedule("0 0 * * 8")
-    assert not cron_router.valid_schedule("0 0 * * */0")   # 步长 0 非法
-    assert not cron_router.valid_schedule(None)
-    assert not cron_router.valid_schedule("  ")
+@pytest.mark.parametrize("expr", ["30 4 * * *", "*/15 * * * *", "0 0 1,15 * *",
+                                  "0 9-18 * * 1-5", "@daily", "0 0 * * 7"])
+def test_合法schedule过闸(client, live_sched, expr):
+    r = client.post("/api/v1/crons/ks-distill/edit",
+                    json={"confirm": True, "schedule": expr}, headers=AUTH)
+    assert r.status_code == 200, expr
 
 
-# ---------------------------------------------------------------- 读面连带
+# ---------------------------------------------------------------- 调度器宕机的降级面
 
-def test_读面带job_id_认不出就退空串(client, monkeypatch, tmp_path):
-    """管理按钮只对认得出 id 的行出现 ⇒ 读面必须老实说「有」还是「没有」。"""
-    f = tmp_path / "jobs.json"
-    f.write_text(json.dumps({"jobs": [
-        {"name": "记忆提炼", "id": JOB_ID},
-        {"name": "记忆去重", "id": "不是12位十六进制"},
-        {"name": "记忆维护"},                                   # 缺键
-    ]}, ensure_ascii=False), encoding="utf-8")
-    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
+def test_调度器起不来_读面200带原因_写面503(monkeypatch, tmp_path, audit_dir):
+    monkeypatch.setenv("CONSOLE_TOKEN", TOKEN)
+    monkeypatch.setattr(bus, "_sched", None)
+    monkeypatch.setattr(bus, "_broken", "OperationalError: PG 失联（测试剧本）")
+    # 拦死真启动：get_scheduler 见 _broken 直接返回 None（降级铁律 3 的既有路径）
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.get("/api/v1/crons", headers=AUTH)
+        assert r.status_code == 200
+        st = r.json()["scheduler_status"]
+        assert "调度器停止" in st["text"] and "PG 失联" in st["text"]
+        assert all(j["next_run"] == "" and j["enabled"] is False for j in r.json()["jobs"])
+        w = c.post("/api/v1/crons/ks-distill/pause", json={"confirm": True}, headers=AUTH)
+        assert w.status_code == 503
+        assert w.json()["detail"]["error"] == "bus_scheduler_down"
+
+
+# ---------------------------------------------------------------- 读面形状（契约）
+
+def test_读面四字段契约与计数(client):
     body = client.get("/api/v1/crons", headers=AUTH).json()
-    got = {j["name"]: j["job_id"] for j in body["jobs"]}
-    assert got == {"记忆提炼": JOB_ID, "记忆去重": "", "记忆维护": ""}
+    assert body["count"] == len(bus.BUS_JOBS) == len(body["jobs"])
+    assert body["source"].startswith("keepsake.core.bus")
+    for j in body["jobs"]:
+        assert set(j) >= {"name", "script", "schedule", "enabled",
+                          "last_run_at", "last_status", "next_run", "job_id"}
+        assert j["job_id"].startswith("ks-")
 
 
-def test_读面scheduler_status_CLI缺失退null不炸(client, monkeypatch, tmp_path):
-    """读面不许因「这台机器没装 CLI」整页报错 —— 那一行退 null，前端显示「未知」。"""
-    f = tmp_path / "jobs.json"
-    f.write_text(json.dumps({"jobs": [{"name": "记忆提炼", "id": JOB_ID}]}, ensure_ascii=False),
-                 encoding="utf-8")
-    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
-    monkeypatch.setattr(cron_router.subprocess, "run",
-                        FakeCLI(raise_exc=FileNotFoundError(2, "No such file")))
-    r = client.get("/api/v1/crons", headers=AUTH)
-    assert r.status_code == 200
-    assert r.json()["scheduler_status"] is None
+def test_读面带上次运行状态_成败都露(client, live_sched, monkeypatch):
+    """_execute 落的 ks_bus_state 是读面 last_* 的唯一来源：rc≠0 必须渲成 failed。"""
+    captured = []
 
+    class _FakeCur:
+        def fetchall(self):
+            return [("ks-distill", _dt(), True, 0, "distilled"),
+                    ("ks-maintenance", _dt(), False, 1, "boom")]
 
-def test_读面scheduler_status_取CLI末行(client, monkeypatch, tmp_path):
-    f = tmp_path / "jobs.json"
-    f.write_text(json.dumps({"jobs": [{"name": "记忆提炼", "id": JOB_ID}]}, ensure_ascii=False),
-                 encoding="utf-8")
-    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
-    fake = FakeCLI(stdout="hermes cron status\ndaemon running, 6 jobs\n")
-    monkeypatch.setattr(cron_router.subprocess, "run", fake)
+    def _dt():
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc)
+
+    class _FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            captured.append(sql)
+            return _FakeCur()
+
+    monkeypatch.setattr(bus.psycopg, "connect", lambda *a, **k: _FakeConn())
     body = client.get("/api/v1/crons", headers=AUTH).json()
-    # 结构化两段：人话与「下次执行」各归各位，前端不必再刨英文自由文本
-    assert body["scheduler_status"] == {"text": "daemon running, 6 jobs", "next_run": ""}
-    assert fake.argvs[0] == ["hermes", "cron", "status"]     # 只读命令，同样 argv 列表
+    rows = {j["job_id"]: j for j in body["jobs"]}
+    assert rows["ks-distill"]["last_status"] == "ok"
+    assert rows["ks-maintenance"]["last_status"] == "failed(rc=1)"
+    assert rows["ks-distill"]["last_run_at"]
 
 
-def test_读面scheduler_status_拆出next_run不把Next_run透传前端(client, monkeypatch, tmp_path):
-    """🔴 主脑真机复验的病灶：`Next run: <ISO>` 原样透传，界面上渲成
-    「调度器：下次 X · Next run:」——同一件事说两遍。拆成结构化两段。"""
-    f = tmp_path / "jobs.json"
-    f.write_text(json.dumps({"jobs": [{"name": "记忆提炼", "id": JOB_ID}]}, ensure_ascii=False),
-                 encoding="utf-8")
-    monkeypatch.setenv("KEEPSAKE_CRON_JOBS", str(f))
-    fake = FakeCLI(
-        stdout="hermes cron status\ndaemon running, 6 jobs · Next run: 2026-10-17T04:30:00.123456+08:00\n")
-    monkeypatch.setattr(cron_router.subprocess, "run", fake)
-    st = client.get("/api/v1/crons", headers=AUTH).json()["scheduler_status"]
-    assert st == {"text": "daemon running, 6 jobs", "next_run": "2026-10-17T04:30:00.123456+08:00"}
-    assert "Next run" not in json.dumps(st, ensure_ascii=False)
+# ---------------------------------------------------------------- 执行体语义
+
+def test_execute_echo落ok_false落failed(monkeypatch):
+    rows = []
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            if params:
+                rows.append(params)
+            return type("C", (), {})()
+
+    monkeypatch.setattr(bus.psycopg, "connect", lambda *a, **k: _Conn())
+    bus._execute({"id": "ks-a", "cmd": ["/bin/echo", "hi"], "timeout": 5})
+    bus._execute({"id": "ks-b", "cmd": ["/bin/false"], "timeout": 5})
+    bus._execute({"id": "ks-c", "cmd": ["/definitely/not/here"], "timeout": 5})
+    ok_a = [r for r in rows if r[0] == "ks-a"][0]
+    ok_b = [r for r in rows if r[0] == "ks-b"][0]
+    ok_c = [r for r in rows if r[0] == "ks-c"][0]
+    assert ok_a[1] is True and ok_a[2] == 0 and ok_a[3] == "hi"
+    assert ok_b[1] is False and ok_b[2] == 1
+    assert ok_c[1] is False and "失败" in (ok_c[3] or "")   # 起进程异常也入账，不抛穿
 
 
-def test_scheduler_status解析_两形与认不出():
-    """直接喂解析器：含 / 不含 Next run 两形，外加认不出时的保守退路。"""
-    p = cron_router._parse_scheduler_status
-    # 整行就是 Next run：text 留空（前端只显示「下次 X」），不许留半截标签
-    assert p("Next run: 2026-10-17T04:30:00+08:00") == {
-        "text": "", "next_run": "2026-10-17T04:30:00+08:00"}
-    # 无冒号 / 中文冒号 / snake 风格字样都认（hermes 改文案不该让界面多出一段英文）
-    assert p("Next run 2026-10-17T04:30:00+08:00")["next_run"] == "2026-10-17T04:30:00+08:00"
-    assert p("Next run：2026-10-17T04:30:00+08:00")["next_run"] == "2026-10-17T04:30:00+08:00"
-    assert p("next_run: 2026-10-17T04:30:00+08:00") == {
-        "text": "", "next_run": "2026-10-17T04:30:00+08:00"}
-    # 认不出 ⇒ text 原样、next_run 空串（保守不猜，猜错比丑更糟）
-    assert p("daemon running, 6 jobs") == {"text": "daemon running, 6 jobs", "next_run": ""}
-    assert p("  ") is None
+# ---------------------------------------------------------------- 静态红线
 
-
-def test_静态判据_不许出现shell等于True():
-    """🔴 红线：subprocess 一律 argv 列表 + shell=False。"""
+def test_静态判据_bus与crons不许shellTrue():
+    """执行体 subprocess 仍是 argv 列表 + shell=False 的红线（两文件一起把关）。"""
     import inspect
-    src = inspect.getsource(cron_router)
-    assert "shell=True" not in src
+    for mod in (cron_router, bus):
+        src = inspect.getsource(mod)
+        assert "shell=True" not in src, mod.__name__
+        assert "shell" not in src or "shell=False" in src or mod is cron_router

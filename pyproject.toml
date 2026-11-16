@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepsake-memory"
-version = "2.1.0"
+version = "2.2.0"
 description = "Keepsake — full-entry memory system for Hermes Agent. On-demand storage of complete memories with semantic search."
 readme = "README.md"
 license = {text = "MIT"}
@@ -38,6 +38,10 @@ dependencies = [
     "tenacity>=8.2",
     # `python -m keepsake.jobs` —— 定时任务统一入口（distill/dedup/tiering）。
     "typer>=0.12",
+    # 记忆班车调度器（v2.2.0 方案 C）：APScheduler 3.x —— 钉死 <4：4.0 停在
+    # alpha6（2025-04 后无发布），生产班车不吊休眠 alpha。SQLAlchemy 供 PG jobstore。
+    "apscheduler>=3.11,<4",
+    "SQLAlchemy>=2.0",
 ]
 
 [project.optional-dependencies]
