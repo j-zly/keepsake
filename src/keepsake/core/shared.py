@@ -1445,6 +1445,35 @@ DENOISE_STOPWORDS = frozenset({
 #: 每词条同义表上限（防 hub 式泛连）—— 同 Redis 侧 `_MAX_SYNS_PER_WORD`
 MAX_SYNONYMS_PER_WORD = 8
 
+#: 🔴 2026-11 synonym_giant_group_guard：**同义组**规模上限（组 = 同义词图上的
+#: 连通分量，按**词数**计）。
+#:
+#: 为什么每词条上限（`MAX_SYNONYMS_PER_WORD`）不够：它只管**单个词**的同义表长度，
+#: 管不住「A-B、B-C、C-D…」**链式串起来**的组 —— 生产 `ks_synonym` 实测 3688 组里
+#: 1045 组 >50 词，最大一组 840 词（组头 task/ssh/agent/the）。检索侧按组展开后
+#: BM25 查询式被撑成几百词，搜索精度在生产实际塌方。
+#:
+#: 取值出处：与 `MAX_SYNONYMS_PER_WORD` 同量级（8）—— 8 个词以内仍算「一组近义词」，
+#: 再大就是泛连（hub）而不是同义。**总线合并与检索展开都从这一个常量取值**，
+#: 别处再抄一份就会漂（两处口径不一致 = 上限形同虚设）。
+MAX_SYN_GROUP = 8
+
+#: 🔴 2026-11 synonym_giant_group_guard：巨型组告警的**去重集合**（进程内）。
+#: 同一个巨型组每被查一次就 WARNING 一次 ⇒ 日志被刷爆；按组去重，每个组只报一次
+#: （首次仍留痕，不静默跳过）。
+_GIANT_GROUP_WARNED: set = set()
+
+#: 🔴 2026-11 synonym_giant_group_guard：同义并入的**共现次数下限**（兜底常量）。
+#:
+#: 现门槛字段 `synonym_min_co_occurrence` 在「只靠 Jaccard」那条成对路径上**形同虚设**
+#: —— 改前那条路径**不要求任何绝对共现数**（低频词之间共现一次就算同义）⇒ 链式泛连
+#: 出巨型组（生产最大 840 词/组）。
+#:
+#: 取值出处：2026-11 生产同义词巨型组事故复盘 —— 巨型组里的边绝大多数只共现过 2~3 次；
+#: **5 次**是「共现关系成立」的下限（比字段默认 3 更严一档、比每词条上限 8 更紧）。
+#: 字段本身无效/形同虚设（<=1 ⇒ 共现一次即算同义）时用它顶替。
+MIN_COOCCURRENCES = 5
+
 
 def is_pure_ascii_short(w: str) -> bool:
     """纯 ASCII 词长度 < 3 → 视为 jieba 切碎渣（同 Redis `discover_synonyms` 口径）。"""
@@ -1524,11 +1553,21 @@ def discover_synonym_pairs(
 ) -> Tuple[Dict[str, set], int]:
     """候选词两两配对 → `{词: {同义词}}`（每词条截断到 8）+ 配对数。
 
-    成对判据（与 Redis/SQLite 侧逐条相同）：Jaccard >= `jaccard_threshold`
-    **或** 共现次数 >= `min_co_occurrence`；中文对额外要求至少一方是 ≥2 字汉字。
+    🔴 2026-11 synonym_giant_group_guard —— 成对判据由「Jaccard **或** 共现」改成
+    **两者同时满足**：
+
+        Jaccard >= `jaccard_threshold`  **且**  共现次数 >= 共现下限
+
+    为什么：改前是「或」，Jaccard 那条路径**不要求任何绝对共现数** ⇒ 门槛
+    形同虚设（低频词共现一次即成同义）⇒ 链式泛连出巨型组（生产最大 840 词/组，
+    组头 task/ssh/agent/the）。共现下限**沿用现成门槛字段** `min_co_occurrence`
+    （运维配多少用多少）；字段本身无效/形同虚设（<=1）时用兜底常量
+    `MIN_COOCCURRENCES` 顶替（取值出处见该常量注释）。
+    中文对额外要求至少一方是 ≥2 字汉字。
     """
     # ponytail: O(候选数²)。候选由词频门槛压住（默认 10 次），
     # 语料再大一个数量级时该换 MinHash/SIMHash，改动点只在这一个循环里。
+    cooc_floor = int(min_co_occurrence) if int(min_co_occurrence) >= 2 else MIN_COOCCURRENCES
     candidates = {w for w, f in word_freq.items() if f >= min_word_freq}
     new_map: Dict[str, set] = {}
     pair_score: Dict[Tuple[str, str], float] = {}
@@ -1543,7 +1582,7 @@ def discover_synonym_pairs(
             c = co_occur.get((word_a, word_b), 0)
             union = word_freq[word_a] + word_freq[word_b] - c
             jaccard = (c / union) if union > 0 else 0.0
-            if jaccard >= jaccard_threshold or c >= min_co_occurrence:
+            if jaccard >= jaccard_threshold and c >= cooc_floor:
                 new_map.setdefault(word_a, set()).add(word_b)
                 new_map.setdefault(word_b, set()).add(word_a)
                 discovered_groups += 1
@@ -1591,8 +1630,12 @@ def stem_synonym_map(syn_map: Dict[str, set]) -> Dict[str, set]:
     return out
 
 
-def merge_synonym_maps(existing: Dict[str, set], discovered: Dict[str, set]) -> Dict[str, set]:
-    """已有（手工/历史）项 + 自动发现项 → 最终 `{词: {同义词}}`。
+def merge_synonym_maps_guarded(
+    existing: Dict[str, set],
+    discovered: Dict[str, set],
+    max_group: int = MAX_SYN_GROUP,
+) -> Tuple[Dict[str, set], int]:
+    """已有（手工/历史）项 + 自动发现项 → 最终 `{词: {同义词}}` + **被跳过的合并次数**。
 
     已有项优先、**不被自动发现覆盖**（手工添加的词条不该被一次 rebuild 洗掉）。
     🔴 **两趟 + 排序遍历**：若一趟遍历且 `if word in merged: continue`，某词若先
@@ -1602,19 +1645,97 @@ def merge_synonym_maps(existing: Dict[str, set], discovered: Dict[str, set]) -> 
     项、再统一补反向 ⇒ 结果与遍历序完全无关。
     🔴 2026-10 ks_en_stem：合并**之前**两侧都按词干归一（`stem_synonym_map`）——
     同义词表因此只有一条轨道（词干），不会「原形一行、词干一行」双轨并存。
+
+    🔴 2026-11 synonym_giant_group_guard —— **组规模硬上限 + 并查集探测**：
+    合并前用并查集（union-find）维护「同义组」（= 同义词图上的连通分量）的规模；
+    **任一目标组规模将超上限**（`max_group`，缺省 `MAX_SYN_GROUP`=8，可覆写）时
+    **整次合并跳过**（不截断、不部分合并），并计入返回值 `skipped`（跑批日志里
+    也会打出这个计数）。
+    改前没有这一层：链式泛连能一路并成 840 词/组（生产实测），检索侧一展开就把
+    BM25 查询式撑成几百词。
+
+    已有（手工/历史）项**不受上限约束、原样保留** —— 存量脏数据的清理由主脑另做
+    （见任务书），本单只防「继续长胖」；上限只约束**新合并进来的**边。
     """
     existing = stem_synonym_map(existing)
     discovered = stem_synonym_map(discovered)
-    merged: Dict[str, set] = {t: set(s) for t, s in existing.items()}
-    for word in sorted(discovered):
-        if word in existing:
-            continue
-        merged.setdefault(word, set()).update(discovered[word])
-    for word in sorted(discovered):
-        if word in existing:
-            continue
-        for syn in discovered[word]:
+
+    parent: Dict[str, str] = {}
+    size: Dict[str, int] = {}
+
+    def _find(x: str) -> str:
+        """并查集查根（路径压缩）。"""
+        parent.setdefault(x, x)
+        size.setdefault(x, 1)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def _union(a: str, b: str, limit: Optional[int]) -> bool:
+        """并两组；`limit` 非空且合并后规模超限 ⇒ **不并**（返回 False）。"""
+        ra, rb = _find(a), _find(b)
+        if ra == rb:
+            return True
+        if limit is not None and size[ra] + size[rb] > limit:
+            return False
+        if size[ra] < size[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        size[ra] += size[rb]
+        return True
+
+    merged: Dict[str, set] = {}
+    skipped = 0
+
+    # ① 已有项：原样保留（不受上限约束），并把反向映射也铺进 merged ——
+    #    库里读出来的表本来就是双向的（`_load_synonym_map` 两侧互指）。
+    for word in sorted(existing):
+        for syn in sorted(existing[word]):
+            if syn == word:
+                continue
+            _union(word, syn, None)
+            merged.setdefault(word, set()).add(syn)
             merged.setdefault(syn, set()).add(word)
+
+    # ② 自动发现项：并入前探测目标组规模，超上限 ⇒ 整次合并跳过（计入 skipped）。
+    for word in sorted(discovered):
+        if word in existing:
+            continue                      # 已有项优先：不被自动发现覆盖（同改前口径）
+        for syn in sorted(discovered[word]):
+            if syn == word:
+                continue
+            if not _union(word, syn, max_group):
+                skipped += 1
+                logger.debug("storage_shared: 同义合并跳过（目标组规模将超上限 %d）：%r ↔ %r",
+                             max_group, word, syn)
+                continue
+            merged.setdefault(word, set()).add(syn)
+            merged.setdefault(syn, set()).add(word)
+
+    if skipped:
+        logger.warning("storage_shared: 同义合并：因同义组规模上限(>%d)跳过 %d 次合并",
+                       max_group, skipped)
+    else:
+        logger.debug("storage_shared: 同义合并：无因组规模上限被跳过的合并（上限 %d）", max_group)
+    return merged, skipped
+
+
+def merge_synonym_maps(
+    existing: Dict[str, set],
+    discovered: Dict[str, set],
+    max_group: int = MAX_SYN_GROUP,
+) -> Dict[str, set]:
+    """总线（`storage.discover_synonyms`）的调用口 —— 合并后的同义词表。
+
+    实现体在 `merge_synonym_maps_guarded`（同一份逻辑，另多返回一个「因组规模
+    上限被跳过」的计数，供直测断言）；这里只把表交出去，两个后端（PG / SQLite）
+    的调用点不用改。
+    """
+    merged, _skipped = merge_synonym_maps_guarded(
+        existing, discovered, max_group=max_group)
     return merged
 
 
@@ -1747,6 +1868,14 @@ def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
     （`stem_synonym_map`），所以查表**原形与词干各试一次** ——
     老表（原形键）与新表（词干键）都能命中，不会出现「扩不出来 ⇒ 这条召回面
     静默失效」。扩出来的词已是词干，查询侧再词干化一次是幂等的（不变）。
+
+    🔴 2026-11 synonym_giant_group_guard —— **巨型组防御**：扩展前逐组查规模，
+    同义词数 > `MAX_SYN_GROUP` 的组**整体跳过、不扩展**（不是截断）。
+    为什么：生产 `ks_synonym` 有 1045 组 >50 词、最大一组 840 词（组头
+    task/ssh/agent/the），展开后 BM25 查询式被撑成几百词 ⇒ 精度塌方。
+    存量清理由主脑另做，在清理完成前这一层**兜住检索面**。
+    上限取**同一个常量源**（`MAX_SYN_GROUP`，与总线合并侧同源），两处口径漂了
+    上限就形同虚设。
     """
     if not synonym_map:
         return terms
@@ -1757,7 +1886,16 @@ def _expand_terms(terms: List[str], synonym_map: Dict[str, set]) -> List[str]:
         for key in (tl, stem_english(tl)):
             if key not in synonym_map:
                 continue
-            for syn in synonym_map[key]:
+            syns = synonym_map[key] or ()
+            if len(syns) > MAX_SYN_GROUP:
+                # 巨型组：整体跳过（截断成 8 个 = 换个姿势继续炸检索）
+                if key not in _GIANT_GROUP_WARNED:
+                    _GIANT_GROUP_WARNED.add(key)
+                    logger.warning(
+                        "storage_shared: 同义组 %r 规模 %d > 上限 %d，整组跳过扩展"
+                        "（生产脏数据，清理前兜底）", key, len(syns), MAX_SYN_GROUP)
+                continue
+            for syn in syns:
                 if syn not in expanded:
                     expanded.append(syn)
     return expanded

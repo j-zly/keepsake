@@ -2669,8 +2669,10 @@ class PgStorage(StorageBase):
           * 候选词：jieba 切词后 `len>=2`、不在 `splitter._STOP_WORDS`、
             不在 `DENOISE_STOPWORDS`、非纯数字、非纯 ASCII 短词（<3 字）
           * 候选集：词频 >= `synonym_min_word_freq`
-          * 成对：Jaccard >= `synonym_jaccard_threshold` **或**
-            共现次数 >= `synonym_min_co_occurrence`（中文对至少一方 >=2 字）
+          * 成对：Jaccard >= `synonym_jaccard_threshold` **且**
+            共现次数 >= `synonym_min_co_occurrence`（中文对至少一方 >=2 字；
+            2026-11 synonym_giant_group_guard：共现下限对两条判据都生效，
+            判定链本体在 storage_shared，本文件不再复述口径）
           * 每词条同义表截断到 8（按 Jaccard 降序 + 字典序 tiebreak，防 hub 泛连）
           * `rebuild=True` → 先清空 `ks_synonym` 再重建（洗历史碎渣）；
             默认**增量**（手动已有项优先，不覆盖）

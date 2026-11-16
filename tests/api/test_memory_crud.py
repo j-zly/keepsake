@@ -72,14 +72,24 @@ _pg_ready = bool(DSN and ALLOWED_HOST in DSN and ALLOWED_DBNAME in DSN)
 # ---------------------------------------------------------------- fixtures
 
 @pytest.fixture()
-def storage(tmp_path):
-    """真 SqliteStorage（临时文件）+ 种子数据。"""
+def storage(tmp_path, monkeypatch):
+    """真 SqliteStorage（临时文件）+ 种子数据。
+
+    🔴 2026-11 synonym_giant_group_guard：**注入空同义词映射**（monkeypatch
+    `_load_synonym_map` 返回 {}）—— 夹具不许读到生产同义词表。生产 `ks_synonym`
+    实测 3688 组里 1045 组 >50 词、最大一组 840 词（组头 task/ssh/agent/the），
+    检索侧按组扩展后「旧词」也会命中新正文分片 ⇒
+    `test_改正文后旧词搜不到新词搜得到` 在有生产库的机器上假红。
+    这里把同义词面**显式清空**，让该用例的语义（索引面与查询面都不含同义词
+    扩展）在任何环境下都成立 —— 断言逻辑本身一个字没动。
+    """
     from keepsake.core.sqlite import SqliteStorage
 
     s = SqliteStorage(path=str(tmp_path / "crud.db"), embedder=None, embed_dim=8,
                       is_primary=True)
     assert s.ensure_index() is not False
     assert s.write_fragments_batch([dict(r) for r in SEED]) == len(SEED)
+    monkeypatch.setattr(s, "_load_synonym_map", lambda: {})
     return s
 
 
