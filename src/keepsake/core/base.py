@@ -28,12 +28,32 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# 实体抽取口径只有一处（写入路径 `store()` 与改正文路径共用同一个函数对象）：
+from ..domain.splitter import extract_entities
+
 # 归属判据只有一处（与检索 / core 可见性同一把尺子）：
 # `govern` 只依赖标准库（不 import `core.*`）⇒ 这里反向引用不成环。
 from ..govern.visibility import fragment_owner
 from .shared import UNATTRIBUTED_AGENT
 
 logger = logging.getLogger("keepsake.storage_base")
+
+
+def entities_for_content(content: str) -> str:
+    """正文 → `entities` 列的落库形态（逗号串）——**单一抽取口径**。
+
+    抽取本体是 `domain.splitter.extract_entities`（写入路径 `store()` /
+    `upsert_fragment()` 用的**同一个函数对象**），这里只多一步「列表 → 逗号串」
+    的落库形态转换。两边一旦漂移，「改正文」这条路就会把**旧正文**的实体词
+    留在库里（而索引三路都读这一列 ⇒ 旧词永久可召回）。
+
+    🔴 为什么改正文必须重抽 entities：entities 是正文的**派生抽取物**，而检索
+    索引 = 正文 + entities + tags 三路拼接（SQLite 的 `_fts_tokens` /
+    PG 的 `content_tsv = A(content) || B(entities+tags)`）⇒ 正文换了而
+    entities 不换 ⇒ 旧正文的实体词永久留在索引里 —— 控制台显示「改成功了」，
+    检索却召回旧内容，而且**不会自愈**。
+    """
+    return ",".join(extract_entities(content or ""))
 
 
 class BackendUnsupportedError(RuntimeError):
@@ -582,13 +602,20 @@ class StorageBase(ABC):
           * `PgStorage`：**覆写**本方法（同事务内重算 `content_tsv`，A=正文
             / B=实体+标签，参数与拼接口径复用 `store()` 的同一份函数）。
 
-        `tags` / `entities` 传 `None` = 这一列不动（B 权重按库里现值算）。
+        🔴 **`entities` 传 `None` = 按新正文重抽取**（不是「这一列不动」）：
+        entities 是正文的派生抽取物，正文换了它就该跟着换。不换 ⇒ 旧正文的
+        实体词留在 `entities` 列里，而索引三路（正文 + entities + tags）都读
+        这一列 ⇒ 旧词**永久**可召回（控制台说改成功了，检索召回旧内容，且不会
+        自愈）。调用方**显式**传 `entities` 时以显式值为准（**不重抽**）。
+
+        `tags` 传 `None` = 标签这一列不动（B 权重按库里现值算）。
         """
         fields: Dict[str, Any] = {"content": content}
         if tags is not None:
             fields["tags"] = tags
-        if entities is not None:
-            fields["entities"] = entities
+        fields["entities"] = (
+            entities if entities is not None else entities_for_content(content)
+        )
         return self.update_fragment_fields(key, fields)
 
     @abstractmethod

@@ -100,6 +100,7 @@ from ..govern.visibility import fragment_owner
 from .base import (
     TOMBSTONE_TABLE,
     StorageBase,
+    entities_for_content,
     fire_hits,
     idem_cutoff_iso,
     idem_now_iso,
@@ -3701,7 +3702,15 @@ class PgStorage(StorageBase):
         `tsv_expr_params`，见模块里那一节的注释）：A = 新正文的 jieba 词元，
         B = 实体 + 标签的词元。另写一份 `to_tsvector` 就是上面那个 bug 复发。
 
-        `tags` / `entities` 传 `None` = 该列不动，但 **B 权重按库里现值算**
+        🔴 `entities` 传 `None` = **按新正文重抽取**（不是「这一列不动」）：
+        entities 是正文的派生抽取物，正文换了它就该跟着换 —— 不换 ⇒ 旧正文的
+        实体词留在 `entities` 列里，而 `content_tsv` 的 B 权重正是读这一列
+        ⇒ 旧词**永久**留在 BM25 索引里（改成功了却召回旧内容，且不会自愈）。
+        抽取口径与 `store()` 同一个函数（`base.entities_for_content` →
+        `domain.splitter.extract_entities`）。调用方**显式**传 `entities` 时
+        以显式值为准（**不重抽**）。
+
+        `tags` 传 `None` = 标签这一列不动，但 **B 权重按库里现值算**
         （先 `SELECT ... FOR UPDATE` 取回，避免用空串把标签的召回面抹掉）。
 
         返回前**回读校验**正文确实变了：控制台要的是「报成功 == 真改到了」，
@@ -3709,25 +3718,24 @@ class PgStorage(StorageBase):
         """
         if not key or not (content or "").strip():
             return False
+        # entities 只有一种「不动」写法：调用方显式传值（见上面的口径分工）。
+        new_entities = entities if entities is not None else entities_for_content(content)
         with self._tx() as cur:
             # FOR UPDATE：同事务里取现值再改，别让并发写把 B 权重算成旧标签。
             cur.execute(
-                "SELECT COALESCE(entities, ''), COALESCE(tags, '') "
-                "FROM ks_fragment WHERE key = %s FOR UPDATE",
+                "SELECT COALESCE(tags, '') FROM ks_fragment WHERE key = %s FOR UPDATE",
                 (key,),
             )
             row = cur.fetchone()
             if row is None:
                 return False
-            cur_entities = row[0] if entities is None else entities
-            cur_tags = row[1] if tags is None else tags
+            cur_tags = row[0] if tags is None else tags
 
-            set_parts = ["content = %s", f"content_tsv = {TSV_SETWEIGHT_SQL}"]
+            set_parts = ["content = %s", f"content_tsv = {TSV_SETWEIGHT_SQL}",
+                         "entities = %s"]
             params: List[Any] = [content]
-            params.extend(tsv_expr_params(content, cur_entities, cur_tags))
-            if entities is not None:
-                set_parts.append("entities = %s")
-                params.append(entities)
+            params.extend(tsv_expr_params(content, new_entities, cur_tags))
+            params.append(new_entities)
             if tags is not None:
                 set_parts.append("tags = %s")
                 params.append(tags)
