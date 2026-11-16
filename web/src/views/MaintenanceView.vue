@@ -2,7 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆维护</h1>
-      <p class="page-sub">合并重复的记忆条目、遗忘过期条目；dry-run 零写入，实跑要手输当前计数。</p>
+      <p class="page-sub">合并重复的记忆条目、遗忘过期条目；dry-run 零写入，实跑要手输当前计数。合并与遗忘每 2 小时自动跑一轮。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -131,6 +131,11 @@
       <p class="src foot-note foot-note--lead">
         dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
       </p>
+      <!-- 自动班车说明：讲清「合并/遗忘本来就每 2 小时自动跑一轮」，
+           这四个按钮是「不想等下一班」时的手动触发。样式沿用现有脚注类，不加卡片。 -->
+      <p class="src foot-note foot-note--lead">
+        合并与遗忘每 2 小时由维护班车自动执行<template v-if="maintLastRun">（上次自动运行 {{ maintLastRun }}）</template>；本页按钮用于不想等下一班时手动触发。
+      </p>
       <div class="ops">
         <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
         <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
@@ -143,7 +148,7 @@
         </el-button>
       </div>
       <p class="src foot-note">
-        分级班车：每天一次 cron 跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
+        分级班车：每天 04:30 自动执行，跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
         <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
       </p>
       <pre v-if="opResult" class="pre">{{ opResult }}</pre>
@@ -241,6 +246,34 @@ const confirmKind = ref('')
 const confirmExpect = ref('')
 const confirmTitle = ref('')
 const confirmConsequences = ref([])
+
+/**
+ * 维护班车（hermes cron `memory-maintenance`，每 120m 一班）的**最近一次运行时间**。
+ *
+ * 走现成的只读端点 `GET /api/v1/crons`（前端 `api.crons()` 已有，看板同款）——
+ * 不新增后端接口、不加存储字段、不改任何 .py。
+ * 读不到（jobs.json 缺失 / 解析失败 / 没这个任务）就**不显示**这一句：
+ * 宁可少一句说明，也不显示一个假的「上次运行」。
+ */
+const maintLastRun = ref('')
+
+/**
+ * 这条 cron 是不是维护班车？认名字或认脚本名（认其一即可）——
+ * provider 注册时给的就是这两样（name=memory-maintenance / script=memory-maintenance.py）。
+ */
+function isMaintJob(j) {
+  return j?.script === 'memory-maintenance.py' || j?.name === 'memory-maintenance'
+}
+
+async function loadMaintLastRun() {
+  try {
+    const res = await api.crons()
+    const job = (res?.jobs || []).find(isMaintJob)
+    maintLastRun.value = job?.last_run_at ? toLocal(job.last_run_at) : ''
+  } catch (e) {
+    maintLastRun.value = ''
+  }
+}
 
 async function load() {
   error.value = ''
@@ -502,6 +535,7 @@ onMounted(() => {
   loadAgentDimension()
   loadDemotes()
   loadObsoleteTodos()
+  loadMaintLastRun()
 })
 
 // ---------------------------------------------------------------------------
