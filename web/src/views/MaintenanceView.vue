@@ -2,18 +2,18 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆维护</h1>
-      <p class="page-sub">常驻层水位、退居提名与待办建议 —— 合并 / 遗忘与班车调度都在「定时任务」页。</p>
+      <p class="page-sub">常驻层水位、退居提名与待办建议 —— 合并 / 遗忘在这里手动执行，班车调度在「定时任务」页。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
     <div class="stat-grid">
-      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" hint="合并 / 遗忘的手动执行在「定时任务」页" />
+      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" hint="合并 / 遗忘的手动执行在本页下面" />
       <StatCard
         label="记忆条目"
         :value="data?.retrieval?.count ?? '-'"
         unit="条"
-        :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : '合并 / 遗忘的手动执行在「定时任务」页'"
+        :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : '合并 / 遗忘的手动执行在本页下面'"
       />
     </div>
 
@@ -125,6 +125,38 @@
       </p>
     </div>
 
+    <!-- 合并 / 遗忘：记忆业务的手动执行入口（2026-11-16 起从「定时任务」页迁回本页 ——
+         调度归调度、记忆归记忆：定时任务页管「车怎么跑」，本页管「记忆怎么并怎么忘」）。
+         预演（dry-run）零写入；实跑走**简单确认弹框**（点确认即执行，不键入任何字符），
+         实跑前的备份导出照旧由后端做（路径回显在结果里）。 -->
+    <h3 class="section-title">维护班车 · 手动执行</h3>
+    <div class="ops-grid">
+      <div class="panel ops-card">
+        <div class="ops-head">
+          <h3 class="section-title">合并 · 遗忘</h3>
+          <p class="ops-meta">每 2 小时自动执行{{ maintLastRun ? ` · 上次 ${maintLastRun}` : '' }}</p>
+        </div>
+        <p class="foot-note foot-note--lead">
+          预演（dry-run）零写入，可放心点；实跑前自动备份受影响条目。
+        </p>
+        <div class="ops-group">
+          <span class="ops-label">预演</span>
+          <div class="ops">
+            <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · 预演</el-button>
+            <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · 预演</el-button>
+          </div>
+        </div>
+        <div class="ops-group">
+          <span class="ops-label">实跑</span>
+          <div class="ops">
+            <el-button type="danger" :loading="busy === 'merge'" @click="askOps('merge')">合并 · 实跑</el-button>
+            <el-button type="danger" :loading="busy === 'forget'" @click="askOps('forget')">遗忘 · 实跑</el-button>
+          </div>
+        </div>
+        <pre v-if="opResult" class="pre">{{ opResult }}</pre>
+      </div>
+    </div>
+
     <!--
       screening 的配置面**已搬到「AI 配置」页**（2026-10 ks_maint_ui_dedup）。
       🔴 一张卡**一个编辑入口**：这一页不再摆第二张筛选卡，只留一行迁移指引 ——
@@ -137,27 +169,129 @@
       <router-link class="card-link" to="/ai-settings">去 AI 配置 ›</router-link>
     </p>
 
-    <!-- 班车那边（合并 / 遗忘 + 分级班车的开关阈值 + 班车的增删改查）已迁到「定时任务」页：
-         调度归调度、记忆归记忆，这一页只管记忆内容。 -->
+    <!-- 分级班车的开关阈值与班车的增删改查已迁到「定时任务」页：
+         调度归调度、记忆归记忆 —— 这一页只管记忆内容。 -->
     <p class="src foot-note migrate-note">
-      合并 / 遗忘与分级班车的开关阈值已移到「定时任务」页 ——
+      分级班车的开关阈值与班车的增删改查已移到「定时任务」页 ——
       <router-link class="card-link" to="/scheduler">去定时任务 ›</router-link>
     </p>
+
+    <!-- 实跑的确认框：**简单确认**（点确认即执行，不键入任何字符）——
+         实跑前的备份导出由后端做（路径回显在结果里）。 -->
+    <ConfirmDialog
+      v-model="confirmOpen"
+      :title="confirmTitle"
+      :consequences="confirmConsequences"
+      :tone="confirmTone"
+      :confirm-text="confirmText"
+      :busy="busy === confirmKind"
+      @confirm="doOps"
+    />
 
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, loadAgentRows, NO_OWNER_LABEL, ownerOf, sharePercent } from '../utils/agents'
+import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
 
 // 计数口径与看板同一接口（/api/v1/stats）：常驻层水位与分列都从这里取
 const data = ref(null)
 const error = ref('')
+
+/* ---------------------------------------------------------------- 合并 / 遗忘
+ * 手动执行入口（记忆业务归本页；调度归「定时任务」页）。
+ * 预演（dry-run）零写入；实跑走**简单确认弹框**（点确认即执行，不键入任何字符）。 */
+const busy = ref('')
+const opResult = ref('')
+
+const confirmOpen = ref(false)
+const confirmKind = ref('')
+const confirmTitle = ref('')
+const confirmConsequences = ref([])
+const confirmTone = ref('danger')
+const confirmText = ref('确认实跑')
+
+/** 实跑前的确认（逐条写后果；不键入任何字符）。 */
+function askOps(kind) {
+  confirmKind.value = kind
+  confirmTitle.value = kind === 'merge' ? '合并 · 实跑' : '遗忘 · 实跑'
+  confirmConsequences.value = kind === 'merge'
+    ? [
+        '会按相似度合并重叠的记忆条目（正文会被改写）。',
+        '实跑前自动备份受影响条目（备份路径回显在结果里）。',
+        '这一步是真改数据，控制台没有回退入口。',
+      ]
+    : [
+        '会物理删除过期记忆条目。',
+        '实跑前自动备份受影响条目（备份目录里留有全文）。',
+        '这一步是真删：控制台没有恢复入口。',
+      ]
+  confirmTone.value = 'danger'
+  confirmText.value = '确认实跑'
+  confirmOpen.value = true
+}
+
+async function doOps() {
+  const kind = confirmKind.value
+  confirmOpen.value = false
+  await runOps(kind, false)
+}
+
+/** 合并 / 遗忘的入口（预演 = dry-run）。 */
+function runMerge(dryRun) {
+  return runOps('merge', dryRun)
+}
+
+function runForget(dryRun) {
+  return runOps('forget', dryRun)
+}
+
+async function runOps(kind, dryRun) {
+  busy.value = dryRun ? `${kind}-dry` : kind
+  const label = kind === 'merge' ? '合并' : '遗忘'
+  try {
+    // 实跑只带 confirm=true（**不再键入计数**）；备份导出由后端照旧做。
+    const payload = dryRun ? { dry_run: true } : { dry_run: false, confirm: true }
+    const r = kind === 'merge' ? await api.merge(payload) : await api.forget(payload)
+    opResult.value = JSON.stringify(r, null, 2)
+    showToast(`${label} ${dryRun ? '预演' : '实跑'}完成：${JSON.stringify(r.stats)}`)
+  } catch (e) {
+    showError(`${label} ${dryRun ? '预演' : '实跑'}失败：${e.message}`)
+  } finally {
+    busy.value = ''
+  }
+}
+
+/**
+ * 维护班车（合并 · 遗忘（维护），每 120m 一班）的**最近一次运行时间**。
+ *
+ * 走现成的只读端点 `GET /api/v1/crons`（前端 `api.crons()` 已有）——
+ * 不新增后端接口、不加存储字段、不改任何 .py。
+ * 读不到就**不显示**这一句（宁可少一句说明，也不显示一个假的「上次运行」）。
+ */
+const maintLastRun = ref('')
+
+/** 这条 cron 是不是维护班车？认 id 或认名字（认其一即可）。 */
+function isMaintJob(j) {
+  return j?.job_id === 'ks-maintenance' || j?.name === '合并 · 遗忘（维护）'
+}
+
+async function loadMaintLastRun() {
+  try {
+    const res = await api.crons()
+    const job = (res?.jobs || []).find(isMaintJob)
+    maintLastRun.value = job?.last_run_at ? toLocal(job.last_run_at) : ''
+  } catch (e) {
+    maintLastRun.value = ''
+  }
+}
 
 async function load() {
   error.value = ''
@@ -364,13 +498,14 @@ onMounted(() => {
   loadAgentDimension()
   loadDemotes()
   loadObsoleteTodos()
+  loadMaintLastRun()
 })
 
 </script>
 
 <style scoped>
-/* 两张班车卡（合并 · 遗忘 / 分级班车）已迁到「定时任务」页 —— 本页只剩记忆面，
-   班车相关的样式一并带走（不留死样式）。 */
+/* 合并 · 遗忘那张卡（手动执行）随面板一起搬回本页 —— 样式也跟着回来，
+   分级班车那张卡还在「定时任务」页（那边只剩它要的那部分样式）。 */
 .src {
   margin-top: 10px;
   color: var(--text-faint);
@@ -385,6 +520,56 @@ onMounted(() => {
 }
 .foot-note--lead {
   margin: 0 0 12px;
+}
+
+/* ---------------------------------------------------------------- 合并 · 遗忘卡
+ * 一张卡两行按钮（预演 / 实跑）：预演是中性描边（无副作用），
+ * 实跑是红色（破坏性）—— 同色不再有两种含义。 */
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 20px;
+  margin-bottom: 20px;
+}
+.ops-grid .ops-card {
+  margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.ops-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.ops-meta {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.ops-group {
+  margin-top: 12px;
+}
+.ops-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.ops-card {
+  padding: 20px;
+  margin-bottom: 20px;
+}
+.pre {
+  margin-top: 12px;
 }
 
 /* ---------------------------------------------------------------- 代理占用卡

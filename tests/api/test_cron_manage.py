@@ -113,11 +113,16 @@ def fake_pg(pg_stub, monkeypatch):
     return pg
 
 
+#: 真实种子（夹具会把 BUS_JOBS 换成假命令 —— 这里要验的是**真种子**的字段）。
+#: 在模块导入时取一份（夹具的 monkeypatch 只在用例期内生效）。
+REAL_BUS_JOBS = list(bus.BUS_JOBS)
+
+
 def _fake_jobs(tmp_path) -> List[dict]:
     return [
         {"id": "ks-distill", "name": "记忆提炼", "schedule": "15 * * * *",
          "cmd": ["/bin/echo", "distilled"], "timeout": 10},
-        {"id": "ks-maintenance", "name": "memory-maintenance",
+        {"id": "ks-maintenance", "name": "合并 · 遗忘（维护）",
          "schedule": "0 */2 * * *", "cmd": ["/bin/false"], "timeout": 10},
     ]
 
@@ -499,6 +504,53 @@ def test_新建缺confirm_400(client, live_sched):
         "id": "ks-nc", "name": "x", "schedule": "0 4 * * *",
         "cmd": ["/bin/echo"], "timeout": 10}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
+
+
+# ---------------------------------------------------------------- 种子更名（scheduler_page_ui_fix）
+#
+# 四条班车的 name 统一成中文（页面可见文案）；id / schedule / cmd / timeout 逐字不动。
+# 🔴 种子同步**不覆盖已存在的任务**（保住暂停态）⇒ 现网 jobstore 里那四行还挂着旧名，
+# 要等主脑清掉那四行（不留墓碑）再重启 console，_sync_jobs 才按新种子重建。
+# 本节钉的是**种子侧**的口径：重建出来的 name 必须是新值。
+
+def test_种子重建后_name是中文新值(live_sched, monkeypatch):
+    """清掉 jobstore 里的常驻行 → _sync_jobs 重建 → name = 新种子的中文名。"""
+    monkeypatch.setattr(bus, "BUS_JOBS", REAL_BUS_JOBS)
+    for jd in REAL_BUS_JOBS:
+        if live_sched.get_job(jd["id"]) is not None:
+            live_sched.remove_job(jd["id"])
+    bus._sync_jobs(live_sched)
+    names = {}
+    for jd in REAL_BUS_JOBS:
+        job = live_sched.get_job(jd["id"])
+        assert job is not None, jd["id"]
+        names[jd["id"]] = job.name
+    assert names == {
+        "ks-distill": "记忆提炼",
+        "ks-maintenance": "合并 · 遗忘（维护）",
+        "ks-tiering": "记忆分级班车",
+        "ks-synonyms": "同义词总线",
+    }
+
+
+def test_种子更名只动name_其余字段逐字不动():
+    """🔴 只许改 name：id / schedule / cmd / timeout 一字都不能动
+    （动 id = 换一条车，墓碑都拦不住）。"""
+    expect = {
+        "ks-distill": ("15 * * * *", 1800),
+        "ks-maintenance": ("0 */2 * * *", 1800),
+        "ks-tiering": ("30 4 * * *", 900),
+        "ks-synonyms": ("0 */8 * * *", 3600),
+    }
+    assert {j["id"] for j in REAL_BUS_JOBS} == set(expect)
+    for j in REAL_BUS_JOBS:
+        sched, timeout = expect[j["id"]]
+        assert j["schedule"] == sched, j["id"]
+        assert j["timeout"] == timeout, j["id"]
+        assert isinstance(j["cmd"], list) and j["cmd"], j["id"]
+    # 旧英文名不许回来
+    for j in REAL_BUS_JOBS:
+        assert j["name"] not in ("memory-maintenance", "synonym-discovery-daily")
 
 
 # ---------------------------------------------------------------- 合并 / 遗忘实跑（confirm 口径改版）

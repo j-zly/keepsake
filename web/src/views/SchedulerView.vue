@@ -17,11 +17,11 @@
     </div>
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
-    <!-- 任务列表：名称 / job_id / 调度 / 下次执行 / 状态 / 操作 -->
+    <!-- 任务列表：名称 / 任务 ID / 调度 / 下次执行 / 状态 / 操作 -->
     <div class="panel job-list">
       <div class="job-head">
         <span class="col-name">名称</span>
-        <span class="col-id">job_id</span>
+        <span class="col-id">任务 ID</span>
         <span class="col-cron">调度</span>
         <span class="col-next">下次执行</span>
         <span class="col-state">状态</span>
@@ -29,75 +29,39 @@
       </div>
       <div v-for="row in jobs" :key="row.job_id" class="job-row">
         <span class="col-name">
-          <span class="job-name">{{ row.name || row.job_id }}</span>
+          <span class="job-name" :title="row.name || row.job_id">{{ row.name || row.job_id }}</span>
           <span class="job-sub">{{ cronHint(row.schedule) }}</span>
         </span>
         <span class="col-id mono">{{ row.job_id }}</span>
         <span class="col-cron mono">{{ row.schedule || '—' }}</span>
         <span class="col-next num">{{ row.next_run ? toLocal(row.next_run) : '—' }}</span>
+        <!-- 状态列**只有徽标**：动作一律在操作列（一个对象一处入口，
+             状态列里塞按钮会让人以为「状态」也能点）。 -->
         <span class="col-state">
           <span class="chip" :class="row.enabled ? 'chip--ok' : 'chip--warn'">
             {{ row.enabled ? '运行中' : '已暂停' }}
           </span>
-          <!-- 分级班车（ks-tiering）的阈值设置入口：它也是一条班车，
-               设置挂在它自己那一行，不另开一张卡（一个对象一个入口）。 -->
-          <template v-if="isTiering(row)">
-            <span class="chip" :class="tStatus?.enabled ? 'chip--ok' : ''">
-              {{ tStatus?.enabled ? '分级已开' : '分级默认关' }}
-            </span>
-            <el-button size="small" :disabled="!tStatus" @click="openTiering">设置</el-button>
-          </template>
+          <span v-if="isTiering(row)" class="chip" :class="tStatus?.enabled ? 'chip--ok' : ''">
+            {{ tStatus?.enabled ? '分级已开' : '分级默认关' }}
+          </span>
         </span>
+        <!-- 操作列：五枚常驻按钮一行排齐（不许 3+2 换行）；
+             分级班车那行多一枚「设置」（它的阈值入口跟着它自己那一行走）。
+             色彩语义：破坏性=红（删除）、触发执行=主色（运行一次）、查看=中性描边。 -->
         <span class="col-acts">
           <el-button size="small" @click="openEdit(row)">编辑</el-button>
           <el-button size="small" @click="askToggle(row)">
             {{ row.enabled ? '暂停' : '恢复' }}
           </el-button>
-          <el-button size="small" @click="askTrigger(row)">运行一次</el-button>
+          <el-button size="small" type="primary" @click="askTrigger(row)">运行一次</el-button>
           <el-button size="small" @click="openRuns(row)">执行记录</el-button>
+          <el-button v-if="isTiering(row)" size="small" :disabled="!tStatus" @click="openTiering">
+            设置
+          </el-button>
           <el-button size="small" type="danger" @click="askDelete(row)">删除</el-button>
         </span>
       </div>
       <div v-if="!jobs.length" class="empty-mini">调度器里没有任务。</div>
-    </div>
-
-    <!-- 合并 / 遗忘（维护班车的手动执行入口，从记忆维护页迁来）：
-         实跑是简单确认弹框（点确认即执行，不键入计数），
-         实跑前的备份导出照旧由后端做（路径回显在结果里）。 -->
-    <h3 class="section-title">维护班车 · 手动执行</h3>
-    <div class="ops-grid">
-      <div class="panel ops-card">
-        <div class="ops-head">
-          <h3 class="section-title">合并 · 遗忘</h3>
-          <p class="ops-meta">每 2 小时自动执行{{ maintLastRun ? ` · 上次 ${maintLastRun}` : '' }}</p>
-        </div>
-        <p class="foot-note foot-note--lead">
-          dry-run 零写入，可放心点；实跑前自动备份受影响条目。
-        </p>
-        <div class="ops-group">
-          <span class="ops-label">预览</span>
-          <div class="ops">
-            <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">
-              合并 · dry-run
-            </el-button>
-            <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">
-              遗忘 · dry-run
-            </el-button>
-          </div>
-        </div>
-        <div class="ops-group">
-          <span class="ops-label">执行</span>
-          <div class="ops">
-            <el-button type="danger" :loading="busy === 'merge'" @click="askOps('merge')">
-              合并 · 实跑
-            </el-button>
-            <el-button type="danger" :loading="busy === 'forget'" @click="askOps('forget')">
-              遗忘 · 实跑
-            </el-button>
-          </div>
-        </div>
-        <pre v-if="opResult" class="pre">{{ opResult }}</pre>
-      </div>
     </div>
 
     <!-- 新建 / 编辑：同一套字段（id 只有新建时可填） -->
@@ -112,7 +76,7 @@
       append-to-body
     >
       <el-form label-position="top">
-        <el-form-item label="job_id（ks- 前缀，创建后不可改）">
+        <el-form-item label="任务 ID（ks- 前缀，创建后不可改）">
           <el-input v-model="form.id" :disabled="formMode !== 'create'" placeholder="ks-my-task" />
         </el-form-item>
         <el-form-item label="名称">
@@ -222,6 +186,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { api } from '../api'
 import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
+import { cronHint } from '../utils/cron'
 
 /** 分级班车那条任务的 id（设置入口挂在它自己那一行）。 */
 const TIERING_JOB_ID = 'ks-tiering'
@@ -245,42 +210,9 @@ async function load() {
   }
 }
 
-/** 维护班车（memory-maintenance，每 120m 一班）的最近一次运行时间。 */
-const maintLastRun = ref('')
-
-function isMaintJob(j) {
-  return j?.job_id === 'ks-maintenance' || j?.name === 'memory-maintenance'
-}
-
-async function loadMaintLastRun() {
-  try {
-    const job = jobs.value.find(isMaintJob)
-    maintLastRun.value = job?.last_run_at ? toLocal(job.last_run_at) : ''
-  } catch (e) {
-    maintLastRun.value = ''
-  }
-}
-
 /* ---------------------------------------------------------------- 调度人话副标
- * 「30 4 * * *」→「每天 04:00」：cron 表达式给不熟 cron 的人看是没有意义的。
- * 认不出来的形状一律退「自定义调度」（不许猜语义）。 */
-const WEEK_CN = ['日', '一', '二', '三', '四', '五', '六']
-
-function cronHint(expr) {
-  const p = String(expr || '').trim().split(/\s+/)
-  if (p.length !== 5) return '自定义调度'
-  const [min, hour, dom, mon, dow] = p
-  const hm = `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`
-  if (dom === '*' && mon === '*' && dow === '*') {
-    if (min.startsWith('*/') && hour === '*') return `每 ${min.slice(2)} 分钟`
-    if (hour.startsWith('*/')) return `每 ${hour.slice(2)} 小时`
-    if (min.startsWith('*/')) return `每 ${min.slice(2)} 分钟起`
-    return `每天 ${hm}`
-  }
-  if (dom === '*' && mon === '*' && /^\d$/.test(dow)) return `每周${WEEK_CN[Number(dow)]} ${hm}`
-  if (dom === '*' && /^\d$/.test(mon)) return `${Number(mon)} 月 ${hm}`
-  return '自定义调度'
-}
+ * 「30 4 * * *」→「每天 04:30」：cron 表达式给不熟 cron 的人看是没有意义的。
+ * 口径与实现都在 utils/cron.js（纯函数，护栏能真跑一遍钉住）。 */
 
 /* ---------------------------------------------------------------- 新建 / 编辑 */
 const formOpen = ref(false)
@@ -333,7 +265,6 @@ async function saveForm() {
     formOpen.value = false
     showToast(formMode.value === 'create' ? '定时任务已创建' : '定时任务已更新')
     await load()
-    loadMaintLastRun()
   } catch (e) {
     formError.value = e.message
   } finally {
@@ -343,7 +274,7 @@ async function saveForm() {
 
 /* ---------------------------------------------------------------- 确认弹框
  * 全部是**简单确认**：点确认即执行，不键入任何字符。
- * 危险动作（删除 / 实跑）用红色主按钮 + 逐条后果。 */
+ * 危险动作（删除）用红色主按钮 + 逐条后果。 */
 const confirmOpen = ref(false)
 const confirmKind = ref('')
 const confirmTarget = ref('')
@@ -395,10 +326,6 @@ async function doConfirm() {
   const kind = confirmKind.value
   const id = confirmTarget.value
   confirmOpen.value = false
-  if (kind === 'merge' || kind === 'forget') {
-    await runOps(kind, false)
-    return
-  }
   busy.value = kind
   try {
     if (kind === 'pause') await api.cronPause(id)
@@ -411,55 +338,8 @@ async function doConfirm() {
       showToast('定时任务已删除（重启后不会复活）')
     }
     await load()
-    loadMaintLastRun()
   } catch (e) {
     showError(`操作失败：${e.message}`)
-  } finally {
-    busy.value = ''
-  }
-}
-
-/* ---------------------------------------------------------------- 合并 / 遗忘 */
-const opResult = ref('')
-
-function askOps(kind) {
-  confirmKind.value = kind
-  confirmTitle.value = kind === 'merge' ? '合并 · 实跑' : '遗忘 · 实跑'
-  confirmConsequences.value = kind === 'merge'
-    ? [
-        '会按相似度合并重叠的记忆条目（正文会被改写）。',
-        '实跑前自动备份受影响条目（备份路径回显在结果里）。',
-        '这一步是真改数据，控制台没有回退入口。',
-      ]
-    : [
-        '会物理删除过期记忆条目。',
-        '实跑前自动备份受影响条目（备份目录里留有全文）。',
-        '这一步是真删：控制台没有恢复入口。',
-      ]
-  confirmTone.value = 'danger'
-  confirmText.value = '确认实跑'
-  confirmOpen.value = true
-}
-
-/** 合并 / 遗忘的入口（名字与旧维护页一致，省得同一件事两个叫法）。 */
-function runMerge(dryRun) {
-  return runOps('merge', dryRun)
-}
-
-function runForget(dryRun) {
-  return runOps('forget', dryRun)
-}
-
-async function runOps(kind, dryRun) {
-  busy.value = dryRun ? `${kind}-dry` : kind
-  try {
-    // 实跑只带 confirm=true（**不再键入计数**）；备份导出由后端照旧做。
-    const payload = dryRun ? { dry_run: true } : { dry_run: false, confirm: true }
-    const r = kind === 'merge' ? await api.merge(payload) : await api.forget(payload)
-    opResult.value = JSON.stringify(r, null, 2)
-    showToast(`${kind} ${dryRun ? 'dry-run' : '实跑'}完成：${JSON.stringify(r.stats)}`)
-  } catch (e) {
-    showError(`${kind} ${dryRun ? 'dry-run' : '实跑'}失败：${e.message}`)
   } finally {
     busy.value = ''
   }
@@ -549,7 +429,6 @@ async function saveTiering() {
 
 onMounted(async () => {
   await load()
-  loadMaintLastRun()      // 上次运行时间要从列表里取（维护班车那条）
   loadTiering()
 })
 </script>
@@ -565,17 +444,24 @@ onMounted(async () => {
 }
 
 /* ---------------------------------------------------------------- 任务列表
- * 六列对齐（名称 / job_id / 调度 / 下次执行 / 状态 / 操作）——
- * 表头与行共用同一套列宽，眼睛往下扫时那一列是一条直线。 */
+ * 六列对齐（名称 / 任务 ID / 调度 / 下次执行 / 状态 / 操作）——
+ * 表头与行共用同一套列宽，眼睛往下扫时那一列是一条直线。
+ *
+ * 列宽口径（scheduler_page_ui_fix）：
+ *   名称 240px 定宽（**两行**：名字 + 人话副标，副标不许被挤没）；
+ *   调度 / 下次执行 收窄（它们本来就是短串）；
+ *   操作列 380px —— 五枚常驻按钮（编辑 / 暂停 / 运行一次 / 执行记录 / 删除）
+ *   一行排齐，分级班车那行第六枚「设置」也塞得下（**不许 3+2 换行**）。 */
 .job-list {
   padding: 0;
-  overflow: hidden;
+  overflow-x: auto;          /* 列宽定死 ⇒ 窄屏横滚，不许把行挤变形 */
+  overflow-y: hidden;
   margin-bottom: 20px;
 }
 .job-head,
 .job-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) 150px 130px 150px 200px 300px;
+  grid-template-columns: 240px 130px 120px 130px 160px 380px;
   align-items: center;
   gap: 12px;
   padding: 12px 20px;
@@ -611,6 +497,9 @@ onMounted(async () => {
 .job-sub {
   color: var(--text-faint);
   font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .col-id,
 .col-cron {
@@ -627,13 +516,18 @@ onMounted(async () => {
   display: flex;
   gap: 8px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
+/* 操作列：一行排齐（不许换行成 3+2）—— 按钮自己排版，
+   Element Plus 默认给相邻按钮加的 margin-left 在这里归零（间距统一交给 gap）。 */
 .col-acts {
   display: flex;
   gap: 6px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+.col-acts :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 @media (max-width: 1100px) {
   .job-head,
@@ -643,6 +537,9 @@ onMounted(async () => {
   }
   .job-head {
     display: none;
+  }
+  .col-acts {
+    flex-wrap: wrap;         /* 单列布局下允许换行（横滚已不需要） */
   }
 }
 
@@ -691,63 +588,6 @@ onMounted(async () => {
   color: var(--danger);
   font-size: 12.5px;
   line-height: 1.7;
-}
-
-/* ---------------------------------------------------------------- 操作卡 */
-.ops-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-  gap: 20px;
-  margin-bottom: 20px;
-}
-.ops-grid .ops-card {
-  margin-bottom: 0;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.ops-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.ops-meta {
-  margin: 0;
-  color: var(--text-dim);
-  font-size: 13px;
-}
-.ops-group {
-  margin-top: 12px;
-}
-.ops-label {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--text-faint);
-  font-size: 12px;
-}
-.ops {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-.ops-card {
-  padding: 20px;
-  margin-bottom: 20px;
-}
-.pre {
-  margin-top: 12px;
-}
-.foot-note {
-  margin: 12px 0 0;
-  color: var(--text-faint);
-  font-size: 12px;
-  line-height: 1.7;
-}
-.foot-note--lead {
-  margin: 0 0 12px;
 }
 
 /* 空态：矮卡片 + 一句灰字 */

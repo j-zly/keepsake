@@ -48,6 +48,18 @@ logger = logging.getLogger("keepsake.bus")
 
 #: 与 Hermes 时代逐字对齐的班车表（schedule 用五段 cron，Asia/Shanghai 口径）。
 #: id 是本包的稳定主键：改名 = 重建任务（暂停态会丢），只增不改。
+#:
+#: 2026-11-16 追加（scheduler_page_ui_fix）：四条班车的 **name** 统一成中文
+#: （页面可见文案；旧名 memory-maintenance / synonym-discovery-daily 是英文代号，
+#: 摆在定时任务页上认不出是哪条车）。
+#: 🔴 **id / schedule / cmd / timeout 逐字不动** —— 动 id 等于换一条车（墓碑都拦不住）。
+#:
+#: 迁移说明（**由主脑在生产侧执行，本包只负责种子**）：
+#: `_sync_jobs` 只补「store 里没有的 id」，**不覆盖已存在的任务**（保住暂停态），
+#: 所以现网 PG jobstore 里那四行还挂着旧 name —— 种子同步不会自己改名。
+#: 主脑收编后需：清掉 PG jobstore 里这四条常驻行（**不留墓碑**）→ 重启 console
+#: → `_sync_jobs` 按新种子重建，name 即新值（不留墓碑 ⇒ 不影响「删除永久生效」）。
+#: 种子侧的重建口径由 tests/api/test_cron_manage.py 钉死。
 BUS_JOBS: List[Dict[str, Any]] = [
     {
         "id": "ks-distill",
@@ -58,21 +70,21 @@ BUS_JOBS: List[Dict[str, Any]] = [
     },
     {
         "id": "ks-maintenance",
-        "name": "memory-maintenance",
+        "name": "合并 · 遗忘（维护）",
         "schedule": "0 */2 * * *",
         "cmd": ["/bin/sh", "/root/.hermes/scripts/memory_maintenance_cron.sh"],
         "timeout": 1800,
     },
     {
         "id": "ks-tiering",
-        "name": "记忆分级班车（实跑）",
+        "name": "记忆分级班车",
         "schedule": "30 4 * * *",
         "cmd": ["/bin/sh", "/root/.hermes/scripts/tiering_cron.sh"],
         "timeout": 900,
     },
     {
         "id": "ks-synonyms",
-        "name": "synonym-discovery-daily",
+        "name": "同义词总线",
         "schedule": "0 */8 * * *",
         "cmd": ["/opt/keepsake-venv/bin/python",
                 "/root/.hermes/scripts/discover_synonyms.py"],
