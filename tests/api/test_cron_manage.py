@@ -49,6 +49,7 @@ def live_sched(tmp_path, monkeypatch):
     monkeypatch.setattr(bus, "_broken", "")
     sch = BackgroundScheduler(
         jobstores={"default": SQLAlchemyJobStore(url=f"sqlite:///{tmp_path}/sched.db")},
+        job_defaults=dict(bus.SCHED_DEFAULTS),
         timezone="Asia/Shanghai")
     sch.start(paused=True)          # 注册任务但不真发车（测试不睡等 cron）
     bus._sync_jobs(sch)
@@ -249,6 +250,14 @@ def test_execute_echo落ok_false落failed(monkeypatch):
 
 
 # ---------------------------------------------------------------- 静态红线
+
+def test_grace_形状钉死_注册后job真带3600(client, live_sched):
+    """陈旧形状实锤（11-16 16:00 班被 dead socket 拖晚 10s、grace=1 直接丢班）：
+    构造口径必须是单点常量，且注册出的 job 真带 grace=3600/coalesce=True。"""
+    assert bus.SCHED_DEFAULTS["misfire_grace_time"] == 3600
+    job = live_sched.get_job("ks-distill")
+    assert job.misfire_grace_time == 3600 and job.coalesce is True
+
 
 def test_静态判据_bus与crons不许shellTrue():
     """执行体 subprocess 仍是 argv 列表 + shell=False 的红线（两文件一起把关）。"""

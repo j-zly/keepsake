@@ -68,6 +68,11 @@ BUS_JOBS: List[Dict[str, Any]] = [
     },
 ]
 
+#: 调度器构造的单点口径（生产 get_scheduler 与测试夹具共用同一份 —— 防止
+#: 「store 里躺着 grace=1 的陈旧形状 job 而默认值写在生产代码里」再复发一次，
+#: 2026-11-16 实踩：16:00 班被 dead socket 拖晚 10 秒、旧 grace=1 直接丢班）。
+SCHED_DEFAULTS = {"coalesce": True, "misfire_grace_time": 3600}
+
 _lock = threading.Lock()
 _sched = None            # BackgroundScheduler 或 None（起不来时）
 _broken = ""             # 起不来的原因（人话），给读面回显
@@ -167,9 +172,14 @@ def get_scheduler():
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
             from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+            from sqlalchemy import create_engine
+            # pool_pre_ping：PG 侧 keepsake 角色挂着 idle_session_timeout（11-14 泄漏止血），
+            # jobstore 的长空闲连接会被服务端掐 —— 不预探测就会在发班时刻报 dead socket、
+            # 拖到下一轮才成功（2026-11-16 实踩：16:00 班因此晚 10s，被旧 grace=1 判 misfire 丢班）。
+            engine = create_engine(_jobstore_url(), pool_pre_ping=True)
             sch = BackgroundScheduler(
-                jobstores={"default": SQLAlchemyJobStore(url=_jobstore_url())},
-                job_defaults={"coalesce": True, "misfire_grace_time": 3600},
+                jobstores={"default": SQLAlchemyJobStore(engine=engine)},
+                job_defaults=dict(SCHED_DEFAULTS),
                 timezone="Asia/Shanghai",
             )
             sch.start()
