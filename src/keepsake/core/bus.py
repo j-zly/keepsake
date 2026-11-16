@@ -19,15 +19,27 @@
 
 misfire 口径：``coalesce=True`` + 宽限期 1 小时 —— console 重启错过几个 tick 只补跑
 一次（提炼 / 维护都是幂等窗口语义，多烧没有意义）。
+
+2026-11-16 追加（scheduler_page_v2）：班车模型从「代码 BUS_JOBS 单源」升级为
+**数据驱动**（Quartz 式）：
+
+- **PG jobstore 是运行期正源**（增 / 删 / 改都落它，重启后还在）；
+  ``BUS_JOBS`` 降级为**首次种子**（只在 store 里没有这个 id 时补建）；
+- **删除必须永久生效**：删掉的 id 写进 ``ks_bus_tombstone`` 墓碑表，
+  种子同步时看见墓碑就不补（重启不复活）；
+- 任务的**字段形状校验与落地**收口在 ``reconcile_register()`` 一处
+  （API 层只管翻译错误码，不自己拼 job）。
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote_plus
 
 import psycopg
@@ -87,6 +99,116 @@ CREATE TABLE IF NOT EXISTS ks_bus_state (
 )
 """
 
+#: 墓碑表：被删掉的任务 id（删除必须永久生效 —— 重启不复活）。
+#: 建表路子沿用 ks_bus_state（同一张 PG、同一套 DDL 写法）。
+_TOMBSTONE_DDL = """
+CREATE TABLE IF NOT EXISTS ks_bus_tombstone (
+    job_id     text PRIMARY KEY,
+    removed_at timestamptz NOT NULL
+)
+"""
+
+#: 执行历史（append-only）：``ks_bus_state`` 是「每任务最近一行」的 upsert 表
+#: （读面要的是「上次跑成没有」），**近 10 次的流水**另存这张表（不覆盖）。
+_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS ks_bus_run (
+    id     bigserial PRIMARY KEY,
+    job_id text NOT NULL,
+    ran_at timestamptz NOT NULL,
+    ok     boolean NOT NULL,
+    rc     integer,
+    detail text
+)
+"""
+
+# --------------------------------------------------------------------------
+# 字段形状闸（**一把尺子**：API 层与调度落地共用，不许两处各写一份）
+# --------------------------------------------------------------------------
+
+#: 本包班车 id 的形状：ks- 前缀 + 小写字母开头的短横串（BUS_JOBS 同一形状）。
+#: 同时挡掉「拿 Hermes 的 12 位十六进制 id 来戳新后端」的旧书签 / 脚本残留。
+JOB_ID_RE = re.compile(r"^ks-[a-z][a-z0-9-]{1,30}$")
+
+#: 五段 cron 的字段取值范围（分 时 日 月 周；周日 0 与 7 都合法）
+_CRON_FIELDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+_CRON_ALIASES = {"@hourly", "@daily", "@midnight", "@weekly", "@monthly",
+                 "@yearly", "@annually"}
+
+#: `@daily` 这类别名 → 五段正身（APScheduler 的 from_crontab 只吃五段）。
+_ALIAS_5F = {
+    "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 1 1 * *",
+    "@weekly": "0 0 * * 0", "@daily": "0 0 * * *", "@midnight": "0 0 * * *",
+    "@hourly": "0 * * * *",
+}
+
+
+def _to_aps_expr(s: str) -> str:
+    """把过了 valid_schedule 的表达式归一成 APScheduler 3.x 能吃的形态。
+
+    两条归一：① 别名展开成五段；② 周字段**单独一个 7**（周日）换成 0 ——
+    3.x 的 parser 顶格 6，而 crontab 传统里 0 和 7 都是周日。`5-7` 这种
+    含 7 的区间/列表它两边都不肯老实认，**保守报错指路用 0-6 或 sun**，
+    不猜语义（宁拒冷门写法，不放行一个会被调度器静默改写的）。
+    """
+    s = s.strip()
+    if s.lower() in _ALIAS_5F:
+        return _ALIAS_5F[s.lower()]
+    parts = s.split()
+    if len(parts) == 5 and "7" in parts[4]:
+        if parts[4] == "7":
+            parts[4] = "0"
+        else:
+            raise ValueError("周字段里的 7 只认单独一个（=周日）；"
+                             "区间/列表请用 0-6 或 sun/mon 这类名字")
+    return " ".join(parts)
+
+
+class JobSpecError(ValueError):
+    """任务定义不合法（字段形状没过）。
+
+    ``error`` 是给 API 层的错误码（bad_schedule / bad_job_spec / bad_job_id），
+    ``str(self)`` 是给人看的话（带例子）—— API 层只负责翻译，不自己判形状。
+    """
+
+    def __init__(self, error: str, message: str):
+        super().__init__(message)
+        self.error = error
+
+
+def _valid_cron_field(tok: str, lo: int, hi: int) -> bool:
+    """一个字段（含 `*` / `a-b` / `*/n` / 逗号列表）合不合法。"""
+    tok = tok.strip()
+    if not tok:
+        return False
+    if "/" in tok:                      # 步长：*/5、0-30/2 都行
+        tok, _, step = tok.partition("/")
+        if not step.isdigit() or int(step) < 1:
+            return False
+    if tok == "*":
+        return True
+    if "-" in tok:                      # 区间：1-5（月份/周日的越界一并挡住）
+        a, _, b = tok.partition("-")
+        if not (a.isdigit() and b.isdigit()):
+            return False
+        return lo <= int(a) <= hi and lo <= int(b) <= hi
+    return tok.isdigit() and lo <= int(tok) <= hi
+
+
+def valid_schedule(s: str) -> bool:
+    """五段 cron 表达式（或 `@daily` 这类别名）校验，口径与旧版逐字一致。"""
+    s = (s or "").strip()
+    if not s:
+        return False
+    if s.lower() in _CRON_ALIASES:
+        return True
+    parts = s.split()
+    if len(parts) != len(_CRON_FIELDS):
+        return False
+    for part, (lo, hi) in zip(parts, _CRON_FIELDS):
+        if not all(_valid_cron_field(t, lo, hi) for t in part.split(",")):
+            return False
+    return True
+
 
 def _pg_conf() -> Dict[str, Any]:
     """config.json 的 storage.postgres 节（与主存储同源，不设第二套账）。"""
@@ -116,11 +238,26 @@ def _conninfo() -> str:
 # 执行体（被 jobstore 序列化引用：必须是模块级函数，args 必须可持久化）
 # --------------------------------------------------------------------------
 
+def _workdir() -> Optional[str]:
+    """执行时的工作目录：生产恒为 /root（班车脚本都在那儿）。
+
+    ponytail: 硬写死 ``cwd="/root"`` 在非 root 账号下会直接 PermissionError ——
+    整条班车起不来（测试机 / 降级场景都踩过），而「脚本找不到」比「进程起不来」
+    好诊断得多。/root 不可用时退回进程 cwd（None = 不改工作目录）。
+    """
+    if os.path.isdir("/root") and os.access("/root", os.W_OK):
+        return "/root"
+    return None
+
+
 def _execute(job_def: Dict[str, Any]) -> None:
     """跑一条班车（argv 列表、shell=False、绝对解释器），结果落 ks_bus_state。
 
     失败不抛（APScheduler 会把异常吞进 logger，值守看不见）；统一转成
     ok=False + 末行摘要，页面与排查看一张表就够。
+
+    两张表各写一行：``ks_bus_state`` 是「每任务最近一行」（upsert，读面要的是
+    「上次跑成没有」），``ks_bus_run`` 是 append-only 的流水（近 10 次执行记录）。
     """
     rc: Optional[int] = None
     ok = False
@@ -128,7 +265,7 @@ def _execute(job_def: Dict[str, Any]) -> None:
     try:
         p = subprocess.run(job_def["cmd"], capture_output=True, text=True,
                            timeout=job_def.get("timeout", 1800), shell=False,
-                           cwd="/root")
+                           cwd=_workdir())
         rc = p.returncode
         ok = (rc == 0)
         blob = (p.stdout if ok else (p.stderr or p.stdout)) or ""
@@ -140,6 +277,8 @@ def _execute(job_def: Dict[str, Any]) -> None:
         detail = f"起进程失败：{e.__class__.__name__}: {e}"[:500]
     if not ok:
         logger.error("bus: %s 跑红 rc=%s detail=%s", job_def.get("id"), rc, detail[:200])
+    # 🔴 两张表**分开两个事务写**：history 建表/写入要是失败（权限不够、老库没这表），
+    # 不许把「上次跑成没有」那一行也赔进去（PG 里一个事务出错会整笔回滚）。
     try:
         with psycopg.connect(_conninfo()) as conn:
             conn.execute(_STATE_DDL)
@@ -152,6 +291,15 @@ def _execute(job_def: Dict[str, Any]) -> None:
                 (job_def.get("id", "?"), ok, rc, detail))
     except Exception as e:            # noqa: BLE001 —— 状态写不进也不能把班车再炸一次
         logger.warning("bus: ks_bus_state 写入失败: %s", e)
+    try:
+        with psycopg.connect(_conninfo()) as conn:
+            conn.execute(_HISTORY_DDL)
+            conn.execute(
+                "INSERT INTO ks_bus_run(job_id, ran_at, ok, rc, detail) "
+                "VALUES (%s, now(), %s, %s, %s)",
+                (job_def.get("id", "?"), ok, rc, detail))
+    except Exception as e:            # noqa: BLE001
+        logger.warning("bus: ks_bus_run 写入失败: %s", e)
 
 
 # --------------------------------------------------------------------------
@@ -204,13 +352,151 @@ def shutdown() -> None:
 
 
 def _sync_jobs(sch) -> None:
-    """BUS_JOBS 里缺的补建；已存在的一律不覆盖（保住页面上的暂停态与改过的调度）。"""
+    """BUS_JOBS（**首次种子**）里缺的补建；已存在的一律不覆盖（保住页面上的暂停态
+    与改过的调度）；**墓碑里的绝不补**（删过的任务重启不许复活）。
+
+    🔴 墓碑读不出来 ⇒ **本轮一个都不补**（fail-closed）：宁可少建（页面少一行），
+    也不把用户明确删掉的任务复活 —— 「删除必须永久生效」是产品红线。
+    """
     from apscheduler.triggers.cron import CronTrigger
+    try:
+        dead = tombstone_ids()
+    except Exception as e:        # noqa: BLE001 —— 读不到墓碑 = 不敢补
+        logger.error("bus: 墓碑表读不出来，本轮不补种子（宁可不建也不复活已删任务）: %s", e)
+        return
+    tz = getattr(sch, "timezone", None)
     for jd in BUS_JOBS:
+        if jd["id"] in dead:
+            continue
         if sch.get_job(jd["id"]) is None:
-            sch.add_job(_execute, CronTrigger.from_crontab(jd["schedule"]),
+            sch.add_job(_execute,
+                        CronTrigger.from_crontab(jd["schedule"], timezone=tz),
                         args=[dict(jd)], id=jd["id"], name=jd["name"],
-                        replace_existing=False, max_instances=1)
+                        replace_existing=False, max_instances=1,
+                        misfire_grace_time=SCHED_DEFAULTS["misfire_grace_time"],
+                        coalesce=SCHED_DEFAULTS["coalesce"])
+
+
+def reconcile_register(sch, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """把一份任务定义校验后**落到调度器**（新增与修改共用这一处）。
+
+    字段口径（越界即抛 JobSpecError，由调用方翻译成 4xx —— API 层不自己拼 job）：
+      id       —— ``ks-`` 前缀形状（JOB_ID_RE，与 API 层同一把尺子）
+      name     —— 非空（空则退回 id）
+      schedule —— 五段 cron（valid_schedule 校验 + _to_aps_expr 归一）
+      cmd      —— 字符串列表，逐元素非空（执行体是 argv 列表，shell=False）
+      timeout  —— 正整数秒
+    misfire_grace / coalesce 一律取 ``SCHED_DEFAULTS``（单点口径：构造口径不许分叉）。
+
+    已存在的任务是**改**（modify_job）：改调度时**保住暂停态**（暂停着的任务改完
+    仍是暂停的 —— 改表达式不该顺手把它复活）。
+    """
+    jid = str(spec.get("id") or "").strip().lower()
+    if not JOB_ID_RE.match(jid):
+        raise JobSpecError("bad_job_id", f"job_id 形状不合法（须形如 ks-xxx）：{jid[:64]}")
+    name = str(spec.get("name") or "").strip() or jid
+    schedule = str(spec.get("schedule") or "").strip()
+    if not valid_schedule(schedule):
+        raise JobSpecError("bad_schedule",
+                           f"调度表达式不合法，例：30 4 * * *"
+                           f"（五段 cron 或 @daily 这类别名）")
+    try:
+        aps_expr = _to_aps_expr(schedule)  # 周字段里的 7 只认单独一个 → 这里抛
+    except ValueError as e:
+        raise JobSpecError("bad_schedule", f"{e}（例：30 4 * * *）") from e
+    cmd = spec.get("cmd")
+    if not isinstance(cmd, list) or not cmd:
+        raise JobSpecError("bad_job_spec", "cmd 必须是非空的字符串列表（每行一条命令要素）")
+    cmd = [str(c) for c in cmd]
+    if not all(c.strip() for c in cmd):
+        raise JobSpecError("bad_job_spec", "cmd 里有空元素（每条命令要素都得非空）")
+    timeout = spec.get("timeout")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise JobSpecError("bad_job_spec", "timeout 必须是正整数秒")
+    job_def = {"id": jid, "name": name, "schedule": schedule,
+               "cmd": cmd, "timeout": int(timeout)}
+
+    from apscheduler.triggers.cron import CronTrigger
+    tz = getattr(sch, "timezone", None)
+    trigger = CronTrigger.from_crontab(aps_expr, timezone=tz)
+    old = sch.get_job(jid)
+    if old is None:
+        sch.add_job(_execute, trigger, args=[job_def], id=jid, name=name,
+                    replace_existing=False, max_instances=1,
+                    misfire_grace_time=SCHED_DEFAULTS["misfire_grace_time"],
+                    coalesce=SCHED_DEFAULTS["coalesce"])
+    else:
+        paused = old.next_run_time is None
+        nxt = None if paused else trigger.get_next_fire_time(None, datetime.now(tz))
+        sch.modify_job(jid, name=name, trigger=trigger, args=[job_def],
+                       misfire_grace_time=SCHED_DEFAULTS["misfire_grace_time"],
+                       coalesce=SCHED_DEFAULTS["coalesce"], next_run_time=nxt)
+    return job_def
+
+
+def job_spec(job) -> Dict[str, Any]:
+    """调度器里的一个 job → 规格 dict（id/name/schedule/cmd/timeout）。
+
+    规格藏在 ``job.args[0]``（注册时就把整份定义塞进去了）—— jobstore 序列化
+    的就是它，重启后读回来的还是它。取不到就退成残缺规格（只有 id/name），
+    页面照样显示一行，不许整页炸掉。
+    """
+    spec: Dict[str, Any] = {}
+    args = getattr(job, "args", None) or []
+    if args and isinstance(args[0], dict):
+        spec = dict(args[0])
+    spec.setdefault("id", getattr(job, "id", ""))
+    spec.setdefault("name", getattr(job, "name", "") or spec.get("id", ""))
+    spec.setdefault("schedule", str(getattr(job, "trigger", "")))
+    if not isinstance(spec.get("cmd"), list):
+        spec["cmd"] = []
+    if not isinstance(spec.get("timeout"), int):
+        spec["timeout"] = 0
+    return spec
+
+
+def trigger_once(sch, spec: Dict[str, Any]) -> str:
+    """投一次**立即执行**（一次性 DateTrigger）：不建常驻 job、跑完自动消失。
+
+    走的是同一个执行包装（``_execute``）—— 「运行一次」与「按点跑」是同一份
+    代码路径（同一份 argv、同一个落库口径），不是另写一条捷径。
+    返回这一次性 job 的 id（调试用）。
+    """
+    from uuid import uuid4
+
+    from apscheduler.triggers.date import DateTrigger
+    one_id = f"{spec.get('id', 'ks-job')}-run-{uuid4().hex[:8]}"
+    sch.add_job(_execute, DateTrigger(run_date=datetime.now(timezone.utc)),
+                args=[dict(spec)], id=one_id,
+                name=f"{spec.get('name') or spec.get('id')}（手动触发）",
+                misfire_grace_time=SCHED_DEFAULTS["misfire_grace_time"],
+                coalesce=SCHED_DEFAULTS["coalesce"])
+    return one_id
+
+
+def tombstone_ids() -> Set[str]:
+    """墓碑表里的 job_id 集合（被删过的任务）。读不到 ⇒ 抛（调用方 fail-closed）。"""
+    with psycopg.connect(_conninfo()) as conn:
+        conn.execute(_TOMBSTONE_DDL)
+        rows = conn.execute("SELECT job_id FROM ks_bus_tombstone").fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def add_tombstone(job_id: str) -> None:
+    """写墓碑（幂等）。写不成功 ⇒ 抛（调用方据此中止删除：不许「删了但会复活」）。"""
+    with psycopg.connect(_conninfo()) as conn:
+        conn.execute(_TOMBSTONE_DDL)
+        conn.execute(
+            "INSERT INTO ks_bus_tombstone(job_id, removed_at) VALUES (%s, now()) "
+            "ON CONFLICT (job_id) DO UPDATE SET removed_at = EXCLUDED.removed_at",
+            (job_id,))
+
+
+def drop_tombstone(job_id: str) -> None:
+    """撤销墓碑（重新添加同一个 id 时用 —— 删除不是永禁，是「别自动复活」）。"""
+    with psycopg.connect(_conninfo()) as conn:
+        conn.execute(_TOMBSTONE_DDL)
+        conn.execute("DELETE FROM ks_bus_tombstone WHERE job_id = %s", (job_id,))
 
 
 def broken_reason() -> str:
@@ -236,3 +522,34 @@ def recent_state(ids: List[str]) -> Dict[str, Dict[str, Any]]:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def recent_runs(job_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """某任务的近 N 次执行记录（读面用）。读不到 ⇒ 空表，不抛。
+
+    口径：``ks_bus_run`` 是 append-only 流水（近 N 次）；一条都没有时退回
+    ``ks_bus_state`` 的那一行（老库/老任务没流水时至少看得见上次结果）。
+    """
+    rows: List[Any] = []
+    try:
+        with psycopg.connect(_conninfo()) as conn:
+            conn.execute(_HISTORY_DDL)
+            rows = conn.execute(
+                "SELECT ran_at, ok, rc, detail FROM ks_bus_run WHERE job_id = %s "
+                "ORDER BY ran_at DESC LIMIT %s", (job_id, limit)).fetchall()
+    except Exception as e:            # noqa: BLE001
+        logger.warning("bus: 执行历史读取失败: %s", e)
+        rows = []
+    if not rows:
+        # 流水一条都没有（老库 / 历史表还没建起来）⇒ 退回「最近一行」，
+        # 页面至少看得见上次跑成没有（两个事务分开：历史读失败不许连累它）。
+        try:
+            with psycopg.connect(_conninfo()) as conn:
+                rows = conn.execute(
+                    "SELECT ran_at, ok, rc, detail FROM ks_bus_state WHERE job_id = %s",
+                    (job_id,)).fetchall()
+        except Exception as e:        # noqa: BLE001
+            logger.warning("bus: 最近状态读取失败: %s", e)
+            return []
+    return [{"ran_at": r[0].isoformat() if r[0] else None,
+             "ok": r[1], "rc": r[2], "detail": r[3]} for r in rows]

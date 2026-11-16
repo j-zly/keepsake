@@ -164,6 +164,22 @@ export const api = {
     http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/resume`, { confirm: true }).then((r) => r.data),
   cronEdit: (jobId, schedule) =>
     http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/edit`, { confirm: true, schedule }).then((r) => r.data),
+  // ---- 定时任务管理面全量开放（scheduler_page_v2）----
+  // 新建：整份规格（id/name/schedule/cmd/timeout）一次给全；cmd 是**数组**
+  // （每元素一条命令要素，后端执行体是 argv 列表、shell=False）。
+  cronCreate: (payload) => http.post('/api/v1/crons', { confirm: true, ...payload }).then((r) => r.data),
+  // 全字段改（没传的字段后端沿用现值）：与 cronEdit 同一条端点，
+  // cronEdit 只改 schedule（看板那张任务卡在用），这里是「整份改」。
+  cronUpdate: (jobId, payload) =>
+    http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/edit`, { confirm: true, ...payload }).then((r) => r.data),
+  // 删除：**永久生效**（后端写墓碑 ⇒ 重启不复活）。没有请求体 ——
+  // 页面上的红色确认弹框就是确认本身（不键入任何字符）。
+  cronDelete: (jobId) => http.delete(`/api/v1/crons/${encodeURIComponent(jobId)}`).then((r) => r.data),
+  // 立即运行一次：一次性 DateTrigger（不建常驻 job），执行照常落状态表。
+  cronTrigger: (jobId) =>
+    http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/trigger`, { confirm: true }).then((r) => r.data),
+  // 执行记录（近 10 次，只读）。
+  cronRuns: (jobId) => http.get(`/api/v1/crons/${encodeURIComponent(jobId)}/runs`).then((r) => r.data),
 
   // ---- 代理治理（agent_registry）：五条全透传，闸门口径照抄后端 ----
   // approve / exclude 的 confirm 是 `true`；revoke 要**手输 agent_id 前 8 位**；

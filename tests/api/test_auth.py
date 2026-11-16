@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是五十三条业务写端点加四条auth_POST():
+def test_写面仍是五十六条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -704,6 +704,8 @@ def test_写面仍是五十三条业务写端点加四条auth_POST():
     **知识库面**的读可见性，不是治理动作（与记忆那个 `share_memory` 解耦）。
     🆕 多凭据再加三条（49 → 52，2026-11-14 用户拍板「一个代理可以生成多个凭证」）：
     新建一把 / 改标签 / 作废单把 —— 三条都只动**这一把**，别的入口不受牵连。
+    🆕 定时任务管理面全量开放再加三条（52 → 55）：新建 / 删除 / 立即运行
+    （scheduler_page_v2 —— 页面归机主本人使用，授权边界由人管）。
     🆕 凭据可还原再加两条（47 → 49，2026-11-14 用户拍板「不能换发，要直接能复制」）：
     `reveal_credential`（从加密存档取出明文）与 `backfill_credential`（把已在用的串
     校验后登记成可还原）。两条都**不签发新钥匙**，但一个产出可用密钥、一个改密文列
@@ -735,6 +737,9 @@ def test_写面仍是五十三条业务写端点加四条auth_POST():
         "/api/v1/settings/ai/{section_id}/probe",
         "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
         "/api/v1/crons/{job_id}/edit",
+        # scheduler_page_v2：定时任务管理面全量开放（增 / 删 / 立即运行）
+        "/api/v1/crons", "/api/v1/crons/{job_id}",
+        "/api/v1/crons/{job_id}/trigger",
         "/api/v1/agents", "/api/v1/agents/{agent_id}/approve",
         "/api/v1/agents/{agent_id}/rename", "/api/v1/agents/{agent_id}/revoke",
         "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
@@ -788,6 +793,8 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/auth/change_password",
                  "/api/v1/crons/{job_id}/pause", "/api/v1/crons/{job_id}/resume",
                  "/api/v1/crons/{job_id}/edit",
+                 "/api/v1/crons", "/api/v1/crons/{job_id}",
+                 "/api/v1/crons/{job_id}/trigger",
                  "/api/v1/agents/{agent_id}/approve", "/api/v1/agents/{agent_id}/revoke",
                  "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
                  "/api/v1/agents/{agent_id}/set_id"}

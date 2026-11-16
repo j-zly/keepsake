@@ -21,6 +21,7 @@ const read = (p) => readFileSync(`${SRC}/${p}`, 'utf8')
 
 const REVIEW = read('views/ReviewView.vue')
 const MAINT = read('views/MaintenanceView.vue')
+const SCHED = read('views/SchedulerView.vue')
 const APP = read('App.vue')
 const ROUTER = read('router/index.js')
 const STATS = read('views/StatsView.vue')
@@ -63,10 +64,15 @@ test('维护页：候选审核区搬干净了（不留残骸，也不留双份�
   for (const s of LEFT_BEHIND) {
     assert.ok(!MAINT.includes(s), `MaintenanceView 里还留着「${s}」—— 审核区已搬到 ReviewView`)
   }
-  // 但维护页自己的三块活儿必须还在（合并 / 遗忘 / 分级班车设置）
+  // 但维护页自己的三块活儿必须还在（合并 / 遗忘 / 分级班车设置）——
+  // 2026-11-16 起这三块**迁到「定时任务」页**（调度归调度、记忆归记忆），
+  // 维护页只留一句迁移指引。
   for (const s of ['合并 · dry-run', '遗忘 · dry-run', 'runMerge', 'runForget', '分级班车设置']) {
-    assert.ok(MAINT.includes(s), `MaintenanceView 少了「${s}」`)
+    assert.ok(SCHED.includes(s), `SchedulerView 少了「${s}」`)
+    assert.ok(!MAINT.includes(s), `MaintenanceView 还留着「${s}」—— 已迁到「定时任务」页`)
   }
+  // 维护页要留一句指路（不许让人以为功能没了）
+  assert.ok(MAINT.includes('to="/scheduler"'), '维护页要有指向「定时任务」页的链接')
   // 维护页不拉候选列表了
   assert.doesNotMatch(MAINT, /loadCandidates\(\)/)
 })

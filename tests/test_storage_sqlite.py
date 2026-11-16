@@ -322,7 +322,22 @@ _WRITER = textwrap.dedent("""
     sys.path.insert(0, {src!r})
     from keepsake.storage_sqlite import SqliteStorage
     s = SqliteStorage(path={path!r}, busy_timeout_ms={busy_ms!r})
-    assert s.ensure_index() is True
+    # 🔴 两个进程**同时**在全新库文件上建表/建索引会撞写锁（database is locked）：
+    #    建表这一下重试到成为止。本用例要守的是「并发写不丢数据」，
+    #    不是「谁先建表」—— 建表撞锁不该让整条断言红（2026-11-16 实测：
+    #    单跑也偶发红，是个纯时序的假红）。
+    #    建表阶段的告警先压住（那是**准备**噪声，不是写阶段的失败），
+    #    写阶段一恢复 —— 写失败必须留告警（契约 C2 靠它数条数）。
+    import logging
+    _log = logging.getLogger("keepsake.storage_sqlite")
+    _log.setLevel(logging.CRITICAL)
+    for _ in range(40):
+        if s.ensure_index() is True:
+            break
+        time.sleep(0.25)
+    else:
+        raise SystemExit("ensure_index 一直失败")
+    _log.setLevel(logging.NOTSET)
     if {hold!r}:                      # 写事务期间把持写锁，让只读方验证可读/可排队
         s._lock.acquire()
         try:

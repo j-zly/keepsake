@@ -5,7 +5,8 @@
  *   1) **方向徽标**：晋升候选（core_candidate）与退居建议（tier:demote-candidate）
  *      各查各的标签、批准的动正好相反（promote / demote）、确认文案按方向切 ——
  *      混起来的后果是「审核人看着像升常驻，按下去是把常驻降了」。
- *      （审核独立成页后这两条在 ReviewView；班车设置弹框留在 MaintenanceView。）
+ *      （审核独立成页后这两条在 ReviewView；班车设置弹框 2026-11-16 起在
+ *       SchedulerView「定时任务」页 —— 入口挂在 ks-tiering 那一行。）
  *   2) **看板卡片**：读 `GET /api/v1/tiering/status`，水位 ≥90% accent / ≥100% danger
  *      （复用 StatCard 的 tone），且「默认关」必须**显示出来**，不能藏在代码里。
  *   3) **交互红线**：设置走 ConfirmDialog / utils/dialog，没有裸 alert/confirm；
@@ -18,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 
 const REVIEW = readFileSync(fileURLToPath(new URL('../src/views/ReviewView.vue', import.meta.url)), 'utf8')
 const MAINT = readFileSync(fileURLToPath(new URL('../src/views/MaintenanceView.vue', import.meta.url)), 'utf8')
+const SCHED = readFileSync(fileURLToPath(new URL('../src/views/SchedulerView.vue', import.meta.url)), 'utf8')
 const STATS = readFileSync(fileURLToPath(new URL('../src/views/StatsView.vue', import.meta.url)), 'utf8')
 const API = readFileSync(fileURLToPath(new URL('../src/api/index.js', import.meta.url)), 'utf8')
 
@@ -76,18 +78,21 @@ test('看板：读 status 端点 + 水位配色 + 默认关要显示', () => {
 
 test('设置弹框：只动 tiering 一节 + confirm 是当前生效 enabled', () => {
   assert.match(API, /setTiering: \(tiering, confirm\) =>\s*http\.put\('\/api\/v1\/settings\/tiering', \{ tiering, confirm \}\)/)
-  assert.match(MAINT, /api\.setTiering\(tDraft\.value, String\(!!tStatus\.value\?\.enabled\)\)/)
+  assert.match(SCHED, /api\.setTiering\(tDraft\.value, String\(!!tStatus\.value\?\.enabled\)\)/)
   assert.match(
-    MAINT,
+    SCHED,
     /String\(tConfirm\.value\)\.trim\(\) === String\(!!tStatus\.value\?\.enabled\)/,
     'confirm 必须逐字等于当前生效 enabled（后端同一口径）',
   )
   // 弹框不许点遮罩关闭（半路改坏阈值）
-  assert.match(MAINT, /v-model="tieringOpen"[\s\S]*?:close-on-click-modal="false"/)
+  assert.match(SCHED, /v-model="tieringOpen"[\s\S]*?:close-on-click-modal="false"/)
+  // 设置弹框已迁到「定时任务」页：维护页不许再留第二份（一个配置面一处）
+  assert.ok(!MAINT.includes('tieringOpen'), '维护页不许再留分级班车设置弹框')
 })
 
 test('交互红线：三个页面都没有裸 alert / confirm', () => {
-  for (const [name, src] of [['ReviewView', REVIEW], ['MaintenanceView', MAINT], ['StatsView', STATS]]) {
+  for (const [name, src] of [['ReviewView', REVIEW], ['MaintenanceView', MAINT],
+    ['StatsView', STATS], ['SchedulerView', SCHED]]) {
     const bare = src.match(/(?<![A-Za-z0-9_.$])(alert|confirm|prompt)\s*\(/g) || []
     assert.deepEqual(bare, [], `${name} 必须走 ConfirmDialog / utils/dialog`)
   }

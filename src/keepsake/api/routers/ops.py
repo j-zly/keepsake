@@ -15,8 +15,9 @@
    🟡 **改正文另走 `update_fragment_content`**：前者契约上不动检索索引，
    PG 后端用它改正文会让 BM25 索引失真（见 `_apply` 的说明段）。
 2. **dry-run 是一等公民**：merge/forget/**import** 默认 `dry_run=true`；
-   实跑（`dry_run=false`）必须带 `confirm="<当前计数>"`（防手滑）——
-   缺 ⇒ 400 `confirm_required`，不匹配 ⇒ 400 `confirm_mismatch`。
+   实跑（`dry_run=false`）必须带 `confirm`（merge/forget：`confirm=true` 即过 ——
+   键入计数环节已废除；import：仍要 `confirm="<will_add 数>"`）——
+   缺 ⇒ 400 `confirm_required`，老口径手输的串不匹配 ⇒ 400 `confirm_mismatch`。
    **除 `dry_run=false` 外没有第二条实跑入口。**
 3. **写前自动备份**（`audit.backup_fragment`）：备份写不成功 ⇒ 整个写操作
    中止，数据一秒都没动。审计落盘位置在进路由时就自检过（`write_guard`）——
@@ -34,7 +35,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NoReturn, Optional, Tuple, Union
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -128,10 +129,16 @@ class CoreBudgetBody(BaseModel):
 
 
 class BulkOpsBody(BaseModel):
-    """`{"dry_run": true}` / `{"dry_run": false, "confirm": "<当前计数>"}`。"""
+    """`{"dry_run": true}` / `{"dry_run": false, "confirm": true}`。
+
+    🔴 **实跑确认口径（2026-11-16 改版）**：``confirm: true`` 即过 ——
+    「键入当前计数」这一步**废除**（页面上就是点一下确认框）。
+    老客户端手输的计数串**仍然认**（``confirm: "<计数>"``：对得上就放行），
+    不为了改交互把老脚本一起打死。
+    """
 
     dry_run: bool = True
-    confirm: Optional[str] = None
+    confirm: Optional[Union[bool, str]] = None
 
 
 class BulkActionBody(BaseModel):
@@ -226,21 +233,30 @@ def _need_text(got: str, expect: str, action: str, target: str,
 
 def _need_count_confirm(body: BulkOpsBody, count_fn: Callable[[], int],
                         action: str, target: str, what: str, hint: str) -> str:
-    """批量操作（merge/forget）的计数确认闸门，**返回当前计数**（回包要用）。
+    """批量操作（merge/forget）的确认闸门，**返回当前计数**（回包要用）。
+
+    🔴 **口径（2026-11-16 改版）**：实跑带 ``confirm: true`` 即过 ——
+    「键入当前计数」这一步废除（页面上就是点一下确认框；防手滑交给那个
+    明确写着后果的确认弹框，不再让用户抄一个数字）。
+    老客户端手输的计数串仍然认：对得上放行，对不上仍是 400 confirm_mismatch。
 
     🔴 **「有没有带 confirm」这一步不许碰存储层**（`count_fn` 是惰性的）：
     忘带确认是最常见的拒绝路径，先连一次库的话，存储不可达时该报的是
     400（请求没写意图）而不是 500（数据源故障）—— 那会把「手滑」误报成「故障」。
-    拿到 confirm 之后才去数当前条数、比对。
     """
-    if not body.dry_run and not (body.confirm or ""):
+    if not body.dry_run:
+        c = body.confirm
+        if c is True:                       # 新口径：点确认即过
+            return ""
+        if isinstance(c, str) and c.strip():   # 老口径：手输计数（对得上才算）
+            expect = str(count_fn())
+            if c.strip() != expect:
+                _reject(400, "confirm_mismatch", f"确认串不匹配，应为 {expect}",
+                        action, target)
+            return expect
         _reject(400, "confirm_required",
-                f"实跑必须带 confirm（{what}，见 {hint}）", action, target)
-    expect = str(count_fn())
-    if not body.dry_run and body.confirm != expect:
-        _reject(400, "confirm_mismatch", f"确认串不匹配，应为 {expect}",
-                action, target)
-    return expect
+                f"实跑必须带 confirm=true（{what}，见 {hint}）", action, target)
+    return str(count_fn())
 
 
 # --------------------------------------------------------------------------

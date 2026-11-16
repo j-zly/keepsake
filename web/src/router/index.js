@@ -12,6 +12,7 @@ import LoginView from '../views/LoginView.vue'
 import MaintenanceView from '../views/MaintenanceView.vue'
 import MessagesView from '../views/MessagesView.vue'
 import ReviewView from '../views/ReviewView.vue'
+import SchedulerView from '../views/SchedulerView.vue'
 import SetupView from '../views/SetupView.vue'
 import StatsView from '../views/StatsView.vue'
 import TokenView from '../views/TokenView.vue'
@@ -28,6 +29,9 @@ const routes = [
   // 审核独立成页（原来挤在记忆维护页里）：候选 70+ 条时整页很长，动线被危险操作淹没
   { path: '/review', name: 'review', component: ReviewView, meta: { title: '记忆审核' } },
   { path: '/maintenance', name: 'maintenance', component: MaintenanceView, meta: { title: '记忆维护' } },
+  // 定时任务独立成页（scheduler_page_v2）：班车的增删改查 / 暂停恢复 / 立即运行
+  // 与执行记录都在这里 —— 维护页只管记忆内容，调度归调度。
+  { path: '/scheduler', name: 'scheduler', component: SchedulerView, meta: { title: '定时任务' } },
   { path: '/kb', name: 'kb', component: KbView, meta: { title: '知识库' } },
   // 知识库审核独立成页（原来挤在 KbView 里、要点顶部那颗 chip 才展开）：待审队列要逐条判，
   // 铺在文档浏览页的抽屉里既看不清也翻不动。配方与 /review 记忆审核同款

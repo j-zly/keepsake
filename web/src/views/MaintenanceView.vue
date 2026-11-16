@@ -2,18 +2,18 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆维护</h1>
-      <p class="page-sub">合并重复的记忆条目、遗忘过期条目。</p>
+      <p class="page-sub">常驻层水位、退居提名与待办建议 —— 合并 / 遗忘与班车调度都在「定时任务」页。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
 
     <div class="stat-grid">
-      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" hint="实跑「合并」要手输这个数" />
+      <StatCard label="常驻层条数" :value="data?.core?.count ?? '-'" unit="条" hint="合并 / 遗忘的手动执行在「定时任务」页" />
       <StatCard
         label="记忆条目"
         :value="data?.retrieval?.count ?? '-'"
         unit="条"
-        :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : '实跑「遗忘」要手输这个数'"
+        :hint="data?.retrieval?.truncated ? '已触扫描上限（5000），非全量' : '合并 / 遗忘的手动执行在「定时任务」页'"
       />
     </div>
 
@@ -125,46 +125,6 @@
       </p>
     </div>
 
-    <!-- 操作卡对：「合并/遗忘」执行区与「分级班车」配置区按对象分卡。
-         状态（自动频率/上次运行）升进卡头 meta 行；长说明从页面移除——
-         规则本体是设置弹框里的字段，开闸前提示收进弹框。 -->
-    <div class="ops-grid">
-      <div class="panel ops-card">
-        <div class="ops-head">
-          <h3 class="section-title">合并 · 遗忘</h3>
-          <p class="ops-meta">每 2 小时自动执行{{ maintLastRun ? ` · 上次 ${maintLastRun}` : '' }}</p>
-        </div>
-        <p class="foot-note foot-note--lead">实跑要手输上方计数，执行前自动备份受影响条目；dry-run 零写入，可放心点。</p>
-        <div class="ops-group">
-          <span class="ops-label">预览</span>
-          <div class="ops">
-            <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
-            <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
-          </div>
-        </div>
-        <div class="ops-group">
-          <span class="ops-label">执行</span>
-          <div class="ops">
-            <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
-            <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
-          </div>
-        </div>
-        <pre v-if="opResult" class="pre">{{ opResult }}</pre>
-      </div>
-
-      <div class="panel ops-card ops-card--tiering">
-        <div class="ops-head">
-          <h3 class="section-title">分级班车</h3>
-          <p class="ops-meta">每天 04:30 自动执行</p>
-        </div>
-        <p class="foot-note foot-note--lead">按召回与预算提名常驻层升降，最终生效走审核队列。</p>
-        <div class="tier-row">
-          <span class="chip" :class="tStatus?.enabled ? 'chip--ok' : ''">{{ tStatus?.enabled ? '已开' : '默认关' }}</span>
-          <el-button :disabled="!tStatus" @click="openTiering">设置</el-button>
-        </div>
-      </div>
-    </div>
-
     <!--
       screening 的配置面**已搬到「AI 配置」页**（2026-10 ks_maint_ui_dedup）。
       🔴 一张卡**一个编辑入口**：这一页不再摆第二张筛选卡，只留一行迁移指引 ——
@@ -177,114 +137,27 @@
       <router-link class="card-link" to="/ai-settings">去 AI 配置 ›</router-link>
     </p>
 
-    <!-- 分级班车设置：总开关 + 阈值。confirm 要手输当前生效的 enabled（防手滑） -->
-    <el-dialog
-      v-model="tieringOpen"
-      title="常驻层分级班车设置"
-      width="520px"
-      align-center
-      :close-on-click-modal="false"
-      :close-on-press-escape="!busyT"
-      :show-close="!busyT"
-      append-to-body
-    >
-      <el-form label-position="top">
-        <el-form-item label="总开关（默认关）">
-          <el-switch v-model="tDraft.enabled" />
-        </el-form-item>
-        <el-form-item label="升提名：窗口天数 / 最少命中数（默认 3000）">
-          <el-input-number v-model="tDraft.promote_nominate.window_days" :min="1" :max="365" />
-          <el-input-number v-model="tDraft.promote_nominate.nominate_min_hits" :min="1" :max="100000" />
-        </el-form-item>
-        <el-form-item label="自动审核：候选挂够天数 / 同一窗通过命中数（默认 7 天 / 5000 次）">
-          <el-input-number v-model="tDraft.promote_auto.review_window_days" :min="1" :max="365" />
-          <el-input-number v-model="tDraft.promote_auto.promote_approve_hits" :min="1" :max="100000" />
-        </el-form-item>
-        <el-form-item label="降级：告警水位 / 释放水位（0.90 / 0.80）">
-          <el-input-number v-model="tDraft.demote_pressure.warn_ratio" :min="0.01" :max="1" :step="0.05" />
-          <el-input-number v-model="tDraft.demote_pressure.release_ratio" :min="0" :max="1" :step="0.05" />
-        </el-form-item>
-        <el-form-item label="每轮提名 / 降级条数上限">
-          <el-input-number v-model="tDraft.batch_cap" :min="1" :max="10000" />
-        </el-form-item>
-        <el-form-item :label="`手输当前生效值 ${tStatus?.enabled ? 'true' : 'false'} 以确认`">
-          <el-input v-model="tConfirm" :placeholder="tStatus?.enabled ? 'true' : 'false'" />
-        </el-form-item>
-      </el-form>
-      <p class="tip">
-        开总开关前建议先观察几天提名走势（关闭时班车不提名、不升降）。开关写的是 config.json 的 <code>tiering</code> 节（只动这一节、其余键与键序不变，写前整份备份）。
-        手写的常驻条目（带 <code>memory</code> 标）永不被自动降，只进退居建议。
-      </p>
-      <template #footer>
-        <el-button :disabled="busyT" @click="tieringOpen = false">取消</el-button>
-        <el-button type="primary" :loading="busyT" :disabled="!canSaveT" @click="saveTiering">
-          保存
-        </el-button>
-      </template>
-    </el-dialog>
+    <!-- 班车那边（合并 / 遗忘 + 分级班车的开关阈值 + 班车的增删改查）已迁到「定时任务」页：
+         调度归调度、记忆归记忆，这一页只管记忆内容。 -->
+    <p class="src foot-note migrate-note">
+      合并 / 遗忘与分级班车的开关阈值已移到「定时任务」页 ——
+      <router-link class="card-link" to="/scheduler">去定时任务 ›</router-link>
+    </p>
 
-    <ConfirmDialog
-      v-model="confirmOpen"
-      :title="confirmTitle"
-      :consequences="confirmConsequences"
-      :expect="confirmExpect"
-      confirm-text="确认实跑"
-      :busy="busy === confirmKind"
-      @confirm="doOps"
-    />
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
 import PagerBar from '../components/PagerBar.vue'
 import StatCard from '../components/StatCard.vue'
 import { api } from '../api'
 import { agentUsageRows, loadAgentRows, NO_OWNER_LABEL, ownerOf, sharePercent } from '../utils/agents'
-import { showError, showToast } from '../utils/dialog'
 import { toLocal } from '../utils/format'
 
-// 计数口径与看板同一接口（/api/v1/stats）：实跑时用户手输的就是这里显示的两个数
+// 计数口径与看板同一接口（/api/v1/stats）：常驻层水位与分列都从这里取
 const data = ref(null)
 const error = ref('')
-const busy = ref('')
-const opResult = ref('')
-
-/** 危险实跑（合并 / 遗忘）的确认态 */
-const confirmOpen = ref(false)
-const confirmKind = ref('')
-const confirmExpect = ref('')
-const confirmTitle = ref('')
-const confirmConsequences = ref([])
-
-/**
- * 维护班车（hermes cron `memory-maintenance`，每 120m 一班）的**最近一次运行时间**。
- *
- * 走现成的只读端点 `GET /api/v1/crons`（前端 `api.crons()` 已有，看板同款）——
- * 不新增后端接口、不加存储字段、不改任何 .py。
- * 读不到（jobs.json 缺失 / 解析失败 / 没这个任务）就**不显示**这一句：
- * 宁可少一句说明，也不显示一个假的「上次运行」。
- */
-const maintLastRun = ref('')
-
-/**
- * 这条 cron 是不是维护班车？认名字或认脚本名（认其一即可）——
- * provider 注册时给的就是这两样（name=memory-maintenance / script=memory-maintenance.py）。
- */
-function isMaintJob(j) {
-  return j?.script === 'memory-maintenance.py' || j?.name === 'memory-maintenance'
-}
-
-async function loadMaintLastRun() {
-  try {
-    const res = await api.crons()
-    const job = (res?.jobs || []).find(isMaintJob)
-    maintLastRun.value = job?.last_run_at ? toLocal(job.last_run_at) : ''
-  } catch (e) {
-    maintLastRun.value = ''
-  }
-}
 
 async function load() {
   error.value = ''
@@ -486,214 +359,18 @@ function barWidth(percent) {
   return Math.min(100, Math.max(0, p))
 }
 
-/**
- * 合并 / 遗忘。**默认 dry-run**（零写入）；实跑要手输「当前计数」——
- * 与后端 confirm 串同口径（core.count / retrieval.count），防手滑。
- * 实跑前后都会把受影响记忆条目全量导出到备份目录，路径回显在结果里。
- */
-function runMerge(dryRun) {
-  const n = data.value?.core?.count
-  if (dryRun) return runOps('merge', true)
-  confirmKind.value = 'merge'
-  confirmExpect.value = String(n)
-  confirmTitle.value = '合并 · 实跑'
-  confirmConsequences.value = [
-    `会按相似度合并重叠的记忆条目，当前常驻层共 ${n} 条。`,
-    '被合并掉的条目正文会被改写，原始全文先导出到备份目录。',
-    '手输的计数会作为 confirm 串发给后端，对不上直接被拒。',
-  ]
-  confirmOpen.value = true
-}
-
-function runForget(dryRun) {
-  const n = data.value?.retrieval?.count
-  if (dryRun) return runOps('forget', true)
-  confirmKind.value = 'forget'
-  confirmExpect.value = String(n)
-  confirmTitle.value = '遗忘 · 实跑'
-  confirmConsequences.value = [
-    `会物理删除过期记忆条目，当前记忆条目共 ${n} 条。`,
-    '这一步是真删：备份目录里留有全文，但控制台没有恢复入口。',
-    '手输的计数会作为 confirm 串发给后端，对不上直接被拒。',
-  ]
-  confirmOpen.value = true
-}
-
-/** ConfirmDialog 确认回调：把用户手输的串原样当 confirm 发给后端。 */
-async function doOps(typed) {
-  confirmOpen.value = false
-  await runOps(confirmKind.value, false, typed)
-}
-
-async function runOps(kind, dryRun, confirm) {
-  busy.value = dryRun ? `${kind}-dry` : kind
-  try {
-    const payload = { dry_run: dryRun, confirm }
-    const r = kind === 'merge' ? await api.merge(payload) : await api.forget(payload)
-    opResult.value = JSON.stringify(r, null, 2)
-    showToast(`${kind} ${dryRun ? 'dry-run' : '实跑'}完成：${JSON.stringify(r.stats)}`)
-    load()
-  } catch (e) {
-    showError(`${kind} ${dryRun ? 'dry-run' : '实跑'}失败：${e.message}`)
-  } finally {
-    busy.value = ''
-  }
-}
-
 onMounted(() => {
   load()
-  loadTiering()
   loadAgentDimension()
   loadDemotes()
   loadObsoleteTodos()
-  loadMaintLastRun()
 })
 
-// ---------------------------------------------------------------------------
-// 分级班车设置（开关 + 阈值）
-// ---------------------------------------------------------------------------
-
-/** 与后端 `keepsake/core/tiering.py` 的缺省表一一对应；打开弹框时按 status 回填 */
-const tieringOpen = ref(false)
-const busyT = ref(false)
-const tStatus = ref(null)
-/** 表单初值 = 后端缺省表（`keepsake/core/tiering.py` DEFAULTS 同一组值）：
-    status 读回来后整份覆盖。给初值而不是 null，弹框的 v-model 才有对象可绑。 */
-const tDraft = ref({
-  enabled: false,
-  promote_nominate: { window_days: 7, nominate_min_hits: 3000 },
-  promote_auto: { review_window_days: 7, promote_approve_hits: 5000 },
-  demote_pressure: { warn_ratio: 0.9, release_ratio: 0.8, force_at_full: true },
-  demote_exempt: { explicit_core: true },
-  batch_cap: 50,
-})
-const tConfirm = ref('')
-
-/** 保存条件：阈值都是正数 + confirm 逐字等于当前生效 enabled（后端同一口径） */
-const canSaveT = computed(() => {
-  const d = tDraft.value
-  if (!d) return false
-  const nums = [d.promote_nominate.window_days, d.promote_nominate.nominate_min_hits,
-    d.promote_auto.review_window_days, d.promote_auto.promote_approve_hits, d.batch_cap]
-  const ratios = [d.demote_pressure.warn_ratio, d.demote_pressure.release_ratio]
-  const okNums = nums.every((n) => Number.isFinite(Number(n)) && Number(n) >= 1)
-  const okRatios = ratios.every((n) => Number(n) > 0 && Number(n) <= 1)
-  return okNums && okRatios && Number(d.demote_pressure.release_ratio) <= Number(d.demote_pressure.warn_ratio)
-    && String(tConfirm.value).trim() === String(!!tStatus.value?.enabled)
-})
-
-async function loadTiering() {
-  try {
-    tStatus.value = await api.tieringStatus()
-  } catch (e) {
-    tStatus.value = null
-    showError(`读取分级班车状态失败：${e.message}`)
-  }
-}
-
-/** 打开时按后端回的**完整生效值**预填（缺省键后端已补齐），confirm 留空手输 */
-function openTiering() {
-  const s = tStatus.value?.settings
-  if (!s) return
-  tDraft.value = JSON.parse(JSON.stringify(s))
-  tConfirm.value = ''
-  tieringOpen.value = true
-}
-
-async function saveTiering() {
-  if (!canSaveT.value) return
-  busyT.value = true
-  try {
-    // confirm 传 'true'/'false' 字符串：开这个开关等于让班车每天动常驻层，
-    // 确认串是「现在是不是开着」而不是条数（条数在另一张卡上，不防这种手滑）。
-    const r = await api.setTiering(tDraft.value, String(!!tStatus.value?.enabled))
-    tieringOpen.value = false
-    showToast(`已保存分级班车设置（enabled=${r.enabled}）`)
-    loadTiering()
-  } catch (e) {
-    showError(`保存分级设置失败：${e.message}`)
-  } finally {
-    busyT.value = false
-  }
-}
 </script>
 
 <style scoped>
-/* 操作卡对网格：宽屏两列铺满、窄屏自动单列（右侧不留大片空白）。 */
-.ops-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-  gap: 20px;
-  margin-bottom: 20px;
-}
-.ops-grid .ops-card {
-  margin-bottom: 0;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-/* 卡头：标题左、自动节奏/上次运行状态右（同一条基线，meta 用次要字色不跟脚注抢）。 */
-.ops-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.ops-meta {
-  margin: 0;
-  color: var(--text-dim);
-  font-size: 13px;
-}
-/* 预览 / 执行分组：组标题小字灰，组内按钮走既有 .ops 弹性行（nowrap 钮文字不碎排）。 */
-.ops-group {
-  margin-top: 12px;
-}
-.ops-label {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--text-faint);
-  font-size: 12px;
-}
-/* 分级卡：chip + 设置按钮贴底（margin-top:auto），与左卡同高时基线一致。 */
-.ops-card--tiering .tier-row {
-  margin-top: auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding-top: 12px;
-}
-/* 「已开」状态 chip：绿字描边，零新色（--ok 令牌；关闭态退默认 chip）。 */
-.chip--ok {
-  color: var(--ok);
-  border-color: currentColor;
-}
-
-/* 操作区卡片：合并 / 遗忘 / 分级班车收进一张卡（脚注 → 按钮行 → 结果块）。 */
-.ops-card {
-  padding: 20px;
-  margin-bottom: 20px;
-}
-.ops {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-.ops-gap {
-  width: 1px;
-  height: 20px;
-  margin: 0 4px;
-  background: var(--border-2);
-}
-.pre {
-  margin-top: 20px;
-}
-/* 卡内的结果块贴着上一步（卡间距档 20px → 卡内区块 12px）。 */
-.ops-card .pre {
-  margin-top: 12px;
-}
+/* 两张班车卡（合并 · 遗忘 / 分级班车）已迁到「定时任务」页 —— 本页只剩记忆面，
+   班车相关的样式一并带走（不留死样式）。 */
 .src {
   margin-top: 10px;
   color: var(--text-faint);

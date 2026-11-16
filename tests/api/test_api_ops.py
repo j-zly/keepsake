@@ -90,6 +90,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",
+    # scheduler_page_v2：定时任务管理面全量开放（增 / 删 / 立即运行）
+    "/api/v1/crons",
+    "/api/v1/crons/{job_id}",
+    "/api/v1/crons/{job_id}/trigger",
     "/api/v1/agents",
     "/api/v1/agents/{agent_id}/approve",
     "/api/v1/agents/{agent_id}/rename",
@@ -535,7 +539,7 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_53条业务加4条认证():
+def test_写面白名单全量断点_56条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
@@ -543,8 +547,9 @@ def test_写面白名单全量断点_53条业务加4条认证():
     # 2026-11-14 凭据可还原加两条（47 → 49），同日多凭据再加三条（49 → 52 业务写、
     # 53 → 56 含 auth）：新建一把 / 改标签 / 作废单把。
     # 改名不动鉴权，但它和"作废""新建"一样是能改变"谁能连进来"的口 ⇒ 必须进名单。
-    assert len(ALLOWED_POST_PATHS) == 57
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 53
+    # scheduler_page_v2 再加三条（定时任务：新建 / 删除 / 立即运行）。
+    assert len(ALLOWED_POST_PATHS) == 60
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 56
 
 
 def test_P1只读路由未被写面影响(client):

@@ -79,6 +79,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/crons/{job_id}/pause",
     "/api/v1/crons/{job_id}/resume",
     "/api/v1/crons/{job_id}/edit",
+    # scheduler_page_v2：定时任务管理面全量开放（增 / 删 / 立即运行）
+    "/api/v1/crons",
+    "/api/v1/crons/{job_id}",
+    "/api/v1/crons/{job_id}/trigger",
     "/api/v1/agents",
     "/api/v1/agents/{agent_id}/approve",
     "/api/v1/agents/{agent_id}/rename",
