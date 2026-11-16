@@ -85,6 +85,11 @@ BUS_JOBS: List[Dict[str, Any]] = [
 #: 2026-11-16 实踩：16:00 班被 dead socket 拖晚 10 秒、旧 grace=1 直接丢班）。
 SCHED_DEFAULTS = {"coalesce": True, "misfire_grace_time": 3600}
 
+#: timeout 的**单点默认值**（秒）：读面补默认（存量 job 没有 timeout 字段时）
+#: 与执行路径缺省用的是同一个值 —— 补 0 会让编辑面拿到 0（编辑校验要求正整数）
+#: ⇒ 存量 job 一编辑就 400；执行路径缺省又按 1800 跑，三处口径必须一致。
+DEFAULT_TIMEOUT = 1800
+
 _lock = threading.Lock()
 _sched = None            # BackgroundScheduler 或 None（起不来时）
 _broken = ""             # 起不来的原因（人话），给读面回显
@@ -264,15 +269,15 @@ def _execute(job_def: Dict[str, Any]) -> None:
     detail = ""
     try:
         p = subprocess.run(job_def["cmd"], capture_output=True, text=True,
-                           timeout=job_def.get("timeout", 1800), shell=False,
-                           cwd=_workdir())
+                           timeout=job_def.get("timeout", DEFAULT_TIMEOUT),
+                           shell=False, cwd=_workdir())
         rc = p.returncode
         ok = (rc == 0)
         blob = (p.stdout if ok else (p.stderr or p.stdout)) or ""
         lines = [ln for ln in blob.splitlines() if ln.strip()]
         detail = (lines[-1] if lines else "")[:500]
     except subprocess.TimeoutExpired:
-        detail = f"超时被杀（>{job_def.get('timeout', 1800)}s）"
+        detail = f"超时被杀（>{job_def.get('timeout', DEFAULT_TIMEOUT)}s）"
     except OSError as e:
         detail = f"起进程失败：{e.__class__.__name__}: {e}"[:500]
     if not ok:
@@ -451,7 +456,10 @@ def job_spec(job) -> Dict[str, Any]:
     if not isinstance(spec.get("cmd"), list):
         spec["cmd"] = []
     if not isinstance(spec.get("timeout"), int):
-        spec["timeout"] = 0
+        # 🔴 存量 job（老 jobstore 里的形状）没有 timeout 字段 ⇒ 补**执行路径同款**
+        # 默认值（DEFAULT_TIMEOUT），不是 0：编辑校验要求正整数，补 0 会让这类
+        # job 一编辑就 400，编辑框也会显示 0。
+        spec["timeout"] = DEFAULT_TIMEOUT
     return spec
 
 

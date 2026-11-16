@@ -430,6 +430,26 @@ def test_merge_confirm必须是当前core条数(client, storage):
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_mismatch"
 
 
+def test_confirm_true实跑_回包confirm_required是真计数(client, storage):
+    """🔴 新口径（confirm=true 直通）的回包不许谎报：`confirm_required` 必须是
+    **当时真实的计数**（与老口径手输计数同源的那个值），不是空串。
+    页面据此显示「本次将处理 N 条」—— 报空串就是谎报。"""
+    n_core = len(storage.list_by_tag("core"))
+    r = client.post("/api/v1/ops/merge",
+                    json={"dry_run": False, "confirm": True}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["confirm_required"] == str(n_core)
+    assert body["confirm_required"] != ""
+
+    n_total = len(storage.scan_fragment_keys("", 5000)[1])
+    r = client.post("/api/v1/ops/forget",
+                    json={"dry_run": False, "confirm": True}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["confirm_required"] == str(n_total)
+    assert r.json()["confirm_required"] != ""
+
+
 # ---------------------------------------------------------------- forget
 
 def test_forget_dry_run_零写入(client, storage):

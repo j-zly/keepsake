@@ -243,11 +243,13 @@ def _need_count_confirm(body: BulkOpsBody, count_fn: Callable[[], int],
     🔴 **「有没有带 confirm」这一步不许碰存储层**（`count_fn` 是惰性的）：
     忘带确认是最常见的拒绝路径，先连一次库的话，存储不可达时该报的是
     400（请求没写意图）而不是 500（数据源故障）—— 那会把「手滑」误报成「故障」。
+    （过了这道闸之后就不一样了：``confirm=true`` 分支照样取真实计数回包 ——
+    那一路本来就要连库执行，报 500 是对的。）
     """
     if not body.dry_run:
         c = body.confirm
         if c is True:                       # 新口径：点确认即过
-            return ""
+            return str(count_fn())           # 🔴 回包要 truthful 的计数（不是空串）
         if isinstance(c, str) and c.strip():   # 老口径：手输计数（对得上才算）
             expect = str(count_fn())
             if c.strip() != expect:

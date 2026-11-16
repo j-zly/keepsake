@@ -534,3 +534,44 @@ def test_实跑_老口径手输计数仍认(ops_client):
     r = ops_client.post("/api/v1/ops/merge",
                         json={"dry_run": False, "confirm": "999999"}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_mismatch"
+
+
+# ---------------------------------------------------------------- timeout 三口径互斥（review fix）
+
+def test_存量job无timeout_编辑面补1800不补0(client, live_sched):
+    """🔴 存量 job（老 jobstore 形状：规格里**没有 timeout 字段**）的编辑面口径。
+
+    读回补 0 ⇒ 编辑校验要求正整数 ⇒ 一编辑就 400、编辑框显示 0；
+    执行路径缺省却是 1800 ⇒ 三处口径互斥。正确口径：读回缺失时补**执行路径同款**
+    的 DEFAULT_TIMEOUT（1800）。"""
+    from apscheduler.triggers.cron import CronTrigger
+
+    # 往 jobstore 塞一条**没有 timeout 字段**的存量 job（老形状）
+    legacy_spec = {"id": "ks-legacy", "name": "存量任务",
+                   "schedule": "0 4 * * *", "cmd": ["/bin/echo", "hi"]}
+    live_sched.add_job(bus._execute, CronTrigger.from_crontab("0 4 * * *"),
+                        args=[legacy_spec], id="ks-legacy", name="存量任务")
+
+    # 读面（编辑框回填的来源）：不是 0，是 1800
+    row = [j for j in client.get("/api/v1/crons", headers=AUTH).json()["jobs"]
+           if j["job_id"] == "ks-legacy"][0]
+    assert row["timeout"] == 1800, row
+
+    # 编辑：只改合法 schedule ⇒ 成功，且落库的 timeout 是 1800（不是 0）
+    r = client.post("/api/v1/crons/ks-legacy/edit",
+                    json={"confirm": True, "schedule": "30 5 * * *"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    stored = bus.job_spec(live_sched.get_job("ks-legacy"))
+    assert stored["timeout"] == 1800, stored
+    assert live_sched.get_job("ks-legacy").args[0]["timeout"] == 1800
+
+
+def test_timeout默认值单点定义():
+    """timeout 的默认值只有一处定义（执行路径与读面补默认共用）。"""
+    import inspect
+    assert bus.DEFAULT_TIMEOUT == 1800
+    src = inspect.getsource(bus)
+    # 执行路径的缺省与读面的补默认都引用常量，不许各自写字面量
+    assert 'job_def.get("timeout", 1800)' not in src
+    assert "'timeout', 1800)" not in src
+    assert 'spec["timeout"] = 0' not in src
