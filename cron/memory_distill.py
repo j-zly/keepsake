@@ -117,7 +117,7 @@ def distill(conversation, max_chars, channel):
         finish_reason = (
             (data.get("choices") or [{}])[0].get("finish_reason") or "?"
         )
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
     except Exception as e:
         print(f"llm 调用失败 ({host}): {e}")
         return []
