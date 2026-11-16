@@ -44,6 +44,11 @@
           <span v-if="isTiering(row)" class="chip" :class="tStatus?.enabled ? 'chip--ok' : ''">
             {{ tStatus?.enabled ? '分级已开' : '分级默认关' }}
           </span>
+          <!-- 代码班车徽标：新形态（func，同进程调函数）替命令行摘要 ——
+               那一行的「执行体」不是一个命令行，看命令没意义。 -->
+          <span v-if="row.func" class="chip chip--code" title="同进程调用的代码班车">
+            代码班车
+          </span>
         </span>
         <!-- 操作列：五枚常驻按钮一行排齐（不许 3+2 换行）；
              分级班车那行多一枚「设置」（它的阈值入口跟着它自己那一行走）。
@@ -85,7 +90,16 @@
         <el-form-item label="调度（五段 cron，如 30 4 * * *）">
           <el-input v-model="form.schedule" placeholder="30 4 * * *" />
         </el-form-item>
-        <el-form-item label="命令（每行一条命令要素，如 /bin/sh）">
+        <el-form-item label="执行方式">
+          <el-radio-group v-model="form.mode">
+            <el-radio value="func">代码班车（模块:函数）</el-radio>
+            <el-radio value="cmd">旧 shell 班车（命令）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="form.mode === 'func'" label="函数引用（模块:函数，如 keepsake.buses.distill:run）">
+          <el-input v-model="form.func" placeholder="keepsake.buses.distill:run" />
+        </el-form-item>
+        <el-form-item v-else label="命令（每行一条命令要素，如 /bin/sh）">
           <el-input v-model="form.cmdText" type="textarea" :rows="4" placeholder="/bin/sh&#10;/root/.hermes/scripts/x.sh" />
         </el-form-item>
         <el-form-item label="超时（秒）">
@@ -218,11 +232,12 @@ async function load() {
 const formOpen = ref(false)
 const formMode = ref('create')        // 'create' | 'edit'
 const formError = ref('')
-const form = ref({ id: '', name: '', schedule: '', cmdText: '', timeout: 1800 })
+/** 执行方式二选一：'func'（代码班车，同进程调函数）| 'cmd'（旧 shell 班车）。 */
+const form = ref({ id: '', name: '', schedule: '', mode: 'func', func: '', cmdText: '', timeout: 1800 })
 
 function openCreate() {
   formMode.value = 'create'
-  form.value = { id: '', name: '', schedule: '0 4 * * *', cmdText: '', timeout: 1800 }
+  form.value = { id: '', name: '', schedule: '0 4 * * *', mode: 'func', func: '', cmdText: '', timeout: 1800 }
   formError.value = ''
   formOpen.value = true
 }
@@ -233,6 +248,9 @@ function openEdit(row) {
     id: row.job_id,
     name: row.name || '',
     schedule: row.schedule || '',
+    // 读面两个字段都在（func / cmd）—— 按「哪个非空」判当前执行方式，不猜。
+    mode: row.func ? 'func' : 'cmd',
+    func: row.func || '',
     cmdText: (row.cmd || []).join('\n'),
     timeout: row.timeout || 1800,
   }
@@ -248,13 +266,30 @@ function parseCmd(text) {
     .filter(Boolean)
 }
 
+/** 函数引用形状：模块:函数（后端注册时还会再验一遍「可 import 且 callable」）。 */
+const FUNC_RE = /^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$/
+
 async function saveForm() {
   const f = form.value
   const payload = {
     name: f.name,
     schedule: f.schedule,
-    cmd: parseCmd(f.cmdText),
     timeout: Number(f.timeout),
+  }
+  // 执行方式二选一：**只发当前那一种**（两个都发后端会拒）。
+  if (f.mode === 'func') {
+    const fn = String(f.func || '').trim()
+    if (!FUNC_RE.test(fn)) {
+      formError.value = '函数引用形状不合法（应形如 keepsake.buses.distill:run）'
+      return
+    }
+    payload.func = fn
+  } else {
+    payload.cmd = parseCmd(f.cmdText)
+    if (!payload.cmd.length) {
+      formError.value = '命令不能空（每行一条命令要素，如 /bin/sh）'
+      return
+    }
   }
   if (formMode.value === 'create') payload.id = f.id
   busy.value = 'form'
@@ -546,6 +581,12 @@ onMounted(async () => {
 /* 「已开」状态 chip：绿字描边（--ok 令牌；关闭态退默认 chip）。 */
 .chip--ok {
   color: var(--ok);
+  border-color: currentColor;
+}
+
+/* 代码班车徽标（func 形态）：中性描边 —— 不跟「运行中 / 已暂停」的绿黄语义混。 */
+.chip--code {
+  color: var(--text-dim);
   border-color: currentColor;
 }
 

@@ -18,6 +18,12 @@
 字段形状的**校验与落地**收口在 ``core.bus.reconcile_register()`` 一处（API 层只
 负责翻译错误码，不自己拼 job）；读面纪律不变：调度器 / 状态表读不到 ⇒ 相应字段
 留空并把「为什么」放进 scheduler_status，**绝不把读失败装成「没有任务」**。
+
+2026-11-16（bus_inprocess_pure_code）：任务的**执行方式**从「argv 列表 + 起子
+进程」扩成**双形态**——``func``（``"模块:可调用"``，**同进程**调用，新形态）与
+``cmd``（旧形态，**保留兼容**：编辑面兜底、老任务继续能注册）。读面**两个字段
+都在**（``cmd`` / ``func``，缺的那个是空值），既有字段一个都没删 —— 前端按
+「哪个非空」判形态。
 """
 
 from __future__ import annotations
@@ -55,8 +61,14 @@ _JOB_ID_MSG = ("job_id 应是本包班车 id（形如 ks-distill；"
 class CronRegisterBody(BaseModel):
     """``POST /api/v1/crons`` 的请求体（新建一条定时任务）。
 
-    ``cmd`` 是**字符串列表**（每元素一条命令要素，如 ["/bin/sh", "/path/x.sh"]）——
-    与执行体一直以来的 argv 口径一致（shell=False，不拼串）。
+    **执行方式二选一**（一条班车只认一种）：
+
+    * ``func`` —— ``"模块:可调用"`` 字符串（如
+      ``"keepsake.buses.distill:run"``）—— **同进程**调用（2026-11-16 新形态）；
+    * ``cmd`` —— **字符串列表**（每元素一条命令要素，如 ["/bin/sh", "/path/x.sh"]）——
+      与老执行体一直以来的 argv 口径一致（shell=False，不拼串），**保留兼容**。
+
+    两个都空 ⇒ 后端 400（执行方式不能空）；两个都给 ⇒ 后端 400（二选一）。
     """
 
     confirm: bool = False
@@ -64,6 +76,7 @@ class CronRegisterBody(BaseModel):
     name: str = ""
     schedule: str = ""
     cmd: List[str] = Field(default_factory=list)
+    func: str = ""
     timeout: int = 0
 
 
@@ -71,22 +84,29 @@ class CronEditBody(BaseModel):
     """``POST /api/v1/crons/{id}/edit`` 的请求体（全字段）。
 
     没传的字段**沿用现值**（不传的字段一律不改动）—— 改调度与改命令可以分开做。
+
+    执行方式同理：**传了哪个就切到哪个**（传 ``func`` ⇒ 清掉旧 cmd，
+    传 ``cmd`` ⇒ 清掉旧 func；两个都不传 ⇒ 沿用现值）。
     """
 
     confirm: bool = False
     name: Optional[str] = None
     schedule: Optional[str] = None
     cmd: Optional[List[str]] = None
+    func: Optional[str] = None
     timeout: Optional[int] = None
 
 
 class CronJobView(CronJob):
-    """读面的一行：在既有字段之外补上**规格**（cmd / timeout）。
+    """读面的一行：在既有字段之外补上**规格**（cmd / func / timeout）。
 
     编辑对话框要拿现值回填 —— 前端不许自己另存一份（那必然与调度器漂移）。
+    ``cmd`` 是旧形态的规格、``func`` 是新形态的规格，**两个都在**（缺的那个是
+    空值）—— 前端按「哪个非空」判执行方式，不用猜。
     """
 
     cmd: List[str] = Field(default_factory=list)
+    func: str = ""
     timeout: int = 0
 
 
@@ -188,13 +208,20 @@ def list_crons(
 
 
 def _view_of(spec: Dict[str, Any], enabled: bool, nxt, st: Dict[str, Any]) -> CronJobView:
-    """一条任务 → 读面的一行（规格 + 调度态 + 上次结果）。"""
+    """一条任务 → 读面的一行（规格 + 调度态 + 上次结果）。
+
+    **双形态**都透传：``cmd``（旧形态 argv 列表）与 ``func``（新形态 "模块:函数"）
+    —— 缺的补空，**既有字段一个都不删**（``script`` 仍旧是「脚本路径」，新形态
+    退成函数引用，页面据此渲染「代码班车」徽标）。
+    """
     cmd = list(spec.get("cmd") or [])
+    func = str(spec.get("func") or "")
     return CronJobView(
         name=spec.get("name") or spec.get("id", ""),
-        script=str(cmd[-1]) if cmd else "",
+        script=str(cmd[-1]) if cmd else func,
         schedule=spec.get("schedule", ""),
         cmd=cmd,
+        func=func,
         timeout=int(spec.get("timeout") or 0),
         enabled=enabled,
         last_run_at=st.get("ran_at"),
@@ -236,7 +263,7 @@ def create_cron(body: CronRegisterBody) -> Dict[str, Any]:
         _reject(409, "job_exists",
                 f"任务 {jid} 已存在（要改它请走「编辑」）", act, jid)
     spec = {"id": jid, "name": body.name, "schedule": body.schedule,
-            "cmd": body.cmd, "timeout": body.timeout}
+            "cmd": body.cmd, "func": body.func, "timeout": body.timeout}
     job_def = _register_or_reject(sch, spec, act, jid)
     # 新建 = 撤销墓碑（删过的同一个 id 可以重新添加；墓碑挡的是「自动复活」）
     try:
@@ -246,7 +273,7 @@ def create_cron(body: CronRegisterBody) -> Dict[str, Any]:
         audit.record(act, jid, ok=True,
                      reason=f"撤销墓碑失败（不影响本次新建）: {type(e).__name__}")
     audit.record(act, jid, ok=True,
-                 reason=f"schedule={job_def['schedule']}; cmd={len(job_def['cmd'])}项")
+                 reason=f"schedule={job_def['schedule']}; {_how_reason(job_def)}")
     return {"ok": True, "job_id": jid, "action": "create",
             "cli_output": f"定时任务 {jid} 已创建（下次执行按新调度）。"}
 
@@ -350,16 +377,33 @@ def edit_cron(job_id: str, body: CronEditBody) -> Dict[str, Any]:
         "id": jid,
         "name": cur.get("name") if body.name is None else body.name,
         "schedule": cur.get("schedule") if body.schedule is None else body.schedule,
-        "cmd": cur.get("cmd") if body.cmd is None else body.cmd,
         "timeout": cur.get("timeout") if body.timeout is None else body.timeout,
     }
+    # 执行方式：**传了哪个就切到哪个**（不传的沿用现值）——
+    # 切到 func ⇒ 清掉旧 cmd，切到 cmd ⇒ 清掉旧 func（一条班车只认一种方式，
+    # 两个都留着会被后端的「二选一」闸门拒掉）。
+    if body.func is not None:
+        spec["func"] = body.func
+        spec["cmd"] = []
+    elif body.cmd is not None:
+        spec["cmd"] = body.cmd
+        spec["func"] = ""
+    else:
+        spec["cmd"] = cur.get("cmd") or []
+        spec["func"] = cur.get("func") or ""
     job_def = _register_or_reject(sch, spec, act, jid)
     for jd in bus.BUS_JOBS:           # 定义面与调度面同一本账（进程内）
         if jd["id"] == jid:
             jd.update({"name": job_def["name"], "schedule": job_def["schedule"],
-                       "cmd": list(job_def["cmd"]), "timeout": job_def["timeout"]})
+                       "timeout": job_def["timeout"]})
+            if job_def.get("func"):
+                jd["func"] = job_def["func"]
+                jd.pop("cmd", None)
+            else:
+                jd["cmd"] = list(job_def.get("cmd") or [])
+                jd.pop("func", None)
     audit.record(act, jid, ok=True,
-                 reason=f"schedule={job_def['schedule']}; cmd={len(job_def['cmd'])}项; "
+                 reason=f"schedule={job_def['schedule']}; {_how_reason(job_def)}; "
                         f"timeout={job_def['timeout']}; name={job_def['name']}")
     return {"ok": True, "job_id": jid, "action": "edit",
             "cli_output": f"定时任务 {jid} 已更新（调度：{job_def['schedule']}）。"}
@@ -387,6 +431,13 @@ def trigger_cron(job_id: str, body: CronActionBody) -> Dict[str, Any]:
     audit.record(act, jid, ok=True, reason="一次性触发")
     return {"ok": True, "job_id": jid, "action": "trigger",
             "cli_output": f"定时任务 {jid} 已排入立即执行（跑完即消失）。"}
+
+
+def _how_reason(job_def: Dict[str, Any]) -> str:
+    """审计理由里的「执行方式」一段（新旧两形态各一句人话）。"""
+    if job_def.get("func"):
+        return f"func={job_def['func']}"
+    return f"cmd={len(job_def.get('cmd') or [])}项"
 
 
 def _register_or_reject(sch, spec: Dict[str, Any], act: str, jid: str) -> Dict[str, Any]:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -38,6 +39,41 @@ from .shared import (
 logger = logging.getLogger("keepsake.storage")
 
 DEFAULT_KEEPSAKE_CONFIG = str(Path.home() / ".config" / "keepsake" / "config.json")
+
+#: 配置路径的环境变量（既有键，provider / 控制台 / 班车共用一份口径）。
+CONFIG_PATH_ENV = "KEEPSAKE_CONFIG"
+
+
+def config_path() -> Path:
+    """本进程实际读取的 ``config.json`` 路径（``KEEPSAKE_CONFIG`` > 默认路径）。
+
+    **单点口径**：provider / 控制台 / 班车（``keepsake.buses``）都走这里 ——
+    读写两端各写一份 env 判断，迟早出现「写的是 A 文件、班车读的是 B 文件」。
+    """
+    return Path(os.environ.get(CONFIG_PATH_ENV) or DEFAULT_KEEPSAKE_CONFIG).expanduser()
+
+
+def load_config(path: Optional[str] = None) -> Dict[str, Any]:
+    """读**整份** config.json。
+
+    * 文件不存在 ⇒ 空 dict（缺省配置）；
+    * 文件坏了 / 读不了 ⇒ 抛 ``ValueError``（**不静默当缺省**：配置坏了还按
+      缺省跑 = 班车按另一套阈值干活，比报错危险得多）。
+    """
+    path = Path(path or config_path())
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise ValueError(f"配置文件读不了: {path}（{type(e).__name__}: {e}）") from e
+    try:
+        cfg = _json.loads(raw) if raw.strip() else {}
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"配置文件不是合法 JSON: {path}（{e}）") from e
+    if not isinstance(cfg, dict):
+        raise ValueError(f"配置文件根节点必须是 JSON 对象: {path}")
+    return cfg
 
 # ---- 后端选择（2026-11：redis 已移除，见模块 docstring 的契约） ----
 BACKEND_POSTGRES = "postgres"

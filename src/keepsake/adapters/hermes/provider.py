@@ -610,8 +610,14 @@ def config_path() -> Path:
 
     控制台的预算设置端点写的就是这个文件 —— 读写两端必须同一条解析规则，
     各写一份 env 判断迟早变成「改了却不生效」。
+
+    🔴 2026-11-16（bus_inprocess_pure_code）：实现**委托给**
+    ``core.factory.config_path()`` —— 班车（``keepsake.buses``）也走那一份，
+    两边各写一份 env 判断迟早分叉（写的是 A 文件、班车读的是 B 文件）。
     """
-    return Path(os.environ.get("KEEPSAKE_CONFIG") or _DEFAULT_CONFIG_PATH).expanduser()
+    from ...core.factory import config_path as _factory_config_path
+
+    return _factory_config_path()
 
 
 def _core_budget() -> int:

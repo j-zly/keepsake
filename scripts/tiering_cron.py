@@ -26,10 +26,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from keepsake.core.tiering import (  # noqa: E402 —— 路径补齐后才能 import
-    resolve_tiering,
-    run_tiering,
-)
+from keepsake.buses.tiering import run_round  # noqa: E402 —— 路径补齐后才能 import
 
 __all__ = ["load_config", "main"]
 
@@ -67,18 +64,10 @@ def main(argv: Any = None) -> int:
     dry_run = bool(args.dry)
 
     cfg = load_config()
-    tiering = resolve_tiering(cfg)
-    if not tiering["enabled"]:
-        # 缺省关死：两条都干净退出，cron 不红（照 spec）
-        print(json.dumps({"skipped": "disabled", "dry_run": dry_run,
-                          "reason": "tiering.enabled=false"}, ensure_ascii=False))
-        return 0
-
-    from keepsake.storage import storage_from_config
-
-    # 同一份 cfg 交给存储层构造（少一次读盘，也保证班车与检索看的是同一个库）
-    storage = storage_from_config(config=cfg)
-    stats = run_tiering(storage, cfg, dry_run=dry_run)
+    # 一轮分级跑在哪：**只有一份实现**（`keepsake.buses.tiering.run_round`）——
+    # 本脚本是**手跑入口**，in-process 班车（`keepsake.buses.tiering:run`）调的是
+    # 同一份。两处各养一套阈值口径，迟早分叉（脚本按一套、班车按另一套）。
+    stats = run_round(dry_run=dry_run, cfg=cfg)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     return 0
 

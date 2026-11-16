@@ -1360,6 +1360,9 @@ has been dormant since).
 Ops notes:
 - Bus definitions live in code (`BUS_JOBS`), by design — adding/removing a bus is a
   reviewed change, not a runtime button. The panel can pause / resume / reschedule.
+- Buses are registered as **functions** (`"keepsake.buses.<name>:run"`, called in the
+  console process — no shell wrapper, no interpreter to pin); the old `cmd` (argv)
+  form is still accepted so existing / external tasks keep working.
 - The scheduler dies with the console service: keep it under a supervisor
   (`Restart=always`). Missed ticks coalesce into one run within a 1 h grace window.
 - Nothing else changed in the public API surface; the old host-cron bridge and the
