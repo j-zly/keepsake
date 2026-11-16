@@ -2,7 +2,7 @@
   <div>
     <div class="page-head">
       <h1 class="page-title">记忆维护</h1>
-      <p class="page-sub">合并重复的记忆条目、遗忘过期条目；dry-run 零写入，实跑要手输当前计数。合并与遗忘每 2 小时自动跑一轮。</p>
+      <p class="page-sub">合并重复的记忆条目、遗忘过期条目。</p>
     </div>
 
     <div v-if="error" class="banner banner--danger">{{ error }}</div>
@@ -125,33 +125,44 @@
       </p>
     </div>
 
-    <!-- 危险操作区：合并 / 遗忘 / 分级班车 —— 收进一张卡（脚注在上，按钮行在中，
-         结果块贴底）；安全要点在按钮文案（dry-run / 实跑）与确认弹框里都写着。 -->
-    <div class="panel ops-card">
-      <p class="src foot-note foot-note--lead">
-        dry-run 零写入，可放心点；实跑必须手输当前计数，且会先自动备份受影响记忆条目。
-      </p>
-      <!-- 自动班车说明：讲清「合并/遗忘本来就每 2 小时自动跑一轮」，
-           这四个按钮是「不想等下一班」时的手动触发。样式沿用现有脚注类，不加卡片。 -->
-      <p class="src foot-note foot-note--lead">
-        合并与遗忘每 2 小时由维护班车自动执行<template v-if="maintLastRun">（上次自动运行 {{ maintLastRun }}）</template>；本页按钮用于不想等下一班时手动触发。
-      </p>
-      <div class="ops">
-        <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
-        <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
-        <span class="ops-gap"></span>
-        <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
-        <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
-        <span class="ops-gap"></span>
-        <el-button :disabled="!tStatus" @click="openTiering">
-          分级班车设置（{{ tStatus?.enabled ? '已开' : '默认关' }}）
-        </el-button>
+    <!-- 操作卡对：「合并/遗忘」执行区与「分级班车」配置区按对象分卡。
+         状态（自动频率/上次运行）升进卡头 meta 行；长说明从页面移除——
+         规则本体是设置弹框里的字段，开闸前提示收进弹框。 -->
+    <div class="ops-grid">
+      <div class="panel ops-card">
+        <div class="ops-head">
+          <h3 class="section-title">合并 · 遗忘</h3>
+          <p class="ops-meta">每 2 小时自动执行{{ maintLastRun ? ` · 上次 ${maintLastRun}` : '' }}</p>
+        </div>
+        <p class="foot-note foot-note--lead">实跑要手输上方计数，执行前自动备份受影响条目；dry-run 零写入，可放心点。</p>
+        <div class="ops-group">
+          <span class="ops-label">预览</span>
+          <div class="ops">
+            <el-button :loading="busy === 'merge-dry'" @click="runMerge(true)">合并 · dry-run</el-button>
+            <el-button :loading="busy === 'forget-dry'" @click="runForget(true)">遗忘 · dry-run</el-button>
+          </div>
+        </div>
+        <div class="ops-group">
+          <span class="ops-label">执行</span>
+          <div class="ops">
+            <el-button type="danger" :loading="busy === 'merge'" @click="runMerge(false)">合并 · 实跑</el-button>
+            <el-button type="danger" :loading="busy === 'forget'" @click="runForget(false)">遗忘 · 实跑</el-button>
+          </div>
+        </div>
+        <pre v-if="opResult" class="pre">{{ opResult }}</pre>
       </div>
-      <p class="src foot-note">
-        分级班车：每天 04:30 自动执行，跑三条规则（7 天窗 ≥ 3000 提名 / 提名后 7 天再 ≥ 5000 自动审核通过、否则自动驳回 / 预算吃紧提名退位）。
-        <b>缺省关死</b>——先用 <code>scripts/tiering_cron.py --dry</code> 人肉观察几天，看清 stats 再在这里开总开关。
-      </p>
-      <pre v-if="opResult" class="pre">{{ opResult }}</pre>
+
+      <div class="panel ops-card ops-card--tiering">
+        <div class="ops-head">
+          <h3 class="section-title">分级班车</h3>
+          <p class="ops-meta">每天 04:30 自动执行</p>
+        </div>
+        <p class="foot-note foot-note--lead">按召回与预算提名常驻层升降，最终生效走审核队列。</p>
+        <div class="tier-row">
+          <span class="chip" :class="tStatus?.enabled ? 'chip--ok' : ''">{{ tStatus?.enabled ? '已开' : '默认关' }}</span>
+          <el-button :disabled="!tStatus" @click="openTiering">设置</el-button>
+        </div>
+      </div>
     </div>
 
     <!--
@@ -201,7 +212,7 @@
         </el-form-item>
       </el-form>
       <p class="tip">
-        开关写的是 config.json 的 <code>tiering</code> 节（只动这一节、其余键与键序不变，写前整份备份）。
+        开总开关前建议先观察几天提名走势（关闭时班车不提名、不升降）。开关写的是 config.json 的 <code>tiering</code> 节（只动这一节、其余键与键序不变，写前整份备份）。
         手写的常驻条目（带 <code>memory</code> 标）永不被自动降，只进退居建议。
       </p>
       <template #footer>
@@ -608,6 +619,57 @@ async function saveTiering() {
 </script>
 
 <style scoped>
+/* 操作卡对网格：宽屏两列铺满、窄屏自动单列（右侧不留大片空白）。 */
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 20px;
+  margin-bottom: 20px;
+}
+.ops-grid .ops-card {
+  margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+/* 卡头：标题左、自动节奏/上次运行状态右（同一条基线，meta 用次要字色不跟脚注抢）。 */
+.ops-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.ops-meta {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+/* 预览 / 执行分组：组标题小字灰，组内按钮走既有 .ops 弹性行（nowrap 钮文字不碎排）。 */
+.ops-group {
+  margin-top: 12px;
+}
+.ops-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+/* 分级卡：chip + 设置按钮贴底（margin-top:auto），与左卡同高时基线一致。 */
+.ops-card--tiering .tier-row {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+}
+/* 「已开」状态 chip：绿字描边，零新色（--ok 令牌；关闭态退默认 chip）。 */
+.chip--ok {
+  color: var(--ok);
+  border-color: currentColor;
+}
+
 /* 操作区卡片：合并 / 遗忘 / 分级班车收进一张卡（脚注 → 按钮行 → 结果块）。 */
 .ops-card {
   padding: 20px;

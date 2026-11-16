@@ -81,7 +81,8 @@ test('A4 空状态是矮卡片 + 一句灰字', () => {
 })
 
 test('A5 页脚说明是 secondary 小字', () => {
-  assert.match(MAINT, /class="src foot-note/, '页脚说明挂 .foot-note')
+  // 2026-11-16 改版：脚注不再叠冗余 .src（与 .foot-note 同尺寸同色），断言钉类在而非类串顺序
+  assert.match(MAINT, /class="[^"]*foot-note/, '页脚说明挂 .foot-note')
   assert.match(MAINT_STYLE, /\.foot-note\s*\{[^}]*font-size:\s*12px/, '脚注 12px')
   assert.match(MAINT_STYLE, /\.foot-note\s*\{[^}]*var\(--text-faint\)/, '脚注走弱文字')
   // 原来那条 banner（蓝竖条，视觉很重）不许再回来抢正文
