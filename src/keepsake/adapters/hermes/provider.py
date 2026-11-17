@@ -29,16 +29,79 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
-try:
-    from agent.memory_provider import MemoryProvider
-    from tools.registry import tool_error
-except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agent 包导入
-    class MemoryProvider:
-        def __init__(self, *args, **kwargs):
-            pass
+# ---------------------------------------------------------------------------
+# 宿主符号导入（**拆分兜底**）—— 2026-11 provider_base_import_split
+#
+# 根因（主脑实证）：原先 `from agent.memory_provider import MemoryProvider` 与
+# `from tools.registry import tool_error` **同处一个 try** —— 后者因
+# tools.registry 内部依赖链抛 ImportError 时**连坐**前者，except 把官方基类
+# 降级成模块内假桩 ⇒ Hermes loader 的 `issubclass(官方 MemoryProvider)` 判
+# False ⇒ 「loaded but no provider instance found」。
+#
+# 修法：**两处各自独立 try/except**，互不牵连（顺序：先 agent 后 tools）。
+#   * agent 行失败 ⇒ 只降级基类（provider 可能装不上，但日志会吭声）；
+#   * tools 行失败 ⇒ 只降级 tool_error（基类仍是官方版 ⇒ provider 照常装载）。
+#
+# 🔴 降级**必须吭声**：任一处走降级路径都记一条 error（静默 = 坏一天没人看见）。
+# ---------------------------------------------------------------------------
 
-    def tool_error(msg):
-        return f"[tool_error] {msg}"
+#: 导入期兜底专用 logger（名字带适配器路径；模块主 logger 是 "keepsake"，
+#: 那个名字是对外钉死的观测口径，见下方 `logger` 定义，不在此处改动）。
+_adapter_logger = logging.getLogger("keepsake.adapter.hermes")
+
+
+def _import_host_symbols():
+    """导入 Hermes 宿主符号 → `(MemoryProvider, tool_error)`。
+
+    两个 import **各自独立 try/except**：任一行炸掉都不牵连另一行 ——
+    这正是本函数存在的唯一理由（原先同处一个 try ⇒ tools.registry 一炸，
+    连坐把官方基类打成假桩，provider 直接装不上）。
+
+    正常环境（Hermes 实际运行时）两行都成功 ⇒ 零降级、零日志。
+    """
+    try:
+        from agent.memory_provider import MemoryProvider
+    except ImportError as e:
+        _adapter_logger.error(
+            "keepsake adapter: %s 不可用，已走本地降级（provider 可能无法被 Hermes 装载）",
+            "agent.memory_provider.MemoryProvider",
+        )
+        _adapter_logger.debug("keepsake adapter: agent.memory_provider 导入异常: %s: %s",
+                              type(e).__name__, e)
+
+        class MemoryProvider:
+            """本地降级桩 —— 仅供独立测试环境。
+
+            ⚠️ Hermes 装载器按 `issubclass(官方 MemoryProvider)` 认 provider，
+            走这条路时装不上（这就是降级必须吭声的原因）。
+            """
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+    try:
+        from tools.registry import tool_error
+    except ImportError as e:
+        _adapter_logger.error(
+            "keepsake adapter: %s 不可用，已走本地降级（provider 可能无法被 Hermes 装载）",
+            "tools.registry.tool_error",
+        )
+        _adapter_logger.debug("keepsake adapter: tools.registry 导入异常: %s: %s"
+                              "（基类不受影响，provider 仍可被 Hermes 装载）",
+                              type(e).__name__, e)
+
+        def tool_error(msg):
+            """本地等价 stub —— 同签名（单参 `msg`）、同返回形状（字符串）。
+
+            行为照抄本模块原降级实现（`[tool_error] {msg}`）：调用面不变，
+            Hermes 侧只把它当「工具错误字符串」用。
+            """
+            return f"[tool_error] {msg}"
+
+    return MemoryProvider, tool_error
+
+
+MemoryProvider, tool_error = _import_host_symbols()
 
 from ...core.embedder import create_embedder, resolve_embedder_api_key
 from ...core.base import BackendUnsupportedError, StorageBase
