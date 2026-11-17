@@ -145,6 +145,12 @@ test('API 层：无裸 alert/confirm（提示统一走 utils/dialog）', () => {
   // StatsView 与 App.vue 都用了 showToast/showError 才是真
   assert.match(APP, /showToast|showError/,
                'App.vue 不需要 dialog 工具（侧栏徽标是只读），但若用了，必须走 utils/dialog')
-  assert.match(STATS, /from ['"]\.\.\/utils\/dialog['"]/,
-               'StatsView 错误提示必须走 utils/dialog（已有同款 import）')
+  // 看板（dashboard_bus_block_remove 之后）是纯只读面，一个提示都不弹：
+  // 红线是「不许裸 alert/confirm」，而不是「必须留着一个 dialog import」。
+  assert.doesNotMatch(STATS, /[^.\w](alert|confirm)\s*\(/,
+               '禁原生弹框（提示一律走 utils/dialog）')
+  if (/showToast|showError/.test(STATS)) {
+    assert.match(STATS, /from ['"]\.\.\/utils\/dialog['"]/,
+                 'StatsView 若要弹提示，必须走 utils/dialog')
+  }
 })
