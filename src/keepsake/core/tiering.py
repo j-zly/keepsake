@@ -577,7 +577,12 @@ def candidates_progress(
     hits: Dict[str, int] = dict(_hits_since_nomination(storage, auto_rows))
     manual_keys = [str(r.get("key")) for r in rows if nominated_on(r) is None]
     if manual_keys:
-        got, _ = _hits_by_key(storage, manual_keys, window_days=nom_window)
+        # 🔴 滚动窗锚点必须吃注入的 moment（2026-11-18 ks_date_landmine）：
+        # 此前漏传 ⇒ manual 分支数的是真实钟滚动窗，now 注入只保护了 auto 分支。
+        # 后果=测试按固定 NOW 写，跨过「NOW+窗口」那一刻起必红且永久红（生产上
+        # now=None ⇒ moment=真实 UTC now，语义与改前逐字相同，零行为变化）。
+        got, _ = _hits_by_key(storage, manual_keys, window_days=nom_window,
+                              since=moment - timedelta(days=nom_window))
         hits.update(got)
 
     items: List[Dict[str, Any]] = []
