@@ -13,11 +13,11 @@
 1. **执行体只调现成的运行手册，绝不内联重写业务逻辑**——班车是被反复打磨过的
    运行手册（tiering 的红报、distill 的窗口语义），调度器只管「何时跑、成没成」。
    2026-11-16（bus_inprocess_pure_code）：运行手册的本体收编进仓
-   （``keepsake.buses.*``），调度器**同进程**调它的 ``run()``；旧形态
-   （``cmd`` = argv 列表 + 起子进程）**保留兼容**（编辑面兜底）。
-2. **解释器钉死树外绝对路径**（/opt/keepsake-venv、/bin/sh），Hermes 安装树升级永远
-   够不着这里 —— 这条只对**旧形态（cmd）**成立：新形态（func）跑在本进程里，
-   压根不经过解释器。
+   （``keepsake.buses.*``），调度器**同进程**调它的 ``run()``。
+2. **执行方式只有一种**（2026-11-18 scheduler_cmd_mode_retire）：旧的 shell 形态
+   （argv 列表 + 起子进程）**整体退役**（迭代决策：迭代了就不要留着旧的）——
+   写面显式拒收、注册面拒注册、执行面 fail-closed、页面不再让用户选。
+   调度器**不再起子进程**（也就没有解释器路径可漂移了）。
 3. **调度器起不来只降级不抛穿**：PG 失联时 console 照常服务，crons 读面显示
    「调度器停止」，绝不为难页面（与 crons.py 的「读面不许 500」同源纪律）。
 
@@ -39,9 +39,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 import re
-import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -61,18 +59,16 @@ logger = logging.getLogger("keepsake.bus")
 #: 🔴 **id / schedule / timeout 逐字不动** —— 动 id 等于换一条车（墓碑都拦不住）。
 #:
 #: 2026-11-16 追加（bus_inprocess_pure_code）：**执行方式从壳脚本换成函数注册**
-#: （Quartz 的 JobType 式）：``cmd``（argv 列表 + 起子进程）换成 ``func``
+#: （Quartz 的 JobType 式）：argv 列表 + 起子进程换成 ``func``
 #: （``"模块:可调用"``，**同进程**调用）。壳脚本是 Hermes cron 时代的补丁
 #: （当时解释器环境不可控），现在调度器住 console 进程内，那个理由已消失。
 #: 四条班车的业务本体因此收编进仓（``keepsake.buses.*``）。
-#: 🔴 **cmd 形态仍然支持**（编辑面兜底：老任务 / 外部脚本继续能注册）。
 #:
-#: 迁移说明（**由主脑在生产侧执行，本包只负责种子**）：
-#: `_sync_jobs` 只补「store 里没有的 id」，**不覆盖已存在的任务**（保住暂停态），
-#: 所以现网 PG jobstore 里那四行还挂着旧 name / 旧 cmd —— 种子同步不会自己改。
-#: 主脑收编后需：清掉 PG jobstore 里这四条常驻行（**不留墓碑**）→ 重启 console
-#: → `_sync_jobs` 按新种子重建，name / func 即新值（不留墓碑 ⇒ 不影响
-#: 「删除永久生效」）。种子侧的重建口径由 tests/api/test_cron_manage.py 钉死。
+#: 2026-11-18 追加（scheduler_cmd_mode_retire）：旧的 shell 形态**整体退役**
+#: （迭代决策：迭代了就不要留着旧的）—— 存量核实：PG jobstore 现役四条
+#: （ks-tiering / ks-synonyms / ks-maintenance / ks-distill）**全部 func 形态，
+#: 旧形态零使用** ⇒ 无迁移负担，直接拆（写面拒收 / 注册面拒注册 / 执行面
+#: fail-closed / 页面不再让用户选）。四条种子**逐字不动**。
 BUS_JOBS: List[Dict[str, Any]] = [
     {
         "id": "ks-distill",
@@ -263,21 +259,15 @@ def _conninfo() -> str:
                pg["user"], pg.get("password", "")))
 
 
+#: 旧 shell 形态（argv 列表 + 起子进程）**已退役**（迭代决策）的统一话术 ——
+#: API 层点名拒收、注册面拒注册、执行面落 ok=False，三处**逐字同一句**
+#: （一把尺子：调用方按这句去改自己的契约，不许各处各编一套）。
+RETIRED_CMD_MSG = "shell 执行形态已退役（迭代决策），请用 func: 模块:函数"
+
+
 # --------------------------------------------------------------------------
 # 执行体（被 jobstore 序列化引用：必须是模块级函数，args 必须可持久化）
 # --------------------------------------------------------------------------
-
-def _workdir() -> Optional[str]:
-    """执行时的工作目录：生产恒为 /root（班车脚本都在那儿）。
-
-    ponytail: 硬写死 ``cwd="/root"`` 在非 root 账号下会直接 PermissionError ——
-    整条班车起不来（测试机 / 降级场景都踩过），而「脚本找不到」比「进程起不来」
-    好诊断得多。/root 不可用时退回进程 cwd（None = 不改工作目录）。
-    """
-    if os.path.isdir("/root") and os.access("/root", os.W_OK):
-        return "/root"
-    return None
-
 
 def _resolve_func(ref: str):
     """``"模块:可调用"`` → 可调用对象（importlib 解析）。
@@ -302,11 +292,11 @@ def _run_func(job_def: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     """in-process 跑一条班车 → ``(ok, 摘要, rc)``。
 
     契约：被调函数返回 ``(ok, 人读摘要)``（见 ``keepsake.buses`` 包头注）。
-    **异常照抛**（这里接住并转成 ok=False —— 落库口径与 cmd 形态逐字同构：
-    ok / rc / detail 三件套，一个字段都不多不少）。
+    **异常照抛**（这里接住并转成 ok=False —— 落库口径 ok / rc / detail
+    三件套，一个字段都不多不少）。
 
     超时口径：函数跑在**独立线程**里、主线程 ``join(timeout)`` —— 超时记
-    ok=False + rc=124（与 cmd 形态的 TimeoutExpired 同一口径）。
+    ok=False + rc=124。
     ponytail: 线程**杀不掉**（Python 没有安全的强杀），超时后那个线程仍会
     跑完 ⇒ 班车本体必须幂等（提炼 / 分级 / 同义都是幂等窗口语义）。
     """
@@ -343,15 +333,10 @@ def _run_func(job_def: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
 def _execute(job_def: Dict[str, Any]) -> None:
     """跑一条班车，结果落 ks_bus_state。
 
-    **双形态**（2026-11-16 bus_inprocess_pure_code）：
-
-    * ``func`` 形态（**新形态**）：``"模块:可调用"``，**同进程**调用 ——
-      调度器与业务同处 console 进程，不再起子进程；
-    * ``cmd`` 形态（**旧形态，保留兼容**）：argv 列表 + shell=False + 绝对
-      解释器（编辑面兜底：外部脚本、老任务继续能注册）。
-
-    两种形态落库的字段**逐字同构**（ok / rc / detail），执行记录页与维护页
-    读起来完全一样。
+    **只受理 func 形态**（2026-11-18 scheduler_cmd_mode_retire）：旧的 shell
+    形态（argv 列表 + 起子进程）**已退役** —— 调度器**不再起子进程**。
+    规格里没有 ``func`` ⇒ fail-closed：落 ok=False + 末行摘要点名退役，
+    **绝不猜**（也不静默当「跑成功但啥也没干」）。
 
     失败不抛（APScheduler 会把异常吞进 logger，值守看不见）；统一转成
     ok=False + 末行摘要，页面与排查看一张表就够。
@@ -366,18 +351,9 @@ def _execute(job_def: Dict[str, Any]) -> None:
         if job_def.get("func"):
             ok, detail, rc = _run_func(job_def)
         else:
-            p = subprocess.run(job_def["cmd"], capture_output=True, text=True,
-                               timeout=job_def.get("timeout", DEFAULT_TIMEOUT),
-                               shell=False, cwd=_workdir())
-            rc = p.returncode
-            ok = (rc == 0)
-            blob = (p.stdout if ok else (p.stderr or p.stdout)) or ""
-            lines = [ln for ln in blob.splitlines() if ln.strip()]
-            detail = (lines[-1] if lines else "")[:500]
-    except subprocess.TimeoutExpired:
-        detail = f"超时被杀（>{job_def.get('timeout', DEFAULT_TIMEOUT)}s）"
-    except OSError as e:
-        detail = f"起进程失败：{e.__class__.__name__}: {e}"[:500]
+            # 旧形态（或空规格）：**不执行**，点名退役（fail-closed）。
+            ok, rc = False, 1
+            detail = RETIRED_CMD_MSG
     except Exception as e:            # noqa: BLE001 —— func 形态的 import 失败等
         detail = f"跑失败：{e.__class__.__name__}: {e}"[:500]
     if not ok:
@@ -456,12 +432,34 @@ def shutdown() -> None:
         _sched = None
 
 
+def _refuse_retired_cmd_jobs(sch) -> None:
+    """jobstore 里**存量**的旧 shell 形态：拒执行 + ERROR 点名（fail-closed）。
+
+    理论上不该存在（现役四条全是 func 形态）—— 出现即**数据被外部写过**：
+    不猜、不迁移、不执行，直接停摆（暂停 ⇒ 不再发车）并打 ERROR 日志点名。
+    行留着不删（删是破坏性动作，得人来定），但**绝不执行**。
+    """
+    for job in list(sch.get_jobs()):
+        spec = job_spec(job)
+        if spec.get("func") or not spec.get("cmd"):
+            continue
+        logger.error("bus: 检出旧 shell 形态的存量任务 %s（%s）—— 拒执行、已停摆",
+                     job.id, RETIRED_CMD_MSG)
+        try:
+            sch.pause_job(job.id)
+        except Exception as e:        # noqa: BLE001 —— 停摆失败也不许放过它
+            logger.error("bus: 存量旧形态任务 %s 停摆失败: %s", job.id, type(e).__name__)
+
+
 def _sync_jobs(sch) -> None:
     """BUS_JOBS（**首次种子**）里缺的补建；已存在的一律不覆盖（保住页面上的暂停态
     与改过的调度）；**墓碑里的绝不补**（删过的任务重启不许复活）。
 
     🔴 墓碑读不出来 ⇒ **本轮一个都不补**（fail-closed）：宁可少建（页面少一行），
     也不把用户明确删掉的任务复活 —— 「删除必须永久生效」是产品红线。
+
+    🔴 存量里若有旧 shell 形态 ⇒ **拒执行 + ERROR 点名**（防复活闸，见
+    ``_refuse_retired_cmd_jobs``）：那不是本包写进去的形状，不猜、不迁移。
     """
     from apscheduler.triggers.cron import CronTrigger
     try:
@@ -469,6 +467,7 @@ def _sync_jobs(sch) -> None:
     except Exception as e:        # noqa: BLE001 —— 读不到墓碑 = 不敢补
         logger.error("bus: 墓碑表读不出来，本轮不补种子（宁可不建也不复活已删任务）: %s", e)
         return
+    _refuse_retired_cmd_jobs(sch)
     tz = getattr(sch, "timezone", None)
     for jd in BUS_JOBS:
         if jd["id"] in dead:
@@ -489,10 +488,10 @@ def reconcile_register(sch, spec: Dict[str, Any]) -> Dict[str, Any]:
       id       —— ``ks-`` 前缀形状（JOB_ID_RE，与 API 层同一把尺子）
       name     —— 非空（空则退回 id）
       schedule —— 五段 cron（valid_schedule 校验 + _to_aps_expr 归一）
-      执行方式 —— **cmd / func 二选一必填其一**（一条班车只认一种执行方式）：
-                   * ``func``：``"模块:可调用"`` 字符串，**必须可 import 且
-                     callable**（注册时就验 —— 存一条跑不起来的任务等于骗人）；
-                   * ``cmd``：字符串列表，逐元素非空（argv 列表，shell=False）。
+      执行方式 —— **只有 func 一种**（2026-11-18 scheduler_cmd_mode_retire：
+                   旧的 shell 形态已退役）：``func`` = ``"模块:可调用"`` 字符串，
+                   **必须可 import 且 callable**（注册时就验 —— 存一条跑不起来的
+                   任务等于骗人）。规格里若还带着旧形态字段 ⇒ 拒注册（点名退役）。
       timeout  —— 正整数秒
     misfire_grace / coalesce 一律取 ``SCHED_DEFAULTS``（单点口径：构造口径不许分叉）。
 
@@ -512,36 +511,26 @@ def reconcile_register(sch, spec: Dict[str, Any]) -> Dict[str, Any]:
         aps_expr = _to_aps_expr(schedule)  # 周字段里的 7 只认单独一个 → 这里抛
     except ValueError as e:
         raise JobSpecError("bad_schedule", f"{e}（例：30 4 * * *）") from e
+    if spec.get("cmd"):
+        # 🔴 旧 shell 形态**已退役**（迭代决策）：拒注册（fail-closed），点名。
+        raise JobSpecError("cmd_retired", RETIRED_CMD_MSG)
     func = spec.get("func")
-    cmd = spec.get("cmd")
     func_ref = func.strip() if isinstance(func, str) else ""
-    if func_ref and cmd:
+    if not func_ref:
         raise JobSpecError("bad_job_spec",
-                           "cmd 与 func 二选一（一条班车只认一种执行方式）")
-    if cmd is not None and not isinstance(cmd, list):
-        raise JobSpecError("bad_job_spec", "cmd 必须是非空的字符串列表（每行一条命令要素）")
-    if not func_ref and not cmd:
-        raise JobSpecError("bad_job_spec",
-                           "cmd 或 func 二选一必填其一（执行方式不能空）")
+                           "func 必填（执行方式只有 func：模块:函数）")
     timeout = spec.get("timeout")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobSpecError("bad_job_spec", "timeout 必须是正整数秒")
-    if func_ref:
-        # 🔴 func 必须**当场验**：能 import 且 callable —— 存一条跑不起来的
-        # 任务等于骗人（页面上看着有班车，到点一声不吭）。
-        try:
-            _resolve_func(func_ref)
-        except Exception as e:        # noqa: BLE001 —— 任何解析失败都回 4xx
-            raise JobSpecError("bad_job_spec",
-                               f"func 不可用（{type(e).__name__}: {e}）") from e
-        job_def = {"id": jid, "name": name, "schedule": schedule,
-                   "func": func_ref, "timeout": int(timeout)}
-    else:
-        cmd = [str(c) for c in cmd]
-        if not all(c.strip() for c in cmd):
-            raise JobSpecError("bad_job_spec", "cmd 里有空元素（每条命令要素都得非空）")
-        job_def = {"id": jid, "name": name, "schedule": schedule,
-                   "cmd": cmd, "timeout": int(timeout)}
+    # 🔴 func 必须**当场验**：能 import 且 callable —— 存一条跑不起来的
+    # 任务等于骗人（页面上看着有班车，到点一声不吭）。
+    try:
+        _resolve_func(func_ref)
+    except Exception as e:        # noqa: BLE001 —— 任何解析失败都回 4xx
+        raise JobSpecError("bad_job_spec",
+                           f"func 不可用（{type(e).__name__}: {e}）") from e
+    job_def = {"id": jid, "name": name, "schedule": schedule,
+               "func": func_ref, "timeout": int(timeout)}
 
     from apscheduler.triggers.cron import CronTrigger
     tz = getattr(sch, "timezone", None)
@@ -562,14 +551,15 @@ def reconcile_register(sch, spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def job_spec(job) -> Dict[str, Any]:
-    """调度器里的一个 job → 规格 dict（id/name/schedule/cmd/func/timeout）。
+    """调度器里的一个 job → 规格 dict（id/name/schedule/func/timeout）。
 
     规格藏在 ``job.args[0]``（注册时就把整份定义塞进去了）—— jobstore 序列化
     的就是它，重启后读回来的还是它。取不到就退成残缺规格（只有 id/name），
     页面照样显示一行，不许整页炸掉。
 
-    **双形态读回**：``cmd``（argv 列表）与 ``func``（"模块:可调用"）都认 ——
-    缺哪个补空（不补 0、不报错），编辑面据此回填当前执行方式。
+    **只认 func 形态**：``func``（"模块:可调用"）缺失补空串（不报错），
+    页面据此回填当前执行方式。存量里若还带着旧形态字段，本函数**原样留着**
+    （不静默抹掉）—— 由注册面 / 执行面点名拒收（fail-closed）。
     """
     spec: Dict[str, Any] = {}
     args = getattr(job, "args", None) or []
@@ -578,8 +568,6 @@ def job_spec(job) -> Dict[str, Any]:
     spec.setdefault("id", getattr(job, "id", ""))
     spec.setdefault("name", getattr(job, "name", "") or spec.get("id", ""))
     spec.setdefault("schedule", str(getattr(job, "trigger", "")))
-    if not isinstance(spec.get("cmd"), list):
-        spec["cmd"] = []
     if not isinstance(spec.get("func"), str):
         spec["func"] = ""
     if not isinstance(spec.get("timeout"), int):
@@ -594,7 +582,7 @@ def trigger_once(sch, spec: Dict[str, Any]) -> str:
     """投一次**立即执行**（一次性 DateTrigger）：不建常驻 job、跑完自动消失。
 
     走的是同一个执行包装（``_execute``）—— 「运行一次」与「按点跑」是同一份
-    代码路径（同一份 argv、同一个落库口径），不是另写一条捷径。
+    代码路径（同一份规格、同一个落库口径），不是另写一条捷径。
     返回这一次性 job 的 id（调试用）。
     """
     from uuid import uuid4

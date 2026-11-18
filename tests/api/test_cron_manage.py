@@ -1,10 +1,10 @@
 """记忆班车管理端点测试（v2.2.0 方案 C：APScheduler 内核，契约不变）。
 
 🔴 **绝不碰真实 PG / 真实班车**：调度器用 tmp_path 里的 sqlite jobstore；
-BUS_JOBS 被换成 echo/false 假命令；状态表写入用假 connect 捕获。
-上一代测试的 FakeCLI / argv 纪律系列随 subprocess 管理通道一起退役 ——
-但 argv 注入的担心并没有消失，只是搬进 core/bus.py 的执行体：那里同样
-有静态红线（shell=True 不许出现），本文件一并把关。
+BUS_JOBS 被换成假 func；状态表写入用假 connect 捕获。
+2026-11-18（scheduler_cmd_mode_retire）：旧的 shell 执行形态**整体退役** ——
+本文件里原先盖着「旧形态仍可注册」的那几条，**改成盖退役口径**：传了就
+400 点名拒收、注册面拒注册、执行面 fail-closed 落 ok=False。
 """
 
 from __future__ import annotations
@@ -134,21 +134,36 @@ def boom_run():
     raise RuntimeError("班车炸了（测试剧本）")
 
 
-#: 两个测试执行体的引用（注册面用）。
+#: 探针路径（模块级）：测试写入目标文件路径，执行体据此写文件 ——
+#: 证明「触发时跑的是**改完之后**的那条 func」。
+PROBE_PATH = {"path": ""}
+
+
+def probe_run():
+    """把探针路径写进文件（成功形态 + 落盘副作用）。"""
+    from pathlib import Path
+    p = PROBE_PATH.get("path") or ""
+    if p:
+        Path(p).write_text("probe", encoding="utf-8")
+    return True, "probe ok"
+
+
+#: 三个测试执行体的引用（注册面用）。
 FUNC_OK = f"{__name__}:ok_run"
 FUNC_BOOM = f"{__name__}:boom_run"
+FUNC_PROBE = f"{__name__}:probe_run"
 
 
 def _fake_jobs(tmp_path) -> List[dict]:
-    """夹具用的假班车表：**新形态（func）一条 + 旧形态（cmd）一条**。
+    """夹具用的假班车表：**两条 func 形态**的种子。
 
-    两种执行方式都要被种子同步走到 —— 只铺一种，另一条路的回归就没人盯了。
+    旧 shell 形态已退役（迭代决策）⇒ 种子侧只剩 func 一条路。
     """
     return [
         {"id": "ks-distill", "name": "记忆提炼", "schedule": "15 * * * *",
          "func": FUNC_OK, "timeout": 10},
         {"id": "ks-maintenance", "name": "合并 · 遗忘（维护）",
-         "schedule": "0 */2 * * *", "cmd": ["/bin/false"], "timeout": 10},
+         "schedule": "0 */2 * * *", "func": FUNC_BOOM, "timeout": 10},
     ]
 
 
@@ -315,6 +330,8 @@ def test_读面四字段契约与计数(client):
         assert set(j) >= {"name", "script", "schedule", "enabled",
                           "last_run_at", "last_status", "next_run", "job_id"}
         assert j["job_id"].startswith("ks-")
+        # 旧的 shell 形态已退役 ⇒ 读面不再回显那个字段
+        assert "cmd" not in j
 
 
 def test_读面带上次运行状态_成败都露(client, live_sched, monkeypatch, pg_stub):
@@ -347,7 +364,9 @@ def test_读面带上次运行状态_成败都露(client, live_sched, monkeypatc
 
 # ---------------------------------------------------------------- 执行体语义
 
-def test_execute_echo落ok_false落failed(monkeypatch, pg_stub):
+def test_execute_旧形态_不执行且落ok_false_点名退役(monkeypatch, pg_stub):
+    """🔴 旧的 shell 形态**已退役**：执行器不再起子进程 —— 规格里没有 func
+    ⇒ fail-closed：落 ok=False + 末行摘要**点名退役**（不静默当「跑成功」）。"""
     rows = []
 
     class _Conn:
@@ -360,14 +379,30 @@ def test_execute_echo落ok_false落failed(monkeypatch, pg_stub):
 
     monkeypatch.setattr(bus.psycopg, "connect", lambda *a, **k: _Conn())
     bus._execute({"id": "ks-a", "cmd": ["/bin/echo", "hi"], "timeout": 5})
-    bus._execute({"id": "ks-b", "cmd": ["/bin/false"], "timeout": 5})
-    bus._execute({"id": "ks-c", "cmd": ["/definitely/not/here"], "timeout": 5})
+    row = [r for r in rows if r[0] == "ks-a"][0]
+    assert row[1] is False and row[2] == 1
+    assert "退役" in (row[3] or ""), row[3]
+
+
+def test_execute_func形态_摘要与异常都入账(monkeypatch, pg_stub):
+    """func 形态：成功落摘要、异常落 ok=False（都不抛穿）。"""
+    rows = []
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            if params:
+                rows.append(params)
+            return type("C", (), {})()
+
+    monkeypatch.setattr(bus.psycopg, "connect", lambda *a, **k: _Conn())
+    bus._execute({"id": "ks-a", "func": FUNC_OK, "timeout": 5})
+    bus._execute({"id": "ks-b", "func": FUNC_BOOM, "timeout": 5})
     ok_a = [r for r in rows if r[0] == "ks-a"][0]
     ok_b = [r for r in rows if r[0] == "ks-b"][0]
-    ok_c = [r for r in rows if r[0] == "ks-c"][0]
-    assert ok_a[1] is True and ok_a[2] == 0 and ok_a[3] == "hi"
-    assert ok_b[1] is False and ok_b[2] == 1
-    assert ok_c[1] is False and "失败" in (ok_c[3] or "")   # 起进程异常也入账，不抛穿
+    assert ok_a[1] is True and ok_a[2] == 0 and ok_a[3] == "提炼 2 条，已写入 2 条"
+    assert ok_b[1] is False and ok_b[2] == 1 and "班车炸了" in (ok_b[3] or "")
 
 
 # ---------------------------------------------------------------- 静态红线
@@ -380,13 +415,16 @@ def test_grace_形状钉死_注册后job真带3600(client, live_sched):
     assert job.misfire_grace_time == 3600 and job.coalesce is True
 
 
-def test_静态判据_bus与crons不许shellTrue():
-    """执行体 subprocess 仍是 argv 列表 + shell=False 的红线（两文件一起把关）。"""
+def test_静态判据_执行器不再起子进程():
+    """🔴 旧的 shell 形态已退役 ⇒ 调度器**不再起子进程**（执行器里 subprocess 消失）。
+
+    这条比「shell=True 不许出现」更强：连 argv 列表那条路都不留了，
+    执行方式只剩 func（同进程调函数）。
+    """
     import inspect
     for mod in (cron_router, bus):
-        src = inspect.getsource(mod)
-        assert "shell=True" not in src, mod.__name__
-        assert "shell" not in src or "shell=False" in src or mod is cron_router
+        assert "shell=True" not in inspect.getsource(mod), mod.__name__
+    assert "subprocess" not in inspect.getsource(bus), "执行器还在起子进程"
 
 
 # ---------------------------------------------------------------- 数据驱动（scheduler_page_v2）
@@ -399,7 +437,7 @@ def test_新建任务_列表可见(client, live_sched):
     """新建 ⇒ 落调度器 ⇒ 读面看得见（规格逐字回显）。"""
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-newbie", "name": "新任务",
-        "schedule": "*/10 * * * *", "cmd": ["/bin/echo", "hi"], "timeout": 30},
+        "schedule": "*/10 * * * *", "func": FUNC_OK, "timeout": 30},
         headers=AUTH)
     assert r.status_code == 200, r.text
     assert live_sched.get_job("ks-newbie") is not None
@@ -407,14 +445,14 @@ def test_新建任务_列表可见(client, live_sched):
     row = [j for j in body["jobs"] if j["job_id"] == "ks-newbie"][0]
     assert row["name"] == "新任务"
     assert row["schedule"] == "*/10 * * * *"
-    assert row["cmd"] == ["/bin/echo", "hi"] and row["timeout"] == 30
+    assert row["func"] == FUNC_OK and row["timeout"] == 30
     assert row["enabled"] is True
 
 
 def test_新建_id撞车_409(client, live_sched):
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-distill", "name": "撞车",
-        "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": 10}, headers=AUTH)
+        "schedule": "0 4 * * *", "func": FUNC_OK, "timeout": 10}, headers=AUTH)
     assert r.status_code == 409
     assert r.json()["detail"]["error"] == "job_exists"
 
@@ -448,25 +486,29 @@ def test_新建同id_撤墓碑_可重新添加(client, live_sched, fake_pg):
     assert "ks-distill" in fake_pg.tombstones
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-distill", "name": "再来一次",
-        "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": 10}, headers=AUTH)
+        "schedule": "0 4 * * *", "func": FUNC_OK, "timeout": 10}, headers=AUTH)
     assert r.status_code == 200, r.text
     assert "ks-distill" not in fake_pg.tombstones
 
 
-def test_edit改cmd_下次触发用新命令(client, live_sched, tmp_path):
-    """改完 cmd，下一次触发跑的是**新命令**（echo 探针写文件为证）。"""
+def test_edit改func_下次触发跑的是新func(client, live_sched, tmp_path):
+    """改完 func 引用，下一次触发跑的是**新引用**（探针文件为证）。"""
     probe = tmp_path / "probe.txt"
-    r = client.post("/api/v1/crons/ks-distill/edit", json={
-        "confirm": True, "cmd": ["/bin/sh", "-c", f"echo probe > {probe}"]}, headers=AUTH)
-    assert r.status_code == 200, r.text
-    live_sched.resume()                       # 夹具默认 paused（不真发车）
-    t = client.post("/api/v1/crons/ks-distill/trigger", json={"confirm": True}, headers=AUTH)
-    assert t.status_code == 200, t.text
-    deadline = time.time() + 20
-    while time.time() < deadline and not probe.exists():
-        time.sleep(0.2)
-    assert probe.exists(), "触发后应跑新命令（探针文件没出现）"
-    assert probe.read_text(encoding="utf-8").strip() == "probe"
+    PROBE_PATH["path"] = str(probe)
+    try:
+        r = client.post("/api/v1/crons/ks-distill/edit", json={
+            "confirm": True, "func": FUNC_PROBE}, headers=AUTH)
+        assert r.status_code == 200, r.text
+        live_sched.resume()                       # 夹具默认 paused（不真发车）
+        t = client.post("/api/v1/crons/ks-distill/trigger", json={"confirm": True}, headers=AUTH)
+        assert t.status_code == 200, t.text
+        deadline = time.time() + 20
+        while time.time() < deadline and not probe.exists():
+            time.sleep(0.2)
+        assert probe.exists(), "触发后应跑新 func（探针文件没出现）"
+        assert probe.read_text(encoding="utf-8").strip() == "probe"
+    finally:
+        PROBE_PATH["path"] = ""
 
 
 def test_trigger_落状态且常驻任务数不增(client, live_sched, fake_pg):
@@ -511,14 +553,16 @@ def test_执行记录_近10次只读(client, live_sched, fake_pg):
 
 
 @pytest.mark.parametrize("payload", [
-    {"id": "nope", "name": "x", "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": 10},
-    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "cmd": "echo hi", "timeout": 10},
-    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": 0},
-    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": -5},
-    {"id": "ks-bad", "name": "x", "schedule": "不是 cron", "cmd": ["/bin/echo"], "timeout": 10},
+    {"id": "nope", "name": "x", "schedule": "0 4 * * *", "func": FUNC_OK, "timeout": 10},
+    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "func": "", "timeout": 10},
+    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "func": "no.such.module:run", "timeout": 10},
+    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "func": FUNC_OK, "timeout": 0},
+    {"id": "ks-bad", "name": "x", "schedule": "0 4 * * *", "func": FUNC_OK, "timeout": -5},
+    {"id": "ks-bad", "name": "x", "schedule": "不是 cron", "func": FUNC_OK, "timeout": 10},
 ])
 def test_非法形状_全4xx(client, live_sched, payload):
-    """形状不合法（没 ks- 前缀 / cmd 非列表 / timeout 非正 / 表达式非法）⇒ 全 4xx。"""
+    """形状不合法（没 ks- 前缀 / func 缺失 / func 不可 import / timeout 非正 /
+    表达式非法）⇒ 全 4xx。"""
     r = client.post("/api/v1/crons", json={"confirm": True, **payload}, headers=AUTH)
     assert 400 <= r.status_code < 500, (payload, r.status_code, r.text)
     assert live_sched.get_job("ks-bad") is None
@@ -527,13 +571,13 @@ def test_非法形状_全4xx(client, live_sched, payload):
 def test_新建缺confirm_400(client, live_sched):
     r = client.post("/api/v1/crons", json={
         "id": "ks-nc", "name": "x", "schedule": "0 4 * * *",
-        "cmd": ["/bin/echo"], "timeout": 10}, headers=AUTH)
+        "func": FUNC_OK, "timeout": 10}, headers=AUTH)
     assert r.status_code == 400 and r.json()["detail"]["error"] == "confirm_required"
 
 
 # ---------------------------------------------------------------- 种子更名（scheduler_page_ui_fix）
 #
-# 四条班车的 name 统一成中文（页面可见文案）；id / schedule / cmd / timeout 逐字不动。
+# 四条班车的 name 统一成中文（页面可见文案）；id / schedule / func / timeout 逐字不动。
 # 🔴 种子同步**不覆盖已存在的任务**（保住暂停态）⇒ 现网 jobstore 里那四行还挂着旧名，
 # 要等主脑清掉那四行（不留墓碑）再重启 console，_sync_jobs 才按新种子重建。
 # 本节钉的是**种子侧**的口径：重建出来的 name 必须是新值。
@@ -556,6 +600,25 @@ def test_种子重建后_name是中文新值(live_sched, monkeypatch):
         "ks-tiering": "记忆分级班车",
         "ks-synonyms": "同义词总线",
     }
+
+
+def test_现役四条_重启重建后func与调度逐字不变(live_sched, monkeypatch):
+    """🔴 红线：func 形态与**现役四条**（ks-distill / ks-maintenance /
+    ks-tiering / ks-synonyms）行为零变化 —— 重启调度后仍照常注册，且
+    func / schedule / timeout 逐字不动（动 id = 换一条车）。"""
+    monkeypatch.setattr(bus, "BUS_JOBS", REAL_BUS_JOBS)
+    for jd in REAL_BUS_JOBS:
+        if live_sched.get_job(jd["id"]) is not None:
+            live_sched.remove_job(jd["id"])
+    bus._sync_jobs(live_sched)
+    for jd in REAL_BUS_JOBS:
+        job = live_sched.get_job(jd["id"])
+        assert job is not None, jd["id"]
+        assert job.next_run_time is not None, jd["id"]
+        spec = bus.job_spec(job)
+        assert spec["func"] == jd["func"], jd["id"]
+        assert spec["schedule"] == jd["schedule"], jd["id"]
+        assert spec["timeout"] == jd["timeout"], jd["id"]
 
 
 def test_种子更名只动name_其余字段逐字不动():
@@ -630,7 +693,7 @@ def test_存量job无timeout_编辑面补1800不补0(client, live_sched):
 
     # 往 jobstore 塞一条**没有 timeout 字段**的存量 job（老形状）
     legacy_spec = {"id": "ks-legacy", "name": "存量任务",
-                   "schedule": "0 4 * * *", "cmd": ["/bin/echo", "hi"]}
+                   "schedule": "0 4 * * *", "func": FUNC_OK}
     live_sched.add_job(bus._execute, CronTrigger.from_crontab("0 4 * * *"),
                         args=[legacy_spec], id="ks-legacy", name="存量任务")
 
@@ -662,9 +725,10 @@ def test_timeout默认值单点定义():
 # ---------------------------------------------------------------- func 形态（in-process）
 #
 # 2026-11-16 bus_inprocess_pure_code：执行方式从「argv 列表 + 起子进程」扩成
-# **双形态**——``func``（"模块:可调用"，同进程调用）与 ``cmd``（旧形态，保留兼容）。
+# **双形态**；2026-11-18 scheduler_cmd_mode_retire：旧的 shell 形态**整体退役**
+# （迭代决策：迭代了就不要留着旧的）⇒ 执行方式只剩 func 一种。
 # 本节钉的是 func 形态的四件事：**注册即验**（不可 import ⇒ 4xx）、**跑完落摘要**
-# （detail = run() 的第二个返回值）、**抛异常落 ok=False**、**旧形态仍可注册**。
+# （detail = run() 的第二个返回值）、**抛异常落 ok=False**、**旧形态拒收**。
 
 def test_func形态_注册即验importable_不可import即4xx(client, live_sched):
     """🔴 注册时就验：func 指向的模块 / 属性不存在 ⇒ 4xx（不许存一条跑不起来的任务）。"""
@@ -679,7 +743,7 @@ def test_func形态_注册即验importable_不可import即4xx(client, live_sched
 
 
 def test_func形态_注册成功且读面回显func(client, live_sched):
-    """func 形态注册 ⇒ 读面回显 func，cmd 为空（旧形态字段照旧在，只是空）。"""
+    """func 形态注册 ⇒ 读面回显 func（旧的 shell 字段已退役，不再回显）。"""
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-funcjob", "name": "函数班车",
         "schedule": "*/10 * * * *", "func": FUNC_OK, "timeout": 30}, headers=AUTH)
@@ -688,7 +752,7 @@ def test_func形态_注册成功且读面回显func(client, live_sched):
     row = [j for j in client.get("/api/v1/crons", headers=AUTH).json()["jobs"]
            if j["job_id"] == "ks-funcjob"][0]
     assert row["func"] == FUNC_OK
-    assert row["cmd"] == []
+    assert "cmd" not in row
     assert row["timeout"] == 30
 
 
@@ -728,37 +792,80 @@ def test_func形态_抛异常落ok_false(client, live_sched, fake_pg):
     assert "班车炸了" in (st["detail"] or "")
 
 
-def test_旧cmd形态仍可注册_兼容面(client, live_sched):
-    """旧形态（cmd 列表）**保留兼容**：编辑面兜底、老任务继续能注册。"""
+def test_旧形态_400拒收_不静默忽略(client, live_sched):
+    """🔴 旧的 shell 形态**已退役**（迭代决策）：写面**显式拒收** —— 400 点名，
+    不收下、也不静默忽略（对齐 AgentHub 代理节点参数退役的同口径）。"""
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-oldcmd", "name": "老壳班车",
         "schedule": "*/10 * * * *", "cmd": ["/bin/echo", "hi"], "timeout": 30},
         headers=AUTH)
-    assert r.status_code == 200, r.text
-    row = [j for j in client.get("/api/v1/crons", headers=AUTH).json()["jobs"]
-           if j["job_id"] == "ks-oldcmd"][0]
-    assert row["cmd"] == ["/bin/echo", "hi"]
-    assert row["func"] == ""
+    assert r.status_code == 400, r.text
+    d = r.json()["detail"]
+    assert d["error"] == "cmd_retired"
+    assert "退役" in d["message"] and "func" in d["message"]
+    assert live_sched.get_job("ks-oldcmd") is None
+    assert "ks-oldcmd" not in {j["job_id"] for j in
+                                client.get("/api/v1/crons", headers=AUTH).json()["jobs"]}
 
 
-def test_cmd与func都给_4xx(client, live_sched):
-    """执行方式**二选一**：两个都给 ⇒ 4xx（一条班车只认一种执行方式）。"""
+def test_旧形态与func都给_同样400拒收(client, live_sched):
+    """旧的 shell 形态 + func 一起给 ⇒ 同样 400 点名（先点名退役，不猜优先级）。"""
     r = client.post("/api/v1/crons", json={
         "confirm": True, "id": "ks-both", "name": "x", "schedule": "0 4 * * *",
         "cmd": ["/bin/echo"], "func": FUNC_OK, "timeout": 10}, headers=AUTH)
-    assert 400 <= r.status_code < 500, r.text
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == "cmd_retired"
     assert live_sched.get_job("ks-both") is None
 
 
-def test_编辑可切换执行方式(client, live_sched):
-    """编辑面：传 func ⇒ 切到 func 形态（旧 cmd 清掉）；传 cmd ⇒ 切回旧形态。"""
-    r = client.post("/api/v1/crons/ks-distill/edit",
-                    json={"confirm": True, "func": FUNC_OK}, headers=AUTH)
-    assert r.status_code == 200, r.text
-    stored = bus.job_spec(live_sched.get_job("ks-distill"))
-    assert stored["func"] == FUNC_OK and stored["cmd"] == []
+def test_编辑传旧形态_400拒收(client, live_sched):
+    """编辑面同样拒收旧形态（改调度的人不该顺手把退休形态写回来）。"""
     r = client.post("/api/v1/crons/ks-distill/edit",
                     json={"confirm": True, "cmd": ["/bin/echo", "hi"]}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"] == "cmd_retired"
+
+
+def test_注册面_旧形态_拒注册(live_sched):
+    """🔴 防复活闸（注册面）：规格里带旧形态 ⇒ 拒注册（点名退役），不落 job。"""
+    from keepsake.core.bus import JobSpecError
+    with pytest.raises(JobSpecError) as ei:
+        bus.reconcile_register(live_sched, {
+            "id": "ks-cmdjob", "name": "老壳班车", "schedule": "0 4 * * *",
+            "cmd": ["/bin/echo"], "timeout": 10})
+    assert ei.value.error == "cmd_retired"
+    assert "退役" in str(ei.value)
+    assert live_sched.get_job("ks-cmdjob") is None
+
+
+def test_加载面_存量旧形态_拒执行并ERROR点名(live_sched, caplog):
+    """🔴 防复活闸（加载面）：jobstore 里出现旧形态 ⇒ 停摆（不再发车）+ 日志点名。
+
+    理论上不该存在（现役四条全是 func 形态）—— 出现即数据被外部写过：
+    fail-closed，不猜、不迁移、不执行。
+    """
+    import logging
+    from apscheduler.triggers.cron import CronTrigger
+    legacy = {"id": "ks-legacycmd", "name": "老壳班车",
+              "schedule": "0 4 * * *", "cmd": ["/bin/echo"], "timeout": 10}
+    live_sched.add_job(bus._execute, CronTrigger.from_crontab("0 4 * * *"),
+                        args=[legacy], id="ks-legacycmd", name="老壳班车")
+    with caplog.at_level(logging.ERROR, logger="keepsake.bus"):
+        bus._sync_jobs(live_sched)
+    assert live_sched.get_job("ks-legacycmd").next_run_time is None, "旧形态仍在排班"
+    assert any("ks-legacycmd" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_编辑可换func引用(client, live_sched):
+    """编辑面：传 func ⇒ 换成新的函数引用；不传 ⇒ 沿用现值。"""
+    r = client.post("/api/v1/crons/ks-distill/edit",
+                    json={"confirm": True, "func": FUNC_PROBE}, headers=AUTH)
     assert r.status_code == 200, r.text
     stored = bus.job_spec(live_sched.get_job("ks-distill"))
-    assert stored["cmd"] == ["/bin/echo", "hi"] and stored["func"] == ""
+    assert stored["func"] == FUNC_PROBE
+    r = client.post("/api/v1/crons/ks-distill/edit",
+                    json={"confirm": True, "schedule": "0 5 * * *"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    stored = bus.job_spec(live_sched.get_job("ks-distill"))
+    assert stored["func"] == FUNC_PROBE and stored["schedule"] == "0 5 * * *"

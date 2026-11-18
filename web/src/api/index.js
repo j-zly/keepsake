@@ -165,8 +165,8 @@ export const api = {
   cronEdit: (jobId, schedule) =>
     http.post(`/api/v1/crons/${encodeURIComponent(jobId)}/edit`, { confirm: true, schedule }).then((r) => r.data),
   // ---- 定时任务管理面全量开放（scheduler_page_v2）----
-  // 新建：整份规格（id/name/schedule/cmd/timeout）一次给全；cmd 是**数组**
-  // （每元素一条命令要素，后端执行体是 argv 列表、shell=False）。
+  // 新建：整份规格（id/name/schedule/func/timeout）一次给全；func 是
+  // 「模块:函数」引用（执行体在同进程里调它）。
   cronCreate: (payload) => http.post('/api/v1/crons', { confirm: true, ...payload }).then((r) => r.data),
   // 全字段改（没传的字段后端沿用现值）：与 cronEdit 同一条端点，
   // cronEdit 只改 schedule（看板那张任务卡在用），这里是「整份改」。
