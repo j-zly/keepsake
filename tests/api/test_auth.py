@@ -679,7 +679,7 @@ def test_改口令_未初始化_签不出会话所以401(env, audit_dirs):
 
 # ---------------------------------------------------------------- 路由形状 / 不回退
 
-def test_写面仍是五十六条业务写端点加四条auth_POST():
+def test_写面仍是五十四条业务写端点加四条auth_POST():
     """写面清单不许悄悄长/短：多一个端点就是多一条能改数据的路（少一个 = 有人删了功能）。
 
     🆕 批2 审核队列加了 approve / reject 两条（23 → 25）。它们只在控制台会话下
@@ -710,6 +710,8 @@ def test_写面仍是五十六条业务写端点加四条auth_POST():
     `reveal_credential`（从加密存档取出明文）与 `backfill_credential`（把已在用的串
     校验后登记成可还原）。两条都**不签发新钥匙**，但一个产出可用密钥、一个改密文列
     ⇒ 都算「能动的口」，进这张名单；闸 = 完整 agent_id + write_guard（见 routers/agents.py）。
+    🔴 2026-11 ks_contract_zombie_retire 退役两条：screening 旧端点（读写两面
+    归 `/api/v1/settings/ai/{节}`）与 agents 的 POST .../delete 别名（前端只用 DELETE）。
     """
     app = create_app()
     write = {r.path for r in flat_routes(app)
@@ -730,8 +732,6 @@ def test_写面仍是五十六条业务写端点加四条auth_POST():
         "/api/v1/kb/documents/bulk-approve", "/api/v1/kb/documents/bulk-reject",
         "/api/v1/kb/documents/bulk-delete",
         "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
-        # 检索筛选配置（screening_ui）
-        "/api/v1/settings/screening",
         # AI 配置页：写一节 + 连通检测（probe 是读性质，但要会话）
         "/api/v1/settings/ai/{section_id}",
         "/api/v1/settings/ai/{section_id}/probe",
@@ -745,7 +745,7 @@ def test_写面仍是五十六条业务写端点加四条auth_POST():
         "/api/v1/agents/{agent_id}/role", "/api/v1/agents/{agent_id}/exclude",
         "/api/v1/agents/{agent_id}/set_id",
         "/api/v1/agents/{agent_id}/dm",
-        # 停凭据 + 整行删除（DELETE 与它的 POST 别名同一条路）
+        # 停凭据 + 整行删除（DELETE 形）
         "/api/v1/agents/{agent_id}/revoke_credential",
         # 凭据可还原两条（ks_credential_recoverable，2026-11-14）：取出明文 / 回填已有串
         "/api/v1/agents/{agent_id}/reveal_credential",
@@ -757,7 +757,6 @@ def test_写面仍是五十六条业务写端点加四条auth_POST():
         "/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
         "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
         "/api/v1/agents/{agent_id}",
-        "/api/v1/agents/{agent_id}/delete",
         # 记忆共享开关：只改读可见性，不是治理动作
         "/api/v1/agents/{agent_id}/share",
         # 共享知识库开关：只改知识库面的读可见性，不是治理动作
@@ -787,7 +786,6 @@ def test_业务路由全部挂了require_session():
                  "/api/v1/ops/merge", "/api/v1/ops/forget", "/api/v1/auth/logout",
                  "/api/v1/auth/me",
                  "/api/v1/settings/core-budget", "/api/v1/settings/tiering",
-                 "/api/v1/settings/screening",
                  "/api/v1/tiering/status", "/api/v1/import/template",
                  "/api/v1/ops/bulk", "/api/v1/ops/bulk-export",
                  "/api/v1/auth/change_password",

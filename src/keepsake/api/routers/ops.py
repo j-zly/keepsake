@@ -173,27 +173,6 @@ class TieringBody(BaseModel):
     confirm: str = ""
 
 
-class ScreeningBody(BaseModel):
-    """`{"confirm": true, "enabled": ..., "default_on": ..., "model": ..., ...}`。
-
-    摊平成一串顶层键（**不像** tiering 那样装整节）：筛选节只有 9 个键，
-    页面上的表单一项对一个键，摊平后校验（越界 400）与回显都能逐字对得上。
-    落盘时仍然只写 config.json 的 `screening` **一节**（其余键一字不动）。
-    """
-
-    confirm: bool = False
-    enabled: bool = False
-    default_on: bool = False
-    model: str = ""
-    base_url: str = ""
-    api_key_file: str = ""
-    #: 协议（openai / anthropic）；留空 = 保持现有值不变（老配置没这一项 = openai）。
-    protocol: str = ""
-    max_pick: int = 10
-    timeout_s: int = 90
-    max_tokens: int = 4096
-
-
 # --------------------------------------------------------------------------
 # 拒绝 / 确认的公共闸门
 # --------------------------------------------------------------------------
@@ -1064,7 +1043,12 @@ def set_tiering(body: TieringBody) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 检索结果 LLM 筛选（screening 节）：只读状态 + 设置开关/阈值
+# 检索结果 LLM 筛选（screening 节）：**共用取值层**
+#
+# 🔴 旧的两条 screening 端点（GET/PUT）已于 2026-11 退役（迭代了就不留旧的）：
+# screening 的读写现由 `/api/v1/settings/ai/screening` 承担（AI 配置页那一节）。
+# 下面这几个 helper **仍被 ai-settings 面调用**
+# （`_ai_screening_section` → `_screening_payload`），故保留函数本体。
 # --------------------------------------------------------------------------
 
 #: 控制台可写的值域（**比 `core.screening.BOUNDS` 窄一档**）。
@@ -1122,110 +1106,6 @@ def _screening_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         # 值域也由后端给（前端数字输入框的 min/max 照抄它，**前端零写死**）
         "bounds": {k: [int(v[0]), int(v[1])] for k, v in SCREENING_BOUNDS.items()},
     }
-
-
-@router.get("/api/v1/settings/screening", dependencies=[Depends(require_session)])
-def get_screening() -> Dict[str, Any]:
-    """检索筛选配置（**只读端点**：不挂 `write_guard`，绝不碰 config.json）。
-
-    返回 `screening` 节的**全量** + 两个状态位：
-
-    * `configured` —— config.json 里**有没有**这一节（没有 = 还没配过，
-      页面显示的是缺省骨架，别让人以为已经配好了）；
-    * `key_present` —— `api_key_file` 指的那个文件**在不在**（填错路径时
-      筛选会一路 fail-open 成「静默不筛」，这个位就是让它当场可见的）。
-
-    🔴 只读端点**绝不因为配置坏了就 500**：config 读不出来时按缺省
-    （= 关死）回，页面照常显示「没配」。
-    """
-    return _screening_payload(_read_config_quiet())
-
-
-@router.put("/api/v1/settings/screening",
-            dependencies=[Depends(require_session), Depends(write_guard)])
-def set_screening(body: ScreeningBody) -> Dict[str, Any]:
-    """设置检索筛选（写 config.json 的 `screening` **一节**）。
-
-    🔴 **只动这一节**：读整份 → 合并这一节 → 原样回写，其余键与键序都不变
-    （`dict(raw)` 浅拷贝后赋值，已存在的键不换位）—— config.json 里还有存储
-    后端、LLM 通道等配置，「改筛选」顺手重排/丢键就能让 provider 读不到 DSN。
-    写前把原 config 整份备份进审计备份目录（`audit.backup_json`），写不成功
-    ⇒ 一条都不写；必须打 `write_guard`（第一次改的是**进程外**的文件）。
-
-    🔴 **热生效走既有 mtime 机制**（改完下一轮检索即生效），本端点**不重载
-    任何进程**。同尺寸改值时指纹可能不变 ⇒ 写完主动失效本进程内的配置缓存
-    （`screening.invalidate_cfg_cache`）；跨进程那一半靠 mtime。
-
-    校验（**越界 400 带人话**，半截值绝不落盘）：
-    * `model` / `base_url` / `api_key_file` 必须是非空串；
-    * `max_pick` 1~30、`timeout_s` 10~300、`max_tokens` 512~16384；
-    * `api_key_file` **允许暂不存在**（可以先填路径后补文件）—— 保存后
-      探测并在回包里带 `key_present`（填错当场可见，不静默失效）。
-    """
-    action, target = "settings.screening", "screening"
-    _need_flag(body.confirm, action, target,
-               "保存筛选配置必须带 confirm=true（这是一次配置写操作）")
-
-    model = (body.model or "").strip()
-    base_url = (body.base_url or "").strip()
-    key_file = (body.api_key_file or "").strip()
-    if not model:
-        _reject(400, "screening_invalid", "模型名不能为空（筛选靠它发请求）",
-                action, target)
-    if not base_url:
-        _reject(400, "screening_invalid",
-                "接口地址不能为空（要带 /v1 这样的完整前缀）", action, target)
-    if not key_file:
-        _reject(400, "screening_invalid",
-                "key 文件路径不能为空（筛选的凭据只从那个文件读）", action, target)
-    for name, (lo, hi) in SCREENING_BOUNDS.items():
-        value = int(getattr(body, name))
-        if not (lo <= value <= hi):
-            _reject(400, "screening_out_of_range",
-                    f"{name} 必须在 {lo}~{hi} 之间，本次 {value}", action, target)
-
-    raw = _read_config_or_reject(action, target)
-    backup = audit.backup_json(f"config.screening.{audit.stamp()}.json", raw)
-
-    old = raw.get("screening") if isinstance(raw.get("screening"), dict) else {}
-    # 协议：body 给了就校验后写；没给 ⇒ 保持原值（老配置没这一项 = openai）。
-    protocol = str(body.protocol or "").strip().lower()
-    if protocol:
-        if protocol not in AI_PROTOCOL_VALUES:
-            _reject(400, "screening_invalid",
-                    f"协议只能是 {' 或 '.join(AI_PROTOCOL_VALUES)}：{protocol[:40]}",
-                    action, target)
-    else:
-        protocol = str(old.get("protocol") or "").strip().lower() or "openai"
-
-    section = {
-        "enabled": bool(body.enabled),
-        "default_on": bool(body.default_on),
-        "model": model,
-        # 尾斜杠去掉：筛选侧拼的是 `{base_url}/chat/completions`
-        "base_url": base_url.rstrip("/"),
-        "protocol": protocol,
-        "api_key_file": key_file,
-        "max_pick": int(body.max_pick),
-        "timeout_s": int(body.timeout_s),
-        "max_tokens": int(body.max_tokens),
-    }
-    new = dict(raw)                       # 顶层保序
-    new["screening"] = section            # 节内由表单补齐成完整一份
-    _write_config_or_reject(new, action, target)
-
-    from keepsake.core import screening as screening_mod
-
-    screening_mod.invalidate_cfg_cache()   # 同尺寸改值时指纹可能不变 ⇒ 主动失效
-
-    key_present = _screening_key_present(key_file)
-    audit.record(action, target, ok=True,
-                 reason=f"enabled={section['enabled']}; default_on={section['default_on']}; "
-                        f"model={model}; backup={backup}; "
-                        f"path={config.keepsake_config_file()}")
-    return {"ok": True, "action": action, "screening": section,
-            "key_present": key_present, "path": str(config.keepsake_config_file()),
-            "backup": backup}
 
 
 # --------------------------------------------------------------------------
@@ -1516,7 +1396,7 @@ def _ai_embedder_section(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ai_screening_section(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """screening 节（检索结果筛选）—— 字段口径与 `settings/screening` **同源**。"""
+    """screening 节（检索结果筛选）—— 字段口径与 config.json 的 `screening` 节**同源**。"""
     p = _screening_payload(raw)
     protocol = str(p.get("protocol") or "").strip()
     return {

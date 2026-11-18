@@ -129,7 +129,7 @@ from ...core.pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_
 from ..generic import Capabilities
 
 # consolidator.py 的运行时接线已于 2026-09-09 退役：
-#   * 两相管线 pipeline.py 已全面接管碎片提纯（提取相+更新相，封边取代旧合并）
+#   * 两相管线 pipeline.py 已全面接管记忆条目提纯（提取相+更新相，封边取代旧合并）
 #   * Consolidator 的「相似度分组 → LLM 缝合多级合并」与 v2 supersede 链互不相认
 #   * 类源码保留（git 可溯），仅摘掉运行接线；resolve_llm_channel / _call_llm
 #     仍从 keepsake.consolidator 模块按需导入，供 v2 pipeline 复用
@@ -150,7 +150,7 @@ FEEDBACK_SCHEMA = {
         "properties": {
             "fragment_key": {
                 "type": "string",
-                "description": "碎片 key（如 memory:frag:abc123），从检索结果的 key 字段获得。",
+                "description": "记忆 key（如 memory:frag:abc123），从检索结果的 key 字段获得。",
             },
             "is_positive": {
                 "type": "boolean",
@@ -196,7 +196,7 @@ _DEFAULT_CONFIG_PATH = "~/.config/keepsake/config.json"
 # ---------------------------------------------------------------------------
 # 常驻核心层（core tag）—— 2026-10 keepsake_core_tier_v1
 #
-# core 碎片 = `tags` 里含 `core` 的**普通碎片**（不新增表、不新增列，三后端共用）。
+# core 记忆条目 = `tags` 里含 `core` 的**普通记忆条目**（不新增表、不新增列，三后端共用）。
 # ---------------------------------------------------------------------------
 
 #: 核心层标记 tag。检索层见到它就跳过（`prefetch`），写入层见它就原文入库。
@@ -1069,7 +1069,7 @@ class KeepsakeProvider(MemoryProvider):
         return cfg
 
     def _should_search(self, query: str) -> bool:
-        """判断当前用户消息是否需要检索碎片。
+        """判断当前用户消息是否需要检索记忆条目。
 
         跳过条件：
           1. 长度 < skip_min_length（默认 2）
@@ -1243,8 +1243,8 @@ class KeepsakeProvider(MemoryProvider):
             "当执行 memory(action='add') 操作时，系统会自动存储完整内容并支持后续检索。",
             "相关的记忆条目就在下面「相关记忆」段落里，直接使用即可。",
             "记忆综合排序 = BM25相似度 × 时间衰减 × 情感权重 × 反馈权重 × 热门话题权重。",
-            "正反馈用 keepsake_feedback(key, positive=True) 标记有用，",
-            "负反馈用 keepsake_feedback(key, positive=False) 标记没用。",
+            "正反馈用 keepsake_feedback(fragment_key=..., is_positive=True) 标记有用，",
+            "负反馈用 keepsake_feedback(fragment_key=..., is_positive=False) 标记没用。",
             "热门话题用 keepsake_topics() 查询。",
         ]
         block = self._core_block(caller_agent_id, caller_role)
@@ -1257,9 +1257,9 @@ class KeepsakeProvider(MemoryProvider):
     # 常驻核心层（core tag）—— 2026-10 keepsake_core_tier_v1
     #
     # 两套记忆并存的根因：Hermes 本体每轮全量注入 MEMORY.md/USER.md（约 8 万字符），
-    # keepsake 只做按查询召回的「相关记忆」段落。本层把常驻记忆收进碎片库，
-    # 让 keepsake 成为**单一记忆系统**：core 碎片每轮原文全量注入，
-    # 其余碎片仍走 prefetch 检索。
+    # keepsake 只做按查询召回的「相关记忆」段落。本层把常驻记忆收进记忆库，
+    # 让 keepsake 成为**单一记忆系统**：core 记忆条目每轮原文全量注入，
+    # 其余记忆条目仍走 prefetch 检索。
     #
     # 🔴 **本层绝不抛异常、绝不阻塞对话**（fail-open）：
     #   * 读库异常 / 耗时超预算 → 只返回静态文案 + logger.warning
@@ -1270,7 +1270,7 @@ class KeepsakeProvider(MemoryProvider):
 
     def _core_fragments(self, caller_agent_id: str = "",
                         caller_role: str = "") -> List[Dict[str, Any]]:
-        """取核心层碎片，带 60s 进程内缓存；任何异常/超时都退化成空列表 + warning。
+        """取核心层记忆条目，带 60s 进程内缓存；任何异常/超时都退化成空列表 + warning。
 
         缓存是进程级而非实例级：core 层在一次对话里只应查一次库，而 Hermes
         可能为多 session 构造 provider 实例。
@@ -1505,7 +1505,7 @@ class KeepsakeProvider(MemoryProvider):
                            type(e).__name__, e)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """根据用户消息检索相关碎片，注入到上下文。"""
+        """根据用户消息检索相关记忆条目，注入到上下文。"""
         # 未读私信提醒：独立于检索（一次 SELECT COUNT，成本可忽略）⇒ 放在
         # 「省钱闸」之前算。寒暄/短消息轮跳过检索，但提醒不能跟着一起跳过
         # （否则短消息轮永远收不到未读私信提醒）。
@@ -1543,7 +1543,7 @@ class KeepsakeProvider(MemoryProvider):
         # 挂点放在**真正发起检索之后**：被 skip 掉的问题没检索过，不记。
         self._touch("read")
 
-        # core 碎片由 system_prompt_block 无条件全量注入，这里必须排除 ——
+        # core 记忆条目由 system_prompt_block 无条件全量注入，这里必须排除 ——
         # 否则同一条记忆每轮出现两次（一次全量、一次检索），且两份可能不同版本。
         fragments = [f for f in fragments if not _has_tag(f.get("tags", ""), _CORE_TAG)]
         # 排除闸只对**主脑侧**生效（ks_exclscope，#133）：本进程不是主脑时
@@ -1628,9 +1628,9 @@ class KeepsakeProvider(MemoryProvider):
             if self._storage.fragment_exists(frag_key):
                 existing_meta = {"key": frag_key}
         except Exception as e:
-            # ⚠️ 不再静默：探测异常会让 R6 去重失效（同一内容会被当新碎片再存一次）。
+            # ⚠️ 不再静默：探测异常会让 R6 去重失效（同一内容会被当新记忆条目再存一次）。
             #   降级本身可接受（fail-open），但必须留痕，否则读日志看不出「去重没跑」。
-            logger.warning("keepsake: 既有碎片探测失败，R6 去重本次跳过 (%s)", e)
+            logger.warning("keepsake: 既有记忆条目探测失败，R6 去重本次跳过 (%s)", e)
         return decide(text, category, existing_meta, getattr(self, "_gate_cfg", None)), existing_meta
 
     def _v1_store_after_decide(self, text, decision, existing_meta, category, source, extra_tags) -> None:
@@ -1829,11 +1829,11 @@ class KeepsakeProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Hermes 常驻记忆（MEMORY.md / USER.md）写入时，**原文**存为 core 碎片。
+        """Hermes 常驻记忆（MEMORY.md / USER.md）写入时，**原文**存为 core 记忆条目。
 
         2026-10 keepsake_core_tier_v1：这是把常驻记忆收进 keepsake 的唯一入口 ——
         与本方法原先的「直接 return」（2026-09 ingest_gate R5 关闭双份入库）相反，
-        现在两侧合并成同一套：常驻记忆存进碎片库并打上 `core` 标签，
+        现在两侧合并成同一套：常驻记忆存进记忆库并打上 `core` 标签，
         `system_prompt_block` 每轮原文全量注入，检索层不再重复召回。
 
         🔴 2026-11 keepsake_core_gate：**代理写入的条目不再直接进常驻层** ——
@@ -1862,7 +1862,7 @@ class KeepsakeProvider(MemoryProvider):
         """`on_memory_write` 的实际动作。**调用方保证异常已被吞掉。**
 
         action 语义（对齐 Hermes memory 工具）：
-          * `add`                  → 入库为**候选**碎片（带提名日戳，不带 `core`）
+          * `add`                  → 入库为**候选**记忆条目（带提名日戳，不带 `core`）
           * `replace` / `update`    → 先删旧（metadata 的 key 或 old_text）再写新
           * `remove`                → 删掉 metadata 指的那条
         识别不了的 action 一律 warning + 跳过，绝不猜。
@@ -1928,9 +1928,9 @@ class KeepsakeProvider(MemoryProvider):
         _CORE_CACHE["frags"] = None
 
     def _core_add(self, content: str, tags: str) -> str:
-        """原文入库为 core 碎片；同 content 已存在则不重复入库（幂等）。
+        """原文入库为 core 记忆条目；同 content 已存在则不重复入库（幂等）。
 
-        返回**新碎片的 key**（空串 = 这次没落库：已存在，或写失败）——
+        返回**新记忆条目的 key**（空串 = 这次没落库：已存在，或写失败）——
         提名基数回填要拿 key（`core.tiering.backfill_nominate_hits`）。
 
         幂等判据用「匹配面（core ∪ core_candidate）里有逐字相同的一条」而不是靠
@@ -2008,7 +2008,7 @@ class KeepsakeProvider(MemoryProvider):
         return frags
 
     def _core_delete(self, metadata: Dict[str, Any], fallback_text: str) -> None:
-        """删掉 metadata 指向的那条 core 碎片。
+        """删掉 metadata 指向的那条 core 记忆条目。
 
         解析顺序（Hermes 侧契约见 agent/memory_manager.notify_memory_tool_write）：
 
@@ -2091,7 +2091,7 @@ class KeepsakeProvider(MemoryProvider):
 
     @staticmethod
     def _fragment_key_for(text: str) -> str:
-        """碎片 key = `memory:frag:{sha256(text)[:12]}`。
+        """记忆 key = `memory:frag:{sha256(text)[:12]}`。
 
         两个后端的 `store()` 用的是同一套算法（SQLite 内联，
         PG 抽成了 `PgStorage._fragment_key_for`），这里为了让 `add()` 能把
@@ -2153,7 +2153,7 @@ class KeepsakeProvider(MemoryProvider):
 
     def get(self, key: str, *, caller_agent_id: str = "",
             caller_role: str = "") -> Optional[Dict[str, Any]]:
-        """按 key 取单条碎片；**确实不存在**返回 None，后端故障抛错。
+        """按 key 取单条记忆条目；**确实不存在**返回 None，后端故障抛错。
 
         🔴 **归属校验**（2026-10 ks_share_memory）：非 primary 取到「未共享代理」
         的条目 ⇒ 返回 **not-found 语义**（None）—— 存在性本身也不许泄露。
@@ -2542,7 +2542,7 @@ class KeepsakeProvider(MemoryProvider):
         return storage.idem_lookup(owner, idem_key)
 
     def idem_record(self, owner: str, idem_key: str, frag_key: str) -> bool:
-        """登记幂等键 → 首次落库的碎片 key（**只在成功落库后**调）。"""
+        """登记幂等键 → 首次落库的记忆条目 key（**只在成功落库后**调）。"""
         storage = self._require_storage()
         return bool(storage.idem_record(owner, idem_key, frag_key))
 
@@ -2563,7 +2563,7 @@ class KeepsakeProvider(MemoryProvider):
         就意味着换 key（存储层的 `cas_update` 会建新条目 + 把旧条转链身，
         演化链完整可回溯）。这里负责的是**这一层之下的治理**：
 
-          * **归属校验与 `add` 同尺**：非 owner 不能改别人的碎片；primary 全量。
+          * **归属校验与 `add` 同尺**：非 owner 不能改别人的记忆条目；primary 全量。
             判据复用 `govern.visibility.can_remove_fragment`（**唯一一份**「谁能动
             这条」的尺子 —— 看得见 ≠ 能改）。
           * **core 内容写入照旧走候选审核队列**：`core_direct` 在这条路径上
@@ -2599,7 +2599,7 @@ class KeepsakeProvider(MemoryProvider):
                 "backend_unsupported: rev CAS 需 PG/SQLite 后端"
             )
 
-        # ---- 归属校验（与 add 同尺：非 owner 不能改别人的碎片；primary 全量）----
+        # ---- 归属校验（与 add 同尺：非 owner 不能改别人的记忆条目；primary 全量）----
         row = storage.get_fragment(key)
         if not row:
             return {"error": "not_found"}

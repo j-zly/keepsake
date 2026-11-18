@@ -38,8 +38,8 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 #: 端点（批准 / 驳回子代理提交的知识文档 —— 只接控制台会话，不接代理身份），
 #: keepsake_agent_setid 起再加 1 条代理治理端点（改代理 id = 换主键 + 归属级联），
 #: ks_messages_console 起再加 1 条私信开关端点（dm_enabled —— 投递偏好，不是治理动作）。
-#: ks_agent_delete 起再加 3 条代理治理端点（停凭据 revoke_credential +
-#: 整行删除 DELETE /api/v1/agents/{agent_id} 及其 POST 别名 .../delete），
+#: ks_agent_delete 起再加 2 条代理治理端点（停凭据 revoke_credential +
+#: 整行删除 DELETE /api/v1/agents/{agent_id}），
 #: ks_share_memory 起再加 1 条记忆共享开关端点（share_memory —— 只改读可见性，
 #: 不是治理动作），ks_agent_budget 起再加 1 条 per-agent 注入预算端点
 #: （core_budget_chars —— 只改一个阈值，不是治理动作）。
@@ -81,8 +81,6 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
-    # 检索筛选配置一条（screening_ui）：写 config.json 的 screening 一节
-    "/api/v1/settings/screening",
     # AI 配置页两条（ai_settings_page）：写 config.json 的一节 + 连通检测
     # （probe 是读性质：不写库、不改 config，但仍要会话、也要留审计）
     "/api/v1/settings/ai/{section_id}",
@@ -104,7 +102,7 @@ ALLOWED_POST_PATHS = {
     # 消息中心加私信开关一条（ks_messages_console）：投递偏好，不是治理动作
     "/api/v1/agents/{agent_id}/dm",
     # 代理治理再加两条（ks_agent_delete）：停凭据（只废钥匙，状态不动）
-    # 与整行删除（DELETE + POST 别名同一条路，primary 拒删）
+    # 与整行删除（DELETE 形，primary 拒删）
     "/api/v1/agents/{agent_id}/revoke_credential",
     # 凭据可还原两条（ks_credential_recoverable，2026-11-14 用户拍板「不能换发，
     # 要直接能复制」）：取出明文 / 把已在用的串校验后登记成可还原
@@ -118,7 +116,6 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/scopes",
     "/api/v1/agents/{agent_id}/credentials/{cred_id}/revoke",
     "/api/v1/agents/{agent_id}",
-    "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
     # 共享知识库开关一条（ks_share_kb）：只改知识库面的读可见性，不是治理动作
@@ -559,7 +556,7 @@ def test_审计目录写不进去_写操作fail_closed(storage, audit_dir, backu
 
 # ---------------------------------------------------------------- 只读不回退
 
-def test_写面白名单全量断点_56条业务加4条认证():
+def test_写面白名单全量断点_54条业务加4条认证():
     app = create_app()
     write = {r.path for r in flat_routes(app)
              if getattr(r, "methods", set()) - {"GET", "HEAD", "OPTIONS"}}
@@ -568,8 +565,10 @@ def test_写面白名单全量断点_56条业务加4条认证():
     # 53 → 56 含 auth）：新建一把 / 改标签 / 作废单把。
     # 改名不动鉴权，但它和"作废""新建"一样是能改变"谁能连进来"的口 ⇒ 必须进名单。
     # scheduler_page_v2 再加三条（定时任务：新建 / 删除 / 立即运行）。
-    assert len(ALLOWED_POST_PATHS) == 60
-    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 56
+    # 2026-11 ks_contract_zombie_retire 退役两条：screening 旧端点（读面已由
+    # /settings/ai/{节} 承担）与 agents 的 POST .../delete 别名（前端只用 DELETE）。
+    assert len(ALLOWED_POST_PATHS) == 58
+    assert len(ALLOWED_POST_PATHS - AUTH_POST_PATHS) == 54
 
 
 def test_P1只读路由未被写面影响(client):

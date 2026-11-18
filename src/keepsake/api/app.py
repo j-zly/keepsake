@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from keepsake.kb.service import KbError
 
 from . import config
-from .routers import (agents, auth, core, crons, fragments, hits, kb, messages, ops, stats, todos)
+from .routers import (agents, auth, core, crons, fragments, kb, messages, ops, stats, todos)
 
 logger = logging.getLogger("keepsake.api")
 
@@ -74,7 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
 
     # ---- 只读业务路由 ----
-    for r in (core.router, fragments.router, hits.router, kb.router,
+    for r in (core.router, fragments.router, kb.router,
               stats.router, crons.router):
         app.include_router(r)
 

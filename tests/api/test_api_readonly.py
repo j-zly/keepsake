@@ -70,8 +70,6 @@ ALLOWED_POST_PATHS = {
     "/api/v1/kb/documents/bulk-delete",
     "/api/v1/settings/core-budget",
     "/api/v1/settings/tiering",
-    # 检索筛选配置一条（screening_ui）：写 config.json 的 screening 一节
-    "/api/v1/settings/screening",
     # AI 配置页两条（ai_settings_page）：写 config.json 的一节 + 连通检测
     # （probe 是读性质：不写库、不改 config，但仍要会话）
     "/api/v1/settings/ai/{section_id}",
@@ -92,11 +90,10 @@ ALLOWED_POST_PATHS = {
     "/api/v1/agents/{agent_id}/set_id",
     # 消息中心加私信开关一条（ks_messages_console）：投递偏好，不是治理动作
     "/api/v1/agents/{agent_id}/dm",
-    # 代理治理再加三条（ks_agent_delete）：停凭据（只废钥匙，状态不动）
-    # 与整行删除（DELETE + POST 别名同一条路，primary 拒删）
+    # 代理治理再加两条（ks_agent_delete）：停凭据（只废钥匙，状态不动）
+    # 与整行删除（DELETE 形，primary 拒删）
     "/api/v1/agents/{agent_id}/revoke_credential",
     "/api/v1/agents/{agent_id}",
-    "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关一条（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
     # 共享知识库开关一条（ks_share_kb）：只改知识库面的读可见性，不是治理动作
@@ -264,8 +261,7 @@ def test_只读路由断言():
     paths = {getattr(r, "path", "") for r in routes}
     assert {"/api/v1/core", "/api/v1/core/stats", "/api/v1/fragments",
             "/api/v1/fragments/{key}", "/api/v1/kb/summary", "/api/v1/kb/search",
-            "/api/v1/kb/pending", "/api/v1/stats", "/api/v1/crons",
-            "/api/v1/hits/stats"} <= paths
+            "/api/v1/kb/pending", "/api/v1/stats", "/api/v1/crons"} <= paths
     assert len([p for p in paths if p.startswith("/api/v1/")]) >= 8
 
 

@@ -241,8 +241,9 @@ def test_改名带走凭据删除不留孤儿(env):
     # 吊销的手输档 = **当前** id 的前 8 位（改名后是 worker2；拿旧名来签 ⇒ 400，正是这道闸该做的）
     assert client.post("/api/v1/agents/worker2/revoke",
                        json={"confirm": "worker2"}, headers=AUTH).status_code == 200
-    assert client.post("/api/v1/agents/worker2/delete",
-                       json={"confirm": "worker2"}, headers=AUTH).status_code == 200
+    assert client.request("DELETE", "/api/v1/agents/worker2",
+                          json={"confirm": "worker2"},
+                          headers=AUTH).status_code == 200
     # 🔴 代理行没了，凭据表不许留孤儿（无人认领的活钥匙）
     assert reg.list_credentials("worker2") == []
     assert reg._cred.list("worker2") == []     # noqa: SLF001

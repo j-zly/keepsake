@@ -729,8 +729,6 @@ def revoke_one_credential(agent_id: str, cred_id: str, body: AgentActionBody,
 
 @router.delete("/api/v1/agents/{agent_id}",
                dependencies=[Depends(require_session), Depends(write_guard)])
-@router.post("/api/v1/agents/{agent_id}/delete",
-             dependencies=[Depends(require_session), Depends(write_guard)])
 def delete_agent(agent_id: str, body: AgentDeleteBody,
                  storage: Any = Depends(get_storage)) -> Dict[str, Any]:
     """**整行删除**：这一行从注册表里消失（凭据哈希一起没）。
@@ -794,7 +792,7 @@ def set_agent_role(agent_id: str, body: AgentRoleBody,
              dependencies=[Depends(require_session), Depends(write_guard)])
 def set_agent_exclude(agent_id: str, body: AgentActionBody,
                       storage: Any = Depends(get_storage)) -> Dict[str, Any]:
-    """「这个代理的条目进不进主脑上下文」开关（退役的 `retrieval.exclude_tags` 的新家）。
+    """「这个代理的条目进不进主脑上下文」开关（全局缺省键 `retrieval.exclude_tags` 的 per-agent 补充开关）。
 
     🔴 现役 primary 除外 ⇒ 409（见 `_need_not_primary`）：过滤是给**别人**看的，
     它自己每轮就在上下文里，把主代理自己排除掉没有任何意义只有自锁风险。

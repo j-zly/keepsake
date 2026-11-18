@@ -36,7 +36,6 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/rename",
     "/api/v1/agents/{agent_id}/set_id",
     "/api/v1/agents/{agent_id}/revoke_credential",
-    "/api/v1/agents/{agent_id}/delete",
     # 记忆共享开关（ks_share_memory）：只改读可见性，不是治理动作
     "/api/v1/agents/{agent_id}/share",
     # per-agent 注入预算（ks_agent_budget）：只改一个阈值，不是治理动作
@@ -47,7 +46,7 @@ WRITE_PATHS = (
     "/api/v1/agents/{agent_id}/backfill_credential",
 )
 
-#: 非 POST 的写端点（DELETE 与 POST 别名是同一条路，只是方法不同）。
+#: 非 POST 的写端点（整行删除只有 DELETE 形；POST 别名已于 2026-11 退役）。
 DELETE_PATHS = (
     "/api/v1/agents/{agent_id}",
 )
@@ -1019,15 +1018,16 @@ def test_整行删除_未知代理404(env):
     assert r.json()["detail"]["error"] == "agent_not_found"
 
 
-def test_整行删除_POST别名与DELETE同一条路(env):
-    """POST .../delete 与 DELETE /api/v1/agents/{id} 是同一条路（前端用 POST 别名）。"""
-    client, reg = env
-    _seed(reg, "worker-1")
-    r = client.post("/api/v1/agents/worker-1/delete", headers=AUTH,
-                    json={"confirm": "worker-1"})
-    assert r.status_code == 200, r.text
-    assert r.json()["deleted"] is True
-    assert reg.get("worker-1") is None
+def test_整行删除_POST别名已退役(env):
+    """POST .../delete 别名已于 2026-11 退役（迭代了就不留旧的）⇒ 路由表里没有它。
+
+    前端只走 DELETE /api/v1/agents/{id}；留着别名 = 多一条没人用的入口。
+    """
+    app = create_app()
+    paths = {getattr(r, "path", "") for r in flat_routes(app)}
+    assert "/api/v1/agents/{agent_id}/delete" not in paths
+    # 正规形仍在（DELETE 形），别把真入口一起删了
+    assert "/api/v1/agents/{agent_id}" in paths
 
 
 def test_停凭据与删除_审计留痕且不记任何凭据内容(env, tmp_path):
