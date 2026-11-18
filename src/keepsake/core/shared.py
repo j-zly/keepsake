@@ -1389,16 +1389,18 @@ def rerank_with_decay(
                     hot_w = hot_boost
                 elif hits >= 1:
                     hot_w = 1.0 + (hot_boost - 1.0) * (hits / 3.0)
-            except Exception:
-                pass
+            except Exception as e:
+                # 🔴 静默降级不可接受：排序五因子整段死掉也必须吭声（判据本身不动）
+                logger.warning("keepsake: 加权查询失败(%s)，本条按权重1.0降级", e)
 
         # 3e: 注意力加权
         attn_w = 1.0
         if content and hasattr(storage, "match_attention"):
             try:
                 attn_w = storage.match_attention(content)
-            except Exception:
-                pass
+            except Exception as e:
+                # 🔴 同上：注意力加权查询失败必须吭声（权重回落 1.0）
+                logger.warning("keepsake: 加权查询失败(%s)，本条按权重1.0降级", e)
 
         frag["_combined_score"] = sim * decay * emotion_w * feedback_w * hot_w * attn_w
         frag["_weights"] = {

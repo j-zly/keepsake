@@ -181,8 +181,11 @@ class Forgetter:
                             attn_w = self._storage.match_attention(content)
                             if attn_w and attn_w > 1.1:
                                 continue  # 高关注度话题，保留
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # 🔴 attention-failclosed（查询失败=保留，不=放行遗忘）
+                            logger.warning(
+                                "keepsake_forget: 注意力查询失败，按 fail-closed 保留该条: %s", e)
+                            continue
 
                     # 所有条件都满足 → 可遗忘
                     forgettable_keys.append(key)

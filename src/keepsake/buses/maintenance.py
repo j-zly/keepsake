@@ -135,6 +135,9 @@ def run(*, dry_run: Optional[bool] = None) -> Tuple[bool, str]:
 
     summary = _summary(cons, forg, dry=False)
     errors = int(cons.get("errors") or 0)
+    # 🔴 合并有失败 ⇒ 这一轮**报红**（ok=False ⇒ 调度层落 ks_bus_state.ok=false
+    # + rc=1，页面取色成红）。旧口径「整体崩才红」是壳脚本遗留，合并失败无人知。
     if errors:
         summary += f"；合并失败 {errors} 条"
+        return False, summary
     return True, summary

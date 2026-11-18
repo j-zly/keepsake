@@ -236,11 +236,31 @@ def valid_schedule(s: str) -> bool:
 
 
 def _pg_conf() -> Dict[str, Any]:
-    """config.json 的 storage.postgres 节（与主存储同源，不设第二套账）。"""
-    import json
-    from pathlib import Path
-    cfg = json.loads(Path("~/.config/keepsake/config.json").expanduser().read_text())
-    return cfg["storage"]["postgres"]
+    """config.json 的 storage.postgres 节（与主存储同源，不设第二套账）。
+
+    🔴 单源纪律（2026-11-18 ks_degradation_robustness_r1）：路径走
+    ``core.factory.config_path()``（= 环境变量 ``KEEPSAKE_CONFIG`` > 缺省
+    ``~/.config/keepsake/config.json``，与 provider / 控制台 / 各班车的
+    ``load_config()`` **同一份文件**），绝不静默回退到写死的默认路径 ——
+    那会绕开主存储实际在用的那份配置（sqlite-only 部署直接 KeyError）。
+
+    文件缺失 / 读不了 / 坏 JSON / 缺 ``storage.postgres`` 节 ⇒ 抛
+    ``ValueError`` 带人话，**绝不猜**（班车没有 PG jobstore 就没有状态表，
+    静默当「没配」= 状态永远不落库）。
+    """
+    from .factory import config_path, load_config
+
+    path = config_path()
+    try:
+        cfg = load_config(str(path))
+    except ValueError as e:      # 配置坏了 / 读不了 ⇒ 人话报错（不猜、不回退默认路径）
+        raise ValueError(f"配置文件不可用: {path}（{e}）—— 班车需要 PG jobstore") from e
+    storage_cfg = cfg.get("storage") if isinstance(cfg, dict) else None
+    pg = storage_cfg.get("postgres") if isinstance(storage_cfg, dict) else None
+    if not isinstance(pg, dict) or not pg:
+        raise ValueError(
+            f"storage.postgres 未配置，班车需要 PG jobstore（配置文件: {path}）")
+    return pg
 
 
 def _jobstore_url() -> str:
