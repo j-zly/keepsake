@@ -458,25 +458,32 @@ onMounted(async () => {
  * 六列对齐（名称 / 任务 ID / 调度 / 下次执行 / 状态 / 操作）——
  * 表头与行共用同一套列宽，眼睛往下扫时那一列是一条直线。
  *
- * 列宽口径（scheduler_page_ui_fix → scheduler_view_polish2）：
- *   名称 minmax(240px, 1fr) —— **吃弹性**：宽屏多出来的宽度全给它，
- *     右边的列跟着推到容器右缘（列宽全定死的话，宽屏右侧会空一大片，
- *     操作列离右缘差着几百像素，看着像「没贴边」）；
- *   调度 / 下次执行 收窄（它们本来就是短串）；
- *   操作列 380px —— 五枚常驻按钮（编辑 / 暂停 / 运行一次 / 执行记录 / 删除）
- *   一行排齐，分级班车那行第六枚「设置」也塞得下（**不许 3+2 换行**）。 */
+ * 列宽口径（scheduler_page_ui_fix → scheduler_view_polish2 → scheduler_col_align_fix_r2）：
+ *   用户终态语义：「除了操作其他的往左边去一些」——
+ *     前五列**全部定宽**（名称 200 / 任务 ID 116 / 调度 100 / 下次执行 128 / 状态 136），
+ *     五列真贴容器左缘；宽屏多出来的富余**不许进名称列**
+ *     （进名称列 ⇒ 后四列被推离左缘，那是旧两版的错法）；
+ *   富余全落在第六轨 **1fr（中间空腔）**：空腔夹在状态列与操作列之间，
+ *     操作列（末轨 380px 定宽）永远钉在容器右缘；
+ *   末轨必须是**px 字面值**：表头与行是两个**独立的 grid 容器**，
+ *     末轨写成 min-content 时两边各算各值（表头「操作」二字 vs 行里六枚按钮），
+ *     中间四列会整片错位 —— 两容器同定宽，天然对齐；
+ *   名称 200px 定宽 + 既有 ellipsis 兜底（长名截断，不顶爆整列）；
+ *   定宽预算：200+116+100+128+136+380 = 1060，gap 10×6 = 60，
+ *     左右 padding 20×2 = 40 ⇒ 合计 1160px（窄屏断点 1200px 之前切单列，
+ *     1160~1200 区间由 1fr 归零消化，任何宽度都不裁操作列）。 */
 .job-list {
   padding: 0;
-  overflow-x: auto;          /* 列宽定死 ⇒ 窄屏横滚，不许把行挤变形 */
+  overflow-x: auto;          /* 定宽列装不下 ⇒ 横滚，不许把行挤变形 */
   overflow-y: hidden;
   margin-bottom: 20px;
 }
 .job-head,
 .job-row {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) 130px 120px 130px 160px 380px;
+  grid-template-columns: 200px 116px 100px 128px 136px 1fr 380px;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   padding: 12px 20px;
 }
 .job-head {
@@ -533,18 +540,23 @@ onMounted(async () => {
 }
 /* 操作列：一行排齐（不许换行成 3+2）—— 按钮自己排版，
    Element Plus 默认给相邻按钮加的 margin-left 在这里归零（间距统一交给 gap）。
+   grid-column: 7 —— 操作列**显式落到末轨**（380px 定宽），第六轨的 1fr
+   空出来当「状态与操作之间」的中间空腔（表头与行都落到同一轨，两边天然对齐）。
    justify-self: end —— 这一列**贴容器右缘**（表头的「操作」二字与行里的按钮同一条右缘）。 */
 .col-acts {
   display: flex;
   gap: 6px;
   align-items: center;
   flex-wrap: nowrap;
+  grid-column: 7;
   justify-self: end;
 }
 .col-acts :deep(.el-button + .el-button) {
   margin-left: 0;
 }
-@media (max-width: 1100px) {
+/* 窄屏（≤1200px）：切单列兜底 —— 定宽六列在更窄的窗口里会裁掉操作列，
+   阈值提前到 1200px：1160~1200 这一段由 1fr 归零消化，任何宽度都不裁操作列。 */
+@media (max-width: 1200px) {
   .job-head,
   .job-row {
     grid-template-columns: minmax(0, 1fr);
@@ -554,6 +566,7 @@ onMounted(async () => {
     display: none;
   }
   .col-acts {
+    grid-column: auto;       /* 单列布局：取消末轨定位（否则会撑出隐式列） */
     flex-wrap: wrap;         /* 单列布局下允许换行（横滚已不需要） */
     justify-self: stretch;   /* 单列布局不再贴右缘，按钮左起排（贴着行首更好读） */
   }
