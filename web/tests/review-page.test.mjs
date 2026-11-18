@@ -64,12 +64,14 @@ test('维护页：候选审核区搬干净了（不留残骸，也不留双份�
   for (const s of LEFT_BEHIND) {
     assert.ok(!MAINT.includes(s), `MaintenanceView 里还留着「${s}」—— 审核区已搬到 ReviewView`)
   }
-  // 分工（2026-11-16 scheduler_page_ui_fix）：
-  //   合并 / 遗忘 = 记忆业务操作 ⇒ **维护页**（定时任务页只管「车怎么跑」）；
-  //   分级班车的开关阈值 + 班车的增删改查 = 调度 ⇒ 「定时任务」页。
-  for (const s of ['合并 · 预演', '遗忘 · 预演', 'runMerge', 'runForget']) {
-    assert.ok(MAINT.includes(s), `MaintenanceView 少了「${s}」—— 合并 / 遗忘归记忆维护页`)
-    assert.ok(!SCHED.includes(s), `SchedulerView 还留着「${s}」—— 定时任务页只管调度`)
+  // 分工（2026-11-18 铁律，maintenance_ops_move_to_scheduler）：
+  //   班车的一切入口（调度 + 执行 + 预演）⇒ **只存在于「定时任务」页**；
+  //   维护页退回纯展示面（水位 / 提名 / 建议），手动执行面板已摘净。
+  for (const s of ['手动执行', '预演', '实跑', 'runMerge', 'runForget']) {
+    assert.ok(!MAINT.includes(s), `MaintenanceView 还留着「${s}」—— 手动执行面板已搬到「定时任务」页`)
+  }
+  for (const s of ['DRYRUN_BUS_FUNCS', 'openDryRun']) {
+    assert.ok(SCHED.includes(s), `SchedulerView 少了「${s}」—— 预演入口归「定时任务」页`)
   }
   for (const s of ['分级班车设置']) {
     assert.ok(SCHED.includes(s), `SchedulerView 少了「${s}」`)

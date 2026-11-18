@@ -10,8 +10,8 @@
  *   S2 增 / 改 / 暂停 / 恢复 / 运行一次 / 删除 六个动作都在页面上；
  *   S3 **确认弹框不要求键入任何东西**（ConfirmDialog 不传 expect ⇒ 不渲染 input）；
  *   S4 删除弹框写明「重启后不会复活」与「可重新添加」（后果要写清）；
- *   S5 两页职责边界：**定时页只管调度**（合并 / 遗忘那套记忆业务操作零残留），
- *      合并 / 遗忘的实跑卡在维护页（scheduler_page_ui_fix 迁回）；
+ *   S5 两页职责边界（2026-11-18 铁律）：**班车的一切入口（调度 + 执行 + 预演）
+ *      只存在于「定时任务」页** —— 预演只走 dry-run（只算不写），维护页退回纯展示面；
  *   S6 无裸 alert / confirm（提示一律走 utils/dialog 与 ConfirmDialog）；
  *   S7 操作列**五枚按钮一行排齐**（不许 3+2 换行），分级那行的「设置」跟着那一行走；
  *   S8 状态列**只有徽标**（没有按钮），色彩语义：破坏性=红 / 触发执行=主色 / 查看=中性描边。
@@ -31,7 +31,10 @@ const SCHED = read('views/SchedulerView.vue')
 const MAINT = read('views/MaintenanceView.vue')
 
 /** 剥掉注释再查红线 —— 否则本文件自己的注释就能把护栏顶红。 */
-const noComment = (s) => s.replace(/<!--[\s\S]*?-->/g, '').replace(/^\s*\/\/.*$/gm, '')
+const noComment = (s) => s
+  .replace(/<!--[\s\S]*?-->/g, '')
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/^\s*\/\/.*$/gm, '')
 
 /** 任务行模板段（从 v-for 到列表结束）——表头在它上面，不混进来。 */
 const JOB_ROWS = SCHED.slice(SCHED.indexOf('v-for="row in jobs"'), SCHED.indexOf('<!-- 新建'))
@@ -84,26 +87,25 @@ test('S4 删除的后果要写清：重启后不会复活 + 可重新添加', ()
   assert.match(SCHED, /立刻执行一次（不影响原有的按点调度）。/)
 })
 
-test('S5 两页职责边界：定时页零残留，维护页有实跑卡', () => {
-  // 定时任务页 = 班车调度管理：合并 / 遗忘那套**记忆业务操作**不许留在这儿
-  for (const s of ['runMerge', 'runForget', '合并 · 预演', '遗忘 · 预演', '合并 · 实跑']) {
-    assert.ok(!SCHED.includes(s), `SchedulerView 还留着「${s}」—— 合并 / 遗忘已迁回维护页`)
+test('S5 两页职责边界（2026-11-18 铁律）：预演只在定时页且只算不写，维护页零手动执行', () => {
+  // 铁律：班车的一切入口（调度 + 执行 + 预演）**只存在于「定时任务」页**。
+  // 维护页退回纯展示面（水位 / 提名 / 建议），不再摆手动执行面板。
+  for (const s of ['手动执行', '预演', '实跑', 'runMerge', 'runForget', 'askOps', 'opResult']) {
+    assert.ok(!MAINT.includes(s), `MaintenanceView 还留着「${s}」—— 手动执行面板已搬到「定时任务」页`)
   }
-  assert.doesNotMatch(SCHED, /ops-card/, '定时任务页不许还留操作卡的类名')
-  assert.doesNotMatch(SCHED, /api\.merge\(|api\.forget\(/, '定时任务页不许还调合并 / 遗忘端点')
-  // 维护页 = 记忆业务操作：实跑卡在这儿，且实跑走简单确认弹框
-  for (const s of ['runMerge', 'runForget', '合并 · 预演', '遗忘 · 预演', '合并 · 实跑', '遗忘 · 实跑']) {
-    assert.ok(MAINT.includes(s), `MaintenanceView 少了「${s}」`)
-  }
-  assert.match(MAINT, /import ConfirmDialog from '\.\.\/components\/ConfirmDialog\.vue'/,
-    '实跑确认框复用现成组件')
-  assert.doesNotMatch(MAINT, /:expect=/, '实跑确认不许键入任何字符（confirm:true 即过）')
-  assert.match(MAINT, /confirm: true/, '实跑只带 confirm=true')
+  // 定时任务页：预演只走 **dry-run**（零写入），后端端点零新增
+  assert.match(SCHED, /DRYRUN_BUS_FUNCS/, '预演白名单单源写在视图常量里')
+  assert.match(SCHED, /api\.merge\(\{ dry_run: true \}\)/, '合并只走 dry-run（实跑不在本页）')
+  assert.match(SCHED, /api\.forget\(\{ dry_run: true \}\)/, '遗忘只走 dry-run（实跑不在本页）')
+  assert.doesNotMatch(noComment(SCHED), /confirm:\s*true/, '定时任务页不许出现实跑位（confirm:true）')
+  assert.doesNotMatch(SCHED, /合并 · 实跑|遗忘 · 实跑/, '定时任务页不许有实跑按钮')
   // 分级班车的设置入口留在定时页（跟着它自己那一行走）
   assert.match(SCHED, /分级班车设置/)
   assert.ok(!MAINT.includes('tieringOpen'), '分级班车设置弹框不在本页')
   // 维护页要留一句指向「定时任务」页的链接（班车调度在那儿）
   assert.match(MAINT, /to="\/scheduler"/, '维护页要留一句指向「定时任务」页的链接')
+  // 维护页顶部的口径要改口径：执行入口在「定时任务」页
+  assert.match(MAINT, /合并 \/ 遗忘的执行入口在「定时任务」页/, '维护页要说清执行入口在定时任务页')
 })
 
 test('S6 无裸 alert / confirm', () => {
@@ -112,13 +114,13 @@ test('S6 无裸 alert / confirm', () => {
   assert.match(SCHED, /import \{ showError, showToast \} from '\.\.\/utils\/dialog'/)
 })
 
-test('S7 操作列：五枚常驻按钮一行排齐（不许 3+2 换行）', () => {
+test('S7 操作列：五枚常驻按钮一行排齐（不许 3+2 换行），预演那枚跟着白名单走', () => {
   // 行里的操作列：编辑 / 暂停 / 运行一次 / 执行记录 / 删除 五枚常驻，
-  // 外加分级那行才出现的第六枚「设置」（v-if 收着）。
+  // 外加分级那行才出现的「设置」与白名单班车才出现的「预演」（都 v-if 收着）。
   const buttons = [...cell('col-acts').matchAll(/<el-button\b[^>]*>/g)].map((m) => m[0])
   const always = buttons.filter((b) => !b.includes('v-if'))
   assert.equal(always.length, 5, `常驻按钮应是 5 枚（现在是 ${always.length} 枚）`)
-  assert.equal(buttons.length, 6, `连分级那行的「设置」一共 6 枚（现在是 ${buttons.length} 枚）`)
+  assert.equal(buttons.length, 7, `连「设置」「预演」一共 7 枚（现在是 ${buttons.length} 枚）`)
   // 一行排齐：nowrap（不许换行）+ 列宽够放六枚
   assert.match(SCHED, /\.col-acts\s*\{[^}]*flex-wrap:\s*nowrap/, '操作列不许换行')
   const cols = SCHED.match(/grid-template-columns:\s*([^;]+);/)
@@ -126,6 +128,14 @@ test('S7 操作列：五枚常驻按钮一行排齐（不许 3+2 换行）', () 
   assert.ok(actsWidth >= 280, `操作列宽度 ${actsWidth}px < 280px（放不下五枚按钮）`)
   // 收纳策略：分级那行的「设置」是**第六枚平铺按钮**，不许另开一列
   assert.match(cell('col-acts'), /v-if="isTiering\(row\)"[^>]*@click="openTiering"/, '「设置」跟着分级那行走')
+  // 预演那枚：只对白名单班车的行渲染（跟着那一行走，不许全员都有）
+  assert.match(cell('col-acts'), /v-if="canDryRun\(row\)"[^>]*@click="openDryRun\(row\)"/, '「预演」跟着白名单那行走')
+  // 末轨 380px 的预算（r2 定死的定宽不许动）：白名单行六枚**文字**按钮 =
+  //   编辑2 + 暂停2 + 运行一次4 + 预演2 + 执行记录4 + 删除2 = 16 个 CJK 字
+  //   ≈ 16×12（字号）+ 6×22（左右 padding）+ 6×2（描边）+ 5×6（gap）= 366px ≤ 380px
+  //   （与分级那行六枚同量级 ⇒ 380px 不用动，也就不用改成无文字的图标按钮）
+  const est = 16 * 12 + 6 * (22 + 2) + 5 * 6
+  assert.ok(est <= actsWidth, `白名单行六枚按钮估算 ${est}px 超过末轨 ${actsWidth}px（末轨定宽不许动）`)
 })
 
 test('S8 状态列只有徽标；色彩语义：破坏性=红 / 触发执行=主色 / 查看=中性描边', () => {

@@ -51,7 +51,8 @@
           </span>
         </span>
         <!-- 操作列：五枚常驻按钮一行排齐（不许 3+2 换行）；
-             分级班车那行多一枚「设置」（它的阈值入口跟着它自己那一行走）。
+             分级班车那行多一枚「设置」（它的阈值入口跟着它自己那一行走）；
+             支持 dry-run 的班车再多一枚「预演」（白名单单源在 DRYRUN_BUS_FUNCS）。
              色彩语义：破坏性=红（删除）、触发执行=主色（运行一次）、查看=中性描边。 -->
         <span class="col-acts">
           <el-button size="small" @click="openEdit(row)">编辑</el-button>
@@ -59,6 +60,10 @@
             {{ row.enabled ? '暂停' : '恢复' }}
           </el-button>
           <el-button size="small" type="primary" @click="askTrigger(row)">运行一次</el-button>
+          <!-- 预演（dry-run，零写入）：班车的一切入口只存在于本页（铁律 2026-11-18）。
+               只对支持 dry-run 的班车显示（别的班车没有只算不写的面，
+               给一个假按钮比不给更坏）。 -->
+          <el-button v-if="canDryRun(row)" size="small" :loading="dryBusy" @click="openDryRun(row)">预演</el-button>
           <el-button size="small" @click="openRuns(row)">执行记录</el-button>
           <el-button v-if="isTiering(row)" size="small" :disabled="!tStatus" @click="openTiering">
             设置
@@ -174,6 +179,21 @@
           保存
         </el-button>
       </template>
+    </el-dialog>
+
+    <!-- 预演结果：形状沿用维护页那块 <pre> JSON（全局 .pre 样式），不新造组件、不新造色。 -->
+    <el-dialog
+      v-model="dryOpen"
+      :title="dryTitle"
+      width="560px"
+      align-center
+      :close-on-click-modal="false"
+      append-to-body
+    >
+      <p v-if="dryNote" class="faint">{{ dryNote }}</p>
+      <p v-if="dryError" class="form-error">{{ dryError }}</p>
+      <pre v-if="dryResult" class="pre">{{ dryResult }}</pre>
+      <p v-else-if="!dryError" class="faint">预演中…（只算不写）</p>
     </el-dialog>
 
     <!-- 危险 / 一般动作的统一确认框：**不键入任何字符**（点确认即执行） -->
@@ -370,6 +390,66 @@ async function openRuns(row) {
     runs.value = res?.runs || []
   } catch (e) {
     showError(`读取执行记录失败：${e.message}`)
+  }
+}
+
+/* ---------------------------------------------------------------- 预演（dry-run）
+ * 铁律（2026-11-18）：班车的一切入口（调度 + 执行 + 预演）**只存在于本页**。
+ * 预演走控制台**现成的** dry-run 面（/api/v1/ops/merge、/api/v1/ops/forget）
+ * —— 后端端点零新增；实跑（confirm:true）不在本页，口径归「定时任务」页的运行一次。 */
+
+/**
+ * 预演白名单（**单源写在这里**，别处不许再抄一份）：
+ * key = 班车的函数引用，value = 这一行的预演说明（说清「这一下预演的是什么」）。
+ * 只有**支持 dry-run 的班车**才给「预演」按钮：维护（合并 · 遗忘）与提炼
+ * （写新记忆）两条动的是记忆内容本身；分级 / 同义词两条动的不是这一层，
+ * 控制台没有对应的只算不写口径 ⇒ 不给按钮（宁可不给，也不给一个假的预演）。
+ */
+const DRYRUN_BUS_FUNCS = {
+  'keepsake.buses.maintenance:run': '合并 / 遗忘 = 维护班车那一轮，只算不写（零写入）。',
+  'keepsake.buses.distill:run':
+    '提炼班车写的是新条目，控制台没有它的预演端点（后端零新增）—— 这里是记忆层合并 / 遗忘的只算不写预演。',
+}
+
+/** 这一行给不给「预演」按钮（函数引用命中白名单才给）。 */
+function canDryRun(row) {
+  return Object.keys(DRYRUN_BUS_FUNCS).includes(String(row?.func || '').trim())
+}
+
+const dryOpen = ref(false)
+const dryTitle = ref('')
+const dryNote = ref('')
+const dryError = ref('')
+const dryResult = ref('')
+const dryBusy = ref(false)
+
+/**
+ * 跑一次只算不写的预演：合并与遗忘各跑一次 dry-run（零写入），
+ * 结果按维护页的形状给一块 JSON（<pre> 块）。
+ * 说明文字跟着白名单单源走（这一行预演的是什么，弹框里写明，不装成
+ * 「提炼会产出什么」）。
+ */
+async function openDryRun(row) {
+  if (dryBusy.value) return
+  const func = String(row?.func || '').trim()
+  dryOpen.value = true
+  dryTitle.value = `预演 · ${row?.name || row?.job_id || ''}`
+  dryNote.value = DRYRUN_BUS_FUNCS[func] || ''
+  dryError.value = ''
+  dryResult.value = ''
+  dryBusy.value = true
+  try {
+    const [merge, forget] = await Promise.all([
+      api.merge({ dry_run: true }),
+      api.forget({ dry_run: true }),
+    ])
+    dryResult.value = JSON.stringify({ merge, forget }, null, 2)
+    showToast('预演完成（只算不写，零写入）')
+  } catch (e) {
+    dryError.value = `预演失败：${e.message}`
+    showError(dryError.value)
+  } finally {
+    dryBusy.value = false
   }
 }
 

@@ -173,6 +173,7 @@ const TMP = [
   `${HERE}.probe-scheduler-view.mjs`,
   `${HERE}.probe-confirm-dialog.mjs`,
   `${HERE}.probe-api.mjs`,
+  `${HERE}.probe-dialog.mjs`,
 ]
 
 /** 把编译产物里的 import 改写到 web/tests/ 下能解析的路径。 */
@@ -219,16 +220,34 @@ const ROW_NO_NAME = {
 const API_STUB = `export const api = {
   crons: async () => ({ jobs: ${JSON.stringify([ROW, ROW_NO_NAME])}, scheduler_status: { text: '' } }),
   tieringStatus: async () => null,
+  // 预演走的既有 dry-run 端点（/api/v1/ops/merge、/api/v1/ops/forget）：
+  // 桩件把调用记下来，断言「只带 dry_run:true、后端端点零新增」。
+  merge: async (payload) => {
+    globalThis.__dryCalls = (globalThis.__dryCalls || []).concat([['merge', payload]])
+    return { ok: true, dry_run: true, action: 'ops.merge', stats: { scanned: 10, would_merge: 2 } }
+  },
+  forget: async (payload) => {
+    globalThis.__dryCalls = (globalThis.__dryCalls || []).concat([['forget', payload]])
+    return { ok: true, dry_run: true, action: 'ops.forget', stats: { scanned: 10, candidates: 3 } }
+  },
 }
+`
+
+/** 提示层桩件：真 ElMessage 要真 DOM，这里只记调用（免得提示炸了测试）。 */
+const DIALOG_STUB = `export const showToast = (m) => { (globalThis.__toasts = globalThis.__toasts || []).push(m) }
+export const showError = (m) => { (globalThis.__toasts = globalThis.__toasts || []).push('ERR:' + m) }
+export const showConfirm = async () => true
+export const showPrompt = async () => ''
 `
 
 function writeTmp() {
   writeFileSync(TMP[1], compileSfc(CONFIRM, 'ConfirmDialog.vue', {}))
   writeFileSync(TMP[2], API_STUB)
+  writeFileSync(TMP[3], DIALOG_STUB)
   writeFileSync(TMP[0], compileSfc(VIEW, 'SchedulerView.vue', {
     "'../components/ConfirmDialog.vue'": "'./.probe-confirm-dialog.mjs'",
     "'../api'": "'./.probe-api.mjs'",
-    "'../utils/dialog'": "'../src/utils/dialog.js'",
+    "'../utils/dialog'": "'./.probe-dialog.mjs'",
     "'../utils/format'": "'../src/utils/format.js'",
     "'../utils/cron'": "'../src/utils/cron.js'",
   }))
@@ -270,8 +289,8 @@ function findAll(...roots) {
   return out
 }
 
-/** 挂页面 → 等首屏 → 点「编辑」→ 等弹框。 */
-async function openEditDialog() {
+/** 挂页面 → 等首屏（列表渲染出来）。 */
+async function mountList() {
   const { SchedulerView, ElementPlus, ID_INJECTION_KEY, ZINDEX_INJECTION_KEY } = await boot()
   bodyEl.children = []
   const root = new El('div')
@@ -284,8 +303,12 @@ async function openEditDialog() {
   // onMounted 里的 load() 是异步的（读后端拿列表），等它把行渲染出来
   await new Promise((r) => setTimeout(r, 0))
   await nextTick()
+  return { root, app, nodes: findAll(root, bodyEl) }
+}
 
-  const nodes = findAll(root, bodyEl)
+/** 挂页面 → 等首屏 → 点「编辑」→ 等弹框。 */
+async function openEditDialog() {
+  const { root, app, nodes } = await mountList()
   const editBtn = nodes.find((n) => n.tag === 'button' && n.textContent.trim() === '编辑')
   assert.ok(editBtn, '列表行里没有「编辑」按钮')
   editBtn.props.onClick(new MouseEvent('click'))
@@ -433,6 +456,41 @@ test('D7 名称列渲染文本非空（缺 name 时兜底 job_id）', async () =
   // 第一行有 name；第二行没有 name ⇒ 兜底成 job_id
   assert.equal(textOf(names[0]), ROW.name, '有 name 的行显示 name')
   assert.equal(textOf(names[1]), ROW_NO_NAME.job_id, '缺 name 的行要兜底成 job_id')
+  app.unmount()
+})
+
+test('D9 预演按钮只渲染在白名单行；点它走既有 dry-run 端点（只算不写，后端零新增）', async () => {
+  const { root, app, nodes } = await mountList()
+  // 两行任务：ROW 带 func=keepsake.buses.distill:run（命中白名单），
+  // ROW_NO_NAME 没有 func（不命中）⇒ 「预演」只该出现在第一行。
+  const dryBtns = nodes.filter((n) => n.tag === 'button' && n.textContent.trim() === '预演')
+  assert.equal(dryBtns.length, 1, `「预演」按钮应只在白名单行出现（现在 ${dryBtns.length} 个）`)
+  const rows = nodes.filter((n) => typeof n.className === 'string' && n.className.includes('job-row'))
+  assert.equal(rows.length, 2, `两行任务（现在 ${rows.length} 行）`)
+  const whiteRow = rows.find((r) => r.contains(dryBtns[0]))
+  assert.ok(whiteRow, '「预演」按钮不在任务行里')
+  const otherRow = rows.find((r) => r !== whiteRow)
+  assert.ok(otherRow, '找不到非白名单那一行')
+  assert.equal(otherRow.children.filter((c) => c.tag === 'button' && c.textContent.trim() === '预演').length, 0,
+    '非白名单的行不许出现「预演」按钮')
+
+  // 点它 → 走**既有** dry-run 端点（ops/merge、ops/forget），payload 只带 dry_run:true
+  globalThis.__dryCalls = []
+  dryBtns[0].props.onClick(new MouseEvent('click'))
+  await new Promise((r) => setTimeout(r, 20))
+  await nextTick()
+  const calls = globalThis.__dryCalls || []
+  assert.deepEqual(calls.map((c) => c[0]).sort(), ['forget', 'merge'],
+    '预演要走合并 + 遗忘两条 dry-run')
+  for (const [, payload] of calls) {
+    assert.deepEqual(payload, { dry_run: true }, '预演只许 dry_run:true（带 confirm 就是实跑）')
+  }
+  // 结果按维护页的形状给一块 <pre> JSON（全局 .pre 样式，不新造组件）
+  const pre = findAll(bodyEl).find((n) => n.tag === 'pre')
+  assert.ok(pre, '预演结果没有 <pre> JSON 块')
+  const text = `${pre.text || ''}${pre.textContent || ''}`
+  assert.match(text, /would_merge/, '结果里要有合并预演的统计')
+  assert.match(text, /candidates/, '结果里要有遗忘预演的统计')
   app.unmount()
 })
 
