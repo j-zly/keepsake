@@ -99,7 +99,11 @@
       </el-form>
       <p v-if="formError" class="form-error">{{ formError }}</p>
       <template #footer>
-        <el-button :disabled="busy" @click="formOpen = false">取消</el-button>
+        <!-- 🔴 :disabled 必须写 !!busy，不能直接绑 busy：busy 是**字符串**状态
+             （'' | 'form' | 'pause' | ...），el-button 的 disabled 是 Boolean 型 prop，
+             Vue 会把空串 '' 强转成 true —— 绑 busy 的话「取消」永远带 is-disabled，
+             看着像坏的、其实也真点不动（用户实拍「取消按钮像禁用」就是这么来的）。 -->
+        <el-button :disabled="!!busy" @click="formOpen = false">取消</el-button>
         <el-button type="primary" :loading="busy === 'form'" @click="saveForm">保存</el-button>
       </template>
     </el-dialog>
@@ -454,8 +458,10 @@ onMounted(async () => {
  * 六列对齐（名称 / 任务 ID / 调度 / 下次执行 / 状态 / 操作）——
  * 表头与行共用同一套列宽，眼睛往下扫时那一列是一条直线。
  *
- * 列宽口径（scheduler_page_ui_fix）：
- *   名称 240px 定宽（**两行**：名字 + 人话副标，副标不许被挤没）；
+ * 列宽口径（scheduler_page_ui_fix → scheduler_view_polish2）：
+ *   名称 minmax(240px, 1fr) —— **吃弹性**：宽屏多出来的宽度全给它，
+ *     右边的列跟着推到容器右缘（列宽全定死的话，宽屏右侧会空一大片，
+ *     操作列离右缘差着几百像素，看着像「没贴边」）；
  *   调度 / 下次执行 收窄（它们本来就是短串）；
  *   操作列 380px —— 五枚常驻按钮（编辑 / 暂停 / 运行一次 / 执行记录 / 删除）
  *   一行排齐，分级班车那行第六枚「设置」也塞得下（**不许 3+2 换行**）。 */
@@ -468,7 +474,7 @@ onMounted(async () => {
 .job-head,
 .job-row {
   display: grid;
-  grid-template-columns: 240px 130px 120px 130px 160px 380px;
+  grid-template-columns: minmax(240px, 1fr) 130px 120px 130px 160px 380px;
   align-items: center;
   gap: 12px;
   padding: 12px 20px;
@@ -526,12 +532,14 @@ onMounted(async () => {
   flex-wrap: nowrap;
 }
 /* 操作列：一行排齐（不许换行成 3+2）—— 按钮自己排版，
-   Element Plus 默认给相邻按钮加的 margin-left 在这里归零（间距统一交给 gap）。 */
+   Element Plus 默认给相邻按钮加的 margin-left 在这里归零（间距统一交给 gap）。
+   justify-self: end —— 这一列**贴容器右缘**（表头的「操作」二字与行里的按钮同一条右缘）。 */
 .col-acts {
   display: flex;
   gap: 6px;
   align-items: center;
   flex-wrap: nowrap;
+  justify-self: end;
 }
 .col-acts :deep(.el-button + .el-button) {
   margin-left: 0;
@@ -547,6 +555,7 @@ onMounted(async () => {
   }
   .col-acts {
     flex-wrap: wrap;         /* 单列布局下允许换行（横滚已不需要） */
+    justify-self: stretch;   /* 单列布局不再贴右缘，按钮左起排（贴着行首更好读） */
   }
 }
 

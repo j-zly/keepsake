@@ -277,6 +277,15 @@ html.dark {
   border-color: var(--text-ghost);
   color: var(--text);
 }
+/* 暗色下的次要按钮（取消一类）：默认档的描边只有 8~11% 白（几乎看不见），
+   文字也偏灰 —— 肉眼与禁用态（灰字 + 无描边）分不开，看着像「按不动」。
+   文字提到 --text 档、描边提到 --text-ghost 档（都是既有令牌，不新增色值），
+   于是「可点」与「禁用」一眼分得开。
+   只管次要按钮：primary / danger 等类型各自带自己的 --el-button-* 变量，不许被这条改掉。 */
+:root[data-theme="dark"] .el-button:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info) {
+  --el-button-text-color: var(--text);
+  --el-button-border-color: var(--text-ghost);
+}
 .el-button.is-link,
 .el-button.is-text {
   box-shadow: none;
