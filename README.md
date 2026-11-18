@@ -411,9 +411,9 @@ Then reference it in config.json:
 | `top_k` | `KEEPSAKE_TOP_K` | `5` | Number of final entries returned |
 | `candidate_k` | `KEEPSAKE_CANDIDATE_K` | `10` | Candidate entries count (for KNN) |
 | `tag_filter` | `KEEPSAKE_TAG_FILTER` | `""` | Tag filtering (comma-separated) |
-| `bm25_limit` | `KEEPSAKE_BM25_LIMIT` | `10` | BM25 search candidate count |
-| `decay_half_days` | `KEEPSAKE_DECAY_HALF_DAYS` | `60` | Time decay half-life (days) |
-| `embed_cache_ttl` | `KEEPSAKE_EMBED_CACHE_TTL` | `3600` | Embedding cache TTL (seconds) |
+| `bm25_limit` | — | `10` | BM25 search candidate count (config-file only) |
+| `decay_half_days` | — | `60` | Time decay half-life (days) (config-file only) |
+| `embed_cache_ttl` | — | `3600` | Embedding cache TTL (seconds) (config-file only) |
 | `sentiment_boost_positive` | — | `1.5` | Positive entry weight multiplier |
 | `sentiment_boost_negative` | — | `1.3` | Negative entry weight multiplier |
 | `feedback_positive_boost` | — | `1.3` | Positive feedback bonus weight |
