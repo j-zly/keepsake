@@ -118,7 +118,7 @@ pip install keepsake-memory                # sqlite-capable core (BM25 only, no 
 pip install 'keepsake-memory[postgres]'    # or the PostgreSQL backend
 ```
 
-**2. Configure** — create `~/.config/keepsake/config.json` (or export environment variables instead; environment variables win):
+**2. Configure** — create `~/.config/keepsake/config.json` (the storage backend and its connection details can only be declared here or in `config.yaml`; environment variables override retrieval parameters only):
 
 ```bash
 mkdir -p ~/.config/keepsake
@@ -133,11 +133,12 @@ cat > ~/.config/keepsake/config.json <<'JSON'
 JSON
 ```
 
-Environment-only alternative:
+Environment overrides for retrieval parameters (they win over the JSON file; `storage.*` is **not** env-overridable since 2.0.0):
 
 ```bash
-export KEEPSAKE_REDIS_HOST=127.0.0.1
-export KEEPSAKE_REDIS_PORT=6379
+export KEEPSAKE_TOP_K=5
+export KEEPSAKE_TAG_FILTER=work
+export KEEPSAKE_AGENT_ID=my-agent
 ```
 
 **3. Point Hermes at it** — in `~/.hermes/config.yaml`:
@@ -165,7 +166,7 @@ Configuration precedence (high to low): **Environment variables > JSON config fi
 There are three ways to configure Keepsake, listed in order of priority:
 
 1. **Environment Variables** (Highest precedence)  
-   Set environment variables like `KEEPSAKE_REDIS_HOST`, `KEEPSAKE_REDIS_PASSWORD`, etc.
+   Set environment variables like `KEEPSAKE_TOP_K`, `KEEPSAKE_EMBEDDER_MODEL`, etc. (storage backend / connection details are **config-file only** — see [Storage Backends](#storage-backends-postgresql--sqlite)).
 
 2. **JSON Config File** (~/.config/keepsake/config.json)  
    A complete JSON configuration file for all settings.
@@ -334,13 +335,13 @@ memory:
 
 If `embedder` is not configured, only BM25 full-text search mode will be used.
 
-Also supports environment variable configuration (highest precedence):
+Also supports environment variable overrides for retrieval / embedder parameters (highest precedence; the `storage` section itself is config-file only):
 
 ```bash
-export KEEPSAKE_REDIS_HOST=127.0.0.1
-export KEEPSAKE_REDIS_PORT=6379
 export KEEPSAKE_TOP_K=5
+export KEEPSAKE_CANDIDATE_K=20
 export KEEPSAKE_EMBEDDER_MODEL=text-embedding-v2
+export KEEPSAKE_EMBEDDER_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export OPENAI_API_KEY=***           # embedder API key
 ```
 
@@ -1186,7 +1187,7 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 
 ## v2 Two-Phase Pipeline (2026-09)
 
-每轮对话走两相 LLM：**提取相**从窗口提炼长期事实（废话/纯确认自然无事实可提而消亡），**更新相**对每条 fact 拿 top-5 相似旧记忆做 ADD / UPDATE / DELETE / NOOP —— UPDATE/DELETE 给旧碎片只打 `superseded_by` 封边不物理删，检索侧统一排除；窗口内 LLM 调用硬顶 `llm_pipeline.max_calls_per_window`（默认 8），任一 LLM/JSON 失败或超预算 → 窗口整体回落 v1 规则闸门直存原文，**绝不静默丢消息**。配置键：`llm_pipeline.{enabled, model, window_pairs, window_seconds, max_calls_per_window, update_top_k, recent_context_size}`、`v2_min_score`。
+每轮对话走两相 LLM：**提取相**从窗口提炼长期事实（废话/纯确认自然无事实可提而消亡），**更新相**对每条 fact 拿 top-5 相似旧记忆做 ADD / UPDATE / DELETE / NOOP —— UPDATE/DELETE 给旧记忆条目只打 `superseded_by` 封边不物理删，检索侧统一排除；窗口内 LLM 调用硬顶 `llm_pipeline.max_calls_per_window`（默认 8），任一 LLM/JSON 失败或超预算 → 窗口整体回落 v1 规则闸门直存原文，**绝不静默丢消息**。配置键：`llm_pipeline.{enabled, model, window_pairs, window_seconds, max_calls_per_window, update_top_k, recent_context_size}`、`v2_min_score`。
 
 ## LLM 通道（2026-09 ks_noqwen 重写）
 
@@ -1241,10 +1242,10 @@ The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin 
 
 **为什么摘掉接线：**
 - 输出质量差：LLM 多级合并产生的「无时态散文」与 v2 封边链（`superseded_by`）互不相认 —— 旧合并产物会被 v2 检索侧的封边过滤误伤或绕过。
-- 职责重叠：v2 两相管线的「提取相」窗口级事实提炼 +「更新相」supersede 封边，已全面覆盖 Consolidator 的碎片提纯职能。
-- 维护成本：双管线并存需要为同一份碎片库维护两套并查链路，得不偿失。
+- 职责重叠：v2 两相管线的「提取相」窗口级事实提炼 +「更新相」supersede 封边，已全面覆盖 Consolidator 的记忆条目提纯职能。
+- 维护成本：双管线并存需要为同一份记忆库维护两套并查链路，得不偿失。
 
-**替代者：** `pipeline.py`（v2 两相管线）。每个 turn 窗口触发提取相 → 更新相，原地 supersede 旧碎片；运行时无独立合并 cron 任务。
+**替代者：** `pipeline.py`（v2 两相管线）。每个 turn 窗口触发提取相 → 更新相，原地 supersede 旧记忆条目；运行时无独立合并 cron 任务。
 
 **怎么用合并：** 运维脚本 / cron **每轮现构造** —— `Consolidator(storage=storage_from_config(...), config=cfg).consolidate(dry_run=False)`。因为是每轮现读 config，改 `consolidate_min_overlap` / `consolidate_min_group` **下一轮即生效，无需重启**。阈值说明见 [Storage Backends](#storage-backends-postgresql--sqlite) → "Consolidation thresholds"，dry-run 用法见 [自检清单](#post-switch-self-check-checklist)。
 
