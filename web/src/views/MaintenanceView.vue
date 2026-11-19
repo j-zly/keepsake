@@ -201,10 +201,10 @@ const agentNames = computed(() =>
     Object.fromEntries(agentRows.value.map((a) => [a.agent_id, a.name || a.agent_id])),
 )
 
-/** 常驻水位总量：优先班车状态端点的 budget（与看板同一口径），退到 stats 的 core。 */
+/** 常驻水位总量：唯一口径 = /api/v1/stats 的 core 段（与看板同一接口）。
+ *  历史坑（2026-11-19 修）：这里曾优先读一个从未定义的 `tStatus`，computed 求值即抛
+ *  ReferenceError、被 Vue 静默吞 ⇒ water 恒 null ⇒ 水位条显示 "-"、代理卡占比恒 0%。 */
 const water = computed(() => {
-    const b = tStatus.value?.budget
-    if (b && typeof b.used === 'number') return b
     const chars = data.value?.core?.chars
     if (typeof chars === 'number') {
         return { used: chars, total: data.value?.core?.budget || 0, ratio: data.value?.core?.percent || 0 }
