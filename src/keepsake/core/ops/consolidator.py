@@ -540,8 +540,10 @@ class Consolidator:
         self._max_age_hours = max_age_hours
         self._llm_model = llm_model
         self._batch_size = batch_size
-        # channel：可选 resolve_llm_channel 输出；None → _call_llm 内部兜底
-        self._channel = channel
+        # channel：显式传入优先；缺省 ⇒ 构造时自解析（2.0.0 回归修复 2026-11-19：
+        # 旧「_call_llm 内部兜底」随 Redis 移除已不存在，裸构造 Consolidator(storage)
+        # 的两个生产调用方（maintenance 班车 / ops 手动触发）全体 channel=None ⇒ 合并全灭。
+        self._channel = channel if channel is not None else resolve_llm_channel_cached()
 
     def consolidate(self, dry_run: bool = False) -> Dict[str, Any]:
         """执行一轮碎片合并。返回操作统计。
