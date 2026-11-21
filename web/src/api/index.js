@@ -246,6 +246,18 @@ export const api = {
   revokeCredential: (agentId, credId) =>
     http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/revoke`,
       { confirm: true }).then((r) => r.data),
+  // 启用一把已作废的钥匙（恢复原钥匙本身；作废时密文已清 ⇒ 明文不可再取，客户端手里的旧串立刻可用）。
+  enableCredential: (agentId, credId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/enable`)
+      .then((r) => r.data),
+  // 换发单把：只作废这一把 + 同标签同授权补发新把（别的入口不动）。明文一次性。
+  rotateCredential: (agentId, credId) =>
+    http.post(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}/rotate`)
+      .then((r) => r.data),
+  // 硬删一把（不可恢复；确认串 = 这把编号前 8 位，后端拒 true）。
+  deleteCredential: (agentId, credId, confirm) =>
+    http.delete(`/api/v1/agents/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credId)}`,
+      { data: { confirm } }).then((r) => r.data),
   // 把**已经在用**的凭据登记成可还原：不换发、不签发新串（⇒ 线上代理不断线）。
   // 🔴 明文只在这一发请求里出浏览器，前端不留副本（粘贴框提交后立刻清空）。
   backfillCredential: (agentId, credential) =>

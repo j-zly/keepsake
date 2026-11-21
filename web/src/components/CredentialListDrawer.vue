@@ -70,6 +70,15 @@
           <el-button v-if="r.status === 'active'" size="small" :disabled="!!busyId" @click="askRevoke(r)">
             作废
           </el-button>
+          <el-button v-if="r.status !== 'active'" size="small" :disabled="!!busyId" @click="doEnable(r)">
+            启用
+          </el-button>
+          <el-button v-if="r.status === 'active'" size="small" plain :disabled="!!busyId" @click="askRotate(r)">
+            重新生成
+          </el-button>
+          <el-button size="small" link type="danger" :disabled="!!busyId" @click="doDelete(r)">
+            删除
+          </el-button>
         </div>
       </li>
     </ul>
@@ -104,6 +113,18 @@
     >
       <p>用它的客户端会<strong>立刻</strong>连不上；这个代理的其余凭据与状态都不受影响。</p>
       <p class="tip">作废后取不出明文（密文一并清掉），历史与用量仍留在清单里。</p>
+    </ConfirmDialog>
+
+    <ConfirmDialog
+      v-model="rotateOpen"
+      title="重新生成这把凭据？"
+      :confirm-text="`换发「${rotateRow?.label || '未命名'}」`"
+      tone="danger"
+      :busy="busy"
+      @confirm="doRotate"
+    >
+      <p>旧钥匙<strong>当场作废</strong>（用它的客户端立刻连不上），并补发一把同标签、同授权的新钥匙。</p>
+      <p class="tip">只动这一把 —— 这个代理的其他凭据一概不牵连。新明文只在下面的弹框里显示一次。</p>
     </ConfirmDialog>
 
     <CredentialDialog
@@ -147,6 +168,8 @@ const credMode = ref('issue')
 const credOpen = ref(false)
 const revokeOpen = ref(false)
 const revokeRow = ref(null)
+const rotateOpen = ref(false)
+const rotateRow = ref(null)
 
 const canAdd = computed(() => props.agent?.status === 'approved')
 const hasUnrecoverable = computed(() =>
@@ -256,8 +279,70 @@ async function doRevoke() {
   }
 }
 
+async function doEnable(r) {
+  busy.value = true
+  try {
+    await api.enableCredential(props.agent.agent_id, r.cred_id)
+    showToast(`已启用「${r.label || '未命名'}」——客户端手里的旧串立刻可用`)
+    await load()
+    emit('changed')
+  } catch (e) {
+    showError(e?.response?.data?.detail?.message || e?.message || '启用失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+function askRotate(r) {
+  rotateRow.value = r
+  rotateOpen.value = true
+}
+
+async function doRotate() {
+  const r = rotateRow.value
+  if (!r) return
+  busy.value = true
+  try {
+    const out = await api.rotateCredential(props.agent.agent_id, r.cred_id)
+    rotateOpen.value = false
+    cred.value = String(out.credential || '')
+    credMode.value = 'new'
+    credOpen.value = true
+    await load()
+    emit('changed')
+  } catch (e) {
+    showError(e?.response?.data?.detail?.message || e?.message || '换发失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+async function doDelete(r) {
+  // 确认串 = 这把编号前 8 位（与后端 delete 闸同档：看着目标打字，传 true 不算数）。
+  const expect = String(r.cred_id || '').slice(0, 8)
+  const got = window.prompt(
+    `删除「${r.label || '未命名'}」（${expect}…）不可恢复——要可逆请用「作废」。\n确认请原样输入这把编号前 8 位：`)
+  if (got === null) return
+  if (got.trim() !== expect) {
+    showError('编号对不上，没有删除任何东西')
+    return
+  }
+  busy.value = true
+  try {
+    await api.deleteCredential(props.agent.agent_id, r.cred_id, got.trim())
+    showToast(`已删除「${r.label || '未命名'}」（删前快照已落审计备份）`)
+    await load()
+    emit('changed')
+  } catch (e) {
+    showError(e?.response?.data?.detail?.message || e?.message || '删除失败')
+  } finally {
+    busy.value = false
+  }
+}
+
 function startEdit(r) {
   editing.value = r.cred_id
+
   editingLabel.value = r.label || ''
 }
 

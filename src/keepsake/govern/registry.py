@@ -284,7 +284,10 @@ KS_CREDENTIAL_DDL = f"""
         -- 缺省 `memory,kb` = 全授权 ⇒ 存量行升级后行为一字不变（收紧要人来勾）。
         -- 🔴 判据只有一处（`has_scope` + 闸门里的 `scope_of_tool`）：
         --    这一列在别处再解一遍，迟早出现"这边说能用、那边说不能用"。
-        scopes             {SCOPES_COLUMN_DECL}
+        scopes             {SCOPES_COLUMN_DECL},
+        -- 这把被作废的时刻（active 行恒空）。2026-11-21 补列：作废动作此前只翻
+        -- status，界面「废于 —」的 — 就是没有这一列的诚实兜底。
+        revoked_at         text NOT NULL DEFAULT ''
     )
 """
 
@@ -868,6 +871,9 @@ class _CredSqlBackend(_SqlBase):
         try:
             if not self.has_column(SCOPES_COLUMN, TABLE_CREDENTIAL):
                 self.add_column(SCOPES_COLUMN, SCOPES_COLUMN_DECL, TABLE_CREDENTIAL)
+            if not self.has_column("revoked_at", TABLE_CREDENTIAL):
+                self.add_column("revoked_at", "text NOT NULL DEFAULT ''",
+                                TABLE_CREDENTIAL)
         except Exception as e:      # noqa: BLE001 —— 交调用方决定降级
             logger.warning("keepsake: 凭据表补列 %s 失败（%s: %s）",
                            SCOPES_COLUMN, type(e).__name__, e)
@@ -947,9 +953,9 @@ class _CredSqlBackend(_SqlBase):
         已作废的行留着 —— 它们是"谁在什么时候被掐掉"的历史。"""
         def _fn(cur: Any) -> int:
             cur.execute(
-                f"UPDATE {TABLE_CREDENTIAL} SET status = {self.ph} "
+                f"UPDATE {TABLE_CREDENTIAL} SET status = {self.ph}, revoked_at = {self.ph} "
                 f"WHERE agent_id = {self.ph} AND status = {self.ph}",
-                (CRED_STATUS_OFF, agent_id, CRED_STATUS_ON))
+                (CRED_STATUS_OFF, _now_iso(), agent_id, CRED_STATUS_ON))
             return cur.rowcount
 
         return int(self.write(_fn) or 0)
@@ -958,6 +964,16 @@ class _CredSqlBackend(_SqlBase):
         def _fn(cur: Any) -> int:
             cur.execute(f"DELETE FROM {TABLE_CREDENTIAL} WHERE agent_id = {self.ph}",
                         (agent_id,))
+            return cur.rowcount
+
+        return int(self.write(_fn) or 0)
+
+    def delete_one(self, cred_id: str, agent_id: str) -> int:
+        # 🔴 双条件硬删：只按 cred_id 删会把别人家的钥匙当成自家垃圾清掉。
+        def _fn(cur: Any) -> int:
+            cur.execute(f"DELETE FROM {TABLE_CREDENTIAL} "
+                        f"WHERE cred_id = {self.ph} AND agent_id = {self.ph}",
+                        (cred_id, agent_id))
             return cur.rowcount
 
         return int(self.write(_fn) or 0)
@@ -1242,6 +1258,7 @@ class Registry:
             return False        # 已经废过：不谎报"刚废掉"（界面据此提示"这把这前就废了"）
         return self._cred.set_fields(cid, {
             "status": CRED_STATUS_OFF,
+            "revoked_at": _now_iso(),
             ENC_COLUMN: "",     # 🔴 密文一起清：留着就随时能再取出来用，作废是假的
         })
 
@@ -1253,6 +1270,67 @@ class Registry:
         if not row or row["agent_id"] != aid:
             return False
         return self._cred.set_fields(cid, {"label": _cred_label(label)})
+
+    def enable_credential(self, agent_id: str, cred_id: str) -> bool:
+        """启用一把**已作废**的凭据（revoked → active，废于时刻清空）。
+
+        🔴 只翻 `status` 与 `revoked_at`，hash/label/scopes/用量一个都不动 —— 启用后的
+        就是原来那把钥匙本身（客户端手里那份旧明文立刻可用）。
+        ⚠️ 作废时密文已清（作废是真的）⇒ 启用**不能**让控制台重新复制明文；
+        明文丢了要新钥匙请走 rotate。在用行返回 False（不谎报"刚启用"，界面据此提示）。
+        """
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return False
+        if row["status"] != CRED_STATUS_OFF:
+            return False
+        return self._cred.set_fields(cid, {
+            "status": CRED_STATUS_ON,
+            "revoked_at": "",
+        })
+
+    def rotate_credential(self, agent_id: str, cred_id: str) -> Optional[str]:
+        """换发单把钥匙：**只作废这一把** + 同 label 同 scopes 补发新把，回明文。
+
+        与 `approve(reissue=True)` 的分界：那边是代理面整体换发（掐全部旧钥匙），
+        这里精确到单把 —— 别的入口一根汗毛都不动。旧把已 revoked 也允许换发
+        （语义 = 就着这把的档案再补一把新的），代理不在册/未批准 ⇒ None。
+        """
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return None
+        if self._be.load(aid) is None or \
+                self._be.load(aid).get("status") != STATUS_APPROVED:
+            return None
+        if row["status"] == CRED_STATUS_ON:
+            self._cred.set_fields(cid, {"status": CRED_STATUS_OFF,
+                                        "revoked_at": _now_iso()})
+        new_plain = self._issue(aid, row.get("label") or "")
+        # 继承旧把的功能授权（换发是换钥匙，不是改权限）。
+        # 新把定位=名下 created_at 最新且非旧把（与 API add 端点同一取新法）。
+        rows = [r for r in self._cred.list(aid) if r["cred_id"] != cid]
+        newest = max(rows, key=lambda r: str(r.get("created_at") or ""),
+                     default=None)
+        if newest and row.get(SCOPES_COLUMN):
+            self._cred.set_scopes(newest["cred_id"], row[SCOPES_COLUMN])
+        return new_plain
+
+    def delete_credential(self, agent_id: str, cred_id: str) -> bool:
+        """硬删一把凭据（行从账上消失，审计与 _backup 留底是调用方的事）。
+
+        🔴 与 revoke 的分界写死在界面上：revoke 留痕可启用，delete 不可恢复。
+        双条件硬删（agent 归属对不上 ⇒ False），主代理的钥匙不许删。
+        """
+        aid = (agent_id or "").strip()
+        cid = (cred_id or "").strip()
+        row = self._cred.get(cid)
+        if not row or row["agent_id"] != aid:
+            return False
+        return self._cred.delete_one(cid, aid) > 0
 
     def approve(self, agent_id: str, reissue: bool = False,
                 label: str = "") -> Optional[str]:

@@ -533,6 +533,21 @@ class AgentCredentialRenameBody(BaseModel):
     label: str = ""
 
 
+class AgentCredentialDeleteBody(BaseModel):
+    """硬删一把凭据的确认闸。
+
+    🔴 `confirm` 必须手输**这把的 cred_id 前 8 位**（与 revoke 手输 agent_id
+    前 8 位同档思路：确认值 = 被毁物的身份，逼操作者看着目标打字）。
+    delete 不可恢复（revoke 留痕可启用）—— 界面上这两个按钮必须分开摆位。
+    """
+
+    confirm: Any = False
+
+
+class AgentCredentialEnableBody(BaseModel):
+    """启用一把已作废的凭据：恢复原钥匙本身 ⇒ 不设确认闸（风险低于新建）。"""
+
+
 class AgentActionBody(BaseModel):
     """approve / revoke / exclude 三条端点共用的请求体。
 

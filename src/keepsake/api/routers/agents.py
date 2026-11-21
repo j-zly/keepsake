@@ -89,6 +89,7 @@ from ..schemas import (
     AgentCredentialAddBody,
     AgentCredentialList,
     AgentCredentialRenameBody,
+    AgentCredentialDeleteBody,
     AgentCredentialScopesBody,
     AgentRoleBody,
 )
@@ -725,6 +726,85 @@ def revoke_one_credential(agent_id: str, cred_id: str, body: AgentActionBody,
                  reason="credential revoked cred_id=%s" % cred_id)
     return {"ok": True, "agent_id": agent_id, "cred_id": cred_id,
             "note": "这把已作废，用它的客户端会立刻连不上；其余各把不受影响"}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/enable",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def enable_one_credential(agent_id: str, cred_id: str,
+                          storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**启用一把已作废的钥匙**（revoked → active，废于时刻清空）。
+
+    恢复的就是原来那把凭据本身（hash/hint/密文/标签/授权/用量都不动）——
+    客户端拿着旧明文立刻能连，不需要重配。在用行 ⇒ 409（本来就活着，不谎报）。
+    """
+    action = "agents.enable_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    if not registry.enable_credential(agent_id, cred_id):
+        _reject(409, "credential_not_revoked",
+                "这把不在这个代理名下，或它本来就在用（启用只针对已作废的行）",
+                action, agent_id)
+    audit.record(action, agent_id, ok=True,
+                 reason="credential enabled cred_id=%s" % cred_id)
+    return {"ok": True, "agent_id": agent_id, "cred_id": cred_id,
+            "note": "这把已恢复启用，客户端旧明文立刻可用"}
+
+
+@router.post("/api/v1/agents/{agent_id}/credentials/{cred_id}/rotate",
+             dependencies=[Depends(require_session), Depends(write_guard)])
+def rotate_one_credential(agent_id: str, cred_id: str,
+                          storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**换发这一把**：旧钥匙当场作废 + 同标签同授权补发新钥匙，明文一次性回传。
+
+    与 `approve(reissue)` 的分界：只动这一把，别的入口一根汗毛都不动。
+    🔴 明文只在响应里出现这一次（库里只落 sha256），关掉弹框即无处可抄。
+    """
+    action = "agents.rotate_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    credential = registry.rotate_credential(agent_id, cred_id)
+    if not credential:
+        _reject(409, "credential_not_found",
+                "这把不在这个代理名下，或代理未批准（换发只对在册已批准的代理开放）",
+                action, agent_id)
+    # 新把编号 = 名下 created_at 最新且非被换那把（与 registry 取新法同口径）。
+    rows = [x for x in registry.list_credentials(agent_id) if x["cred_id"] != cred_id]
+    newest = max(rows, key=lambda x: str(x.get("created_at") or ""), default=None)
+    audit.record(action, agent_id, ok=True,
+                 reason="credential rotated old_cred_id=%s" % cred_id)
+    return {"ok": True, "agent_id": agent_id, "rotated_from": cred_id,
+            "cred_id": str(newest["cred_id"]) if newest else "",
+            "credential": credential,
+            "note": "旧钥匙已当场作废；新钥匙请立刻抄走，关掉弹框就不再显示"}
+
+
+@router.delete("/api/v1/agents/{agent_id}/credentials/{cred_id}",
+               dependencies=[Depends(require_session), Depends(write_guard)])
+def delete_one_credential(agent_id: str, cred_id: str, body: AgentCredentialDeleteBody,
+                          storage: Any = Depends(get_storage)) -> Dict[str, Any]:
+    """**硬删一把钥匙**（行从凭据账消失，不可恢复；要可逆请用作废）。
+
+    🔴 确认串 = cred_id 前 8 位（被毁物的身份），传 `true` 一律 400；
+    🔴 主代理的钥匙不许删（删它等于把主脑自己降级，与 revoke 同闸）。
+    """
+    action = "agents.delete_credential"
+    registry = _registry(storage)
+    _need_agent(registry, agent_id, action)
+    _need_not_primary(registry, agent_id, action)
+    expected = cred_id[:8]
+    got = str(body.confirm or "").strip()
+    if got != expected:
+        _reject(400, "confirm_required",
+                f"删除凭据不可恢复：confirm 必须手输这把编号前 8 位（{expected}），"
+                "传 true 不算数", action, agent_id)
+    snapshot = _backup(action, registry.list_credentials(agent_id))
+    if not registry.delete_credential(agent_id, cred_id):
+        _reject(409, "credential_not_found",
+                "这把不在这个代理名下（编号写错，或它是别人的凭据）", action, agent_id)
+    audit.record(action, agent_id, ok=True,
+                 reason=f"credential deleted cred_id={cred_id} backup={snapshot}")
+    return {"ok": True, "agent_id": agent_id, "cred_id": cred_id,
+            "note": "这把已从凭据账删除（不可恢复；删前快照已落审计备份）"}
 
 
 @router.delete("/api/v1/agents/{agent_id}",
