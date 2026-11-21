@@ -791,12 +791,14 @@ def delete_one_credential(agent_id: str, cred_id: str, body: AgentCredentialDele
     registry = _registry(storage)
     _need_agent(registry, agent_id, action)
     _need_not_primary(registry, agent_id, action)
-    expected = cred_id[:8]
-    got = str(body.confirm or "").strip()
-    if got != expected:
+    # 确认闸（用户 11-21 拍板放宽）：界面=警示弹框点确认（confirm:true）即可删；
+    # 兼容 CLI 传编号前 8 位（两种都认，其余一律拒）。
+    conf = body.confirm
+    accepted = (conf is True) or (str(conf or "").strip() == cred_id[:8])
+    if not accepted:
         _reject(400, "confirm_required",
-                f"删除凭据不可恢复：confirm 必须手输这把编号前 8 位（{expected}），"
-                "传 true 不算数", action, agent_id)
+                "删除不可恢复：需确认（界面弹框点「删除」，或 CLI 传这把编号前 8 位）",
+                action, agent_id)
     snapshot = _backup(action, registry.list_credentials(agent_id))
     if not registry.delete_credential(agent_id, cred_id):
         _reject(409, "credential_not_found",

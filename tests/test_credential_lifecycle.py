@@ -113,13 +113,15 @@ def test_换发只掐这一把_新旧边界清晰(env):
 # ------------------------------------------------------------------ 删除
 
 
-def test_删除要手输编号前8位_true不算(env):
+def test_删除确认可true或编号串_乱值拒(env):
+    # 用户 11-21 拍板：界面弹框点确认（true）即删；CLI 编号前 8 位兼容；其余拒。
     client, reg, first, second, cid = _seed_two(env)
     r = client.request("DELETE", f"/api/v1/agents/worker/credentials/{cid}",
-                       json={"confirm": True}, headers=AUTH)
+                       json={"confirm": "胡填"}, headers=AUTH)
     assert r.status_code == 400, r.text
+    assert reg.verify("worker", second)["ok"]      # 拒删：钥匙还在
     r = client.request("DELETE", f"/api/v1/agents/worker/credentials/{cid}",
-                       json={"confirm": cid[:8]}, headers=AUTH)
+                       json={"confirm": True}, headers=AUTH)
     assert r.status_code == 200, r.text
     assert not reg.verify("worker", second)["ok"]  # 钥匙没了
     ids = [x["cred_id"] for x in reg.list_credentials("worker")]

@@ -76,7 +76,7 @@
           <el-button v-if="r.status === 'active'" size="small" plain :disabled="!!busyId" @click="askRotate(r)">
             重新生成
           </el-button>
-          <el-button size="small" link type="danger" :disabled="!!busyId" @click="doDelete(r)">
+          <el-button size="small" link type="danger" :disabled="!!busyId" @click="askDelete(r)">
             删除
           </el-button>
         </div>
@@ -127,6 +127,18 @@
       <p class="tip">只动这一把 —— 这个代理的其他凭据一概不牵连。新明文只在下面的弹框里显示一次。</p>
     </ConfirmDialog>
 
+    <ConfirmDialog
+      v-model="deleteOpen"
+      title="删除这把凭据？"
+      :confirm-text="`删除「${deleteRow?.label || '未命名'}」`"
+      tone="danger"
+      :busy="busy"
+      @confirm="doDelete"
+    >
+      <p>这把钥匙将从凭据账上<strong>永久删除，不可恢复</strong>；用它的客户端会立刻连不上。</p>
+      <p class="tip">只是想临时停用？用「作废」——留痕且随时可启用。删除前系统会自动留一份快照备份。</p>
+    </ConfirmDialog>
+
     <CredentialDialog
       v-model="credOpen"
       :credential="cred"
@@ -170,6 +182,8 @@ const revokeOpen = ref(false)
 const revokeRow = ref(null)
 const rotateOpen = ref(false)
 const rotateRow = ref(null)
+const deleteOpen = ref(false)
+const deleteRow = ref(null)
 
 const canAdd = computed(() => props.agent?.status === 'approved')
 const hasUnrecoverable = computed(() =>
@@ -298,6 +312,11 @@ function askRotate(r) {
   rotateOpen.value = true
 }
 
+function askDelete(r) {
+  deleteRow.value = r
+  deleteOpen.value = true
+}
+
 async function doRotate() {
   const r = rotateRow.value
   if (!r) return
@@ -317,19 +336,13 @@ async function doRotate() {
   }
 }
 
-async function doDelete(r) {
-  // 确认串 = 这把编号前 8 位（与后端 delete 闸同档：看着目标打字，传 true 不算数）。
-  const expect = String(r.cred_id || '').slice(0, 8)
-  const got = window.prompt(
-    `删除「${r.label || '未命名'}」（${expect}…）不可恢复——要可逆请用「作废」。\n确认请原样输入这把编号前 8 位：`)
-  if (got === null) return
-  if (got.trim() !== expect) {
-    showError('编号对不上，没有删除任何东西')
-    return
-  }
+async function doDelete() {
+  const r = deleteRow.value
+  if (!r) return
   busy.value = true
   try {
-    await api.deleteCredential(props.agent.agent_id, r.cred_id, got.trim())
+    await api.deleteCredential(props.agent.agent_id, r.cred_id, true)
+    deleteOpen.value = false
     showToast(`已删除「${r.label || '未命名'}」（删前快照已落审计备份）`)
     await load()
     emit('changed')
