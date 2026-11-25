@@ -34,12 +34,14 @@ def load_conf():
 
 
 DISTILL_PROMPT = """你是记忆提炼助手。从下面的对话中提炼「值得长期记住」的信息，输出 JSON 数组。
-只提炼：用户偏好/习惯、项目事实、环境配置、技术决策、踩坑教训、用户身份信息。
+只提炼：用户偏好/习惯、稳定的项目事实、环境配置、技术决策、踩坑教训、用户身份信息。
 忽略：寒暄、临时任务进度、纯工具输出、重复内容。
+一律不记（运维瞬时态，明天就失效）：/tmp 路径与临时文件名、帧号/事件ID/账本水位、任务书与重投进度、巡检/监控/验收的过程叙述、部署中间状态、「待确认/待清理/待收编」类悬置事项。
+判据：这条信息一个月后还成立吗？不成立 ⇒ 不记。
 每条: {"content": "一句话记忆内容(中文)", "category": "preference|fact|lesson|project|identity", "tags": "逗号分隔关键词"}
 要求:
 - content 具体明确，不写模糊的废话
-- 最多 8 条，宁缺毋滥
+- 最多 3 条，宁缺毋滥；没有值得长期记住的就输出空数组 []
 - 只输出 JSON 数组，不要任何解释
 
 对话:
@@ -51,10 +53,12 @@ def get_recent_messages(hours, last_id=0):
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     ts = time.time() - hours * 3600
     rows = conn.execute(
-        """SELECT id, role, content, timestamp FROM messages
-           WHERE role IN ('user','assistant') AND content IS NOT NULL
-           AND id > ? AND timestamp > ?
-           ORDER BY id DESC LIMIT 300""", (last_id, ts)).fetchall()
+        """SELECT m.id, m.role, m.content, m.timestamp FROM messages m
+           JOIN sessions s ON m.session_id = s.id
+           WHERE m.role IN ('user','assistant') AND m.content IS NOT NULL
+           AND m.id > ? AND m.timestamp > ?
+           AND s.source IN ('feishu','cli','qqbot')
+           ORDER BY m.id DESC LIMIT 300""", (last_id, ts)).fetchall()
     conn.close()
     max_id = rows[0][0] if rows else last_id
     # 按时间正序
@@ -112,7 +116,7 @@ def distill(conversation, max_chars, channel):
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     finish_reason = "?"  # 用于截断日志，区分 stop/length/...
     try:
-        resp = urllib.request.urlopen(req, timeout=120)
+        resp = urllib.request.urlopen(req, timeout=300)
         data = json.loads(resp.read())
         finish_reason = (
             (data.get("choices") or [{}])[0].get("finish_reason") or "?"
